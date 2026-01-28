@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strings"
 	"sync"
 	"time"
 
@@ -17,6 +18,10 @@ type Config struct {
 	LLM          llm.ChatModel
 	Tools        []tools.Tool
 	SystemPrompt string
+
+	// InitialMessages restores a previous conversation history.
+	// If provided, the agent will not auto-insert SystemPrompt on first query unless you include it here.
+	InitialMessages []llm.Message
 
 	MaxIterations int
 	ToolChoice    llm.ToolChoice
@@ -65,8 +70,11 @@ func New(cfg Config) (*Agent, error) {
 	}
 
 	compSvc := compaction.NewService(cfg.Compaction)
+	if cfg.InitialMessages == nil {
+		cfg.InitialMessages = nil
+	}
 
-	return &Agent{
+	ag := &Agent{
 		llm:           cfg.LLM,
 		systemPrompt:  cfg.SystemPrompt,
 		maxIterations: cfg.MaxIterations,
@@ -76,7 +84,11 @@ func New(cfg Config) (*Agent, error) {
 		toolMap:       toolMap,
 		deps:          cfg.Deps,
 		compactor:     compSvc,
-	}, nil
+	}
+	if len(cfg.InitialMessages) > 0 {
+		ag.messages = append([]llm.Message(nil), cfg.InitialMessages...)
+	}
+	return ag, nil
 }
 
 func (a *Agent) Messages() []llm.Message {
@@ -93,15 +105,34 @@ func (a *Agent) ClearHistory() {
 	a.messages = nil
 }
 
+// ReplaceHistory replaces the current conversation history.
+// Callers should include the system prompt message if they want it preserved.
+func (a *Agent) ReplaceHistory(messages []llm.Message) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.messages = append([]llm.Message(nil), messages...)
+}
+
 func (a *Agent) Query(ctx context.Context, text string) (string, error) {
 	ch := a.QueryStream(ctx, llm.TextContent(text))
 	final := ""
+	var lastErr error
 	for ev := range ch {
 		if f, ok := ev.(FinalResponseEvent); ok {
 			final = f.Content
 		}
+		if e, ok := ev.(ErrorEvent); ok {
+			// Preserve provider/status info in the error string.
+			if e.StatusCode != 0 {
+				lastErr = fmt.Errorf("%s error (%d): %s", e.Provider, e.StatusCode, e.Message)
+			} else if e.Provider != "" {
+				lastErr = fmt.Errorf("%s error: %s", e.Provider, e.Message)
+			} else {
+				lastErr = fmt.Errorf("agent error: %s", e.Message)
+			}
+		}
 	}
-	return final, nil
+	return final, lastErr
 }
 
 func (a *Agent) QueryStream(ctx context.Context, input llm.Content) <-chan Event {
@@ -135,7 +166,7 @@ func (a *Agent) QueryStream(ctx context.Context, input llm.Content) <-chan Event
 				ToolChoice: a.toolChoice,
 			})
 			if err != nil {
-				out <- FinalResponseEvent{Content: fmt.Sprintf("LLM error: %v", err)}
+				out <- a.errEvent(err)
 				return
 			}
 
@@ -272,11 +303,76 @@ func (a *Agent) checkAndCompact(ctx context.Context, last *llm.Completion) {
 	copy(messages, a.messages)
 	a.mu.Unlock()
 
+	origMsgs := messages
 	newMsgs, _, err := a.compactor.Compact(ctx, a.llm, messages)
 	if err != nil {
 		return
 	}
+	newMsgs = a.withPreservedSystem(origMsgs, newMsgs)
 	a.mu.Lock()
 	a.messages = newMsgs
 	a.mu.Unlock()
+}
+
+// CompactNow forces a compaction run regardless of current token usage.
+func (a *Agent) CompactNow(ctx context.Context) (compaction.Result, error) {
+	if a.compactor == nil {
+		return compaction.Result{Compacted: false}, nil
+	}
+	a.mu.Lock()
+	orig := make([]llm.Message, len(a.messages))
+	copy(orig, a.messages)
+	a.mu.Unlock()
+
+	newMsgs, res, err := a.compactor.Compact(ctx, a.llm, orig)
+	if err != nil {
+		return res, err
+	}
+	newMsgs = a.withPreservedSystem(orig, newMsgs)
+	a.mu.Lock()
+	a.messages = newMsgs
+	a.mu.Unlock()
+	return res, nil
+}
+
+func (a *Agent) withPreservedSystem(orig []llm.Message, compacted []llm.Message) []llm.Message {
+	if len(compacted) > 0 && compacted[0].Role == llm.RoleSystem {
+		return compacted
+	}
+	sys := make([]llm.Message, 0, 1)
+	for _, m := range orig {
+		if m.Role == llm.RoleSystem {
+			sys = append(sys, m)
+		}
+	}
+	if len(sys) == 0 && strings.TrimSpace(a.systemPrompt) != "" {
+		sys = append(sys, llm.NewSystemMessage(a.systemPrompt))
+	}
+	if len(sys) == 0 {
+		return compacted
+	}
+	out := make([]llm.Message, 0, len(sys)+len(compacted))
+	out = append(out, sys...)
+	out = append(out, compacted...)
+	return out
+}
+
+func (a *Agent) errEvent(err error) ErrorEvent {
+	if err == nil {
+		return ErrorEvent{Provider: a.llm.Provider(), Message: "<nil>", Kind: "unknown"}
+	}
+	var rl *llm.RateLimitError
+	if errors.As(err, &rl) {
+		return ErrorEvent{Provider: rl.Provider, StatusCode: 429, Message: rl.Message, Kind: "rate_limit"}
+	}
+	var pe *llm.ProviderError
+	if errors.As(err, &pe) {
+		return ErrorEvent{Provider: pe.Provider, StatusCode: pe.StatusCode, Message: pe.Message, Kind: "provider"}
+	}
+	// Best-effort: preserve model provider when possible.
+	prov := ""
+	if a.llm != nil {
+		prov = a.llm.Provider()
+	}
+	return ErrorEvent{Provider: prov, Message: err.Error(), Kind: "unknown"}
 }

@@ -9,6 +9,17 @@ func (TextEvent) isEvent() {}
 type ThinkingEvent struct{ Content string }
 func (ThinkingEvent) isEvent() {}
 
+// ErrorEvent is emitted when the agent hits a fatal error (e.g. provider API error).
+// The stream will end after emitting this event.
+type ErrorEvent struct {
+	Provider   string
+	StatusCode int
+	Message    string
+	Kind       string // "rate_limit"|"provider"|"network"|"unknown"
+}
+
+func (ErrorEvent) isEvent() {}
+
 type HiddenUserMessageEvent struct{ Content string }
 func (HiddenUserMessageEvent) isEvent() {}
 

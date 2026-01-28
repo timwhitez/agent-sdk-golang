@@ -87,8 +87,8 @@ func (c *ChatClient) Invoke(ctx context.Context, req llm.InvokeRequest) (*llm.Co
 
 		resp, err := client.Do(httpReq)
 		if err == nil {
-			defer resp.Body.Close()
 			data, readErr := io.ReadAll(resp.Body)
+			_ = resp.Body.Close()
 			if readErr != nil {
 				return nil, readErr
 			}

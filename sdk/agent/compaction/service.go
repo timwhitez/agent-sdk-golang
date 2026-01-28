@@ -15,8 +15,12 @@ type Service struct {
 
 func NewService(cfg *Config) *Service {
 	c := DefaultConfig()
+	ctxWindow := DefaultContextWindow
 	if cfg != nil {
 		c = *cfg
+		if cfg.ContextWindow > 0 {
+			ctxWindow = cfg.ContextWindow
+		}
 		if c.ThresholdRatio <= 0 {
 			c.ThresholdRatio = DefaultThresholdRatio
 		}
@@ -24,7 +28,10 @@ func NewService(cfg *Config) *Service {
 			c.SummaryPrompt = DefaultSummaryPrompt
 		}
 	}
-	return &Service{Config: c, ContextWindow: DefaultContextWindow}
+	if ctxWindow <= 0 {
+		ctxWindow = DefaultContextWindow
+	}
+	return &Service{Config: c, ContextWindow: ctxWindow}
 }
 
 func (s *Service) threshold() int {

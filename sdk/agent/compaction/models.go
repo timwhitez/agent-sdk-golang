@@ -41,12 +41,15 @@ Wrap your summary in <summary></summary> tags.`
 
 type Config struct {
 	Enabled        bool
+	// ContextWindow is the model context window used for computing the compaction threshold.
+	// If <=0, DefaultContextWindow is used.
+	ContextWindow  int
 	ThresholdRatio float64
 	SummaryPrompt  string
 }
 
 func DefaultConfig() Config {
-	return Config{Enabled: true, ThresholdRatio: DefaultThresholdRatio, SummaryPrompt: DefaultSummaryPrompt}
+	return Config{Enabled: true, ContextWindow: DefaultContextWindow, ThresholdRatio: DefaultThresholdRatio, SummaryPrompt: DefaultSummaryPrompt}
 }
 
 type Result struct {
