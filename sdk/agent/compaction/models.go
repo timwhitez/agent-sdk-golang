@@ -4,7 +4,7 @@ import "regexp"
 
 const (
 	DefaultContextWindow  = 128_000
-	DefaultThresholdRatio = 0.80
+	DefaultThresholdRatio = 0.85
 )
 
 // DefaultSummaryPrompt is adapted from the Python SDK.
@@ -40,7 +40,7 @@ Be concise but complete - err on the side of including information that would pr
 Wrap your summary in <summary></summary> tags.`
 
 type Config struct {
-	Enabled        bool
+	Enabled bool
 	// ContextWindow is the model context window used for computing the compaction threshold.
 	// If <=0, DefaultContextWindow is used.
 	ContextWindow  int

@@ -169,6 +169,9 @@ func (a *Agent) QueryStream(ctx context.Context, input llm.Content) <-chan Event
 				out <- a.errEvent(err)
 				return
 			}
+			if comp.Usage != nil {
+				out <- UsageEvent{Usage: *comp.Usage}
+			}
 
 			if comp.Thinking != "" {
 				out <- ThinkingEvent{Content: comp.Thinking}
@@ -191,7 +194,7 @@ func (a *Agent) QueryStream(ctx context.Context, input llm.Content) <-chan Event
 						incompleteTodosPrompted = true
 					}
 					// compaction check
-					a.checkAndCompact(ctx, comp)
+					a.checkAndCompact(ctx, comp, out)
 					out <- FinalResponseEvent{Content: comp.PlainText()}
 					return
 				}
@@ -246,7 +249,7 @@ func (a *Agent) QueryStream(ctx context.Context, input llm.Content) <-chan Event
 				out <- StepCompleteEvent{StepID: tc.ID, Status: status, DurationMS: time.Since(start).Milliseconds()}
 			}
 
-			a.checkAndCompact(ctx, comp)
+			a.checkAndCompact(ctx, comp, out)
 		}
 
 		out <- FinalResponseEvent{Content: fmt.Sprintf("[Max iterations reached] %d", a.maxIterations)}
@@ -291,7 +294,7 @@ func (a *Agent) destroyEphemeralMessages() {
 	}
 }
 
-func (a *Agent) checkAndCompact(ctx context.Context, last *llm.Completion) {
+func (a *Agent) checkAndCompact(ctx context.Context, last *llm.Completion, out chan<- Event) {
 	if a.compactor == nil || last == nil {
 		return
 	}
@@ -304,7 +307,7 @@ func (a *Agent) checkAndCompact(ctx context.Context, last *llm.Completion) {
 	a.mu.Unlock()
 
 	origMsgs := messages
-	newMsgs, _, err := a.compactor.Compact(ctx, a.llm, messages)
+	newMsgs, res, err := a.compactor.Compact(ctx, a.llm, messages)
 	if err != nil {
 		return
 	}
@@ -312,6 +315,9 @@ func (a *Agent) checkAndCompact(ctx context.Context, last *llm.Completion) {
 	a.mu.Lock()
 	a.messages = newMsgs
 	a.mu.Unlock()
+	if out != nil {
+		out <- CompactionEvent{Result: res, TriggerUsage: last.Usage}
+	}
 }
 
 // CompactNow forces a compaction run regardless of current token usage.
