@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -108,24 +109,42 @@ func Tools() []tools.Tool {
 	}
 }
 
+func toolWithArgs[Args any](name, description string, fn func(ctx context.Context, args Args, deps *tools.Container) (llm.Content, error)) tools.Tool {
+	schema := tools.SchemaFor[Args]()
+	return tools.Tool{
+		Name:        name,
+		Description: description,
+		Schema:      schema,
+		Handler: func(ctx context.Context, raw json.RawMessage, deps *tools.Container) (llm.Content, error) {
+			var a Args
+			dec := json.NewDecoder(bytes.NewReader(raw))
+			dec.DisallowUnknownFields()
+			if err := dec.Decode(&a); err != nil {
+				return llm.TextContent(fmt.Sprintf("Error parsing arguments: %v", err)), err
+			}
+			return fn(ctx, a, deps)
+		},
+	}
+}
+
 type bashArgs struct {
 	Command string `json:"command"`
 	Timeout int    `json:"timeout,omitempty"` // seconds
 }
 
 func bashTool() tools.Tool {
-	return tools.Func[bashArgs]("bash", "Execute a shell command and return output", func(ctx context.Context, a bashArgs, deps *tools.Container) (any, error) {
+	return toolWithArgs[bashArgs]("bash", "Execute a shell command and return output", func(ctx context.Context, a bashArgs, deps *tools.Container) (llm.Content, error) {
 		s, err := tools.Get(deps, ctx, Key)
 		if err != nil {
-			return "", err
+			return llm.TextContent(""), err
 		}
 		conf := getConfirmer(deps, ctx)
 		ok, err := conf.Confirm(ctx, "bash", a.Command)
 		if err != nil {
-			return "Error: " + err.Error(), nil
+			return llm.TextContent("Error: " + err.Error()), err
 		}
 		if !ok {
-			return "Denied", nil
+			return llm.TextContent("Denied"), fmt.Errorf("denied")
 		}
 		timeout := a.Timeout
 		if timeout <= 0 {
@@ -138,16 +157,16 @@ func bashTool() tools.Tool {
 		cmd.Dir = s.WorkingDir
 		out, err := cmd.CombinedOutput()
 		if errors.Is(cctx.Err(), context.DeadlineExceeded) {
-			return fmt.Sprintf("Command timed out after %ds", timeout), nil
+			return llm.TextContent(fmt.Sprintf("Command timed out after %ds", timeout)), context.DeadlineExceeded
 		}
 		res := strings.TrimSpace(string(out))
 		if res == "" {
 			res = "(no output)"
 		}
 		if err != nil {
-			return res, nil
+			return llm.TextContent(res), err
 		}
-		return res, nil
+		return llm.TextContent(res), nil
 	})
 }
 
@@ -166,35 +185,35 @@ type readArgs struct {
 }
 
 func readTool() tools.Tool {
-	return tools.Func[readArgs]("read", "Read contents of a file", func(ctx context.Context, a readArgs, deps *tools.Container) (any, error) {
+	return toolWithArgs[readArgs]("read", "Read contents of a file", func(ctx context.Context, a readArgs, deps *tools.Container) (llm.Content, error) {
 		s, err := tools.Get(deps, ctx, Key)
 		if err != nil {
-			return "", err
+			return llm.TextContent(""), err
 		}
 		p, err := s.Resolve(a.FilePath)
 		if err != nil {
-			return "Security error: " + err.Error(), nil
+			return llm.TextContent("Security error: " + err.Error()), err
 		}
 		st, err := os.Stat(p)
 		if err != nil {
 			if os.IsNotExist(err) {
-				return "File not found: " + a.FilePath, nil
+				return llm.TextContent("File not found: " + a.FilePath), err
 			}
-			return "Error: " + err.Error(), nil
+			return llm.TextContent("Error: " + err.Error()), err
 		}
 		if st.IsDir() {
-			return "Path is a directory: " + a.FilePath, nil
+			return llm.TextContent("Path is a directory: " + a.FilePath), fmt.Errorf("is a directory")
 		}
 		b, err := os.ReadFile(p)
 		if err != nil {
-			return "Error reading file: " + err.Error(), nil
+			return llm.TextContent("Error reading file: " + err.Error()), err
 		}
 		lines := splitLines(string(b))
 		out := make([]string, 0, len(lines))
 		for i, line := range lines {
 			out = append(out, fmt.Sprintf("%4d  %s", i+1, line))
 		}
-		return strings.Join(out, "\n"), nil
+		return llm.TextContent(strings.Join(out, "\n")), nil
 	})
 }
 
@@ -215,30 +234,30 @@ type writeArgs struct {
 }
 
 func writeTool() tools.Tool {
-	return tools.Func[writeArgs]("write", "Write content to a file", func(ctx context.Context, a writeArgs, deps *tools.Container) (any, error) {
+	return toolWithArgs[writeArgs]("write", "Write content to a file", func(ctx context.Context, a writeArgs, deps *tools.Container) (llm.Content, error) {
 		s, err := tools.Get(deps, ctx, Key)
 		if err != nil {
-			return "", err
+			return llm.TextContent(""), err
 		}
 		conf := getConfirmer(deps, ctx)
 		ok, err := conf.Confirm(ctx, "write", fmt.Sprintf("%s (%d bytes)", a.FilePath, len(a.Content)))
 		if err != nil {
-			return "Error: " + err.Error(), nil
+			return llm.TextContent("Error: " + err.Error()), err
 		}
 		if !ok {
-			return "Denied", nil
+			return llm.TextContent("Denied"), fmt.Errorf("denied")
 		}
 		p, err := s.Resolve(a.FilePath)
 		if err != nil {
-			return "Security error: " + err.Error(), nil
+			return llm.TextContent("Security error: " + err.Error()), err
 		}
 		if err := os.MkdirAll(filepath.Dir(p), 0o755); err != nil {
-			return "Error writing file: " + err.Error(), nil
+			return llm.TextContent("Error writing file: " + err.Error()), err
 		}
 		if err := os.WriteFile(p, []byte(a.Content), 0o644); err != nil {
-			return "Error writing file: " + err.Error(), nil
+			return llm.TextContent("Error writing file: " + err.Error()), err
 		}
-		return fmt.Sprintf("Wrote %d bytes to %s", len(a.Content), a.FilePath), nil
+		return llm.TextContent(fmt.Sprintf("Wrote %d bytes to %s", len(a.Content), a.FilePath)), nil
 	})
 }
 
@@ -249,40 +268,40 @@ type editArgs struct {
 }
 
 func editTool() tools.Tool {
-	return tools.Func[editArgs]("edit", "Replace text in a file", func(ctx context.Context, a editArgs, deps *tools.Container) (any, error) {
+	return toolWithArgs[editArgs]("edit", "Replace text in a file", func(ctx context.Context, a editArgs, deps *tools.Container) (llm.Content, error) {
 		s, err := tools.Get(deps, ctx, Key)
 		if err != nil {
-			return "", err
+			return llm.TextContent(""), err
 		}
 		conf := getConfirmer(deps, ctx)
 		ok, err := conf.Confirm(ctx, "edit", a.FilePath)
 		if err != nil {
-			return "Error: " + err.Error(), nil
+			return llm.TextContent("Error: " + err.Error()), err
 		}
 		if !ok {
-			return "Denied", nil
+			return llm.TextContent("Denied"), fmt.Errorf("denied")
 		}
 		p, err := s.Resolve(a.FilePath)
 		if err != nil {
-			return "Security error: " + err.Error(), nil
+			return llm.TextContent("Security error: " + err.Error()), err
 		}
 		b, err := os.ReadFile(p)
 		if err != nil {
 			if os.IsNotExist(err) {
-				return "File not found: " + a.FilePath, nil
+				return llm.TextContent("File not found: " + a.FilePath), err
 			}
-			return "Error editing file: " + err.Error(), nil
+			return llm.TextContent("Error editing file: " + err.Error()), err
 		}
 		content := string(b)
 		if !strings.Contains(content, a.OldString) {
-			return "String not found in " + a.FilePath, nil
+			return llm.TextContent("String not found in " + a.FilePath), fmt.Errorf("string not found")
 		}
 		count := strings.Count(content, a.OldString)
 		newContent := strings.ReplaceAll(content, a.OldString, a.NewString)
 		if err := os.WriteFile(p, []byte(newContent), 0o644); err != nil {
-			return "Error editing file: " + err.Error(), nil
+			return llm.TextContent("Error editing file: " + err.Error()), err
 		}
-		return fmt.Sprintf("Replaced %d occurrence(s) in %s", count, a.FilePath), nil
+		return llm.TextContent(fmt.Sprintf("Replaced %d occurrence(s) in %s", count, a.FilePath)), nil
 	})
 }
 
