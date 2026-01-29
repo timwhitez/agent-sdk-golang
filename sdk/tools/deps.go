@@ -21,6 +21,7 @@ type ctxKey string
 
 const (
 	toolCallIDKey ctxKey = "tools.tool_call_id"
+	toolResultMetaKey ctxKey = "tools.tool_result_meta"
 )
 
 // WithToolCallID attaches a tool_call_id to the context for tool handlers.
@@ -39,6 +40,117 @@ func ToolCallID(ctx context.Context) string {
 	}
 	v, _ := ctx.Value(toolCallIDKey).(string)
 	return strings.TrimSpace(v)
+}
+
+// ---- tool result metadata ----
+
+// ToolResultMetadata is an ephemeral metadata bag tools can attach to their result.
+// Interactive clients may use it to enhance UI without polluting the LLM-visible content.
+//
+// NOTE: This is intentionally best-effort and not persisted in llm.Message.
+type ToolResultMetadata struct {
+	mu sync.Mutex
+	m  map[string]any
+}
+
+// WithToolResultMetadata attaches a mutable metadata store to the context.
+// Tools can call Set/Upsert helpers to record metadata for the current tool call.
+func WithToolResultMetadata(ctx context.Context) context.Context {
+	if ctx == nil {
+		return ctx
+	}
+	if _, ok := ctx.Value(toolResultMetaKey).(*ToolResultMetadata); ok {
+		return ctx
+	}
+	return context.WithValue(ctx, toolResultMetaKey, &ToolResultMetadata{m: map[string]any{}})
+}
+
+func toolResultMeta(ctx context.Context) *ToolResultMetadata {
+	if ctx == nil {
+		return nil
+	}
+	v, _ := ctx.Value(toolResultMetaKey).(*ToolResultMetadata)
+	return v
+}
+
+// SetToolResultMetadata replaces metadata for the current tool call.
+func SetToolResultMetadata(ctx context.Context, meta map[string]any) {
+	s := toolResultMeta(ctx)
+	if s == nil {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if meta == nil {
+		s.m = map[string]any{}
+		return
+	}
+	out := make(map[string]any, len(meta))
+	for k, v := range meta {
+		if strings.TrimSpace(k) == "" {
+			continue
+		}
+		out[k] = v
+	}
+	s.m = out
+}
+
+// UpsertToolResultMetadata merges metadata for the current tool call.
+func UpsertToolResultMetadata(ctx context.Context, meta map[string]any) {
+	s := toolResultMeta(ctx)
+	if s == nil || meta == nil {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.m == nil {
+		s.m = map[string]any{}
+	}
+	for k, v := range meta {
+		kk := strings.TrimSpace(k)
+		if kk == "" {
+			continue
+		}
+		s.m[kk] = v
+	}
+}
+
+// ToolResultMetadataSnapshot returns a defensive copy of current tool metadata.
+func ToolResultMetadataSnapshot(ctx context.Context) map[string]any {
+	s := toolResultMeta(ctx)
+	if s == nil {
+		return nil
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if len(s.m) == 0 {
+		return nil
+	}
+	out := make(map[string]any, len(s.m))
+	for k, v := range s.m {
+		out[k] = v
+	}
+	return out
+}
+
+// TakeToolResultMetadataSnapshot returns metadata and clears it.
+func TakeToolResultMetadataSnapshot(ctx context.Context) map[string]any {
+	s := toolResultMeta(ctx)
+	if s == nil {
+		return nil
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if len(s.m) == 0 {
+		return nil
+	}
+	out := make(map[string]any, len(s.m))
+	for k, v := range s.m {
+		out[k] = v
+	}
+	// clear
+	s.m = map[string]any{}
+	return out
 }
 
 // Container resolves dependencies using registered providers with optional overrides.

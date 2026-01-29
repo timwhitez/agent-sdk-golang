@@ -134,8 +134,12 @@ func Tools() []tools.Tool {
 		applyPatchTool().WithEphemeralKeep(1),
 		globTool().WithEphemeralKeep(1),
 		grepTool().WithEphemeralKeep(1),
-		todoReadTool(),
-		todoWriteTool(),
+		// Preferred (opencode-compatible) names.
+		todoReadToolNamed("todoread"),
+		todoWriteToolNamed("todowrite"),
+		// Backward-compatible aliases.
+		todoReadToolNamed("todo_read"),
+		todoWriteToolNamed("todo_write"),
 		doneTool(),
 	}
 }
@@ -151,11 +155,11 @@ func attachToolCallMeta(ctx context.Context, meta map[string]any) map[string]any
 }
 
 type webfetchArgs struct {
-	URL     string            `json:"url"`
-	Method  string            `json:"method,omitempty"`  // GET|HEAD (default GET)
-	Headers map[string]string `json:"headers,omitempty"` // best-effort
-	Timeout int               `json:"timeout,omitempty"` // seconds
-	MaxBytes int              `json:"max_bytes,omitempty"`
+	URL      string            `json:"url"`
+	Method   string            `json:"method,omitempty"`  // GET|HEAD (default GET)
+	Headers  map[string]string `json:"headers,omitempty"` // best-effort
+	Timeout  int               `json:"timeout,omitempty"` // seconds
+	MaxBytes int               `json:"max_bytes,omitempty"`
 }
 
 func webfetchTool() tools.Tool {
@@ -194,9 +198,9 @@ func webfetchTool() tools.Tool {
 
 		meta := attachToolCallMeta(ctx, map[string]any{
 			"category": "network",
-			"summary": fmt.Sprintf("%s %s", method, rawURL),
-			"url":     rawURL,
-			"raw":     fmt.Sprintf("%s %s (timeout=%ds, max_bytes=%d)", method, rawURL, timeout, maxBytes),
+			"summary":  fmt.Sprintf("%s %s", method, rawURL),
+			"url":      rawURL,
+			"raw":      fmt.Sprintf("%s %s (timeout=%ds, max_bytes=%d)", method, rawURL, timeout, maxBytes),
 		})
 		ok, err := conf.Confirm(ctx, "webfetch", buildConfirmDetail(meta))
 		if err != nil {
@@ -573,7 +577,7 @@ func writeTool() tools.Tool {
 		conf := getConfirmer(deps, ctx)
 		p, err := s.Resolve(a.FilePath)
 		if err != nil {
-			return llm.TextContent("Security error: "+err.Error()), err
+			return llm.TextContent("Security error: " + err.Error()), err
 		}
 		// Build confirm meta with a diff preview.
 		raw := fmt.Sprintf("%s (%d bytes)", a.FilePath, len(a.Content))
@@ -648,7 +652,7 @@ func editTool() tools.Tool {
 		})
 		ok, err := conf.Confirm(ctx, "edit", buildConfirmDetail(meta))
 		if err != nil {
-			return llm.TextContent("Error: "+err.Error()), err
+			return llm.TextContent("Error: " + err.Error()), err
 		}
 		if !ok {
 			return llm.TextContent("Denied"), nil
@@ -770,10 +774,10 @@ func applyPatchTool() tools.Tool {
 		raw := fmt.Sprintf("apply_patch (%d bytes)", len(a.Patch))
 		meta := attachToolCallMeta(ctx, map[string]any{
 			"category": "filesystem_write",
-			"summary": raw,
-			"paths":   paths,
-			"diff":    a.Patch,
-			"raw":     raw,
+			"summary":  raw,
+			"paths":    paths,
+			"diff":     a.Patch,
+			"raw":      raw,
 		})
 		ok, err := conf.Confirm(ctx, "apply_patch", buildConfirmDetail(meta))
 		if err != nil {
@@ -1376,11 +1380,32 @@ type todoWriteArgs struct {
 	Todos []TodoItem `json:"todos"`
 }
 
-func todoReadTool() tools.Tool {
-	return tools.Func[struct{}]("todo_read", "Read current todo list", func(ctx context.Context, _ struct{}, deps *tools.Container) (any, error) {
+func todoReadToolNamed(name string) tools.Tool {
+	name = strings.TrimSpace(name)
+	if name == "" {
+		name = "todo_read"
+	}
+	desc := "Read current todo list"
+	if name == "todoread" {
+		desc = "Read current todo list (alias: todo_read)"
+	}
+	return tools.Func[struct{}](name, desc, func(ctx context.Context, _ struct{}, deps *tools.Container) (any, error) {
 		s, err := tools.Get(deps, ctx, Key)
 		if err != nil {
 			return "", err
+		}
+		conf := getConfirmer(deps, ctx)
+		meta := attachToolCallMeta(ctx, map[string]any{
+			"category": "state_read",
+			"summary":  fmt.Sprintf("%s", name),
+			"raw":      "read todos",
+		})
+		ok, err := conf.Confirm(ctx, name, buildConfirmDetail(meta))
+		if err != nil {
+			return "Error: " + err.Error(), err
+		}
+		if !ok {
+			return "Denied", nil
 		}
 		todos := s.TodosSnapshot()
 		if len(todos) == 0 {
@@ -1398,8 +1423,16 @@ func todoReadTool() tools.Tool {
 	})
 }
 
-func todoWriteTool() tools.Tool {
-	return tools.Func[todoWriteArgs]("todo_write", "Update the todo list", func(ctx context.Context, a todoWriteArgs, deps *tools.Container) (any, error) {
+func todoWriteToolNamed(name string) tools.Tool {
+	name = strings.TrimSpace(name)
+	if name == "" {
+		name = "todo_write"
+	}
+	desc := "Update the todo list"
+	if name == "todowrite" {
+		desc = "Update the todo list (alias: todo_write)"
+	}
+	return tools.Func[todoWriteArgs](name, desc, func(ctx context.Context, a todoWriteArgs, deps *tools.Container) (any, error) {
 		s, err := tools.Get(deps, ctx, Key)
 		if err != nil {
 			return "", err
@@ -1407,10 +1440,10 @@ func todoWriteTool() tools.Tool {
 		conf := getConfirmer(deps, ctx)
 		meta := attachToolCallMeta(ctx, map[string]any{
 			"category": "state_write",
-			"summary":  fmt.Sprintf("todo_write (%d items)", len(a.Todos)),
+			"summary":  fmt.Sprintf("%s (%d items)", name, len(a.Todos)),
 			"raw":      fmt.Sprintf("%d items", len(a.Todos)),
 		})
-		ok, err := conf.Confirm(ctx, "todo_write", buildConfirmDetail(meta))
+		ok, err := conf.Confirm(ctx, name, buildConfirmDetail(meta))
 		if err != nil {
 			return "Error: " + err.Error(), err
 		}

@@ -219,12 +219,14 @@ func (a *Agent) QueryStream(ctx context.Context, input llm.Content) <-chan Event
 				start := time.Now()
 				tool := a.toolMap[tc.Function.Name]
 				ctxTool := tools.WithToolCallID(ctx, tc.ID)
+				ctxTool = tools.WithToolResultMetadata(ctxTool)
 				content, toolErr := tool.Execute(ctxTool, tc.Function.Arguments, a.deps)
 				isError := toolErr != nil
 				status := "completed"
 				if isError {
 					status = "error"
 				}
+				meta := tools.TakeToolResultMetadataSnapshot(ctxTool)
 
 				// If tool is configured ephemeral, mark tool message accordingly.
 				ephemeral := tool.EphemeralKeep > 0
@@ -239,7 +241,7 @@ func (a *Agent) QueryStream(ctx context.Context, input llm.Content) <-chan Event
 					a.mu.Lock()
 					a.messages = append(a.messages, llm.Message{Role: llm.RoleTool, ToolCallID: tc.ID, ToolName: tc.Function.Name, Content: content, IsError: false, Ephemeral: ephemeral})
 					a.mu.Unlock()
-					out <- ToolResultEvent{Tool: tc.Function.Name, Result: content.PlainText(), ToolCallID: tc.ID, IsError: false}
+					out <- ToolResultEvent{Tool: tc.Function.Name, Result: content.PlainText(), ToolCallID: tc.ID, IsError: false, Metadata: meta}
 					out <- StepCompleteEvent{StepID: tc.ID, Status: status, DurationMS: time.Since(start).Milliseconds()}
 					out <- FinalResponseEvent{Content: tce.Message}
 					return
@@ -250,7 +252,7 @@ func (a *Agent) QueryStream(ctx context.Context, input llm.Content) <-chan Event
 				a.messages = append(a.messages, llm.Message{Role: llm.RoleTool, ToolCallID: tc.ID, ToolName: tc.Function.Name, Content: content, IsError: isError, Ephemeral: ephemeral})
 				a.mu.Unlock()
 
-				out <- ToolResultEvent{Tool: tc.Function.Name, Result: content.PlainText(), ToolCallID: tc.ID, IsError: isError}
+				out <- ToolResultEvent{Tool: tc.Function.Name, Result: content.PlainText(), ToolCallID: tc.ID, IsError: isError, Metadata: meta}
 				out <- StepCompleteEvent{StepID: tc.ID, Status: status, DurationMS: time.Since(start).Milliseconds()}
 			}
 

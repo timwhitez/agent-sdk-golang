@@ -68,6 +68,7 @@ type ToolResultEvent struct {
 	ToolCallID       string
 	IsError          bool
 	ScreenshotBase64 string
+	Metadata         map[string]any
 }
 
 func (ToolResultEvent) isEvent() {}
