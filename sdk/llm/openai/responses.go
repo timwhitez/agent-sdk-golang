@@ -35,6 +35,11 @@ type ResponsesClient struct {
 	RetryBaseDelay       time.Duration
 	RetryMaxDelay        time.Duration
 	RetryableStatusCodes map[int]struct{}
+
+	// ForceStringInput enables a compatibility mode where `input[].content` is sent as a plain string
+	// instead of the official array-of-content-parts form.
+	// Some OpenAI-compatible gateways (e.g. certain enterprise proxies) require this.
+	ForceStringInput bool
 }
 
 func (c *ResponsesClient) Provider() string { return "openai" }
@@ -102,6 +107,13 @@ func (c *ResponsesClient) Invoke(ctx context.Context, req llm.InvokeRequest) (*l
 			// Automatic downgrade: some gateways reject reasoning settings.
 			if (resp.StatusCode == 400 || resp.StatusCode == 422) && strings.TrimSpace(c.ReasoningEffort) != "" && looksLikeReasoningUnsupported(msg) {
 				c.ReasoningEffort = ""
+				if attempt < maxRetries-1 {
+					continue
+				}
+			}
+			// Automatic compat: some gateways require input.content to be a string.
+			if (resp.StatusCode == 400 || resp.StatusCode == 422) && strings.Contains(msg, "MissingParameter") && strings.Contains(msg, "input.content") {
+				c.ForceStringInput = true
 				if attempt < maxRetries-1 {
 					continue
 				}
@@ -210,6 +222,18 @@ type responsesRequest struct {
 	Stream bool `json:"stream,omitempty"`
 }
 
+func (c *ResponsesClient) forceStringInput() bool {
+	if c == nil {
+		return false
+	}
+	if c.ForceStringInput {
+		return true
+	}
+	// Auto-detect: enterprise versioned endpoints tend to be OpenAI-compatible but not fully spec-complete.
+	base := strings.TrimRight(strings.TrimSpace(c.baseURL()), "/")
+	return strings.Contains(base, "/api/v")
+}
+
 // InvokeStream implements true SSE streaming for OpenAI responses.
 // It emits text deltas and basic tool-call deltas (best-effort).
 func (c *ResponsesClient) InvokeStream(ctx context.Context, req llm.InvokeRequest) (<-chan llm.StreamEvent, error) {
@@ -285,6 +309,13 @@ func (c *ResponsesClient) InvokeStream(ctx context.Context, req llm.InvokeReques
 				// Automatic downgrade: disable reasoning when unsupported.
 				if (resp.StatusCode == 400 || resp.StatusCode == 422) && strings.TrimSpace(c.ReasoningEffort) != "" && looksLikeReasoningUnsupported(msg) {
 					c.ReasoningEffort = ""
+					if attempt < maxRetries-1 {
+						continue
+					}
+				}
+				// Automatic compat: some gateways require input.content to be a string.
+				if (resp.StatusCode == 400 || resp.StatusCode == 422) && strings.Contains(msg, "MissingParameter") && strings.Contains(msg, "input.content") {
+					c.ForceStringInput = true
 					if attempt < maxRetries-1 {
 						continue
 					}
@@ -417,6 +448,7 @@ func (c *ResponsesClient) buildRequest(req llm.InvokeRequest) (*responsesRequest
 		return nil, fmt.Errorf("openai responses: model is required")
 	}
 
+	stringContent := c.forceStringInput()
 	input := make([]responsesMessage, 0, len(req.Messages))
 	for _, m := range req.Messages {
 		role := string(m.Role)
@@ -440,13 +472,28 @@ func (c *ResponsesClient) buildRequest(req llm.InvokeRequest) (*responsesRequest
 			// prepend to content
 			m = llm.Message{Role: llm.RoleUser, Content: llm.TextContent(prefix + "\n" + m.Content.PlainText())}
 		}
-		content := []map[string]any{}
-		if txt := m.Content.PlainText(); strings.TrimSpace(txt) != "" {
-			content = append(content, map[string]any{"type": "input_text", "text": txt})
+		txt := strings.TrimSpace(m.Content.PlainText())
+		if txt == "" {
+			// Some providers reject empty content; skip.
+			continue
+		}
+		var content any
+		if stringContent {
+			content = txt
+		} else {
+			content = []map[string]any{{"type": "input_text", "text": txt}}
 		}
 		msg := responsesMessage{Role: role, Content: content}
 		// tool_call_id is only valid for role "tool"; skip for compatibility.
 		input = append(input, msg)
+	}
+	if len(input) == 0 {
+		// Always send at least one user message to satisfy strict gateways.
+		var content any = "(empty)"
+		if !stringContent {
+			content = []map[string]any{{"type": "input_text", "text": "(empty)"}}
+		}
+		input = append(input, responsesMessage{Role: "user", Content: content})
 	}
 
 	toolsList := []responsesTool(nil)

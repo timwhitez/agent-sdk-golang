@@ -211,7 +211,9 @@ func (a *Agent) QueryStream(ctx context.Context, input llm.Content) <-chan Event
 				out <- StepStartEvent{StepID: tc.ID, Title: tc.Function.Name, StepNumber: step}
 
 				argsMap := map[string]any{}
-				_ = json.Unmarshal([]byte(tc.Function.Arguments), &argsMap)
+				if err := json.Unmarshal([]byte(tc.Function.Arguments), &argsMap); err != nil {
+					argsMap = map[string]any{"__raw": tc.Function.Arguments}
+				}
 				out <- ToolCallEvent{Tool: tc.Function.Name, Args: argsMap, ToolCallID: tc.ID, DisplayName: tc.Function.Name}
 
 				start := time.Now()
