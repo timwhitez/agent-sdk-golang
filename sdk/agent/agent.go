@@ -160,11 +160,11 @@ func (a *Agent) QueryStream(ctx context.Context, input llm.Content) <-chan Event
 				toolDefs = append(toolDefs, t.Definition())
 			}
 
-			comp, err := a.llm.Invoke(ctx, llm.InvokeRequest{
+			comp, streamedText, err := a.invokeCompletion(ctx, llm.InvokeRequest{
 				Messages:   messages,
 				Tools:      toolDefs,
 				ToolChoice: a.toolChoice,
-			})
+			}, out)
 			if err != nil {
 				out <- a.errEvent(err)
 				return
@@ -176,8 +176,10 @@ func (a *Agent) QueryStream(ctx context.Context, input llm.Content) <-chan Event
 			if comp.Thinking != "" {
 				out <- ThinkingEvent{Content: comp.Thinking}
 			}
-			if txt := comp.PlainText(); txt != "" {
-				out <- TextEvent{Content: txt}
+			if !streamedText {
+				if txt := comp.PlainText(); txt != "" {
+					out <- TextEvent{Content: txt}
+				}
 			}
 
 			// Append assistant message.
@@ -214,7 +216,8 @@ func (a *Agent) QueryStream(ctx context.Context, input llm.Content) <-chan Event
 
 				start := time.Now()
 				tool := a.toolMap[tc.Function.Name]
-				content, toolErr := tool.Execute(ctx, tc.Function.Arguments, a.deps)
+				ctxTool := tools.WithToolCallID(ctx, tc.ID)
+				content, toolErr := tool.Execute(ctxTool, tc.Function.Arguments, a.deps)
 				isError := toolErr != nil
 				status := "completed"
 				if isError {
@@ -255,6 +258,119 @@ func (a *Agent) QueryStream(ctx context.Context, input llm.Content) <-chan Event
 		out <- FinalResponseEvent{Content: fmt.Sprintf("[Max iterations reached] %d", a.maxIterations)}
 	}()
 	return out
+}
+
+type toolCallBuilder struct {
+	id   string
+	name strings.Builder
+	args strings.Builder
+}
+
+type toolCallAccumulator struct {
+	items []toolCallBuilder
+}
+
+func (a *toolCallAccumulator) ensure(index int) *toolCallBuilder {
+	if index < 0 {
+		index = 0
+	}
+	for len(a.items) <= index {
+		a.items = append(a.items, toolCallBuilder{})
+	}
+	return &a.items[index]
+}
+
+func (a *toolCallAccumulator) apply(d llm.StreamToolCallDeltaEvent) {
+	it := a.ensure(d.Index)
+	if strings.TrimSpace(d.ID) != "" && strings.TrimSpace(it.id) == "" {
+		it.id = d.ID
+	}
+	if strings.TrimSpace(d.NameDelta) != "" {
+		it.name.WriteString(d.NameDelta)
+	}
+	if strings.TrimSpace(d.ArgumentsDelta) != "" {
+		it.args.WriteString(d.ArgumentsDelta)
+	}
+}
+
+func (a *toolCallAccumulator) finalize() []llm.ToolCall {
+	out := []llm.ToolCall{}
+	for i := range a.items {
+		it := &a.items[i]
+		name := strings.TrimSpace(it.name.String())
+		args := strings.TrimSpace(it.args.String())
+		if name == "" {
+			continue
+		}
+		if args == "" {
+			args = "{}"
+		}
+		id := strings.TrimSpace(it.id)
+		if id == "" {
+			id = fmt.Sprintf("call_%d", i)
+		}
+		out = append(out, llm.ToolCall{ID: id, Type: "function", Function: llm.FunctionCall{Name: name, Arguments: args}})
+	}
+	return out
+}
+
+// invokeCompletion calls the provider using streaming when available.
+// It returns the completion, whether text was streamed, and error.
+func (a *Agent) invokeCompletion(ctx context.Context, req llm.InvokeRequest, out chan<- Event) (*llm.Completion, bool, error) {
+	if a == nil || a.llm == nil {
+		return nil, false, fmt.Errorf("agent: nil llm")
+	}
+	if sm, ok := a.llm.(llm.StreamingChatModel); ok {
+		ch, err := sm.InvokeStream(ctx, req)
+		if err != nil {
+			return nil, false, err
+		}
+		var text strings.Builder
+		var thinking strings.Builder
+		acc := &toolCallAccumulator{}
+		var usage *llm.Usage
+		streamedText := false
+		for ev := range ch {
+			switch e := ev.(type) {
+			case llm.StreamTextDeltaEvent:
+				if strings.TrimSpace(e.Delta) != "" || e.Delta == "\n" {
+					text.WriteString(e.Delta)
+					streamedText = true
+					if out != nil {
+						out <- TextDeltaEvent{Delta: e.Delta}
+					}
+				} else {
+					// preserve whitespace as-is
+					text.WriteString(e.Delta)
+					if e.Delta != "" {
+						streamedText = true
+						if out != nil {
+							out <- TextDeltaEvent{Delta: e.Delta}
+						}
+					}
+				}
+			case llm.StreamThinkingDeltaEvent:
+				thinking.WriteString(e.Delta)
+			case llm.StreamToolCallDeltaEvent:
+				acc.apply(e)
+			case llm.StreamUsageEvent:
+				u := e.Usage
+				usage = &u
+			case llm.StreamErrorEvent:
+				if e.Err != nil {
+					return nil, streamedText, e.Err
+				}
+				return nil, streamedText, fmt.Errorf("stream error")
+			case llm.StreamDoneEvent:
+				// ignore
+			default:
+				// ignore unknown
+			}
+		}
+		return &llm.Completion{Content: llm.TextContent(text.String()), Thinking: strings.TrimSpace(thinking.String()), ToolCalls: acc.finalize(), Usage: usage}, streamedText, nil
+	}
+	comp, err := a.llm.Invoke(ctx, req)
+	return comp, false, err
 }
 
 func (a *Agent) destroyEphemeralMessages() {

@@ -3,6 +3,7 @@ package tools
 import (
 	"context"
 	"fmt"
+	"strings"
 	"sync"
 )
 
@@ -13,6 +14,32 @@ type DepKey[T any] struct{ Name string }
 func Dep[T any](name string) DepKey[T] { return DepKey[T]{Name: name} }
 
 type Provider[T any] func(ctx context.Context) (T, error)
+
+// ---- tool call context ----
+
+type ctxKey string
+
+const (
+	toolCallIDKey ctxKey = "tools.tool_call_id"
+)
+
+// WithToolCallID attaches a tool_call_id to the context for tool handlers.
+// Interactive clients can use it to correlate confirmations/previews/results.
+func WithToolCallID(ctx context.Context, id string) context.Context {
+	id = strings.TrimSpace(id)
+	if ctx == nil || id == "" {
+		return ctx
+	}
+	return context.WithValue(ctx, toolCallIDKey, id)
+}
+
+func ToolCallID(ctx context.Context) string {
+	if ctx == nil {
+		return ""
+	}
+	v, _ := ctx.Value(toolCallIDKey).(string)
+	return strings.TrimSpace(v)
+}
 
 // Container resolves dependencies using registered providers with optional overrides.
 // Resolved values are memoized per Container instance.

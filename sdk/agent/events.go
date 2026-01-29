@@ -12,6 +12,12 @@ type TextEvent struct{ Content string }
 
 func (TextEvent) isEvent() {}
 
+// TextDeltaEvent is emitted when the underlying model supports true streaming.
+// Delta should be appended to the current assistant output buffer.
+type TextDeltaEvent struct{ Delta string }
+
+func (TextDeltaEvent) isEvent() {}
+
 type ThinkingEvent struct{ Content string }
 
 func (ThinkingEvent) isEvent() {}
