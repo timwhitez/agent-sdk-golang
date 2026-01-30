@@ -91,6 +91,10 @@ func main() {
 
 Contributions are welcome! Please feel free to submit a Pull Request.
 
+## 📄 License
+
+This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
+
 ---
 
 # 中文说明
@@ -176,3 +180,6 @@ func main() {
 
 - `sdk/`：SDK 核心实现（agent/llm/tools/tokens）。
 
+## 📄 许可证
+
+本项目采用 [MIT License](LICENSE) 开源协议。
