@@ -50,6 +50,13 @@ type Agent struct {
 	messages []llm.Message
 }
 
+// SteeringMsg represents a user message injected mid-turn for real-time steering.
+// This enables the "Real-time steering" feature where users can send feedback
+// while the agent is working, and the agent incorporates it immediately.
+type SteeringMsg struct {
+	Content string
+}
+
 func New(cfg Config) (*Agent, error) {
 	if cfg.LLM == nil {
 		return nil, fmt.Errorf("agent: LLM is required")
@@ -136,6 +143,19 @@ func (a *Agent) Query(ctx context.Context, text string) (string, error) {
 }
 
 func (a *Agent) QueryStream(ctx context.Context, input llm.Content) <-chan Event {
+	return a.QueryStreamWithSteering(ctx, input, nil)
+}
+
+// QueryStreamWithSteering is like QueryStream but accepts an optional steering channel.
+// When steeringCh is non-nil, the agent checks for new user messages at natural breakpoints
+// (before each LLM invocation and after each tool execution). Any received steering messages
+// are appended to the conversation history as user messages, so the next LLM call will
+// see them and can adjust its plan accordingly.
+//
+// This implements "boundary-aware queuing" and "real-time steering":
+//   - Boundary-aware: messages are processed at tool-call boundaries, not just at turn end
+//   - Real-time steering: users can redirect the agent mid-turn without waiting for completion
+func (a *Agent) QueryStreamWithSteering(ctx context.Context, input llm.Content, steeringCh <-chan SteeringMsg) <-chan Event {
 	out := make(chan Event, 32)
 	go func() {
 		defer close(out)
@@ -151,6 +171,9 @@ func (a *Agent) QueryStream(ctx context.Context, input llm.Content) <-chan Event
 		incompleteTodosPrompted := false
 
 		for iter := 0; iter < a.maxIterations; iter++ {
+			// *** Boundary-aware steering: check for new user messages before each LLM call ***
+			a.drainSteering(steeringCh, out)
+
 			// Remove old ephemeral messages before the next LLM call.
 			a.destroyEphemeralMessages()
 
@@ -189,6 +212,18 @@ func (a *Agent) QueryStream(ctx context.Context, input llm.Content) <-chan Event
 
 			// Stopping condition.
 			if !comp.HasToolCalls() {
+				// Auto-continue: if the response was truncated due to max_tokens,
+				// send a continuation prompt and loop again.
+				if comp.StopReason == "max_tokens" {
+					a.mu.Lock()
+					a.messages = append(a.messages, llm.Message{
+						Role:    llm.RoleUser,
+						Content: llm.TextContent("Your response was truncated. Please continue exactly where you left off."),
+					})
+					a.mu.Unlock()
+					out <- TextDeltaEvent{Delta: "\n[auto-continue]\n"}
+					continue
+				}
 				if !a.requireDone {
 					// Hook placeholder: incomplete todo prompting (future), matching Python API.
 					if !incompleteTodosPrompted {
@@ -254,6 +289,9 @@ func (a *Agent) QueryStream(ctx context.Context, input llm.Content) <-chan Event
 
 				out <- ToolResultEvent{Tool: tc.Function.Name, Result: content.PlainText(), ToolCallID: tc.ID, IsError: isError, Metadata: meta}
 				out <- StepCompleteEvent{StepID: tc.ID, Status: status, DurationMS: time.Since(start).Milliseconds()}
+
+				// *** Boundary-aware steering: check for new user messages after each tool execution ***
+				a.drainSteering(steeringCh, out)
 			}
 
 			a.checkAndCompact(ctx, comp, out)
@@ -333,6 +371,7 @@ func (a *Agent) invokeCompletion(ctx context.Context, req llm.InvokeRequest, out
 		var thinking strings.Builder
 		acc := &toolCallAccumulator{}
 		var usage *llm.Usage
+		stopReason := ""
 		streamedText := false
 		for ev := range ch {
 			switch e := ev.(type) {
@@ -366,12 +405,12 @@ func (a *Agent) invokeCompletion(ctx context.Context, req llm.InvokeRequest, out
 				}
 				return nil, streamedText, fmt.Errorf("stream error")
 			case llm.StreamDoneEvent:
-				// ignore
+				stopReason = e.StopReason
 			default:
 				// ignore unknown
 			}
 		}
-		return &llm.Completion{Content: llm.TextContent(text.String()), Thinking: strings.TrimSpace(thinking.String()), ToolCalls: acc.finalize(), Usage: usage}, streamedText, nil
+		return &llm.Completion{Content: llm.TextContent(text.String()), Thinking: strings.TrimSpace(thinking.String()), ToolCalls: acc.finalize(), Usage: usage, StopReason: stopReason}, streamedText, nil
 	}
 	comp, err := a.llm.Invoke(ctx, req)
 	return comp, false, err
@@ -501,4 +540,41 @@ func (a *Agent) errEvent(err error) ErrorEvent {
 		prov = a.llm.Provider()
 	}
 	return ErrorEvent{Provider: prov, Message: err.Error(), Kind: "unknown"}
+}
+
+// drainSteering non-blockingly reads all pending messages from the steering channel
+// and appends them to the conversation history as user messages. This allows users
+// to inject new instructions at natural breakpoints (tool-call boundaries) without
+// blocking the agent's execution loop.
+//
+// The function returns immediately if the channel is nil or empty.
+// Each received message triggers a SteeringReceivedEvent to notify the CLI layer.
+func (a *Agent) drainSteering(ch <-chan SteeringMsg, out chan<- Event) {
+	if ch == nil {
+		return
+	}
+	for {
+		select {
+		case msg, ok := <-ch:
+			if !ok {
+				// Channel closed, stop draining
+				return
+			}
+			if strings.TrimSpace(msg.Content) == "" {
+				continue
+			}
+			a.mu.Lock()
+			a.messages = append(a.messages, llm.Message{
+				Role:    llm.RoleUser,
+				Content: llm.TextContent(msg.Content),
+			})
+			a.mu.Unlock()
+			if out != nil {
+				out <- SteeringReceivedEvent{Content: msg.Content}
+			}
+		default:
+			// Channel empty, return immediately (non-blocking)
+			return
+		}
+	}
 }

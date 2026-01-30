@@ -131,11 +131,12 @@ type Usage struct {
 }
 
 type Completion struct {
-	Content   Content    `json:"content"`
-	Thinking  string     `json:"thinking,omitempty"`
-	ToolCalls []ToolCall `json:"tool_calls,omitempty"`
-	Usage     *Usage     `json:"usage,omitempty"`
-	Raw       json.RawMessage
+	Content    Content         `json:"content"`
+	Thinking   string          `json:"thinking,omitempty"`
+	ToolCalls  []ToolCall      `json:"tool_calls,omitempty"`
+	Usage      *Usage          `json:"usage,omitempty"`
+	StopReason string          `json:"stop_reason,omitempty"`
+	Raw        json.RawMessage `json:"-"`
 }
 
 func (c Completion) HasToolCalls() bool { return len(c.ToolCalls) > 0 }

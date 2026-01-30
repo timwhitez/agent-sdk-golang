@@ -461,6 +461,7 @@ func (c *Client) InvokeStream(ctx context.Context, req llm.InvokeRequest) (<-cha
 			blockToToolIndex := map[int]int{}
 			inputTokens := 0
 			outputTokens := 0
+			stopReason := ""
 			nextTool := 0
 			getToolIndex := func(blockIdx int) int {
 				if v, ok := blockToToolIndex[blockIdx]; ok {
@@ -490,6 +491,11 @@ func (c *Client) InvokeStream(ctx context.Context, req llm.InvokeRequest) (<-cha
 						}
 					}
 				case "message_delta":
+					if d, ok := root["delta"].(map[string]any); ok {
+						if sr, ok := d["stop_reason"].(string); ok && sr != "" {
+							stopReason = sr
+						}
+					}
 					if u, ok := root["usage"].(map[string]any); ok {
 						ot := intFromAny(u["output_tokens"])
 						if ot > outputTokens {
@@ -537,7 +543,7 @@ func (c *Client) InvokeStream(ctx context.Context, req llm.InvokeRequest) (<-cha
 				out <- llm.StreamErrorEvent{Err: err}
 				return
 			}
-			out <- llm.StreamDoneEvent{}
+			out <- llm.StreamDoneEvent{StopReason: stopReason}
 			return
 		}
 		out <- llm.StreamErrorEvent{Err: errors.New("anthropic stream: retry loop ended without result")}
@@ -860,7 +866,8 @@ type responsePayload struct {
 		Signature string          `json:"signature,omitempty"`
 		Data      string          `json:"data,omitempty"`
 	} `json:"content"`
-	Usage struct {
+	StopReason string `json:"stop_reason,omitempty"`
+	Usage      struct {
 		InputTokens              int  `json:"input_tokens"`
 		OutputTokens             int  `json:"output_tokens"`
 		CacheReadInputTokens     *int `json:"cache_read_input_tokens,omitempty"`
@@ -918,10 +925,11 @@ func parseResponse(data []byte) (*llm.Completion, error) {
 	}
 
 	return &llm.Completion{
-		Content:   llm.Content{Blocks: blocks},
-		Thinking:  strings.Join(thinkingParts, "\n"),
-		ToolCalls: toolCalls,
-		Usage:     usage,
-		Raw:       append([]byte(nil), data...),
+		Content:    llm.Content{Blocks: blocks},
+		Thinking:   strings.Join(thinkingParts, "\n"),
+		ToolCalls:  toolCalls,
+		Usage:      usage,
+		StopReason: rp.StopReason,
+		Raw:        append([]byte(nil), data...),
 	}, nil
 }

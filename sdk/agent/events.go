@@ -91,3 +91,13 @@ type CompactionEvent struct {
 }
 
 func (CompactionEvent) isEvent() {}
+
+// SteeringReceivedEvent is emitted when a steering message from the user
+// has been incorporated into the conversation history mid-turn.
+// This enables real-time steering: users can send feedback while the agent
+// is working, and the agent will adjust its approach immediately.
+type SteeringReceivedEvent struct {
+	Content string
+}
+
+func (SteeringReceivedEvent) isEvent() {}

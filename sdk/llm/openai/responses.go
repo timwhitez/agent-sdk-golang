@@ -353,6 +353,7 @@ func (c *ResponsesClient) InvokeStream(ctx context.Context, req llm.InvokeReques
 				return idx
 			}
 
+			stopReason := ""
 			err = consumeSSE(resp.Body, func(data string) error {
 				data = strings.TrimSpace(data)
 				if data == "" {
@@ -400,6 +401,16 @@ func (c *ResponsesClient) InvokeStream(ctx context.Context, req llm.InvokeReques
 					if u := usageFromResponses(respObj); u != nil {
 						out <- llm.StreamUsageEvent{Usage: *u}
 					}
+					// Extract stop reason from completed response
+					if respObj != nil {
+						if sr, ok := respObj["status"].(string); ok {
+							if sr == "incomplete" {
+								stopReason = "max_tokens"
+							} else if sr == "completed" {
+								stopReason = "end_turn"
+							}
+						}
+					}
 				case "response.error", "error":
 					if e, ok := root["error"].(map[string]any); ok {
 						if m, ok := e["message"].(string); ok && strings.TrimSpace(m) != "" {
@@ -411,14 +422,14 @@ func (c *ResponsesClient) InvokeStream(ctx context.Context, req llm.InvokeReques
 			})
 			_ = resp.Body.Close()
 			if errors.Is(err, errSSEDone) {
-				out <- llm.StreamDoneEvent{}
+				out <- llm.StreamDoneEvent{StopReason: stopReason}
 				return
 			}
 			if err != nil {
 				out <- llm.StreamErrorEvent{Err: err}
 				return
 			}
-			out <- llm.StreamDoneEvent{}
+			out <- llm.StreamDoneEvent{StopReason: stopReason}
 			return
 		}
 		out <- llm.StreamErrorEvent{Err: errors.New("openai responses stream: retry loop ended without result")}
@@ -614,5 +625,15 @@ func parseResponses(data []byte) (*llm.Completion, error) {
 		}
 	}
 
-	return &llm.Completion{Content: llm.Content{Blocks: blocks}, ToolCalls: toolCalls, Usage: usage, Raw: append([]byte(nil), data...)}, nil
+	// Extract stop reason from responses API (status field).
+	stopReason := ""
+	if sr, ok := root["status"].(string); ok {
+		if sr == "incomplete" {
+			stopReason = "max_tokens"
+		} else if sr == "completed" {
+			stopReason = "end_turn"
+		}
+	}
+
+	return &llm.Completion{Content: llm.Content{Blocks: blocks}, ToolCalls: toolCalls, Usage: usage, StopReason: stopReason, Raw: append([]byte(nil), data...)}, nil
 }

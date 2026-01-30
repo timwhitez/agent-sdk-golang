@@ -50,7 +50,9 @@ type StreamUsageEvent struct{ Usage Usage }
 func (StreamUsageEvent) isStreamEvent() {}
 
 // StreamDoneEvent marks successful stream completion.
-type StreamDoneEvent struct{}
+type StreamDoneEvent struct {
+	StopReason string
+}
 
 func (StreamDoneEvent) isStreamEvent() {}
 

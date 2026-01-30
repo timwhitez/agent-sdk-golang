@@ -235,6 +235,7 @@ func (c *ChatClient) InvokeStream(ctx context.Context, req llm.InvokeRequest) (<
 				return
 			}
 
+			stopReason := ""
 			err = consumeSSE(resp.Body, func(data string) error {
 				data = strings.TrimSpace(data)
 				if data == "" {
@@ -254,6 +255,13 @@ func (c *ChatClient) InvokeStream(ctx context.Context, req llm.InvokeRequest) (<
 					out <- llm.StreamUsageEvent{Usage: *u}
 				}
 				for _, ch := range r.Choices {
+					if ch.FinishReason != "" {
+						sr := ch.FinishReason
+						if sr == "length" {
+							sr = "max_tokens"
+						}
+						stopReason = sr
+					}
 					// Preserve whitespace deltas to keep streaming output faithful.
 					if ch.Delta.Content != "" {
 						out <- llm.StreamTextDeltaEvent{Delta: ch.Delta.Content}
@@ -270,14 +278,14 @@ func (c *ChatClient) InvokeStream(ctx context.Context, req llm.InvokeRequest) (<
 			})
 			_ = resp.Body.Close()
 			if errors.Is(err, errSSEDone) {
-				out <- llm.StreamDoneEvent{}
+				out <- llm.StreamDoneEvent{StopReason: stopReason}
 				return
 			}
 			if err != nil {
 				out <- llm.StreamErrorEvent{Err: err}
 				return
 			}
-			out <- llm.StreamDoneEvent{}
+			out <- llm.StreamDoneEvent{StopReason: stopReason}
 			return
 		}
 		out <- llm.StreamErrorEvent{Err: errors.New("openai stream: retry loop ended without result")}
@@ -299,6 +307,7 @@ type chatCompletionStreamResponse struct {
 				} `json:"function"`
 			} `json:"tool_calls"`
 		} `json:"delta"`
+		FinishReason string `json:"finish_reason"`
 	} `json:"choices"`
 	Usage map[string]any `json:"usage"`
 	Error *struct {
@@ -732,6 +741,7 @@ type chatCompletionResponse struct {
 			Content   string         `json:"content"`
 			ToolCalls []llm.ToolCall `json:"tool_calls"`
 		} `json:"message"`
+		FinishReason string `json:"finish_reason"`
 	} `json:"choices"`
 	Usage map[string]any `json:"usage"`
 }
@@ -748,11 +758,18 @@ func parseChatCompletion(data []byte) (*llm.Completion, error) {
 
 	usage := parseUsage(r.Usage)
 
+	// Map OpenAI finish_reason to normalized stop reason
+	stopReason := r.Choices[0].FinishReason
+	if stopReason == "length" {
+		stopReason = "max_tokens"
+	}
+
 	return &llm.Completion{
-		Content:   llm.TextContent(msg.Content),
-		ToolCalls: msg.ToolCalls,
-		Usage:     usage,
-		Raw:       append([]byte(nil), data...),
+		Content:    llm.TextContent(msg.Content),
+		ToolCalls:  msg.ToolCalls,
+		Usage:      usage,
+		StopReason: stopReason,
+		Raw:        append([]byte(nil), data...),
 	}, nil
 }
 
