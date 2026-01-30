@@ -86,12 +86,6 @@ func main() {
 
 - `sdk/`: Core SDK implementation (agent, llm, tools, tokens).
 
-## 🗺 Roadmap
-
-- [ ] Support for more providers (DeepSeek, Google Gemini).
-- [ ] Enhanced long-term memory & RAG integration.
-- [ ] Multi-agent coordination patterns.
-- [ ] Improved observability and tracing.
 
 ## 🤝 Contributing
 
@@ -182,9 +176,3 @@ func main() {
 
 - `sdk/`：SDK 核心实现（agent/llm/tools/tokens）。
 
-## 🗺 路线图 (Roadmap)
-
-- [ ] 支持更多模型提供商 (DeepSeek, Google Gemini)。
-- [ ] 增强长短期记忆与 RAG 集成。
-- [ ] 多 Agent 协作模式。
-- [ ] 改进的可观测性和链路追踪。
