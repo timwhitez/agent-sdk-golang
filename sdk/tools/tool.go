@@ -163,6 +163,26 @@ func repairJSONKeysBySchema(schema map[string]any, raw []byte) ([]byte, bool) {
 		expected[kk] = struct{}{}
 		expectedNoDelims[normalizeKeyNoDelims(kk)] = kk
 	}
+	aliasMap := map[string]string{} // normalized alias -> canonical key
+	for k := range props {
+		for _, alias := range aliasKeysForExpected(k) {
+			if alias == "" {
+				continue
+			}
+			aliasMap[normalizeKeyNoDelims(alias)] = k
+		}
+	}
+	if len(props) == 1 {
+		for k := range props {
+			for _, alias := range singleFieldAliases() {
+				if alias == "" {
+					continue
+				}
+				aliasMap[normalizeKeyNoDelims(alias)] = k
+			}
+			break
+		}
+	}
 
 	changed := false
 	for k, v := range m {
@@ -171,7 +191,16 @@ func repairJSONKeysBySchema(schema map[string]any, raw []byte) ([]byte, bool) {
 		}
 		cand := normalizeCandidateKey(k)
 		if cand != "" {
-			if canon, ok := expectedNoDelims[normalizeKeyNoDelims(cand)]; ok {
+			norm := normalizeKeyNoDelims(cand)
+			if canon, ok := expectedNoDelims[norm]; ok {
+				if _, exists := m[canon]; !exists {
+					m[canon] = v
+					changed = true
+				}
+				delete(m, k)
+				continue
+			}
+			if canon, ok := aliasMap[norm]; ok {
 				if _, exists := m[canon]; !exists {
 					m[canon] = v
 					changed = true
@@ -181,6 +210,16 @@ func repairJSONKeysBySchema(schema map[string]any, raw []byte) ([]byte, bool) {
 			}
 		}
 		if canon, ok := expectedNoDelims[normalizeKeyNoDelims(k)]; ok {
+			if canon != k {
+				if _, exists := m[canon]; !exists {
+					m[canon] = v
+					changed = true
+				}
+				delete(m, k)
+				continue
+			}
+		}
+		if canon, ok := aliasMap[normalizeKeyNoDelims(k)]; ok {
 			if canon != k {
 				if _, exists := m[canon]; !exists {
 					m[canon] = v
@@ -239,6 +278,39 @@ func normalizeKeyNoDelims(k string) string {
 		}
 		return -1
 	}, k)
+}
+
+func aliasKeysForExpected(key string) []string {
+	switch normalizeKeyNoDelims(key) {
+	case "filepath":
+		return []string{"path", "file", "filename", "file_path"}
+	case "path":
+		return []string{"filepath", "file_path", "dir", "directory", "folder"}
+	case "command":
+		return []string{"cmd", "shell", "bash", "sh"}
+	case "content":
+		return []string{"contents", "data", "text", "body"}
+	case "pattern":
+		return []string{"query", "regex", "search", "match"}
+	case "url":
+		return []string{"uri", "link"}
+	case "oldstring":
+		return []string{"old", "from", "before"}
+	case "newstring":
+		return []string{"new", "to", "after", "replacement"}
+	case "patch":
+		return []string{"diff"}
+	case "offset":
+		return []string{"start", "line", "start_line"}
+	case "limit":
+		return []string{"lines", "max_lines", "count"}
+	default:
+		return nil
+	}
+}
+
+func singleFieldAliases() []string {
+	return []string{"input", "args", "argument", "value", "text", "data"}
 }
 
 // repairLooseJSONObject tries to repair a JSON-object-like string where some string
@@ -360,10 +432,10 @@ func repairLooseJSONObject(raw string) ([]byte, bool) {
 func Func[Args any](name, description string, fn func(ctx context.Context, args Args, deps *Container) (any, error)) Tool {
 	schema := SchemaFor[Args]()
 	return Tool{
-		Name:        name,
-		Description: description,
+		Name:          name,
+		Description:   description,
 		EphemeralKeep: 0,
-		Schema:      schema,
+		Schema:        schema,
 		Handler: func(ctx context.Context, raw json.RawMessage, deps *Container) (llm.Content, error) {
 			var a Args
 			dec := json.NewDecoder(bytes.NewReader(raw))

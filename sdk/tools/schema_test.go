@@ -75,3 +75,34 @@ func TestToolExecuteRepairsNonJSONArgs(t *testing.T) {
 		})
 	}
 }
+
+func TestToolExecuteRepairsAliasKeys(t *testing.T) {
+	type writeArgs struct {
+		FilePath string `json:"file_path"`
+		Content  string `json:"content"`
+	}
+	writeTool := Func[writeArgs]("write", "test", func(_ context.Context, a writeArgs, _ *Container) (any, error) {
+		return a.FilePath + "|" + a.Content, nil
+	})
+	out, err := writeTool.Execute(context.Background(), `{"path":"notes.txt","contents":"hello"}`, NewContainer())
+	if err != nil {
+		t.Fatalf("execute alias: %v", err)
+	}
+	if out.PlainText() != "notes.txt|hello" {
+		t.Fatalf("expected alias mapping, got %q", out.PlainText())
+	}
+
+	type patternArgs struct {
+		Pattern string `json:"pattern"`
+	}
+	patternTool := Func[patternArgs]("grep", "test", func(_ context.Context, a patternArgs, _ *Container) (any, error) {
+		return a.Pattern, nil
+	})
+	out, err = patternTool.Execute(context.Background(), `{"input":"TODO"}`, NewContainer())
+	if err != nil {
+		t.Fatalf("execute single-field alias: %v", err)
+	}
+	if out.PlainText() != "TODO" {
+		t.Fatalf("expected single-field alias mapping, got %q", out.PlainText())
+	}
+}

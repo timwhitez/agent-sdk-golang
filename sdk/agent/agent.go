@@ -324,13 +324,13 @@ func (a *toolCallAccumulator) ensure(index int) *toolCallBuilder {
 
 func (a *toolCallAccumulator) apply(d llm.StreamToolCallDeltaEvent) {
 	it := a.ensure(d.Index)
-	if strings.TrimSpace(d.ID) != "" && strings.TrimSpace(it.id) == "" {
-		it.id = d.ID
+	if id := strings.TrimSpace(d.ID); id != "" && strings.TrimSpace(it.id) == "" {
+		it.id = id
 	}
-	if strings.TrimSpace(d.NameDelta) != "" {
+	if d.NameDelta != "" {
 		it.name.WriteString(d.NameDelta)
 	}
-	if strings.TrimSpace(d.ArgumentsDelta) != "" {
+	if d.ArgumentsDelta != "" {
 		it.args.WriteString(d.ArgumentsDelta)
 	}
 }

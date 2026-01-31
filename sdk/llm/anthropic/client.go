@@ -72,6 +72,9 @@ func (c *Client) Invoke(ctx context.Context, req llm.InvokeRequest) (*llm.Comple
 	}
 
 	for attempt := 0; attempt < maxRetries; attempt++ {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
 		payload, err := c.buildRequest(req)
 		if err != nil {
 			return nil, err
@@ -141,6 +144,9 @@ func (c *Client) Invoke(ctx context.Context, req llm.InvokeRequest) (*llm.Comple
 		}
 
 		// Network / timeout errors.
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return nil, ctxErr
+		}
 		lastErr = err
 		if attempt < maxRetries-1 && isRetryableNetErr(err) {
 			c.sleepBackoff(ctx, attempt, baseDelay, maxDelay, 0)
@@ -380,6 +386,10 @@ func (c *Client) InvokeStream(ctx context.Context, req llm.InvokeRequest) (<-cha
 		}
 
 		for attempt := 0; attempt < maxRetries; attempt++ {
+			if err := ctx.Err(); err != nil {
+				out <- llm.StreamErrorEvent{Err: err}
+				return
+			}
 			payload, err := c.buildRequest(req)
 			if err != nil {
 				out <- llm.StreamErrorEvent{Err: err}
@@ -413,6 +423,10 @@ func (c *Client) InvokeStream(ctx context.Context, req llm.InvokeRequest) (<-cha
 
 			resp, err := client.Do(httpReq)
 			if err != nil {
+				if ctxErr := ctx.Err(); ctxErr != nil {
+					out <- llm.StreamErrorEvent{Err: ctxErr}
+					return
+				}
 				if attempt < maxRetries-1 && isRetryableNetErr(err) {
 					c.sleepBackoff(ctx, attempt, baseDelay, maxDelay, 0)
 					continue
@@ -526,7 +540,7 @@ func (c *Client) InvokeStream(ctx context.Context, req llm.InvokeRequest) (<-cha
 						return nil
 					}
 					// tool input json delta
-					if pj, ok := del["partial_json"].(string); ok && strings.TrimSpace(pj) != "" {
+					if pj, ok := del["partial_json"].(string); ok && pj != "" {
 						ti := getToolIndex(idx)
 						out <- llm.StreamToolCallDeltaEvent{Index: ti, ArgumentsDelta: pj}
 						return nil

@@ -67,6 +67,9 @@ func (c *ChatClient) Invoke(ctx context.Context, req llm.InvokeRequest) (*llm.Co
 	}
 
 	for attempt := 0; attempt < maxRetries; attempt++ {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
 		payload, err := c.buildRequest(req)
 		if err != nil {
 			return nil, err
@@ -126,6 +129,9 @@ func (c *ChatClient) Invoke(ctx context.Context, req llm.InvokeRequest) (*llm.Co
 			return nil, lastErr
 		}
 
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return nil, ctxErr
+		}
 		lastErr = err
 		if attempt < maxRetries-1 && isRetryableNetErr(err) {
 			c.sleepBackoff(ctx, attempt, baseDelay, maxDelay, 0)
@@ -165,6 +171,10 @@ func (c *ChatClient) InvokeStream(ctx context.Context, req llm.InvokeRequest) (<
 		}
 
 		for attempt := 0; attempt < maxRetries; attempt++ {
+			if err := ctx.Err(); err != nil {
+				out <- llm.StreamErrorEvent{Err: err}
+				return
+			}
 			payload, err := c.buildRequest(req)
 			if err != nil {
 				out <- llm.StreamErrorEvent{Err: err}
@@ -191,6 +201,10 @@ func (c *ChatClient) InvokeStream(ctx context.Context, req llm.InvokeRequest) (<
 
 			resp, err := client.Do(httpReq)
 			if err != nil {
+				if ctxErr := ctx.Err(); ctxErr != nil {
+					out <- llm.StreamErrorEvent{Err: ctxErr}
+					return
+				}
 				if attempt < maxRetries-1 && isRetryableNetErr(err) {
 					c.sleepBackoff(ctx, attempt, baseDelay, maxDelay, 0)
 					continue
@@ -269,7 +283,7 @@ func (c *ChatClient) InvokeStream(ctx context.Context, req llm.InvokeRequest) (<
 					for _, tc := range ch.Delta.ToolCalls {
 						name := strings.TrimSpace(tc.Function.Name)
 						args := tc.Function.Arguments
-						if name != "" || strings.TrimSpace(args) != "" || strings.TrimSpace(tc.ID) != "" {
+						if name != "" || args != "" || strings.TrimSpace(tc.ID) != "" {
 							out <- llm.StreamToolCallDeltaEvent{Index: tc.Index, ID: tc.ID, NameDelta: name, ArgumentsDelta: args}
 						}
 					}

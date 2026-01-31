@@ -66,6 +66,9 @@ func (c *ResponsesClient) Invoke(ctx context.Context, req llm.InvokeRequest) (*l
 	}
 
 	for attempt := 0; attempt < maxRetries; attempt++ {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
 		payload, err := c.buildRequest(req)
 		if err != nil {
 			return nil, err
@@ -130,6 +133,9 @@ func (c *ResponsesClient) Invoke(ctx context.Context, req llm.InvokeRequest) (*l
 			return nil, lastErr
 		}
 
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return nil, ctxErr
+		}
 		lastErr = err
 		if attempt < maxRetries-1 && isRetryableNetErr(err) {
 			c.sleepBackoff(ctx, attempt, baseDelay, maxDelay, 0)
@@ -259,6 +265,10 @@ func (c *ResponsesClient) InvokeStream(ctx context.Context, req llm.InvokeReques
 		}
 
 		for attempt := 0; attempt < maxRetries; attempt++ {
+			if err := ctx.Err(); err != nil {
+				out <- llm.StreamErrorEvent{Err: err}
+				return
+			}
 			payload, err := c.buildRequest(req)
 			if err != nil {
 				out <- llm.StreamErrorEvent{Err: err}
@@ -284,6 +294,10 @@ func (c *ResponsesClient) InvokeStream(ctx context.Context, req llm.InvokeReques
 
 			resp, err := client.Do(httpReq)
 			if err != nil {
+				if ctxErr := ctx.Err(); ctxErr != nil {
+					out <- llm.StreamErrorEvent{Err: ctxErr}
+					return
+				}
 				if attempt < maxRetries-1 && isRetryableNetErr(err) {
 					c.sleepBackoff(ctx, attempt, baseDelay, maxDelay, 0)
 					continue
@@ -392,7 +406,7 @@ func (c *ResponsesClient) InvokeStream(ctx context.Context, req llm.InvokeReques
 					if itemID == "" {
 						itemID, _ = root["id"].(string)
 					}
-					if d, ok := root["delta"].(string); ok && strings.TrimSpace(d) != "" {
+					if d, ok := root["delta"].(string); ok && d != "" {
 						idx := getIndex(itemID)
 						out <- llm.StreamToolCallDeltaEvent{Index: idx, ID: itemID, ArgumentsDelta: d}
 					}
