@@ -41,6 +41,8 @@ type Sandbox struct {
 
 	mu    sync.Mutex
 	Todos []TodoItem
+
+	allowedRoots []string
 }
 
 func (s *Sandbox) TodosSnapshot() []TodoItem {
@@ -60,6 +62,55 @@ func (s *Sandbox) ReplaceTodos(todos []TodoItem) {
 	}
 	s.mu.Lock()
 	s.Todos = append([]TodoItem(nil), todos...)
+	s.mu.Unlock()
+}
+
+// AllowedRootsSnapshot returns the currently allowed external roots.
+func (s *Sandbox) AllowedRootsSnapshot() []string {
+	if s == nil {
+		return nil
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	out := make([]string, len(s.allowedRoots))
+	copy(out, s.allowedRoots)
+	return out
+}
+
+// ReplaceAllowedRoots replaces the external allowed roots with a cleaned list.
+// The roots are assumed to already be normalized (absolute, canonical).
+func (s *Sandbox) ReplaceAllowedRoots(roots []string) {
+	if s == nil {
+		return
+	}
+	cleaned := make([]string, 0, len(roots))
+	seen := map[string]bool{}
+	base := strings.TrimSpace(s.RootDir)
+	if base == "" {
+		base = strings.TrimSpace(s.WorkingDir)
+	}
+	for _, r := range roots {
+		r = strings.TrimSpace(r)
+		if r == "" {
+			continue
+		}
+		if !filepath.IsAbs(r) {
+			if base != "" {
+				r = filepath.Join(base, r)
+			}
+		}
+		r = filepath.Clean(r)
+		if r == "" {
+			continue
+		}
+		if seen[r] {
+			continue
+		}
+		seen[r] = true
+		cleaned = append(cleaned, r)
+	}
+	s.mu.Lock()
+	s.allowedRoots = cleaned
 	s.mu.Unlock()
 }
 
@@ -86,15 +137,123 @@ func (s *Sandbox) Resolve(path string) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	root := s.RootDir
-	if abs == root {
+	if s.isAllowedPath(abs) {
 		return abs, nil
 	}
-	sep := string(os.PathSeparator)
-	if !strings.HasPrefix(abs, root+sep) {
-		return "", &SecurityError{Message: fmt.Sprintf("path escapes sandbox: %q -> %q", path, abs)}
+	return "", &SecurityError{Message: fmt.Sprintf("path escapes sandbox: %q -> %q", path, abs)}
+}
+
+func isWithinRoot(path, root string) bool {
+	path = filepath.Clean(path)
+	root = filepath.Clean(root)
+	if path == "" || root == "" {
+		return false
 	}
-	return abs, nil
+	if path == root {
+		return true
+	}
+	sep := string(os.PathSeparator)
+	if root == sep {
+		return strings.HasPrefix(path, root)
+	}
+	return strings.HasPrefix(path, root+sep)
+}
+
+func (s *Sandbox) isAllowedPath(abs string) bool {
+	if s == nil {
+		return false
+	}
+	if isWithinRoot(abs, s.RootDir) {
+		return true
+	}
+	s.mu.Lock()
+	allowed := append([]string(nil), s.allowedRoots...)
+	s.mu.Unlock()
+	for _, root := range allowed {
+		if isWithinRoot(abs, root) {
+			return true
+		}
+	}
+	return false
+}
+
+func (s *Sandbox) isAllowedExternalRoot(abs string) bool {
+	if s == nil {
+		return false
+	}
+	s.mu.Lock()
+	allowed := append([]string(nil), s.allowedRoots...)
+	s.mu.Unlock()
+	for _, root := range allowed {
+		if isWithinRoot(abs, root) {
+			return true
+		}
+	}
+	return false
+}
+
+func (s *Sandbox) normalizeExternalRoot(path string) (string, error) {
+	if s == nil {
+		return "", fmt.Errorf("nil sandbox")
+	}
+	p := strings.TrimSpace(path)
+	if p == "" {
+		return "", fmt.Errorf("empty path")
+	}
+	var abs string
+	if filepath.IsAbs(p) {
+		abs = filepath.Clean(p)
+	} else {
+		base := s.WorkingDir
+		if strings.TrimSpace(base) == "" {
+			base = s.RootDir
+		}
+		abs = filepath.Clean(filepath.Join(base, p))
+	}
+	abs, err := filepath.Abs(abs)
+	if err != nil {
+		return "", err
+	}
+	resolved, err := filepath.EvalSymlinks(abs)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return "", fmt.Errorf("path does not exist: %s", abs)
+		}
+		return "", err
+	}
+	resolved = filepath.Clean(resolved)
+	st, err := os.Stat(resolved)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return "", fmt.Errorf("path does not exist: %s", resolved)
+		}
+		return "", err
+	}
+	if !st.IsDir() {
+		return "", fmt.Errorf("path is not a directory: %s", resolved)
+	}
+	return resolved, nil
+}
+
+// AllowExternalDirectory adds an external directory to the sandbox allowlist.
+// It returns the normalized path, whether it was newly added, and any error.
+func (s *Sandbox) AllowExternalDirectory(path string) (string, bool, error) {
+	normalized, err := s.normalizeExternalRoot(path)
+	if err != nil {
+		return "", false, err
+	}
+	if isWithinRoot(normalized, s.RootDir) {
+		return normalized, false, nil
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for _, root := range s.allowedRoots {
+		if isWithinRoot(normalized, root) {
+			return normalized, false, nil
+		}
+	}
+	s.allowedRoots = append(s.allowedRoots, normalized)
+	return normalized, true, nil
 }
 
 var Key = tools.Dep[*Sandbox]("sandbox")
@@ -133,6 +292,7 @@ func Tools() []tools.Tool {
 		multieditTool().WithEphemeralKeep(1),
 		applyPatchTool().WithEphemeralKeep(1),
 		globTool().WithEphemeralKeep(1),
+		externalDirectoryTool().WithEphemeralKeep(1),
 		grepTool().WithEphemeralKeep(1),
 		// Preferred (opencode-compatible) names.
 		todoReadToolNamed("todoread"),
@@ -1116,6 +1276,58 @@ func globTool() tools.Tool {
 			return "No files match pattern: " + a.Pattern, nil
 		}
 		return fmt.Sprintf("Found %d file(s):\n%s", len(files), strings.Join(files, "\n")), nil
+	})
+}
+
+type externalDirectoryArgs struct {
+	Path string `json:"path"`
+}
+
+func externalDirectoryTool() tools.Tool {
+	return tools.Func[externalDirectoryArgs]("external_directory", "Allow access to a directory outside the sandbox root", func(ctx context.Context, a externalDirectoryArgs, deps *tools.Container) (any, error) {
+		s, err := tools.Get(deps, ctx, Key)
+		if err != nil {
+			return "", err
+		}
+		raw := strings.TrimSpace(a.Path)
+		if raw == "" {
+			return "", fmt.Errorf("missing path")
+		}
+		normalized, err := s.normalizeExternalRoot(raw)
+		if err != nil {
+			return "", err
+		}
+		if isWithinRoot(normalized, s.RootDir) {
+			return fmt.Sprintf("Path is already inside the sandbox root: %s", normalized), nil
+		}
+		if s.isAllowedExternalRoot(normalized) {
+			return fmt.Sprintf("External directory already allowed: %s", normalized), nil
+		}
+
+		conf := getConfirmer(deps, ctx)
+		meta := attachToolCallMeta(ctx, map[string]any{
+			"category":  "external_directory",
+			"summary":   fmt.Sprintf("Allow external directory: %s", normalized),
+			"file_path": normalized,
+			"path":      normalized,
+			"raw":       normalized,
+		})
+		ok, err := conf.Confirm(ctx, "external_directory", buildConfirmDetail(meta))
+		if err != nil {
+			return "", err
+		}
+		if !ok {
+			return "Denied", nil
+		}
+
+		finalPath, added, err := s.AllowExternalDirectory(normalized)
+		if err != nil {
+			return "", err
+		}
+		if !added {
+			return fmt.Sprintf("External directory already allowed: %s", finalPath), nil
+		}
+		return fmt.Sprintf("Allowed external directory: %s", finalPath), nil
 	})
 }
 
