@@ -258,6 +258,29 @@ func normalizeCandidateKey(k string) string {
 		if same {
 			return parts[0]
 		}
+		// Drop tokens that are substrings of longer tokens (e.g. "file filepath" -> "filepath").
+		filtered := make([]string, 0, len(parts))
+		for i, p := range parts {
+			keep := true
+			for j, q := range parts {
+				if i == j {
+					continue
+				}
+				if strings.Contains(q, p) && len(q) >= len(p) {
+					keep = false
+					break
+				}
+			}
+			if keep {
+				filtered = append(filtered, p)
+			}
+		}
+		if len(filtered) == 1 {
+			return filtered[0]
+		}
+		if len(filtered) > 1 {
+			return strings.Join(filtered, "_")
+		}
 		return strings.Join(parts, "_")
 	}
 	// Replace common separators.

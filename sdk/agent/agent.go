@@ -394,6 +394,9 @@ func (a *Agent) invokeCompletion(ctx context.Context, req llm.InvokeRequest, out
 				}
 			case llm.StreamThinkingDeltaEvent:
 				thinking.WriteString(e.Delta)
+				if out != nil {
+					out <- ThinkingDeltaEvent{Delta: e.Delta}
+				}
 			case llm.StreamToolCallDeltaEvent:
 				acc.apply(e)
 			case llm.StreamUsageEvent:

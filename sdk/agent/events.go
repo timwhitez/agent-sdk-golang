@@ -22,6 +22,10 @@ type ThinkingEvent struct{ Content string }
 
 func (ThinkingEvent) isEvent() {}
 
+type ThinkingDeltaEvent struct{ Delta string }
+
+func (ThinkingDeltaEvent) isEvent() {}
+
 // ErrorEvent is emitted when the agent hits a fatal error (e.g. provider API error).
 // The stream will end after emitting this event.
 type ErrorEvent struct {

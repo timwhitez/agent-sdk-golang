@@ -26,6 +26,11 @@ type ChatClient struct {
 
 	ModelName string
 
+	// Extra request fields for OpenAI-compatible gateways.
+	// Extra is merged at the top-level; ExtraBody is nested under "extra_body".
+	Extra     map[string]any
+	ExtraBody map[string]any
+
 	Temperature         *float64
 	TopP                *float64
 	Seed                *int
@@ -114,6 +119,11 @@ func (c *ChatClient) Invoke(ctx context.Context, req llm.InvokeRequest) (*llm.Co
 				c.ReasoningEffort = ""
 				// Retry immediately without surfacing the first error.
 				if attempt < maxRetries-1 {
+					continue
+				}
+			}
+			if (resp.StatusCode == 400 || resp.StatusCode == 422) && hasThinkingExtra(c.Extra, c.ExtraBody) && looksLikeThinkingUnsupported(msg) {
+				if dropThinkingExtra(c.Extra, c.ExtraBody) && attempt < maxRetries-1 {
 					continue
 				}
 			}
@@ -234,6 +244,11 @@ func (c *ChatClient) InvokeStream(ctx context.Context, req llm.InvokeRequest) (<
 						continue
 					}
 				}
+				if (resp.StatusCode == 400 || resp.StatusCode == 422) && hasThinkingExtra(c.Extra, c.ExtraBody) && looksLikeThinkingUnsupported(msg) {
+					if dropThinkingExtra(c.Extra, c.ExtraBody) && attempt < maxRetries-1 {
+						continue
+					}
+				}
 
 				var lastErr error
 				if resp.StatusCode == 429 {
@@ -280,6 +295,12 @@ func (c *ChatClient) InvokeStream(ctx context.Context, req llm.InvokeRequest) (<
 					if ch.Delta.Content != "" {
 						out <- llm.StreamTextDeltaEvent{Delta: ch.Delta.Content}
 					}
+					if ch.Delta.ReasoningContent != "" {
+						out <- llm.StreamThinkingDeltaEvent{Delta: ch.Delta.ReasoningContent}
+					}
+					if ch.Delta.Thinking != "" {
+						out <- llm.StreamThinkingDeltaEvent{Delta: ch.Delta.Thinking}
+					}
 					for _, tc := range ch.Delta.ToolCalls {
 						name := strings.TrimSpace(tc.Function.Name)
 						args := tc.Function.Arguments
@@ -310,8 +331,10 @@ func (c *ChatClient) InvokeStream(ctx context.Context, req llm.InvokeRequest) (<
 type chatCompletionStreamResponse struct {
 	Choices []struct {
 		Delta struct {
-			Content   string `json:"content"`
-			ToolCalls []struct {
+			Content          string `json:"content"`
+			ReasoningContent string `json:"reasoning_content"`
+			Thinking         string `json:"thinking"`
+			ToolCalls        []struct {
 				Index    int    `json:"index"`
 				ID       string `json:"id"`
 				Type     string `json:"type"`
@@ -464,6 +487,61 @@ func looksLikeReasoningUnsupported(msg string) bool {
 	return false
 }
 
+func looksLikeThinkingUnsupported(msg string) bool {
+	s := strings.ToLower(msg)
+	if strings.Contains(s, "enable_thinking") {
+		return true
+	}
+	if strings.Contains(s, "thinking") && strings.Contains(s, "unknown") {
+		return true
+	}
+	if strings.Contains(s, "thinking") && strings.Contains(s, "unsupported") {
+		return true
+	}
+	if strings.Contains(s, "thinking") && strings.Contains(s, "unrecognized") {
+		return true
+	}
+	return false
+}
+
+func hasThinkingExtra(extra, extraBody map[string]any) bool {
+	if extra != nil {
+		if _, ok := extra["thinking"]; ok {
+			return true
+		}
+	}
+	if extraBody != nil {
+		if _, ok := extraBody["enable_thinking"]; ok {
+			return true
+		}
+		if _, ok := extraBody["thinking"]; ok {
+			return true
+		}
+	}
+	return false
+}
+
+func dropThinkingExtra(extra, extraBody map[string]any) bool {
+	removed := false
+	if extra != nil {
+		if _, ok := extra["thinking"]; ok {
+			delete(extra, "thinking")
+			removed = true
+		}
+	}
+	if extraBody != nil {
+		if _, ok := extraBody["enable_thinking"]; ok {
+			delete(extraBody, "enable_thinking")
+			removed = true
+		}
+		if _, ok := extraBody["thinking"]; ok {
+			delete(extraBody, "thinking")
+			removed = true
+		}
+	}
+	return removed
+}
+
 func parseRetryAfter(v string) time.Duration {
 	v = strings.TrimSpace(v)
 	if v == "" {
@@ -545,6 +623,27 @@ type chatRequest struct {
 
 	Stream        bool           `json:"stream,omitempty"`
 	StreamOptions map[string]any `json:"stream_options,omitempty"`
+
+	ExtraBody map[string]any `json:"extra_body,omitempty"`
+	Extra     map[string]any `json:"-"`
+}
+
+func (r chatRequest) MarshalJSON() ([]byte, error) {
+	type alias chatRequest
+	base := map[string]any{}
+	b, err := json.Marshal(alias(r))
+	if err != nil {
+		return nil, err
+	}
+	if err := json.Unmarshal(b, &base); err != nil {
+		return nil, err
+	}
+	for k, v := range r.Extra {
+		if v != nil {
+			base[k] = v
+		}
+	}
+	return json.Marshal(base)
 }
 
 func (c *ChatClient) buildRequest(req llm.InvokeRequest) (*chatRequest, error) {
@@ -608,6 +707,9 @@ func (c *ChatClient) buildRequest(req llm.InvokeRequest) (*chatRequest, error) {
 		ptc = &v
 	}
 
+	extra := cloneMap(c.Extra)
+	extraBody := cloneMap(c.ExtraBody)
+
 	return &chatRequest{
 		Model:               c.ModelName,
 		Messages:            msgs,
@@ -619,6 +721,8 @@ func (c *ChatClient) buildRequest(req llm.InvokeRequest) (*chatRequest, error) {
 		MaxCompletionTokens: c.MaxCompletionTokens,
 		ReasoningEffort:     c.ReasoningEffort,
 		ParallelToolCalls:   ptc,
+		Extra:               extra,
+		ExtraBody:           extraBody,
 	}, nil
 }
 
@@ -751,9 +855,11 @@ func makeStrictProperty(prop map[string]any, wasRequired bool) map[string]any {
 type chatCompletionResponse struct {
 	Choices []struct {
 		Message struct {
-			Role      string         `json:"role"`
-			Content   string         `json:"content"`
-			ToolCalls []llm.ToolCall `json:"tool_calls"`
+			Role             string         `json:"role"`
+			Content          string         `json:"content"`
+			ReasoningContent string         `json:"reasoning_content"`
+			Thinking         string         `json:"thinking"`
+			ToolCalls        []llm.ToolCall `json:"tool_calls"`
 		} `json:"message"`
 		FinishReason string `json:"finish_reason"`
 	} `json:"choices"`
@@ -778,8 +884,14 @@ func parseChatCompletion(data []byte) (*llm.Completion, error) {
 		stopReason = "max_tokens"
 	}
 
+	thinking := strings.TrimSpace(msg.ReasoningContent)
+	if thinking == "" {
+		thinking = strings.TrimSpace(msg.Thinking)
+	}
+
 	return &llm.Completion{
 		Content:    llm.TextContent(msg.Content),
+		Thinking:   thinking,
 		ToolCalls:  msg.ToolCalls,
 		Usage:      usage,
 		StopReason: stopReason,

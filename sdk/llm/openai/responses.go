@@ -24,6 +24,11 @@ type ResponsesClient struct {
 
 	ModelName string
 
+	// Extra request fields for OpenAI-compatible gateways.
+	// Extra is merged at the top-level; ExtraBody is nested under "extra_body".
+	Extra     map[string]any
+	ExtraBody map[string]any
+
 	Temperature     *float64
 	TopP            *float64
 	Seed            *int
@@ -111,6 +116,11 @@ func (c *ResponsesClient) Invoke(ctx context.Context, req llm.InvokeRequest) (*l
 			if (resp.StatusCode == 400 || resp.StatusCode == 422) && strings.TrimSpace(c.ReasoningEffort) != "" && looksLikeReasoningUnsupported(msg) {
 				c.ReasoningEffort = ""
 				if attempt < maxRetries-1 {
+					continue
+				}
+			}
+			if (resp.StatusCode == 400 || resp.StatusCode == 422) && hasThinkingExtra(c.Extra, c.ExtraBody) && looksLikeThinkingUnsupported(msg) {
+				if dropThinkingExtra(c.Extra, c.ExtraBody) && attempt < maxRetries-1 {
 					continue
 				}
 			}
@@ -226,6 +236,27 @@ type responsesRequest struct {
 	Reasoning map[string]any `json:"reasoning,omitempty"`
 
 	Stream bool `json:"stream,omitempty"`
+
+	ExtraBody map[string]any `json:"extra_body,omitempty"`
+	Extra     map[string]any `json:"-"`
+}
+
+func (r responsesRequest) MarshalJSON() ([]byte, error) {
+	type alias responsesRequest
+	base := map[string]any{}
+	b, err := json.Marshal(alias(r))
+	if err != nil {
+		return nil, err
+	}
+	if err := json.Unmarshal(b, &base); err != nil {
+		return nil, err
+	}
+	for k, v := range r.Extra {
+		if v != nil {
+			base[k] = v
+		}
+	}
+	return json.Marshal(base)
 }
 
 func (c *ResponsesClient) forceStringInput() bool {
@@ -327,6 +358,11 @@ func (c *ResponsesClient) InvokeStream(ctx context.Context, req llm.InvokeReques
 						continue
 					}
 				}
+				if (resp.StatusCode == 400 || resp.StatusCode == 422) && hasThinkingExtra(c.Extra, c.ExtraBody) && looksLikeThinkingUnsupported(msg) {
+					if dropThinkingExtra(c.Extra, c.ExtraBody) && attempt < maxRetries-1 {
+						continue
+					}
+				}
 				// Automatic compat: some gateways require input.content to be a string.
 				if (resp.StatusCode == 400 || resp.StatusCode == 422) && strings.Contains(msg, "MissingParameter") && strings.Contains(msg, "input.content") {
 					c.ForceStringInput = true
@@ -380,6 +416,9 @@ func (c *ResponsesClient) InvokeStream(ctx context.Context, req llm.InvokeReques
 				if json.Unmarshal([]byte(data), &root) != nil {
 					return nil
 				}
+				if rc, ok := root["reasoning_content"].(string); ok && rc != "" {
+					out <- llm.StreamThinkingDeltaEvent{Delta: rc}
+				}
 				typ, _ := root["type"].(string)
 				switch typ {
 				case "response.output_text.delta":
@@ -387,9 +426,21 @@ func (c *ResponsesClient) InvokeStream(ctx context.Context, req llm.InvokeReques
 					if d, ok := root["delta"].(string); ok && d != "" {
 						out <- llm.StreamTextDeltaEvent{Delta: d}
 					}
+				case "response.reasoning.delta", "response.reasoning_text.delta", "response.reasoning_content.delta", "response.thinking.delta":
+					if d, ok := root["delta"].(string); ok && d != "" {
+						out <- llm.StreamThinkingDeltaEvent{Delta: d}
+					}
 				case "response.output_item.added":
 					item, _ := root["item"].(map[string]any)
 					itType, _ := item["type"].(string)
+					if itType == "reasoning" || itType == "thinking" || itType == "reasoning_text" {
+						if txt, ok := item["text"].(string); ok && strings.TrimSpace(txt) != "" {
+							out <- llm.StreamThinkingDeltaEvent{Delta: txt}
+						} else if txt, ok := item["content"].(string); ok && strings.TrimSpace(txt) != "" {
+							out <- llm.StreamThinkingDeltaEvent{Delta: txt}
+						}
+						return nil
+					}
 					if itType == "function_call" || itType == "tool_call" {
 						id, _ := item["id"].(string)
 						if id == "" {
@@ -558,6 +609,9 @@ func (c *ResponsesClient) buildRequest(req llm.InvokeRequest) (*responsesRequest
 		reasoning = map[string]any{"effort": c.ReasoningEffort}
 	}
 
+	extra := cloneMap(c.Extra)
+	extraBody := cloneMap(c.ExtraBody)
+
 	return &responsesRequest{
 		Model:           c.ModelName,
 		Input:           input,
@@ -568,6 +622,8 @@ func (c *ResponsesClient) buildRequest(req llm.InvokeRequest) (*responsesRequest
 		Seed:            c.Seed,
 		MaxOutputTokens: c.MaxOutputTokens,
 		Reasoning:       reasoning,
+		Extra:           extra,
+		ExtraBody:       extraBody,
 	}, nil
 }
 
@@ -580,6 +636,7 @@ func parseResponses(data []byte) (*llm.Completion, error) {
 	}
 
 	blocks := []llm.ContentBlock{}
+	thinkingParts := []string{}
 	toolCalls := []llm.ToolCall{}
 
 	if outArr, ok := root["output"].([]any); ok {
@@ -602,7 +659,19 @@ func parseResponses(data []byte) (*llm.Completion, error) {
 						if txt, ok := cm["text"].(string); ok {
 							blocks = append(blocks, llm.ContentBlock{Type: "text", Text: txt})
 						}
+					} else if ct == "reasoning" || ct == "reasoning_text" || ct == "thinking" {
+						if txt, ok := cm["text"].(string); ok && strings.TrimSpace(txt) != "" {
+							thinkingParts = append(thinkingParts, txt)
+						} else if txt, ok := cm["content"].(string); ok && strings.TrimSpace(txt) != "" {
+							thinkingParts = append(thinkingParts, txt)
+						}
 					}
+				}
+			case "reasoning", "reasoning_text", "thinking":
+				if txt, ok := item["text"].(string); ok && strings.TrimSpace(txt) != "" {
+					thinkingParts = append(thinkingParts, txt)
+				} else if txt, ok := item["content"].(string); ok && strings.TrimSpace(txt) != "" {
+					thinkingParts = append(thinkingParts, txt)
 				}
 			case "function_call", "tool_call":
 				id, _ := item["id"].(string)
@@ -638,6 +707,11 @@ func parseResponses(data []byte) (*llm.Completion, error) {
 			blocks = append(blocks, llm.ContentBlock{Type: "text", Text: t})
 		}
 	}
+	if t, ok := root["reasoning_content"].(string); ok && strings.TrimSpace(t) != "" {
+		thinkingParts = append(thinkingParts, t)
+	} else if t, ok := root["thinking"].(string); ok && strings.TrimSpace(t) != "" {
+		thinkingParts = append(thinkingParts, t)
+	}
 
 	// Extract stop reason from responses API (status field).
 	stopReason := ""
@@ -649,5 +723,6 @@ func parseResponses(data []byte) (*llm.Completion, error) {
 		}
 	}
 
-	return &llm.Completion{Content: llm.Content{Blocks: blocks}, ToolCalls: toolCalls, Usage: usage, StopReason: stopReason, Raw: append([]byte(nil), data...)}, nil
+	thinking := strings.TrimSpace(strings.Join(thinkingParts, "\n"))
+	return &llm.Completion{Content: llm.Content{Blocks: blocks}, Thinking: thinking, ToolCalls: toolCalls, Usage: usage, StopReason: stopReason, Raw: append([]byte(nil), data...)}, nil
 }
