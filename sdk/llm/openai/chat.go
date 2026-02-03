@@ -122,6 +122,12 @@ func (c *ChatClient) Invoke(ctx context.Context, req llm.InvokeRequest) (*llm.Co
 					continue
 				}
 			}
+			if (resp.StatusCode == 400 || resp.StatusCode == 422) && c.ExtraBody != nil && looksLikeExtraBodyUnsupported(msg) {
+				c.ExtraBody = nil
+				if attempt < maxRetries-1 {
+					continue
+				}
+			}
 			if (resp.StatusCode == 400 || resp.StatusCode == 422) && hasThinkingExtra(c.Extra, c.ExtraBody) && looksLikeThinkingUnsupported(msg) {
 				if dropThinkingExtra(c.Extra, c.ExtraBody) && attempt < maxRetries-1 {
 					continue
@@ -240,6 +246,12 @@ func (c *ChatClient) InvokeStream(ctx context.Context, req llm.InvokeRequest) (<
 				// Automatic downgrade: disable reasoning_effort when unsupported.
 				if (resp.StatusCode == 400 || resp.StatusCode == 422) && strings.TrimSpace(c.ReasoningEffort) != "" && looksLikeReasoningUnsupported(msg) {
 					c.ReasoningEffort = ""
+					if attempt < maxRetries-1 {
+						continue
+					}
+				}
+				if (resp.StatusCode == 400 || resp.StatusCode == 422) && c.ExtraBody != nil && looksLikeExtraBodyUnsupported(msg) {
+					c.ExtraBody = nil
 					if attempt < maxRetries-1 {
 						continue
 					}
@@ -504,9 +516,32 @@ func looksLikeThinkingUnsupported(msg string) bool {
 	return false
 }
 
+func looksLikeExtraBodyUnsupported(msg string) bool {
+	s := strings.ToLower(msg)
+	if !strings.Contains(s, "extra_body") {
+		return false
+	}
+	if strings.Contains(s, "unknown field") {
+		return true
+	}
+	if strings.Contains(s, "unrecognized field") {
+		return true
+	}
+	if strings.Contains(s, "invalid parameter") {
+		return true
+	}
+	if strings.Contains(s, "unexpected") && strings.Contains(s, "field") {
+		return true
+	}
+	return false
+}
+
 func hasThinkingExtra(extra, extraBody map[string]any) bool {
 	if extra != nil {
 		if _, ok := extra["thinking"]; ok {
+			return true
+		}
+		if _, ok := extra["enable_thinking"]; ok {
 			return true
 		}
 	}
@@ -526,6 +561,10 @@ func dropThinkingExtra(extra, extraBody map[string]any) bool {
 	if extra != nil {
 		if _, ok := extra["thinking"]; ok {
 			delete(extra, "thinking")
+			removed = true
+		}
+		if _, ok := extra["enable_thinking"]; ok {
+			delete(extra, "enable_thinking")
 			removed = true
 		}
 	}

@@ -918,7 +918,6 @@ func parseResponse(data []byte) (*llm.Completion, error) {
 			})
 		case "thinking":
 			thinkingParts = append(thinkingParts, blk.Thinking)
-			blocks = append(blocks, llm.ContentBlock{Type: "thinking", Thinking: blk.Thinking, Signature: blk.Signature})
 		case "redacted_thinking":
 			blocks = append(blocks, llm.ContentBlock{Type: "redacted_thinking", Data: blk.Data})
 		default:

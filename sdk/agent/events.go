@@ -1,6 +1,8 @@
 package agent
 
 import (
+	"encoding/json"
+
 	"github.com/timwhitez/agent-sdk-golang/sdk/agent/compaction"
 	"github.com/timwhitez/agent-sdk-golang/sdk/llm"
 )
@@ -60,6 +62,8 @@ func (StepCompleteEvent) isEvent() {}
 type ToolCallEvent struct {
 	Tool        string
 	Args        map[string]any
+	ArgsJSON    json.RawMessage
+	ArgsMeta    map[string]any
 	ToolCallID  string
 	DisplayName string
 }

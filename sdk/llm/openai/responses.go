@@ -119,6 +119,12 @@ func (c *ResponsesClient) Invoke(ctx context.Context, req llm.InvokeRequest) (*l
 					continue
 				}
 			}
+			if (resp.StatusCode == 400 || resp.StatusCode == 422) && c.ExtraBody != nil && looksLikeExtraBodyUnsupported(msg) {
+				c.ExtraBody = nil
+				if attempt < maxRetries-1 {
+					continue
+				}
+			}
 			if (resp.StatusCode == 400 || resp.StatusCode == 422) && hasThinkingExtra(c.Extra, c.ExtraBody) && looksLikeThinkingUnsupported(msg) {
 				if dropThinkingExtra(c.Extra, c.ExtraBody) && attempt < maxRetries-1 {
 					continue
@@ -358,6 +364,12 @@ func (c *ResponsesClient) InvokeStream(ctx context.Context, req llm.InvokeReques
 						continue
 					}
 				}
+				if (resp.StatusCode == 400 || resp.StatusCode == 422) && c.ExtraBody != nil && looksLikeExtraBodyUnsupported(msg) {
+					c.ExtraBody = nil
+					if attempt < maxRetries-1 {
+						continue
+					}
+				}
 				if (resp.StatusCode == 400 || resp.StatusCode == 422) && hasThinkingExtra(c.Extra, c.ExtraBody) && looksLikeThinkingUnsupported(msg) {
 					if dropThinkingExtra(c.Extra, c.ExtraBody) && attempt < maxRetries-1 {
 						continue
@@ -404,6 +416,7 @@ func (c *ResponsesClient) InvokeStream(ctx context.Context, req llm.InvokeReques
 			}
 
 			stopReason := ""
+			thinkingEmitted := false
 			err = consumeSSE(resp.Body, func(data string) error {
 				data = strings.TrimSpace(data)
 				if data == "" {
@@ -418,6 +431,7 @@ func (c *ResponsesClient) InvokeStream(ctx context.Context, req llm.InvokeReques
 				}
 				if rc, ok := root["reasoning_content"].(string); ok && rc != "" {
 					out <- llm.StreamThinkingDeltaEvent{Delta: rc}
+					thinkingEmitted = true
 				}
 				typ, _ := root["type"].(string)
 				switch typ {
@@ -429,6 +443,7 @@ func (c *ResponsesClient) InvokeStream(ctx context.Context, req llm.InvokeReques
 				case "response.reasoning.delta", "response.reasoning_text.delta", "response.reasoning_content.delta", "response.thinking.delta":
 					if d, ok := root["delta"].(string); ok && d != "" {
 						out <- llm.StreamThinkingDeltaEvent{Delta: d}
+						thinkingEmitted = true
 					}
 				case "response.output_item.added":
 					item, _ := root["item"].(map[string]any)
@@ -436,8 +451,20 @@ func (c *ResponsesClient) InvokeStream(ctx context.Context, req llm.InvokeReques
 					if itType == "reasoning" || itType == "thinking" || itType == "reasoning_text" {
 						if txt, ok := item["text"].(string); ok && strings.TrimSpace(txt) != "" {
 							out <- llm.StreamThinkingDeltaEvent{Delta: txt}
+							thinkingEmitted = true
 						} else if txt, ok := item["content"].(string); ok && strings.TrimSpace(txt) != "" {
 							out <- llm.StreamThinkingDeltaEvent{Delta: txt}
+							thinkingEmitted = true
+						} else if summaryArr, ok := item["summary"].([]any); ok {
+							// GLM format: reasoning in summary[].text
+							for _, sumAny := range summaryArr {
+								if sumMap, ok := sumAny.(map[string]any); ok {
+									if txt, ok := sumMap["text"].(string); ok && strings.TrimSpace(txt) != "" {
+										out <- llm.StreamThinkingDeltaEvent{Delta: txt}
+										thinkingEmitted = true
+									}
+								}
+							}
 						}
 						return nil
 					}
@@ -465,6 +492,12 @@ func (c *ResponsesClient) InvokeStream(ctx context.Context, req llm.InvokeReques
 					respObj, _ := root["response"].(map[string]any)
 					if u := usageFromResponses(respObj); u != nil {
 						out <- llm.StreamUsageEvent{Usage: *u}
+					}
+					if !thinkingEmitted {
+						if thinking := extractThinkingFromResponses(respObj); thinking != "" {
+							out <- llm.StreamThinkingDeltaEvent{Delta: thinking}
+							thinkingEmitted = true
+						}
 					}
 					// Extract stop reason from completed response
 					if respObj != nil {
@@ -517,6 +550,63 @@ func usageFromResponses(resp map[string]any) *llm.Usage {
 		tt = pt + ct
 	}
 	return &llm.Usage{PromptTokens: pt, CompletionTokens: ct, TotalTokens: tt}
+}
+
+func extractThinkingFromResponses(resp map[string]any) string {
+	if resp == nil {
+		return ""
+	}
+	thinkingParts := []string{}
+
+	if outArr, ok := resp["output"].([]any); ok {
+		for _, itemAny := range outArr {
+			item, ok := itemAny.(map[string]any)
+			if !ok {
+				continue
+			}
+			typeStr, _ := item["type"].(string)
+			switch typeStr {
+			case "message":
+				contentArr, _ := item["content"].([]any)
+				for _, cAny := range contentArr {
+					cm, ok := cAny.(map[string]any)
+					if !ok {
+						continue
+					}
+					ct, _ := cm["type"].(string)
+					if ct == "reasoning" || ct == "reasoning_text" || ct == "thinking" {
+						if txt, ok := cm["text"].(string); ok && strings.TrimSpace(txt) != "" {
+							thinkingParts = append(thinkingParts, txt)
+						} else if txt, ok := cm["content"].(string); ok && strings.TrimSpace(txt) != "" {
+							thinkingParts = append(thinkingParts, txt)
+						}
+					}
+				}
+			case "reasoning", "reasoning_text", "thinking":
+				if txt, ok := item["text"].(string); ok && strings.TrimSpace(txt) != "" {
+					thinkingParts = append(thinkingParts, txt)
+				} else if txt, ok := item["content"].(string); ok && strings.TrimSpace(txt) != "" {
+					thinkingParts = append(thinkingParts, txt)
+				} else if summaryArr, ok := item["summary"].([]any); ok {
+					// GLM format: reasoning in summary[].text
+					for _, sumAny := range summaryArr {
+						if sumMap, ok := sumAny.(map[string]any); ok {
+							if txt, ok := sumMap["text"].(string); ok && strings.TrimSpace(txt) != "" {
+								thinkingParts = append(thinkingParts, txt)
+							}
+						}
+					}
+				}
+			}
+		}
+	}
+	if t, ok := resp["reasoning_content"].(string); ok && strings.TrimSpace(t) != "" {
+		thinkingParts = append(thinkingParts, t)
+	} else if t, ok := resp["thinking"].(string); ok && strings.TrimSpace(t) != "" {
+		thinkingParts = append(thinkingParts, t)
+	}
+
+	return strings.TrimSpace(strings.Join(thinkingParts, "\n"))
 }
 
 func (c *ResponsesClient) buildRequest(req llm.InvokeRequest) (*responsesRequest, error) {
@@ -672,6 +762,15 @@ func parseResponses(data []byte) (*llm.Completion, error) {
 					thinkingParts = append(thinkingParts, txt)
 				} else if txt, ok := item["content"].(string); ok && strings.TrimSpace(txt) != "" {
 					thinkingParts = append(thinkingParts, txt)
+				} else if summaryArr, ok := item["summary"].([]any); ok {
+					// GLM format: reasoning in summary[].text
+					for _, sumAny := range summaryArr {
+						if sumMap, ok := sumAny.(map[string]any); ok {
+							if txt, ok := sumMap["text"].(string); ok && strings.TrimSpace(txt) != "" {
+								thinkingParts = append(thinkingParts, txt)
+							}
+						}
+					}
 				}
 			case "function_call", "tool_call":
 				id, _ := item["id"].(string)

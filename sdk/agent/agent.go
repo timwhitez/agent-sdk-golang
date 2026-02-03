@@ -2,7 +2,6 @@ package agent
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"strings"
@@ -245,14 +244,22 @@ func (a *Agent) QueryStreamWithSteering(ctx context.Context, input llm.Content, 
 				step++
 				out <- StepStartEvent{StepID: tc.ID, Title: tc.Function.Name, StepNumber: step}
 
-				argsMap := map[string]any{}
-				if err := json.Unmarshal([]byte(tc.Function.Arguments), &argsMap); err != nil {
+				tool := a.toolMap[tc.Function.Name]
+				norm := tools.NormalizeToolArgs(tc.Function.Name, tc.Function.Arguments, tool.Schema)
+				argsMap := norm.Display
+				if argsMap == nil {
 					argsMap = map[string]any{"__raw": tc.Function.Arguments}
 				}
-				out <- ToolCallEvent{Tool: tc.Function.Name, Args: argsMap, ToolCallID: tc.ID, DisplayName: tc.Function.Name}
+				out <- ToolCallEvent{
+					Tool:        tc.Function.Name,
+					Args:        argsMap,
+					ArgsJSON:    norm.Normalized,
+					ArgsMeta:    norm.Meta,
+					ToolCallID:  tc.ID,
+					DisplayName: tc.Function.Name,
+				}
 
 				start := time.Now()
-				tool := a.toolMap[tc.Function.Name]
 				ctxTool := tools.WithToolCallID(ctx, tc.ID)
 				ctxTool = tools.WithToolResultMetadata(ctxTool)
 				content, toolErr := tool.Execute(ctxTool, tc.Function.Arguments, a.deps)

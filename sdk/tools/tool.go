@@ -37,93 +37,43 @@ func (t Tool) Execute(ctx context.Context, argsJSON string, deps *Container) (ll
 	if t.Handler == nil {
 		return llm.Content{}, fmt.Errorf("tool %q missing handler", t.Name)
 	}
-	s := strings.TrimSpace(argsJSON)
-	call := func(raw []byte) (llm.Content, error) {
-		content, err := t.Handler(ctx, json.RawMessage(raw), deps)
+	norm := NormalizeToolArgs(t.Name, argsJSON, t.Schema)
+	if norm.Err != nil {
+		if argsRepaired(norm.Meta) {
+			UpsertToolResultMetadata(ctx, norm.Meta)
+		}
+		return llm.TextContent(fmt.Sprintf("Error parsing arguments: %v", norm.Err)), norm.Err
+	}
+	if norm.Normalized == nil {
+		if norm.Err != nil {
+			return llm.TextContent(fmt.Sprintf("Error parsing arguments: %v", norm.Err)), norm.Err
+		}
+		return llm.TextContent("Error parsing arguments: invalid tool args"), fmt.Errorf("invalid tool args")
+	}
+
+	call := func(raw json.RawMessage, meta map[string]any) (llm.Content, error, map[string]any) {
+		content, err := t.Handler(ctx, raw, deps)
 		if err == nil {
-			return content, nil
+			return content, nil, meta
 		}
 		// Second-chance: some models/proxies emit slightly-wrong keys (e.g. "content content")
 		// that fail strict decoding. Try to normalize keys to the schema and retry.
 		if looksLikeUnknownFieldErr(err) {
-			if repaired, ok := repairJSONKeysBySchema(t.Schema, raw); ok {
-				if content2, err2 := t.Handler(ctx, json.RawMessage(repaired), deps); err2 == nil {
-					return content2, nil
+			meta = ensureArgsRaw(meta, argsJSON)
+			if repaired, meta2, ok := repairToolArgsBySchema(t.Schema, raw, meta); ok {
+				if content2, err2 := t.Handler(ctx, repaired, deps); err2 == nil {
+					return content2, nil, meta2
 				}
 			}
 		}
-		return content, err
+		return content, err, meta
 	}
 
-	if s == "" {
-		return call([]byte(`{}`))
+	content, err, meta := call(norm.Normalized, norm.Meta)
+	if argsRepaired(meta) {
+		UpsertToolResultMetadata(ctx, meta)
 	}
-	dec := json.NewDecoder(bytes.NewReader([]byte(s)))
-	dec.DisallowUnknownFields()
-	var raw json.RawMessage
-	if err := dec.Decode(&raw); err == nil {
-		return call(raw)
-	}
-
-	// Fallback: some providers/gateways occasionally produce non-JSON (or malformed-JSON)
-	// tool arguments (e.g. a bare string like "/path" or {"path":/tmp}).
-	// Best-effort repair for common tools.
-	if repaired, ok := repairToolArgs(t.Name, s); ok {
-		return call(repaired)
-	}
-
-	// Preserve the original parsing error message for debuggability.
-	dec2 := json.NewDecoder(bytes.NewReader([]byte(s)))
-	dec2.DisallowUnknownFields()
-	var raw2 json.RawMessage
-	if err2 := dec2.Decode(&raw2); err2 != nil {
-		return llm.TextContent(fmt.Sprintf("Error parsing arguments: %v", err2)), err2
-	}
-	return call(raw2)
-}
-
-func repairToolArgs(toolName string, raw string) ([]byte, bool) {
-	toolName = strings.TrimSpace(toolName)
-	raw = strings.TrimSpace(raw)
-	if raw == "" {
-		return []byte(`{}`), true
-	}
-
-	// If it looks like a JSON object but is malformed (common: unquoted string values),
-	// attempt a minimal repair.
-	if strings.HasPrefix(raw, "{") {
-		if repaired, ok := repairLooseJSONObject(raw); ok {
-			return repaired, true
-		}
-	}
-
-	// Treat as a plain string argument.
-	// Map to the most likely single-field schema.
-	switch toolName {
-	case "ls":
-		b, _ := json.Marshal(map[string]any{"path": raw})
-		return b, true
-	case "read":
-		b, _ := json.Marshal(map[string]any{"file_path": raw})
-		return b, true
-	case "bash":
-		b, _ := json.Marshal(map[string]any{"command": raw})
-		return b, true
-	case "glob":
-		b, _ := json.Marshal(map[string]any{"pattern": raw})
-		return b, true
-	case "grep":
-		b, _ := json.Marshal(map[string]any{"pattern": raw})
-		return b, true
-	case "webfetch":
-		b, _ := json.Marshal(map[string]any{"url": raw})
-		return b, true
-	case "apply_patch":
-		b, _ := json.Marshal(map[string]any{"patch": raw})
-		return b, true
-	default:
-		return nil, false
-	}
+	return content, err
 }
 
 func looksLikeUnknownFieldErr(err error) bool {
