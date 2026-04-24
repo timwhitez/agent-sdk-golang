@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"math"
 	"strings"
 
 	"github.com/timwhitez/agent-sdk-golang/sdk/llm"
@@ -21,8 +22,16 @@ type Tool struct {
 
 	Schema map[string]any
 
+	// Hidden excludes the tool from model-visible tool definitions.
+	Hidden bool
+
 	Handler func(ctx context.Context, args json.RawMessage, deps *Container) (llm.Content, error)
 }
+
+const (
+	toolDiagnosticInvalidArgsAction = "Provide valid JSON arguments that match the tool schema and retry."
+	toolDiagnosticDefaultAction     = "Review the diagnostic details and retry."
+)
 
 func (t Tool) Definition() llm.ToolDefinition {
 	return llm.ToolDefinition{
@@ -42,13 +51,14 @@ func (t Tool) Execute(ctx context.Context, argsJSON string, deps *Container) (ll
 		if argsRepaired(norm.Meta) {
 			UpsertToolResultMetadata(ctx, norm.Meta)
 		}
-		return llm.TextContent(fmt.Sprintf("Error parsing arguments: %v", norm.Err)), norm.Err
+		return llm.TextContent(formatToolErrorDiagnostic("Invalid tool arguments", norm.Err, toolDiagnosticInvalidArgsAction)), norm.Err
 	}
 	if norm.Normalized == nil {
-		if norm.Err != nil {
-			return llm.TextContent(fmt.Sprintf("Error parsing arguments: %v", norm.Err)), norm.Err
+		parseErr := norm.Err
+		if parseErr == nil {
+			parseErr = fmt.Errorf("invalid tool args")
 		}
-		return llm.TextContent("Error parsing arguments: invalid tool args"), fmt.Errorf("invalid tool args")
+		return llm.TextContent(formatToolErrorDiagnostic("Invalid tool arguments", parseErr, toolDiagnosticInvalidArgsAction)), parseErr
 	}
 
 	call := func(raw json.RawMessage, meta map[string]any) (llm.Content, error, map[string]any) {
@@ -60,7 +70,7 @@ func (t Tool) Execute(ctx context.Context, argsJSON string, deps *Container) (ll
 		// that fail strict decoding. Try to normalize keys to the schema and retry.
 		if looksLikeUnknownFieldErr(err) {
 			meta = ensureArgsRaw(meta, argsJSON)
-			if repaired, meta2, ok := repairToolArgsBySchema(t.Schema, raw, meta); ok {
+			if repaired, meta2, ok := repairToolArgsBySchema(t.Name, t.Schema, raw, meta); ok {
 				if content2, err2 := t.Handler(ctx, repaired, deps); err2 == nil {
 					return content2, nil, meta2
 				}
@@ -70,6 +80,13 @@ func (t Tool) Execute(ctx context.Context, argsJSON string, deps *Container) (ll
 	}
 
 	content, err, meta := call(norm.Normalized, norm.Meta)
+	if err != nil && content.IsEmpty() {
+		content = llm.TextContent(formatToolErrorDiagnostic("Tool execution failed", err, toolDiagnosticDefaultAction))
+	}
+	if err == nil && content.IsEmpty() {
+		content = llm.TextContent("Warning: tool returned no output.")
+		UpsertToolResultMetadata(ctx, map[string]any{"tool_warning": "handler returned empty content"})
+	}
 	if argsRepaired(meta) {
 		UpsertToolResultMetadata(ctx, meta)
 	}
@@ -85,41 +102,108 @@ func looksLikeUnknownFieldErr(err error) bool {
 	return strings.Contains(err.Error(), "unknown field")
 }
 
+func formatToolErrorDiagnostic(summary string, err error, action string) string {
+	if err != nil {
+		if detail := strings.TrimSpace(err.Error()); isSeverityActionDiagnostic(detail) {
+			return detail
+		} else if detail != "" {
+			detail = strings.Join(strings.Fields(detail), " ")
+			summary = strings.TrimSpace(summary)
+			if summary == "" {
+				summary = detail
+			} else {
+				summary = fmt.Sprintf("%s (%s)", summary, detail)
+			}
+		}
+	}
+	summary = strings.TrimSpace(summary)
+	if summary == "" {
+		summary = "Tool execution failed"
+	}
+	action = strings.TrimSpace(action)
+	if action == "" {
+		action = toolDiagnosticDefaultAction
+	}
+	return fmt.Sprintf("[ERROR] %s - %s", summary, action)
+}
+
+func isSeverityActionDiagnostic(text string) bool {
+	text = strings.TrimSpace(text)
+	if !strings.HasPrefix(text, "[") {
+		return false
+	}
+	end := strings.Index(text, "]")
+	if end <= 1 {
+		return false
+	}
+	severity := strings.ToUpper(strings.TrimSpace(text[1:end]))
+	switch severity {
+	case "INFO", "WARN", "ERROR":
+	default:
+		return false
+	}
+	return strings.Contains(strings.TrimSpace(text[end+1:]), " - ")
+}
+
+type schemaRepairOptions struct {
+	StripUnknown bool
+	ToolName     string
+}
+
 func repairJSONKeysBySchema(schema map[string]any, raw []byte) ([]byte, bool) {
+	return repairJSONKeysBySchemaWithOptions(schema, raw, schemaRepairOptions{})
+}
+
+func repairJSONKeysBySchemaWithOptions(schema map[string]any, raw []byte, opts schemaRepairOptions) ([]byte, bool) {
 	if len(raw) == 0 || schema == nil {
 		return nil, false
 	}
-	propsAny, ok := schema["properties"]
+	var v any
+	if err := json.Unmarshal(raw, &v); err != nil {
+		return nil, false
+	}
+	m, ok := v.(map[string]any)
 	if !ok {
 		return nil, false
 	}
-	props, ok := propsAny.(map[string]any)
-	if !ok || len(props) == 0 {
+
+	repaired, changed := repairObjectBySchema(m, schema, opts)
+	if !changed {
 		return nil, false
 	}
-
-	var m map[string]any
-	if err := json.Unmarshal(raw, &m); err != nil {
+	b, err := json.Marshal(repaired)
+	if err != nil {
 		return nil, false
 	}
+	return b, true
+}
 
-	expected := map[string]struct{}{}
-	expectedNoDelims := map[string]string{} // normalized -> canonical key
+type objectKeyMatcher struct {
+	expected        map[string]struct{}
+	expectedNoDelim map[string]string
+	aliasByNoDelim  map[string]string
+}
+
+func newObjectKeyMatcher(props map[string]any, toolName string) objectKeyMatcher {
+	matcher := objectKeyMatcher{
+		expected:        map[string]struct{}{},
+		expectedNoDelim: map[string]string{},
+		aliasByNoDelim:  map[string]string{},
+	}
 	for k := range props {
 		kk := strings.TrimSpace(k)
 		if kk == "" {
 			continue
 		}
-		expected[kk] = struct{}{}
-		expectedNoDelims[normalizeKeyNoDelims(kk)] = kk
+		matcher.expected[kk] = struct{}{}
+		matcher.expectedNoDelim[normalizeKeyNoDelims(kk)] = kk
 	}
-	aliasMap := map[string]string{} // normalized alias -> canonical key
 	for k := range props {
-		for _, alias := range aliasKeysForExpected(k) {
+		for _, alias := range aliasKeysForExpected(toolName, k) {
 			if alias == "" {
 				continue
 			}
-			aliasMap[normalizeKeyNoDelims(alias)] = k
+			matcher.aliasByNoDelim[normalizeKeyNoDelims(alias)] = k
 		}
 	}
 	if len(props) == 1 {
@@ -128,65 +212,144 @@ func repairJSONKeysBySchema(schema map[string]any, raw []byte) ([]byte, bool) {
 				if alias == "" {
 					continue
 				}
-				aliasMap[normalizeKeyNoDelims(alias)] = k
+				matcher.aliasByNoDelim[normalizeKeyNoDelims(alias)] = k
 			}
 			break
 		}
 	}
+	return matcher
+}
 
+func (m objectKeyMatcher) canonicalKey(k string) (string, bool) {
+	if _, ok := m.expected[k]; ok {
+		return k, true
+	}
+	norm := normalizeKeyNoDelims(k)
+	if canon, ok := m.expectedNoDelim[norm]; ok {
+		return canon, true
+	}
+	if canon, ok := m.aliasByNoDelim[norm]; ok {
+		return canon, true
+	}
+
+	cand := normalizeCandidateKey(k)
+	if cand == "" {
+		return "", false
+	}
+	candNorm := normalizeKeyNoDelims(cand)
+	if canon, ok := m.expectedNoDelim[candNorm]; ok {
+		return canon, true
+	}
+	if canon, ok := m.aliasByNoDelim[candNorm]; ok {
+		return canon, true
+	}
+	return "", false
+}
+
+func repairBySchemaValue(v any, schema map[string]any, opts schemaRepairOptions) (any, bool) {
+	if schema == nil {
+		return v, false
+	}
+	switch vv := v.(type) {
+	case map[string]any:
+		return repairObjectBySchema(vv, schema, opts)
+	case []any:
+		return repairArrayBySchema(vv, schema, opts)
+	default:
+		return v, false
+	}
+}
+
+func repairArrayBySchema(in []any, schema map[string]any, opts schemaRepairOptions) ([]any, bool) {
+	if len(in) == 0 {
+		return in, false
+	}
+	itemSchema, ok := schema["items"].(map[string]any)
+	if !ok || itemSchema == nil {
+		return in, false
+	}
 	changed := false
-	for k, v := range m {
-		if _, ok := expected[k]; ok {
+	for i, item := range in {
+		repaired, itemChanged := repairBySchemaValue(item, itemSchema, opts)
+		if !itemChanged {
 			continue
 		}
-		cand := normalizeCandidateKey(k)
-		if cand != "" {
-			norm := normalizeKeyNoDelims(cand)
-			if canon, ok := expectedNoDelims[norm]; ok {
-				if _, exists := m[canon]; !exists {
-					m[canon] = v
-					changed = true
-				}
-				delete(m, k)
-				continue
-			}
-			if canon, ok := aliasMap[norm]; ok {
-				if _, exists := m[canon]; !exists {
-					m[canon] = v
-					changed = true
-				}
-				delete(m, k)
-				continue
-			}
-		}
-		if canon, ok := expectedNoDelims[normalizeKeyNoDelims(k)]; ok {
+		in[i] = repaired
+		changed = true
+	}
+	return in, changed
+}
+
+func repairObjectBySchema(in map[string]any, schema map[string]any, opts schemaRepairOptions) (map[string]any, bool) {
+	props, _ := schema["properties"].(map[string]any)
+	matcher := newObjectKeyMatcher(props, opts.ToolName)
+	_, additionalSchema := schemaAllowsAdditionalProperties(schema)
+	stripUnknown := opts.StripUnknown
+	// Keep map-like payloads (no fixed properties + typed additionalProperties).
+	if len(props) == 0 && additionalSchema != nil {
+		stripUnknown = false
+	}
+
+	out := make(map[string]any, len(in))
+	for k, v := range in {
+		out[k] = v
+	}
+
+	changed := false
+	for k, v := range in {
+		canon, ok := matcher.canonicalKey(k)
+		if ok {
 			if canon != k {
-				if _, exists := m[canon]; !exists {
-					m[canon] = v
-					changed = true
+				if _, exists := out[canon]; !exists {
+					out[canon] = v
 				}
-				delete(m, k)
-				continue
+				delete(out, k)
+				changed = true
 			}
+			continue
 		}
-		if canon, ok := aliasMap[normalizeKeyNoDelims(k)]; ok {
-			if canon != k {
-				if _, exists := m[canon]; !exists {
-					m[canon] = v
-					changed = true
-				}
-				delete(m, k)
-			}
+		if stripUnknown {
+			delete(out, k)
+			changed = true
 		}
+	}
+
+	for k, v := range out {
+		childSchema := map[string]any(nil)
+		if propSchema, ok := props[k].(map[string]any); ok {
+			childSchema = propSchema
+		} else if additionalSchema != nil {
+			childSchema = additionalSchema
+		}
+		if childSchema == nil {
+			continue
+		}
+		repaired, childChanged := repairBySchemaValue(v, childSchema, opts)
+		if !childChanged {
+			continue
+		}
+		out[k] = repaired
+		changed = true
 	}
 	if !changed {
-		return nil, false
+		return in, false
 	}
-	b, err := json.Marshal(m)
-	if err != nil {
-		return nil, false
+	return out, true
+}
+
+func schemaAllowsAdditionalProperties(schema map[string]any) (bool, map[string]any) {
+	apAny, ok := schema["additionalProperties"]
+	if !ok {
+		return true, nil
 	}
-	return b, true
+	switch ap := apAny.(type) {
+	case bool:
+		return ap, nil
+	case map[string]any:
+		return true, ap
+	default:
+		return true, nil
+	}
 }
 
 func normalizeCandidateKey(k string) string {
@@ -253,7 +416,7 @@ func normalizeKeyNoDelims(k string) string {
 	}, k)
 }
 
-func aliasKeysForExpected(key string) []string {
+func aliasKeysForExpected(toolName, key string) []string {
 	switch normalizeKeyNoDelims(key) {
 	case "filepath":
 		return []string{"path", "file", "filename", "file_path"}
@@ -274,7 +437,11 @@ func aliasKeysForExpected(key string) []string {
 	case "patch":
 		return []string{"diff"}
 	case "offset":
-		return []string{"start", "line", "start_line"}
+		aliases := []string{"start"}
+		if supportsLineOffsetAliases(toolName) {
+			aliases = append(aliases, "line", "start_line")
+		}
+		return aliases
 	case "limit":
 		return []string{"lines", "max_lines", "count"}
 	default:
@@ -282,33 +449,58 @@ func aliasKeysForExpected(key string) []string {
 	}
 }
 
+func supportsLineOffsetAliases(toolName string) bool {
+	switch NormalizeToolName(toolName) {
+	case "read":
+		return true
+	default:
+		return false
+	}
+}
+
 func singleFieldAliases() []string {
 	return []string{"input", "args", "argument", "value", "text", "data"}
 }
 
-// repairLooseJSONObject tries to repair a JSON-object-like string where some string
-// values are unquoted (common in tool args): {"path":/tmp} -> {"path":"/tmp"}.
-// It is intentionally conservative; returns ok=false if it cannot safely repair.
-func repairLooseJSONObject(raw string) ([]byte, bool) {
+// repairLooseJSONObject tries to repair a JSON-object-like string where some scalar
+// values are unquoted (for example {"path":/tmp}). It applies conservative heuristics
+// and validates the repaired payload shape against the tool schema when available.
+func repairLooseJSONObject(raw string, schema map[string]any) ([]byte, bool) {
 	raw = strings.TrimSpace(raw)
-	if !strings.HasPrefix(raw, "{") {
+	if !strings.HasPrefix(raw, "{") || !strings.HasSuffix(raw, "}") {
 		return nil, false
 	}
-	// Fast path: if it becomes valid after trimming, no repair.
-	{
-		dec := json.NewDecoder(bytes.NewReader([]byte(raw)))
-		dec.DisallowUnknownFields()
-		var tmp json.RawMessage
-		if err := dec.Decode(&tmp); err == nil {
-			return tmp, true
+
+	if v, err := decodeJSONValueStrict(raw); err == nil {
+		obj, ok := v.(map[string]any)
+		if !ok || !looseRepairSchemaCompatible(obj, schema) {
+			return nil, false
 		}
+		return []byte(raw), true
 	}
 
-	// Minimal state machine: whenever we see a ':' and the next non-space byte starts an
-	// unquoted token, wrap it in JSON string quotes until ',' or '}'.
+	repaired, changed, ok := quoteLooseObjectScalars(raw)
+	if !ok || !changed {
+		return nil, false
+	}
+
+	var parsed any
+	if err := json.Unmarshal(repaired, &parsed); err != nil {
+		return nil, false
+	}
+	obj, ok := parsed.(map[string]any)
+	if !ok || !looseRepairSchemaCompatible(obj, schema) {
+		return nil, false
+	}
+	return repaired, true
+}
+
+func quoteLooseObjectScalars(raw string) ([]byte, bool, bool) {
 	out := make([]byte, 0, len(raw)+16)
 	inStr := false
 	esc := false
+	changed := false
+
 	for i := 0; i < len(raw); {
 		c := raw[i]
 		if inStr {
@@ -329,22 +521,20 @@ func repairLooseJSONObject(raw string) ([]byte, bool) {
 			i++
 			continue
 		}
+
 		if c == '"' {
 			inStr = true
 			out = append(out, c)
 			i++
 			continue
 		}
+
+		out = append(out, c)
+		i++
 		if c != ':' {
-			out = append(out, c)
-			i++
 			continue
 		}
 
-		// ':' encountered
-		out = append(out, c)
-		i++
-		// Copy whitespace
 		for i < len(raw) {
 			s := raw[i]
 			if s == ' ' || s == '\n' || s == '\r' || s == '\t' {
@@ -355,49 +545,225 @@ func repairLooseJSONObject(raw string) ([]byte, bool) {
 			break
 		}
 		if i >= len(raw) {
-			break
+			return nil, false, false
 		}
-		n := raw[i]
-		// Already quoted or starts a structured / literal value.
-		if n == '"' || n == '{' || n == '[' || n == '-' || (n >= '0' && n <= '9') {
+		if !shouldRepairLooseScalar(raw[i:]) {
 			continue
 		}
-		// true/false/null
-		if strings.HasPrefix(raw[i:], "true") || strings.HasPrefix(raw[i:], "false") || strings.HasPrefix(raw[i:], "null") {
+
+		end, token, ok := readLooseScalarToken(raw, i)
+		if !ok {
+			return nil, false, false
+		}
+		if !isSafeLooseScalarToken(token) {
 			continue
 		}
-		// Wrap token as string.
-		out = append(out, '"')
-		start := len(out)
-		for i < len(raw) {
-			cc := raw[i]
-			if cc == ',' || cc == '}' {
-				break
-			}
-			out = append(out, cc)
-			i++
+		quoted, err := json.Marshal(token)
+		if err != nil {
+			return nil, false, false
 		}
-		// Trim trailing whitespace inside the quotes.
-		for len(out) > start {
-			last := out[len(out)-1]
-			if last == ' ' || last == '\n' || last == '\r' || last == '\t' {
-				out = out[:len(out)-1]
-				continue
-			}
-			break
-		}
-		out = append(out, '"')
-		// Do not consume ',' / '}' here; outer loop will handle it.
+		out = append(out, quoted...)
+		i = end
+		changed = true
 	}
 
-	// Validate repaired JSON.
-	dec := json.NewDecoder(bytes.NewReader(out))
-	dec.DisallowUnknownFields()
-	var fixed json.RawMessage
-	if err := dec.Decode(&fixed); err != nil {
-		return nil, false
+	if inStr {
+		return nil, false, false
 	}
-	return fixed, true
+	return out, changed, true
+}
+
+func shouldRepairLooseScalar(raw string) bool {
+	if raw == "" {
+		return false
+	}
+	n := raw[0]
+	if n == '"' || n == '{' || n == '[' || n == '-' || (n >= '0' && n <= '9') {
+		return false
+	}
+	if n == ',' || n == '}' || n == ']' {
+		return false
+	}
+	if hasJSONLiteralPrefix(raw) {
+		return false
+	}
+	return true
+}
+
+func hasJSONLiteralPrefix(raw string) bool {
+	for _, lit := range []string{"true", "false", "null"} {
+		if !strings.HasPrefix(raw, lit) {
+			continue
+		}
+		if len(raw) == len(lit) {
+			return true
+		}
+		if isJSONValueDelimiter(raw[len(lit)]) {
+			return true
+		}
+	}
+	return false
+}
+
+func isJSONValueDelimiter(b byte) bool {
+	switch b {
+	case ' ', '\n', '\r', '\t', ',', '}', ']':
+		return true
+	default:
+		return false
+	}
+}
+
+func readLooseScalarToken(raw string, start int) (int, string, bool) {
+	i := start
+	for i < len(raw) {
+		c := raw[i]
+		if c == ',' || c == '}' || c == ']' {
+			break
+		}
+		if c == '"' || c == '{' || c == '[' {
+			return 0, "", false
+		}
+		i++
+	}
+	token := strings.TrimSpace(raw[start:i])
+	if token == "" {
+		return 0, "", false
+	}
+	return i, token, true
+}
+
+func isSafeLooseScalarToken(token string) bool {
+	token = strings.TrimSpace(token)
+	if token == "" {
+		return false
+	}
+	if strings.ContainsAny(token, "\"'{}[]") {
+		return false
+	}
+	if token == "-" {
+		return false
+	}
+	return true
+}
+
+func looseRepairSchemaCompatible(value any, schema map[string]any) bool {
+	if schema == nil || len(schema) == 0 {
+		return true
+	}
+	return schemaAllowsValue(value, schema)
+}
+
+func schemaAllowsValue(value any, schema map[string]any) bool {
+	if schema == nil || len(schema) == 0 {
+		return true
+	}
+	if !schemaAllowsType(value, schema) {
+		return false
+	}
+
+	switch v := value.(type) {
+	case map[string]any:
+		props, _ := schema["properties"].(map[string]any)
+		allowUnknown, additionalSchema := schemaAllowsAdditionalProperties(schema)
+		for k, child := range v {
+			if propSchema, ok := props[k].(map[string]any); ok {
+				if !schemaAllowsValue(child, propSchema) {
+					return false
+				}
+				continue
+			}
+			if additionalSchema != nil {
+				if !schemaAllowsValue(child, additionalSchema) {
+					return false
+				}
+				continue
+			}
+			if !allowUnknown {
+				return false
+			}
+		}
+	case []any:
+		itemSchema, _ := schema["items"].(map[string]any)
+		if itemSchema == nil {
+			return true
+		}
+		for _, child := range v {
+			if !schemaAllowsValue(child, itemSchema) {
+				return false
+			}
+		}
+	}
+
+	return true
+}
+
+func schemaAllowsType(value any, schema map[string]any) bool {
+	types := schemaTypeSet(schema)
+	if len(types) == 0 {
+		return true
+	}
+	vType := jsonValueType(value)
+	if vType == "" {
+		return false
+	}
+	if _, ok := types[vType]; ok {
+		return true
+	}
+	if vType == "integer" {
+		_, ok := types["number"]
+		return ok
+	}
+	return false
+}
+
+func schemaTypeSet(schema map[string]any) map[string]struct{} {
+	out := map[string]struct{}{}
+	t, ok := schema["type"]
+	if !ok {
+		return out
+	}
+	switch vv := t.(type) {
+	case string:
+		v := strings.ToLower(strings.TrimSpace(vv))
+		if v != "" {
+			out[v] = struct{}{}
+		}
+	case []any:
+		for _, item := range vv {
+			s, ok := item.(string)
+			if !ok {
+				continue
+			}
+			v := strings.ToLower(strings.TrimSpace(s))
+			if v != "" {
+				out[v] = struct{}{}
+			}
+		}
+	}
+	return out
+}
+
+func jsonValueType(value any) string {
+	switch v := value.(type) {
+	case nil:
+		return "null"
+	case map[string]any:
+		return "object"
+	case []any:
+		return "array"
+	case string:
+		return "string"
+	case bool:
+		return "boolean"
+	case float64:
+		if v == math.Trunc(v) {
+			return "integer"
+		}
+		return "number"
+	default:
+		return ""
+	}
 }
 
 // Func creates a tool from an Args struct and a handler.
@@ -414,11 +780,11 @@ func Func[Args any](name, description string, fn func(ctx context.Context, args 
 			dec := json.NewDecoder(bytes.NewReader(raw))
 			dec.DisallowUnknownFields()
 			if err := dec.Decode(&a); err != nil {
-				return llm.TextContent(fmt.Sprintf("Error parsing arguments: %v", err)), err
+				return llm.TextContent(formatToolErrorDiagnostic("Invalid tool arguments", err, toolDiagnosticInvalidArgsAction)), err
 			}
 			res, err := fn(ctx, a, deps)
 			if err != nil {
-				return llm.TextContent(fmt.Sprintf("Error: %v", err)), err
+				return llm.TextContent(formatToolErrorDiagnostic("Tool execution failed", err, toolDiagnosticDefaultAction)), err
 			}
 			return SerializeResult(res)
 		},

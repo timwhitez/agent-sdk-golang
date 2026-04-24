@@ -23,10 +23,10 @@ const (
 type ToolChoice string
 
 type ToolDefinition struct {
-	Name        string                 `json:"name"`
-	Description string                 `json:"description"`
-	Parameters  map[string]any         `json:"parameters"`
-	Strict      bool                   `json:"strict"`
+	Name        string         `json:"name"`
+	Description string         `json:"description"`
+	Parameters  map[string]any `json:"parameters"`
+	Strict      bool           `json:"strict"`
 }
 
 type FunctionCall struct {
@@ -35,17 +35,17 @@ type FunctionCall struct {
 }
 
 type ToolCall struct {
-	ID             string       `json:"id"`
-	Type           string       `json:"type"` // currently "function"
-	Function       FunctionCall `json:"function"`
-	ThoughtSig     []byte       `json:"thought_signature,omitempty"` // for Gemini-style providers
+	ID         string       `json:"id"`
+	Type       string       `json:"type"` // currently "function"
+	Function   FunctionCall `json:"function"`
+	ThoughtSig []byte       `json:"thought_signature,omitempty"` // for Gemini-style providers
 }
 
 // ContentBlock is a provider-agnostic content part representation.
 // Providers may serialize this differently; the SDK keeps it for multimodal
 // messages and for persisting conversation state.
 type ContentBlock struct {
-	Type      string    `json:"type"`                // "text", "image_url", "document", "thinking", "redacted_thinking"
+	Type      string    `json:"type"` // "text", "image_url", "document", "thinking", "redacted_thinking"
 	Text      string    `json:"text,omitempty"`
 	ImageURL  *ImageURL `json:"image_url,omitempty"`
 	Source    *DocSrc   `json:"source,omitempty"`
@@ -136,6 +136,7 @@ type Completion struct {
 	ToolCalls  []ToolCall      `json:"tool_calls,omitempty"`
 	Usage      *Usage          `json:"usage,omitempty"`
 	StopReason string          `json:"stop_reason,omitempty"`
+	ResponseID string          `json:"response_id,omitempty"`
 	Raw        json.RawMessage `json:"-"`
 }
 

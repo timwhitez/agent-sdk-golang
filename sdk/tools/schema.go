@@ -8,11 +8,11 @@ import (
 // SchemaFor generates a JSON schema suitable for OpenAI/Anthropic tool calling.
 // It is intentionally conservative and focuses on the shapes used by this repo.
 func SchemaFor[T any]() map[string]any {
-	var zero T
-	rt := reflect.TypeOf(zero)
+	rt := reflect.TypeOf((*T)(nil))
 	if rt == nil {
 		return map[string]any{"type": "object", "properties": map[string]any{}, "required": []any{}, "additionalProperties": false}
 	}
+	rt = rt.Elem()
 	if rt.Kind() == reflect.Pointer {
 		rt = rt.Elem()
 	}
@@ -93,6 +93,9 @@ func schemaForType(t reflect.Type) map[string]any {
 		return map[string]any{"type": "string"}
 	case reflect.Bool:
 		return map[string]any{"type": "boolean"}
+	case reflect.Interface:
+		// Allow any JSON value for interface{} / any fields.
+		return map[string]any{}
 	case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64:
 		return map[string]any{"type": "integer"}
 	case reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64, reflect.Uintptr:

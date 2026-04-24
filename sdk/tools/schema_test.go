@@ -14,6 +14,10 @@ type schemaArgs struct {
 	Omit     string `json:"omit,omitempty"`
 }
 
+type schemaInterfaceArgs struct {
+	Any any `json:"any"`
+}
+
 func TestSchemaForRequiredFields(t *testing.T) {
 	s := SchemaFor[schemaArgs]()
 	req, ok := s["required"].([]any)
@@ -34,6 +38,36 @@ func TestSchemaForRequiredFields(t *testing.T) {
 	}
 	if reqSet["omit"] {
 		t.Fatalf("did not expect 'omit' to be required")
+	}
+}
+
+func TestSchemaForInterfaceField(t *testing.T) {
+	s := SchemaFor[schemaInterfaceArgs]()
+	props, ok := s["properties"].(map[string]any)
+	if !ok {
+		t.Fatalf("properties not map[string]any")
+	}
+	anySchema, ok := props["any"].(map[string]any)
+	if !ok {
+		t.Fatalf("any schema not map[string]any")
+	}
+	if len(anySchema) != 0 {
+		t.Fatalf("expected interface schema to be empty, got %v", anySchema)
+	}
+}
+
+func TestSchemaForInterfaceType(t *testing.T) {
+	s := SchemaFor[any]()
+	props, ok := s["properties"].(map[string]any)
+	if !ok {
+		t.Fatalf("properties not map[string]any")
+	}
+	valueSchema, ok := props["value"].(map[string]any)
+	if !ok {
+		t.Fatalf("value schema not map[string]any")
+	}
+	if len(valueSchema) != 0 {
+		t.Fatalf("expected interface schema to be empty, got %v", valueSchema)
 	}
 }
 

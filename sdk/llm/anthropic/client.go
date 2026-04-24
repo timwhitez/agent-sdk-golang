@@ -4,12 +4,13 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	cryptorand "crypto/rand"
+	"encoding/binary"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
-	"math/rand"
-	"net"
+	"log"
 	"net/http"
 	"strings"
 	"time"
@@ -18,6 +19,12 @@ import (
 )
 
 const defaultBaseURL = "https://api.anthropic.com"
+
+const promptCachingBeta = "prompt-caching-2024-07-31"
+
+var retryAfterWarningf = log.Printf
+var backoffRandRead = cryptorand.Read
+var toolIDNormalizationWarningf = log.Printf
 
 type Client struct {
 	HTTPClient *http.Client
@@ -70,12 +77,15 @@ func (c *Client) Invoke(ctx context.Context, req llm.InvokeRequest) (*llm.Comple
 	if maxDelay <= 0 {
 		maxDelay = 60 * time.Second
 	}
+	localBeta := append([]string(nil), c.Beta...)
+	localThinking := c.ThinkingBudgetTokens
+	usedFinalDowngradeRetry := false
 
-	for attempt := 0; attempt < maxRetries; attempt++ {
+	for attempt := 0; attempt < maxRetries+1; attempt++ {
 		if err := ctx.Err(); err != nil {
 			return nil, err
 		}
-		payload, err := c.buildRequest(req)
+		payload, err := c.buildRequest(req, localThinking)
 		if err != nil {
 			return nil, err
 		}
@@ -90,7 +100,7 @@ func (c *Client) Invoke(ctx context.Context, req llm.InvokeRequest) (*llm.Comple
 		}
 		httpReq.Header.Set("Content-Type", "application/json")
 		httpReq.Header.Set("anthropic-version", "2023-06-01")
-		betaHeader := strings.TrimSpace(strings.Join(c.Beta, ", "))
+		betaHeader := strings.TrimSpace(strings.Join(localBeta, ", "))
 		if betaHeader != "" {
 			httpReq.Header.Set("anthropic-beta", betaHeader)
 		}
@@ -103,10 +113,10 @@ func (c *Client) Invoke(ctx context.Context, req llm.InvokeRequest) (*llm.Comple
 
 		resp, err := client.Do(httpReq)
 		if err == nil {
-			data, readErr := io.ReadAll(resp.Body)
-			_ = resp.Body.Close()
+			data, readErr := readResponseBodyLimited(resp.Body, endpoint)
 			if readErr != nil {
-				return nil, readErr
+				retryAfter := parseRetryAfter(resp.Header.Get("Retry-After"))
+				return nil, anthropicReadBodyError(resp.StatusCode, retryAfter, readErr)
 			}
 
 			if resp.StatusCode >= 200 && resp.StatusCode < 300 {
@@ -116,25 +126,26 @@ func (c *Client) Invoke(ctx context.Context, req llm.InvokeRequest) (*llm.Comple
 			retryAfter := parseRetryAfter(resp.Header.Get("Retry-After"))
 			msg := strings.TrimSpace(string(data))
 
+			didDowngrade := false
 			// Automatic downgrade: some gateways reject Claude Code betas.
 			if (resp.StatusCode == 400 || resp.StatusCode == 422) && betaHeader != "" && looksLikeBetaUnsupported(msg) {
-				c.Beta = []string{"prompt-caching-2024-07-31"}
-				if attempt < maxRetries-1 {
-					continue
+				if setPromptCachingBeta(&localBeta) {
+					didDowngrade = true
 				}
 			}
 			// Automatic downgrade: disable extended thinking on models/endpoints that don't support it.
-			if (resp.StatusCode == 400 || resp.StatusCode == 422) && c.ThinkingBudgetTokens != nil && *c.ThinkingBudgetTokens > 0 && looksLikeThinkingUnsupported(msg) {
-				c.ThinkingBudgetTokens = nil
-				if attempt < maxRetries-1 {
-					continue
-				}
+			if (resp.StatusCode == 400 || resp.StatusCode == 422) && localThinking != nil && *localThinking > 0 && looksLikeThinkingUnsupported(msg) {
+				localThinking = nil
+				didDowngrade = true
+			}
+			if didDowngrade && allowDowngradeRetry(attempt, maxRetries, &usedFinalDowngradeRetry) {
+				continue
 			}
 
 			if resp.StatusCode == 429 {
-				lastErr = &llm.RateLimitError{Provider: "anthropic", Message: msg}
+				lastErr = &llm.RateLimitError{Provider: "anthropic", Message: msg, RetryAfter: retryAfter}
 			} else {
-				lastErr = &llm.ProviderError{Provider: "anthropic", StatusCode: resp.StatusCode, Message: msg}
+				lastErr = &llm.ProviderError{Provider: "anthropic", StatusCode: resp.StatusCode, Message: msg, RetryAfter: retryAfter}
 			}
 			if c.isRetryableStatus(resp.StatusCode) && attempt < maxRetries-1 {
 				c.sleepBackoff(ctx, attempt, baseDelay, maxDelay, retryAfter)
@@ -195,7 +206,7 @@ func (c *Client) sleepBackoff(ctx context.Context, attempt int, baseDelay, maxDe
 		}
 	}
 	// 10% jitter
-	jitter := time.Duration(rand.Float64() * float64(d) * 0.1)
+	jitter := time.Duration(randomBackoffFraction() * float64(d) * 0.1)
 	d += jitter
 	t := time.NewTimer(d)
 	defer t.Stop()
@@ -207,37 +218,216 @@ func (c *Client) sleepBackoff(ctx context.Context, attempt int, baseDelay, maxDe
 	}
 }
 
-func looksLikeThinkingUnsupported(msg string) bool {
-	s := strings.ToLower(msg)
-	if strings.Contains(s, "thinking") {
-		// covers: thinking, extended thinking, redacted_thinking
+func randomBackoffFraction() float64 {
+	const scale = float64(1 << 53)
+
+	var b [8]byte
+	if _, err := backoffRandRead(b[:]); err == nil {
+		// Keep top 53 bits so float64 conversion retains entropy exactly.
+		sample := binary.BigEndian.Uint64(b[:]) >> 11
+		return float64(sample) / scale
+	}
+
+	// Fallback still adds jitter if the entropy source is temporarily unavailable.
+	n := uint64(time.Now().UnixNano())
+	n ^= n << 13
+	n ^= n >> 7
+	n ^= n << 17
+	return float64(n>>11) / scale
+}
+
+func allowDowngradeRetry(attempt, maxRetries int, usedFinalDowngradeRetry *bool) bool {
+	if attempt < maxRetries-1 {
 		return true
 	}
-	if strings.Contains(s, "budget_tokens") {
-		return true
-	}
-	if strings.Contains(s, "unknown") && strings.Contains(s, "budget") {
-		return true
-	}
-	if strings.Contains(s, "unsupported") && strings.Contains(s, "thinking") {
+	if attempt == maxRetries-1 && usedFinalDowngradeRetry != nil && !*usedFinalDowngradeRetry {
+		*usedFinalDowngradeRetry = true
 		return true
 	}
 	return false
 }
 
-func looksLikeBetaUnsupported(msg string) bool {
+func setPromptCachingBeta(beta *[]string) bool {
+	if beta == nil {
+		return false
+	}
+	if len(*beta) == 1 && strings.EqualFold(strings.TrimSpace((*beta)[0]), promptCachingBeta) {
+		return false
+	}
+	*beta = []string{promptCachingBeta}
+	return true
+}
+
+type compatibilityError struct {
+	Message string
+	Code    string
+	Type    string
+	Param   string
+}
+
+func parseCompatibilityError(raw string) compatibilityError {
+	trimmed := strings.TrimSpace(raw)
+	parsed := compatibilityError{Message: strings.ToLower(trimmed)}
+	if trimmed == "" {
+		return parsed
+	}
+
+	var root map[string]any
+	if err := json.Unmarshal([]byte(trimmed), &root); err != nil {
+		return parsed
+	}
+
+	msg := ""
+	if errObj, ok := root["error"].(map[string]any); ok {
+		if msg == "" {
+			msg = compatibilityString(errObj["message"])
+		}
+		if parsed.Code == "" {
+			parsed.Code = compatibilityString(errObj["code"])
+		}
+		if parsed.Type == "" {
+			parsed.Type = compatibilityString(errObj["type"])
+		}
+		if parsed.Param == "" {
+			parsed.Param = firstCompatibilityParam(errObj)
+		}
+	}
+	if msg == "" {
+		msg = compatibilityString(root["message"])
+	}
+	if parsed.Code == "" {
+		parsed.Code = compatibilityString(root["code"])
+	}
+	if parsed.Type == "" {
+		parsed.Type = compatibilityString(root["type"])
+	}
+	if parsed.Param == "" {
+		parsed.Param = firstCompatibilityParam(root)
+	}
+	if msg != "" {
+		parsed.Message = msg
+	}
+	return parsed
+}
+
+func firstCompatibilityParam(m map[string]any) string {
+	if m == nil {
+		return ""
+	}
+	keys := []string{"param", "field", "path", "pointer", "name"}
+	for _, k := range keys {
+		if s := compatibilityString(m[k]); s != "" {
+			return s
+		}
+	}
+	if details, ok := m["details"].([]any); ok {
+		for _, d := range details {
+			dm, ok := d.(map[string]any)
+			if !ok {
+				continue
+			}
+			if s := firstCompatibilityParam(dm); s != "" {
+				return s
+			}
+		}
+	}
+	return ""
+}
+
+func compatibilityString(v any) string {
+	switch x := v.(type) {
+	case string:
+		return strings.ToLower(strings.TrimSpace(x))
+	case []any:
+		parts := make([]string, 0, len(x))
+		for _, item := range x {
+			s := compatibilityString(item)
+			if s != "" {
+				parts = append(parts, s)
+			}
+		}
+		return strings.Join(parts, ".")
+	default:
+		if x == nil {
+			return ""
+		}
+		return strings.ToLower(strings.TrimSpace(fmt.Sprintf("%v", x)))
+	}
+}
+
+func looksLikeUnsupportedError(msg string) bool {
 	s := strings.ToLower(msg)
-	// best-effort patterns seen on gateways when they reject custom betas
-	if strings.Contains(s, "anthropic-beta") {
+	if s == "" {
+		return false
+	}
+	if strings.Contains(s, "unsupported") || strings.Contains(s, "not supported") {
 		return true
 	}
-	if strings.Contains(s, "beta") && (strings.Contains(s, "invalid") || strings.Contains(s, "unknown") || strings.Contains(s, "unsupported")) {
+	if strings.Contains(s, "unknown") || strings.Contains(s, "unrecognized") {
 		return true
 	}
-	if strings.Contains(s, "claude-code") && (strings.Contains(s, "invalid") || strings.Contains(s, "unknown") || strings.Contains(s, "unsupported")) {
+	if strings.Contains(s, "invalid parameter") || strings.Contains(s, "unknown field") || strings.Contains(s, "unrecognized field") {
+		return true
+	}
+	if strings.Contains(s, "unexpected") && strings.Contains(s, "field") {
+		return true
+	}
+	if strings.Contains(s, "extra fields not permitted") {
 		return true
 	}
 	return false
+}
+
+func looksLikeUnsupportedCode(s string) bool {
+	s = strings.ToLower(s)
+	if s == "" {
+		return false
+	}
+	if strings.Contains(s, "unsupported") || strings.Contains(s, "unknown") || strings.Contains(s, "unrecognized") {
+		return true
+	}
+	if strings.Contains(s, "invalid_parameter") || strings.Contains(s, "invalid-parameter") || strings.Contains(s, "unknown_parameter") {
+		return true
+	}
+	if strings.Contains(s, "invalid_request_error") {
+		return true
+	}
+	return false
+}
+
+func containsAny(msg string, needles ...string) bool {
+	for _, n := range needles {
+		if strings.Contains(msg, n) {
+			return true
+		}
+	}
+	return false
+}
+
+func looksLikeThinkingUnsupported(msg string) bool {
+	parsed := parseCompatibilityError(msg)
+	thinkingFields := []string{"thinking", "budget_tokens", "redacted_thinking", "enable_thinking"}
+
+	if containsAny(parsed.Param, thinkingFields...) && (looksLikeUnsupportedCode(parsed.Code) || looksLikeUnsupportedCode(parsed.Type) || looksLikeUnsupportedError(parsed.Message)) {
+		return true
+	}
+	if (looksLikeUnsupportedCode(parsed.Code) || looksLikeUnsupportedCode(parsed.Type)) && containsAny(parsed.Message, thinkingFields...) {
+		return true
+	}
+	return looksLikeUnsupportedError(parsed.Message) && containsAny(parsed.Message, thinkingFields...)
+}
+
+func looksLikeBetaUnsupported(msg string) bool {
+	parsed := parseCompatibilityError(msg)
+	betaFields := []string{"anthropic-beta", "beta", "claude-code"}
+
+	if containsAny(parsed.Param, betaFields...) && (looksLikeUnsupportedCode(parsed.Code) || looksLikeUnsupportedCode(parsed.Type) || looksLikeUnsupportedError(parsed.Message)) {
+		return true
+	}
+	if (looksLikeUnsupportedCode(parsed.Code) || looksLikeUnsupportedCode(parsed.Type)) && containsAny(parsed.Message, betaFields...) {
+		return true
+	}
+	return looksLikeUnsupportedError(parsed.Message) && containsAny(parsed.Message, betaFields...)
 }
 
 func parseRetryAfter(v string) time.Duration {
@@ -250,12 +440,15 @@ func parseRetryAfter(v string) time.Duration {
 		if secs > 0 {
 			return secs
 		}
+		retryAfterWarningf("[WARN] Anthropic Retry-After %q is non-positive - ignoring header and using exponential backoff.", v)
+		return 0
 	}
 	if t, err := http.ParseTime(v); err == nil {
 		d := time.Until(t)
 		if d > 0 {
 			return d
 		}
+		retryAfterWarningf("[WARN] Anthropic Retry-After %q is non-positive - ignoring header and using exponential backoff.", v)
 	}
 	return 0
 }
@@ -264,9 +457,12 @@ func isRetryableNetErr(err error) bool {
 	if err == nil {
 		return false
 	}
-	var netErr net.Error
-	if errors.As(err, &netErr) {
-		return netErr.Timeout() || netErr.Temporary()
+	var timeoutErr interface{ Timeout() bool }
+	if errors.As(err, &timeoutErr) && timeoutErr.Timeout() {
+		return true
+	}
+	if errors.Is(err, context.DeadlineExceeded) {
+		return true
 	}
 	// best-effort string matching
 	msg := strings.ToLower(err.Error())
@@ -320,6 +516,11 @@ type messageParam struct {
 }
 
 func normalizeToolCallID(id string) string {
+	return normalizeToolCallIDWithWarning(id, toolIDNormalizationWarningf)
+}
+
+func normalizeToolCallIDWithWarning(id string, warnf func(string, ...any)) string {
+	original := id
 	id = strings.TrimSpace(id)
 	if id == "" {
 		return ""
@@ -334,7 +535,11 @@ func normalizeToolCallID(id string) string {
 			out = append(out, '_')
 		}
 	}
-	return string(out)
+	normalized := string(out)
+	if normalized != original && warnf != nil {
+		warnf("anthropic: normalized tool call id original=%q normalized=%q", original, normalized)
+	}
+	return normalized
 }
 
 type thinkingParam struct {
@@ -384,13 +589,16 @@ func (c *Client) InvokeStream(ctx context.Context, req llm.InvokeRequest) (<-cha
 		if maxDelay <= 0 {
 			maxDelay = 60 * time.Second
 		}
+		localBeta := append([]string(nil), c.Beta...)
+		localThinking := c.ThinkingBudgetTokens
+		usedFinalDowngradeRetry := false
 
-		for attempt := 0; attempt < maxRetries; attempt++ {
+		for attempt := 0; attempt < maxRetries+1; attempt++ {
 			if err := ctx.Err(); err != nil {
 				out <- llm.StreamErrorEvent{Err: err}
 				return
 			}
-			payload, err := c.buildRequest(req)
+			payload, err := c.buildRequest(req, localThinking)
 			if err != nil {
 				out <- llm.StreamErrorEvent{Err: err}
 				return
@@ -410,7 +618,7 @@ func (c *Client) InvokeStream(ctx context.Context, req llm.InvokeRequest) (<-cha
 			httpReq.Header.Set("Content-Type", "application/json")
 			httpReq.Header.Set("Accept", "text/event-stream")
 			httpReq.Header.Set("anthropic-version", "2023-06-01")
-			betaHeader := strings.TrimSpace(strings.Join(c.Beta, ", "))
+			betaHeader := strings.TrimSpace(strings.Join(localBeta, ", "))
 			if betaHeader != "" {
 				httpReq.Header.Set("anthropic-beta", betaHeader)
 			}
@@ -436,33 +644,34 @@ func (c *Client) InvokeStream(ctx context.Context, req llm.InvokeRequest) (<-cha
 			}
 
 			if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-				data, readErr := io.ReadAll(resp.Body)
-				_ = resp.Body.Close()
+				data, readErr := readResponseBodyLimited(resp.Body, endpoint)
 				if readErr != nil {
-					out <- llm.StreamErrorEvent{Err: readErr}
+					retryAfter := parseRetryAfter(resp.Header.Get("Retry-After"))
+					out <- llm.StreamErrorEvent{Err: anthropicReadBodyError(resp.StatusCode, retryAfter, readErr)}
 					return
 				}
 				retryAfter := parseRetryAfter(resp.Header.Get("Retry-After"))
 				msg := strings.TrimSpace(string(data))
 
+				didDowngrade := false
 				if (resp.StatusCode == 400 || resp.StatusCode == 422) && betaHeader != "" && looksLikeBetaUnsupported(msg) {
-					c.Beta = []string{"prompt-caching-2024-07-31"}
-					if attempt < maxRetries-1 {
-						continue
+					if setPromptCachingBeta(&localBeta) {
+						didDowngrade = true
 					}
 				}
 				// Automatic downgrade: disable thinking when unsupported.
-				if (resp.StatusCode == 400 || resp.StatusCode == 422) && c.ThinkingBudgetTokens != nil && *c.ThinkingBudgetTokens > 0 && looksLikeThinkingUnsupported(msg) {
-					c.ThinkingBudgetTokens = nil
-					if attempt < maxRetries-1 {
-						continue
-					}
+				if (resp.StatusCode == 400 || resp.StatusCode == 422) && localThinking != nil && *localThinking > 0 && looksLikeThinkingUnsupported(msg) {
+					localThinking = nil
+					didDowngrade = true
+				}
+				if didDowngrade && allowDowngradeRetry(attempt, maxRetries, &usedFinalDowngradeRetry) {
+					continue
 				}
 				var lastErr error
 				if resp.StatusCode == 429 {
-					lastErr = &llm.RateLimitError{Provider: "anthropic", Message: msg}
+					lastErr = &llm.RateLimitError{Provider: "anthropic", Message: msg, RetryAfter: retryAfter}
 				} else {
-					lastErr = &llm.ProviderError{Provider: "anthropic", StatusCode: resp.StatusCode, Message: msg}
+					lastErr = &llm.ProviderError{Provider: "anthropic", StatusCode: resp.StatusCode, Message: msg, RetryAfter: retryAfter}
 				}
 				if c.isRetryableStatus(resp.StatusCode) && attempt < maxRetries-1 {
 					c.sleepBackoff(ctx, attempt, baseDelay, maxDelay, retryAfter)
@@ -475,8 +684,19 @@ func (c *Client) InvokeStream(ctx context.Context, req llm.InvokeRequest) (<-cha
 			blockToToolIndex := map[int]int{}
 			inputTokens := 0
 			outputTokens := 0
+			var promptCachedTokens *int
+			var promptCacheCreationTokens *int
 			stopReason := ""
+			responseID := ""
 			nextTool := 0
+			emitResponseID := func(id string) {
+				id = strings.TrimSpace(id)
+				if id == "" || id == responseID {
+					return
+				}
+				responseID = id
+				out <- llm.StreamResponseEvent{ResponseID: id}
+			}
 			getToolIndex := func(blockIdx int) int {
 				if v, ok := blockToToolIndex[blockIdx]; ok {
 					return v
@@ -487,21 +707,31 @@ func (c *Client) InvokeStream(ctx context.Context, req llm.InvokeRequest) (<-cha
 				return idx
 			}
 
-			err = consumeSSE(resp.Body, func(data string) error {
+			err = consumeSSEWithBodyClose(resp.Body, func(data string) error {
 				data = strings.TrimSpace(data)
 				if data == "" {
 					return nil
 				}
 				var root map[string]any
-				if json.Unmarshal([]byte(data), &root) != nil {
-					return nil
+				if err := json.Unmarshal([]byte(data), &root); err != nil {
+					return fmt.Errorf("anthropic stream: failed to decode SSE JSON event: %w", err)
+				}
+				if root == nil {
+					return errors.New("anthropic stream: failed to decode SSE JSON event: expected object payload")
 				}
 				typ, _ := root["type"].(string)
+				emitResponseID(streamResponseIDFromEvent(typ, root))
 				switch typ {
 				case "message_start":
 					if msg, ok := root["message"].(map[string]any); ok {
 						if u, ok := msg["usage"].(map[string]any); ok {
 							inputTokens = intFromAny(u["input_tokens"])
+							if raw, ok := u["cache_read_input_tokens"]; ok {
+								promptCachedTokens = intPtrFromAny(raw)
+							}
+							if raw, ok := u["cache_creation_input_tokens"]; ok {
+								promptCacheCreationTokens = intPtrFromAny(raw)
+							}
 						}
 					}
 				case "message_delta":
@@ -535,7 +765,7 @@ func (c *Client) InvokeStream(ctx context.Context, req llm.InvokeRequest) (<-cha
 						return nil
 					}
 					// thinking delta
-					if t, ok := del["thinking"].(string); ok && strings.TrimSpace(t) != "" {
+					if t, ok := del["thinking"].(string); ok && t != "" {
 						out <- llm.StreamThinkingDeltaEvent{Delta: t}
 						return nil
 					}
@@ -546,13 +776,18 @@ func (c *Client) InvokeStream(ctx context.Context, req llm.InvokeRequest) (<-cha
 						return nil
 					}
 				case "message_stop":
-					if inputTokens > 0 || outputTokens > 0 {
-						out <- llm.StreamUsageEvent{Usage: llm.Usage{PromptTokens: inputTokens, CompletionTokens: outputTokens, TotalTokens: inputTokens + outputTokens}}
+					if inputTokens > 0 || outputTokens > 0 || promptCachedTokens != nil || promptCacheCreationTokens != nil {
+						out <- llm.StreamUsageEvent{Usage: llm.Usage{
+							PromptTokens:              inputTokens,
+							CompletionTokens:          outputTokens,
+							TotalTokens:               inputTokens + outputTokens,
+							PromptCachedTokens:        promptCachedTokens,
+							PromptCacheCreationTokens: promptCacheCreationTokens,
+						}}
 					}
 				}
 				return nil
 			})
-			_ = resp.Body.Close()
 			if err != nil {
 				out <- llm.StreamErrorEvent{Err: err}
 				return
@@ -565,22 +800,73 @@ func (c *Client) InvokeStream(ctx context.Context, req llm.InvokeRequest) (<-cha
 	return out, nil
 }
 
+func streamResponseIDFromEvent(eventType string, root map[string]any) string {
+	if root == nil {
+		return ""
+	}
+	extractMessageID := func(m map[string]any) string {
+		if m == nil {
+			return ""
+		}
+		if id, ok := m["id"].(string); ok {
+			return strings.TrimSpace(id)
+		}
+		return ""
+	}
+	switch strings.TrimSpace(eventType) {
+	case "message_start":
+		if msg, ok := root["message"].(map[string]any); ok {
+			if id := extractMessageID(msg); id != "" {
+				return id
+			}
+		}
+		if id, ok := root["id"].(string); ok {
+			return strings.TrimSpace(id)
+		}
+	case "message_delta", "message_stop":
+		if id, ok := root["id"].(string); ok {
+			return strings.TrimSpace(id)
+		}
+		if msg, ok := root["message"].(map[string]any); ok {
+			if id := extractMessageID(msg); id != "" {
+				return id
+			}
+		}
+	}
+	return ""
+}
+
 func consumeSSE(r io.Reader, onData func(data string) error) error {
 	sc := bufio.NewScanner(r)
 	sc.Buffer(make([]byte, 0, 64*1024), 4*1024*1024)
 	dataLines := []string{}
-	flush := func() error {
+	pending := ""
+	flush := func(final bool) error {
 		if len(dataLines) == 0 {
+			if final && pending != "" {
+				return fmt.Errorf("anthropic stream: malformed SSE event payload")
+			}
 			return nil
 		}
 		data := strings.Join(dataLines, "\n")
 		dataLines = nil
+		if pending != "" {
+			data = pending + "\n" + data
+		}
+		if !json.Valid([]byte(data)) {
+			pending = data
+			if final {
+				return fmt.Errorf("anthropic stream: malformed SSE event payload")
+			}
+			return nil
+		}
+		pending = ""
 		return onData(data)
 	}
 	for sc.Scan() {
 		line := sc.Text()
 		if line == "" {
-			if err := flush(); err != nil {
+			if err := flush(false); err != nil {
 				return err
 			}
 			continue
@@ -592,7 +878,14 @@ func consumeSSE(r io.Reader, onData func(data string) error) error {
 	if err := sc.Err(); err != nil {
 		return err
 	}
-	return flush()
+	return flush(true)
+}
+
+func consumeSSEWithBodyClose(body io.ReadCloser, onData func(data string) error) error {
+	defer func() {
+		_ = body.Close()
+	}()
+	return consumeSSE(body, onData)
 }
 
 func streamHTTPClient(base *http.Client) *http.Client {
@@ -623,7 +916,22 @@ func intFromAny(v any) int {
 	}
 }
 
-func (c *Client) buildRequest(req llm.InvokeRequest) (*requestPayload, error) {
+func intPtrFromAny(v any) *int {
+	i := intFromAny(v)
+	if i == 0 {
+		switch v.(type) {
+		case float64, int, int64, json.Number:
+			vv := 0
+			return &vv
+		default:
+			return nil
+		}
+	}
+	vv := i
+	return &vv
+}
+
+func (c *Client) buildRequest(req llm.InvokeRequest, thinkingBudgetTokens *int) (*requestPayload, error) {
 	if c.ModelName == "" {
 		return nil, fmt.Errorf("anthropic: model is required")
 	}
@@ -658,8 +966,8 @@ func (c *Client) buildRequest(req llm.InvokeRequest) (*requestPayload, error) {
 	}
 
 	var thinking *thinkingParam
-	if c.ThinkingBudgetTokens != nil && *c.ThinkingBudgetTokens > 0 {
-		thinking = &thinkingParam{Type: "enabled", BudgetTokens: *c.ThinkingBudgetTokens}
+	if thinkingBudgetTokens != nil && *thinkingBudgetTokens > 0 {
+		thinking = &thinkingParam{Type: "enabled", BudgetTokens: *thinkingBudgetTokens}
 	}
 
 	return &requestPayload{
@@ -720,7 +1028,6 @@ func serializeTools(tools []llm.ToolDefinition, maxCached int) []toolParam {
 
 func serializeMessages(in []llm.Message) (system any, out []messageParam, err error) {
 	var sysBlocks []contentBlockParam
-	var sysTextParts []string
 
 	for _, m := range in {
 		switch m.Role {
@@ -729,10 +1036,8 @@ func serializeMessages(in []llm.Message) (system any, out []messageParam, err er
 				blk := contentBlockParam{Type: "text", Text: m.Content.Text}
 				if m.Cache {
 					blk.CacheCtrl = &cacheControl{Type: "ephemeral"}
-					sysBlocks = append(sysBlocks, blk)
-				} else {
-					sysTextParts = append(sysTextParts, m.Content.Text)
 				}
+				sysBlocks = append(sysBlocks, blk)
 			}
 			for _, b := range m.Content.Blocks {
 				sysBlocks = append(sysBlocks, toAnthropicBlock(b, m.Cache))
@@ -749,12 +1054,25 @@ func serializeMessages(in []llm.Message) (system any, out []messageParam, err er
 	}
 
 	if len(sysBlocks) > 0 {
-		// Use structured system blocks when we need cache_control or non-text blocks.
-		system = sysBlocks
-	} else if len(sysTextParts) > 0 {
-		system = strings.Join(sysTextParts, "\n\n")
+		if text, ok := joinPlainSystemText(sysBlocks); ok {
+			system = text
+		} else {
+			// Use structured system blocks when we need cache_control or non-text blocks.
+			system = sysBlocks
+		}
 	}
 	return system, out, nil
+}
+
+func joinPlainSystemText(blocks []contentBlockParam) (string, bool) {
+	parts := make([]string, 0, len(blocks))
+	for _, blk := range blocks {
+		if blk.Type != "text" || blk.CacheCtrl != nil {
+			return "", false
+		}
+		parts = append(parts, blk.Text)
+	}
+	return strings.Join(parts, "\n\n"), true
 }
 
 func toAnthropicMessage(m llm.Message) (*messageParam, error) {
@@ -870,6 +1188,7 @@ func anthropicEndpoint(baseURL, suffix string) string {
 }
 
 type responsePayload struct {
+	ID      string `json:"id,omitempty"`
 	Content []struct {
 		Type      string          `json:"type"`
 		Text      string          `json:"text,omitempty"`
@@ -925,12 +1244,8 @@ func parseResponse(data []byte) (*llm.Completion, error) {
 		}
 	}
 
-	pt := rp.Usage.InputTokens
-	if rp.Usage.CacheReadInputTokens != nil {
-		pt += *rp.Usage.CacheReadInputTokens
-	}
 	usage := &llm.Usage{
-		PromptTokens:              pt,
+		PromptTokens:              rp.Usage.InputTokens,
 		CompletionTokens:          rp.Usage.OutputTokens,
 		TotalTokens:               rp.Usage.InputTokens + rp.Usage.OutputTokens,
 		PromptCachedTokens:        rp.Usage.CacheReadInputTokens,
@@ -943,6 +1258,7 @@ func parseResponse(data []byte) (*llm.Completion, error) {
 		ToolCalls:  toolCalls,
 		Usage:      usage,
 		StopReason: rp.StopReason,
+		ResponseID: strings.TrimSpace(rp.ID),
 		Raw:        append([]byte(nil), data...),
 	}, nil
 }

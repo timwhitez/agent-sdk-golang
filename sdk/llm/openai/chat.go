@@ -8,9 +8,8 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"math/rand"
-	"net"
 	"net/http"
+	"net/url"
 	"strings"
 	"time"
 
@@ -35,6 +34,7 @@ type ChatClient struct {
 	TopP                *float64
 	Seed                *int
 	MaxCompletionTokens *int
+	ServiceTier         string
 
 	// Reasoning effort for reasoning-capable models (best-effort).
 	ReasoningEffort string
@@ -53,29 +53,22 @@ func (c *ChatClient) Provider() string { return "openai" }
 func (c *ChatClient) Model() string { return c.ModelName }
 
 func (c *ChatClient) Invoke(ctx context.Context, req llm.InvokeRequest) (*llm.Completion, error) {
-	client := c.httpClient()
-	baseURL := strings.TrimRight(c.baseURL(), "/")
+	local := *c
+	local.Extra = cloneMap(c.Extra)
+	local.ExtraBody = cloneMap(c.ExtraBody)
+
+	client := local.httpClient()
+	baseURL := strings.TrimRight(local.baseURL(), "/")
 	endpoint := openAIEndpoint(baseURL, "chat/completions")
 	lastErr := error(nil)
 
-	maxRetries := c.MaxRetries
-	if maxRetries <= 0 {
-		maxRetries = 10
-	}
-	baseDelay := c.RetryBaseDelay
-	if baseDelay <= 0 {
-		baseDelay = 1 * time.Second
-	}
-	maxDelay := c.RetryMaxDelay
-	if maxDelay <= 0 {
-		maxDelay = 60 * time.Second
-	}
+	retry := resolveRetryPolicy(local.MaxRetries, local.RetryBaseDelay, local.RetryMaxDelay)
 
-	for attempt := 0; attempt < maxRetries; attempt++ {
+	for attempt := 0; attempt < retry.maxRetries; attempt++ {
 		if err := ctx.Err(); err != nil {
 			return nil, err
 		}
-		payload, err := c.buildRequest(req)
+		payload, err := local.buildRequest(req)
 		if err != nil {
 			return nil, err
 		}
@@ -95,10 +88,10 @@ func (c *ChatClient) Invoke(ctx context.Context, req llm.InvokeRequest) (*llm.Co
 
 		resp, err := client.Do(httpReq)
 		if err == nil {
-			data, readErr := io.ReadAll(resp.Body)
-			_ = resp.Body.Close()
+			data, readErr := readResponseBodyLimited(resp.Body, endpoint)
 			if readErr != nil {
-				return nil, readErr
+				retryAfter := parseRetryAfter(resp.Header.Get("Retry-After"))
+				return nil, openAIReadBodyError(resp.StatusCode, retryAfter, readErr)
 			}
 
 			if resp.StatusCode >= 200 && resp.StatusCode < 300 {
@@ -113,33 +106,31 @@ func (c *ChatClient) Invoke(ctx context.Context, req llm.InvokeRequest) (*llm.Co
 			// Include endpoint to make debugging (base-url/path) easier.
 			msg = fmt.Sprintf("%s (POST %s)", msg, endpoint)
 
-			// Automatic downgrade: some OpenAI-compatible providers/models reject reasoning_effort.
-			if (resp.StatusCode == 400 || resp.StatusCode == 422) && strings.TrimSpace(c.ReasoningEffort) != "" && looksLikeReasoningUnsupported(msg) {
-				// Disable for subsequent calls too.
-				c.ReasoningEffort = ""
-				// Retry immediately without surfacing the first error.
-				if attempt < maxRetries-1 {
-					continue
+			// Automatic downgrade: some OpenAI-compatible providers/models reject reasoning or extra request settings.
+			compatChanged := false
+			if resp.StatusCode == 400 || resp.StatusCode == 422 {
+				if strings.TrimSpace(local.ReasoningEffort) != "" && looksLikeReasoningUnsupported(msg) {
+					local.ReasoningEffort = ""
+					compatChanged = true
+				}
+				if local.ExtraBody != nil && looksLikeExtraBodyUnsupported(msg) {
+					local.ExtraBody = nil
+					compatChanged = true
+				}
+				if hasThinkingExtra(local.Extra, local.ExtraBody) && looksLikeThinkingUnsupported(msg) && dropThinkingExtra(local.Extra, local.ExtraBody) {
+					compatChanged = true
 				}
 			}
-			if (resp.StatusCode == 400 || resp.StatusCode == 422) && c.ExtraBody != nil && looksLikeExtraBodyUnsupported(msg) {
-				c.ExtraBody = nil
-				if attempt < maxRetries-1 {
-					continue
-				}
-			}
-			if (resp.StatusCode == 400 || resp.StatusCode == 422) && hasThinkingExtra(c.Extra, c.ExtraBody) && looksLikeThinkingUnsupported(msg) {
-				if dropThinkingExtra(c.Extra, c.ExtraBody) && attempt < maxRetries-1 {
-					continue
-				}
+			if compatChanged && attempt < retry.maxRetries-1 {
+				continue
 			}
 			if resp.StatusCode == 429 {
-				lastErr = &llm.RateLimitError{Provider: "openai", Message: msg}
+				lastErr = &llm.RateLimitError{Provider: "openai", Message: msg, RetryAfter: retryAfter}
 			} else {
-				lastErr = &llm.ProviderError{Provider: "openai", StatusCode: resp.StatusCode, Message: msg}
+				lastErr = &llm.ProviderError{Provider: "openai", StatusCode: resp.StatusCode, Message: msg, RetryAfter: retryAfter}
 			}
-			if c.isRetryableStatus(resp.StatusCode) && attempt < maxRetries-1 {
-				c.sleepBackoff(ctx, attempt, baseDelay, maxDelay, retryAfter)
+			if local.isRetryableStatus(resp.StatusCode) && attempt < retry.maxRetries-1 {
+				local.sleepBackoff(ctx, attempt, retry.baseDelay, retry.maxDelay, retryAfter)
 				continue
 			}
 			return nil, lastErr
@@ -149,8 +140,8 @@ func (c *ChatClient) Invoke(ctx context.Context, req llm.InvokeRequest) (*llm.Co
 			return nil, ctxErr
 		}
 		lastErr = err
-		if attempt < maxRetries-1 && isRetryableNetErr(err) {
-			c.sleepBackoff(ctx, attempt, baseDelay, maxDelay, 0)
+		if attempt < retry.maxRetries-1 && isRetryableNetErr(err) {
+			local.sleepBackoff(ctx, attempt, retry.baseDelay, retry.maxDelay, 0)
 			continue
 		}
 		return nil, err
@@ -166,38 +157,33 @@ func (c *ChatClient) Invoke(ctx context.Context, req llm.InvokeRequest) (*llm.Co
 // It emits text deltas and tool_call deltas.
 func (c *ChatClient) InvokeStream(ctx context.Context, req llm.InvokeRequest) (<-chan llm.StreamEvent, error) {
 	out := make(chan llm.StreamEvent, 128)
+	local := *c
+	local.Extra = cloneMap(c.Extra)
+	local.ExtraBody = cloneMap(c.ExtraBody)
 	go func() {
 		defer close(out)
 
-		client := streamHTTPClient(c.httpClient())
-		baseURL := strings.TrimRight(c.baseURL(), "/")
+		client := streamHTTPClient(local.httpClient())
+		baseURL := strings.TrimRight(local.baseURL(), "/")
 		endpoint := openAIEndpoint(baseURL, "chat/completions")
 
-		maxRetries := c.MaxRetries
-		if maxRetries <= 0 {
-			maxRetries = 10
-		}
-		baseDelay := c.RetryBaseDelay
-		if baseDelay <= 0 {
-			baseDelay = 1 * time.Second
-		}
-		maxDelay := c.RetryMaxDelay
-		if maxDelay <= 0 {
-			maxDelay = 60 * time.Second
-		}
+		retry := resolveRetryPolicy(local.MaxRetries, local.RetryBaseDelay, local.RetryMaxDelay)
+		includeStreamOptions := true
 
-		for attempt := 0; attempt < maxRetries; attempt++ {
+		for attempt := 0; attempt < retry.maxRetries; attempt++ {
 			if err := ctx.Err(); err != nil {
 				out <- llm.StreamErrorEvent{Err: err}
 				return
 			}
-			payload, err := c.buildRequest(req)
+			payload, err := local.buildRequest(req)
 			if err != nil {
 				out <- llm.StreamErrorEvent{Err: err}
 				return
 			}
 			payload.Stream = true
-			payload.StreamOptions = map[string]any{"include_usage": true}
+			if includeStreamOptions {
+				payload.StreamOptions = map[string]any{"include_usage": true}
+			}
 			body, err := json.Marshal(payload)
 			if err != nil {
 				out <- llm.StreamErrorEvent{Err: err}
@@ -221,8 +207,8 @@ func (c *ChatClient) InvokeStream(ctx context.Context, req llm.InvokeRequest) (<
 					out <- llm.StreamErrorEvent{Err: ctxErr}
 					return
 				}
-				if attempt < maxRetries-1 && isRetryableNetErr(err) {
-					c.sleepBackoff(ctx, attempt, baseDelay, maxDelay, 0)
+				if attempt < retry.maxRetries-1 && isRetryableNetErr(err) {
+					local.sleepBackoff(ctx, attempt, retry.baseDelay, retry.maxDelay, 0)
 					continue
 				}
 				out <- llm.StreamErrorEvent{Err: err}
@@ -230,10 +216,10 @@ func (c *ChatClient) InvokeStream(ctx context.Context, req llm.InvokeRequest) (<
 			}
 
 			if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-				data, readErr := io.ReadAll(resp.Body)
-				_ = resp.Body.Close()
+				data, readErr := readResponseBodyLimited(resp.Body, endpoint)
 				if readErr != nil {
-					out <- llm.StreamErrorEvent{Err: readErr}
+					retryAfter := parseRetryAfter(resp.Header.Get("Retry-After"))
+					out <- llm.StreamErrorEvent{Err: openAIReadBodyError(resp.StatusCode, retryAfter, readErr)}
 					return
 				}
 				retryAfter := parseRetryAfter(resp.Header.Get("Retry-After"))
@@ -243,33 +229,37 @@ func (c *ChatClient) InvokeStream(ctx context.Context, req llm.InvokeRequest) (<
 				}
 				msg = fmt.Sprintf("%s (POST %s)", msg, endpoint)
 
-				// Automatic downgrade: disable reasoning_effort when unsupported.
-				if (resp.StatusCode == 400 || resp.StatusCode == 422) && strings.TrimSpace(c.ReasoningEffort) != "" && looksLikeReasoningUnsupported(msg) {
-					c.ReasoningEffort = ""
-					if attempt < maxRetries-1 {
-						continue
+				// Automatic downgrade: disable unsupported request settings in one retry step.
+				compatChanged := false
+				if resp.StatusCode == 400 || resp.StatusCode == 422 {
+					if strings.TrimSpace(local.ReasoningEffort) != "" && looksLikeReasoningUnsupported(msg) {
+						local.ReasoningEffort = ""
+						compatChanged = true
+					}
+					if local.ExtraBody != nil && looksLikeExtraBodyUnsupported(msg) {
+						local.ExtraBody = nil
+						compatChanged = true
+					}
+					if hasThinkingExtra(local.Extra, local.ExtraBody) && looksLikeThinkingUnsupported(msg) && dropThinkingExtra(local.Extra, local.ExtraBody) {
+						compatChanged = true
+					}
+					if includeStreamOptions && looksLikeStreamOptionsUnsupported(msg) {
+						includeStreamOptions = false
+						compatChanged = true
 					}
 				}
-				if (resp.StatusCode == 400 || resp.StatusCode == 422) && c.ExtraBody != nil && looksLikeExtraBodyUnsupported(msg) {
-					c.ExtraBody = nil
-					if attempt < maxRetries-1 {
-						continue
-					}
-				}
-				if (resp.StatusCode == 400 || resp.StatusCode == 422) && hasThinkingExtra(c.Extra, c.ExtraBody) && looksLikeThinkingUnsupported(msg) {
-					if dropThinkingExtra(c.Extra, c.ExtraBody) && attempt < maxRetries-1 {
-						continue
-					}
+				if compatChanged && attempt < retry.maxRetries-1 {
+					continue
 				}
 
 				var lastErr error
 				if resp.StatusCode == 429 {
-					lastErr = &llm.RateLimitError{Provider: "openai", Message: msg}
+					lastErr = &llm.RateLimitError{Provider: "openai", Message: msg, RetryAfter: retryAfter}
 				} else {
-					lastErr = &llm.ProviderError{Provider: "openai", StatusCode: resp.StatusCode, Message: msg}
+					lastErr = &llm.ProviderError{Provider: "openai", StatusCode: resp.StatusCode, Message: msg, RetryAfter: retryAfter}
 				}
-				if c.isRetryableStatus(resp.StatusCode) && attempt < maxRetries-1 {
-					c.sleepBackoff(ctx, attempt, baseDelay, maxDelay, retryAfter)
+				if local.isRetryableStatus(resp.StatusCode) && attempt < retry.maxRetries-1 {
+					local.sleepBackoff(ctx, attempt, retry.baseDelay, retry.maxDelay, retryAfter)
 					continue
 				}
 				out <- llm.StreamErrorEvent{Err: lastErr}
@@ -277,7 +267,8 @@ func (c *ChatClient) InvokeStream(ctx context.Context, req llm.InvokeRequest) (<
 			}
 
 			stopReason := ""
-			err = consumeSSE(resp.Body, func(data string) error {
+			responseID := ""
+			err = consumeSSEWithBodyClose(resp.Body, func(data string) error {
 				data = strings.TrimSpace(data)
 				if data == "" {
 					return nil
@@ -286,32 +277,42 @@ func (c *ChatClient) InvokeStream(ctx context.Context, req llm.InvokeRequest) (<
 					return errSSEDone
 				}
 				var r chatCompletionStreamResponse
-				if json.Unmarshal([]byte(data), &r) != nil {
-					return nil
+				if err := json.Unmarshal([]byte(data), &r); err != nil {
+					return fmt.Errorf("openai chat stream: decode error (provider=openai status=%d model=%q url=%s): %w", resp.StatusCode, local.ModelName, endpoint, err)
 				}
 				if r.Error != nil && strings.TrimSpace(r.Error.Message) != "" {
 					return fmt.Errorf("openai stream error: %s", r.Error.Message)
+				}
+				if id := strings.TrimSpace(r.ID); id != "" && responseID == "" {
+					responseID = id
+					out <- llm.StreamResponseEvent{ResponseID: id}
 				}
 				if u := parseUsage(r.Usage); u != nil {
 					out <- llm.StreamUsageEvent{Usage: *u}
 				}
 				for _, ch := range r.Choices {
 					if ch.FinishReason != "" {
-						sr := ch.FinishReason
-						if sr == "length" {
-							sr = "max_tokens"
-						}
-						stopReason = sr
+						stopReason = normalizeOpenAIStopReason(ch.FinishReason)
 					}
 					// Preserve whitespace deltas to keep streaming output faithful.
 					if ch.Delta.Content != "" {
 						out <- llm.StreamTextDeltaEvent{Delta: ch.Delta.Content}
+					}
+					if ch.Delta.Refusal != "" {
+						out <- llm.StreamTextDeltaEvent{Delta: ch.Delta.Refusal}
 					}
 					if ch.Delta.ReasoningContent != "" {
 						out <- llm.StreamThinkingDeltaEvent{Delta: ch.Delta.ReasoningContent}
 					}
 					if ch.Delta.Thinking != "" {
 						out <- llm.StreamThinkingDeltaEvent{Delta: ch.Delta.Thinking}
+					}
+					if fc := ch.Delta.FunctionCall; fc != nil {
+						name := strings.TrimSpace(fc.Name)
+						args := fc.Arguments
+						if name != "" || args != "" {
+							out <- llm.StreamToolCallDeltaEvent{Index: 0, NameDelta: name, ArgumentsDelta: args}
+						}
 					}
 					for _, tc := range ch.Delta.ToolCalls {
 						name := strings.TrimSpace(tc.Function.Name)
@@ -323,7 +324,6 @@ func (c *ChatClient) InvokeStream(ctx context.Context, req llm.InvokeRequest) (<
 				}
 				return nil
 			})
-			_ = resp.Body.Close()
 			if errors.Is(err, errSSEDone) {
 				out <- llm.StreamDoneEvent{StopReason: stopReason}
 				return
@@ -341,11 +341,14 @@ func (c *ChatClient) InvokeStream(ctx context.Context, req llm.InvokeRequest) (<
 }
 
 type chatCompletionStreamResponse struct {
+	ID      string `json:"id"`
 	Choices []struct {
 		Delta struct {
-			Content          string `json:"content"`
-			ReasoningContent string `json:"reasoning_content"`
-			Thinking         string `json:"thinking"`
+			Content          string              `json:"content"`
+			Refusal          string              `json:"refusal"`
+			ReasoningContent string              `json:"reasoning_content"`
+			Thinking         string              `json:"thinking"`
+			FunctionCall     *legacyFunctionCall `json:"function_call"`
 			ToolCalls        []struct {
 				Index    int    `json:"index"`
 				ID       string `json:"id"`
@@ -369,15 +372,43 @@ var errSSEDone = errors.New("_sse_done")
 func consumeSSE(r io.Reader, onData func(data string) error) error {
 	sc := bufio.NewScanner(r)
 	// Large chunks can appear in tool-call argument streaming.
-	sc.Buffer(make([]byte, 0, 64*1024), 4*1024*1024)
+	sc.Buffer(make([]byte, 0, 64*1024), 32*1024*1024)
 	dataLines := []string{}
+	pending := ""
 	flush := func() error {
 		if len(dataLines) == 0 {
 			return nil
 		}
 		data := strings.Join(dataLines, "\n")
 		dataLines = nil
-		return onData(data)
+		if pending != "" {
+			data = pending + "\n" + data
+		}
+		err := onData(data)
+		if err != nil {
+			if isLikelyOpenAIDecodeError(err) {
+				// Some gateways emit a premature blank line in the middle of one JSON event.
+				// Keep buffering and retry decode with the next data fragment.
+				pending = data
+				return nil
+			}
+			return err
+		}
+		pending = ""
+		return nil
+	}
+	flushFinal := func() error {
+		if err := flush(); err != nil {
+			return err
+		}
+		if strings.TrimSpace(pending) != "" {
+			err := onData(pending)
+			if err == nil {
+				pending = ""
+			}
+			return err
+		}
+		return nil
 	}
 	for sc.Scan() {
 		line := sc.Text()
@@ -394,7 +425,21 @@ func consumeSSE(r io.Reader, onData func(data string) error) error {
 	if err := sc.Err(); err != nil {
 		return err
 	}
-	return flush()
+	return flushFinal()
+}
+
+func isLikelyOpenAIDecodeError(err error) bool {
+	if err == nil {
+		return false
+	}
+	return strings.Contains(strings.ToLower(err.Error()), "decode error")
+}
+
+func consumeSSEWithBodyClose(body io.ReadCloser, onData func(data string) error) error {
+	defer func() {
+		_ = body.Close()
+	}()
+	return consumeSSE(body, onData)
 }
 
 func streamHTTPClient(base *http.Client) *http.Client {
@@ -430,7 +475,7 @@ func (c *ChatClient) baseURL() string {
 // - baseURL like "https://proxy.example.com/v1" => "/..." (avoid double v1)
 // - baseURL like "https://host/api/v3" => "/..." (enterprise version path already encoded)
 func openAIEndpoint(baseURL, suffix string) string {
-	baseURL = strings.TrimRight(strings.TrimSpace(baseURL), "/")
+	baseURL = normalizeOpenAIBaseURL(baseURL)
 	suffix = strings.TrimLeft(strings.TrimSpace(suffix), "/")
 	if baseURL == "" {
 		baseURL = strings.TrimRight(defaultBaseURL, "/")
@@ -444,10 +489,54 @@ func openAIEndpoint(baseURL, suffix string) string {
 		return baseURL + "/" + suffix
 	}
 	// If base contains explicit enterprise versioning like /api/v3, assume version is included.
-	if strings.Contains(baseURL, "/api/v") {
+	if hasEnterpriseVersionPath(baseURL) {
 		return baseURL + "/" + suffix
 	}
 	return baseURL + "/v1/" + suffix
+}
+
+func normalizeOpenAIBaseURL(baseURL string) string {
+	baseURL = strings.TrimSpace(baseURL)
+	for len(baseURL) >= 2 {
+		quote := baseURL[0]
+		if (quote != '"' && quote != '\'' && quote != '`') || baseURL[len(baseURL)-1] != quote {
+			break
+		}
+		baseURL = strings.TrimSpace(baseURL[1 : len(baseURL)-1])
+	}
+	return strings.TrimRight(baseURL, "/")
+}
+
+func hasEnterpriseVersionPath(baseURL string) bool {
+	path := strings.TrimSpace(baseURL)
+	if path == "" {
+		return false
+	}
+	if parsed, err := url.Parse(path); err == nil && strings.TrimSpace(parsed.Path) != "" {
+		path = parsed.Path
+	}
+	parts := strings.Split(strings.ToLower(path), "/")
+	for i := 0; i < len(parts)-1; i++ {
+		if parts[i] != "api" {
+			continue
+		}
+		if isNumericVersionSegment(parts[i+1]) {
+			return true
+		}
+	}
+	return false
+}
+
+func isNumericVersionSegment(seg string) bool {
+	if len(seg) < 2 || seg[0] != 'v' {
+		return false
+	}
+	for i := 1; i < len(seg); i++ {
+		if seg[i] < '0' || seg[i] > '9' {
+			return false
+		}
+	}
+	return true
 }
 
 func (c *ChatClient) isRetryableStatus(code int) bool {
@@ -459,26 +548,34 @@ func (c *ChatClient) isRetryableStatus(code int) bool {
 }
 
 func (c *ChatClient) sleepBackoff(ctx context.Context, attempt int, baseDelay, maxDelay time.Duration, retryAfter time.Duration) {
-	d := time.Duration(1<<attempt) * baseDelay
-	if d > maxDelay {
-		d = maxDelay
+	sleepRetryBackoff(ctx, attempt, baseDelay, maxDelay, retryAfter)
+}
+
+func exponentialBackoffDelay(attempt int, baseDelay, maxDelay time.Duration) time.Duration {
+	if maxDelay <= 0 {
+		maxDelay = baseDelay
 	}
-	if retryAfter > d {
-		d = retryAfter
-		if d > maxDelay {
-			d = maxDelay
+	if baseDelay <= 0 {
+		return maxDelay
+	}
+	if baseDelay >= maxDelay {
+		return maxDelay
+	}
+	if attempt <= 0 {
+		return baseDelay
+	}
+
+	d := baseDelay
+	for i := 0; i < attempt; i++ {
+		if d >= maxDelay || d > maxDelay/2 {
+			return maxDelay
 		}
+		d *= 2
 	}
-	jitter := time.Duration(rand.Float64() * float64(d) * 0.1)
-	d += jitter
-	t := time.NewTimer(d)
-	defer t.Stop()
-	select {
-	case <-ctx.Done():
-		return
-	case <-t.C:
-		return
+	if d > maxDelay {
+		return maxDelay
 	}
+	return d
 }
 
 func looksLikeReasoningUnsupported(msg string) bool {
@@ -511,6 +608,26 @@ func looksLikeThinkingUnsupported(msg string) bool {
 		return true
 	}
 	if strings.Contains(s, "thinking") && strings.Contains(s, "unrecognized") {
+		return true
+	}
+	return false
+}
+
+func looksLikeStreamOptionsUnsupported(msg string) bool {
+	s := strings.ToLower(msg)
+	if !strings.Contains(s, "stream_options") {
+		return false
+	}
+	if strings.Contains(s, "unknown field") {
+		return true
+	}
+	if strings.Contains(s, "unrecognized field") {
+		return true
+	}
+	if strings.Contains(s, "invalid parameter") {
+		return true
+	}
+	if strings.Contains(s, "unsupported") {
 		return true
 	}
 	return false
@@ -605,9 +722,12 @@ func isRetryableNetErr(err error) bool {
 	if err == nil {
 		return false
 	}
-	var netErr net.Error
-	if errors.As(err, &netErr) {
-		return netErr.Timeout() || netErr.Temporary()
+	var timeoutErr interface{ Timeout() bool }
+	if errors.As(err, &timeoutErr) && timeoutErr.Timeout() {
+		return true
+	}
+	if errors.Is(err, context.DeadlineExceeded) {
+		return true
 	}
 	msg := strings.ToLower(err.Error())
 	return strings.Contains(msg, "timeout") || strings.Contains(msg, "connection") || strings.Contains(msg, "tls")
@@ -654,7 +774,8 @@ type chatRequest struct {
 	TopP        *float64 `json:"top_p,omitempty"`
 	Seed        *int     `json:"seed,omitempty"`
 
-	MaxCompletionTokens *int `json:"max_completion_tokens,omitempty"`
+	MaxCompletionTokens *int   `json:"max_completion_tokens,omitempty"`
+	ServiceTier         string `json:"service_tier,omitempty"`
 
 	ReasoningEffort string `json:"reasoning_effort,omitempty"`
 
@@ -688,6 +809,9 @@ func (r chatRequest) MarshalJSON() ([]byte, error) {
 func (c *ChatClient) buildRequest(req llm.InvokeRequest) (*chatRequest, error) {
 	if c.ModelName == "" {
 		return nil, fmt.Errorf("openai: model is required")
+	}
+	if err := validateOpenAIToolHistory(req.Messages, "openai"); err != nil {
+		return nil, err
 	}
 
 	msgs := make([]messageParam, 0, len(req.Messages))
@@ -741,7 +865,7 @@ func (c *ChatClient) buildRequest(req llm.InvokeRequest) (*chatRequest, error) {
 	}
 
 	var ptc *bool
-	if len(tools) > 0 {
+	if len(tools) > 0 && c.ParallelToolCalls {
 		v := c.ParallelToolCalls
 		ptc = &v
 	}
@@ -758,6 +882,7 @@ func (c *ChatClient) buildRequest(req llm.InvokeRequest) (*chatRequest, error) {
 		TopP:                c.TopP,
 		Seed:                c.Seed,
 		MaxCompletionTokens: c.MaxCompletionTokens,
+		ServiceTier:         strings.TrimSpace(c.ServiceTier),
 		ReasoningEffort:     c.ReasoningEffort,
 		ParallelToolCalls:   ptc,
 		Extra:               extra,
@@ -797,12 +922,55 @@ func contentToOpenAI(c llm.Content) any {
 		parts = append(parts, map[string]any{"type": "text", "text": c.Text})
 	}
 	for _, b := range c.Blocks {
-		if b.Type == "text" {
-			parts = append(parts, map[string]any{"type": "text", "text": b.Text})
+		switch b.Type {
+		case "text":
+			if strings.TrimSpace(b.Text) != "" {
+				parts = append(parts, map[string]any{"type": "text", "text": b.Text})
+			}
+		case "image_url":
+			if b.ImageURL != nil && strings.TrimSpace(b.ImageURL.URL) != "" {
+				imagePayload := map[string]any{"url": b.ImageURL.URL}
+				if detail := strings.TrimSpace(b.ImageURL.Detail); detail != "" {
+					imagePayload["detail"] = detail
+				}
+				parts = append(parts, map[string]any{"type": "image_url", "image_url": imagePayload})
+			}
+		default:
+			if fallback := openAIContentFallbackText(b); fallback != "" {
+				parts = append(parts, map[string]any{"type": "text", "text": fallback})
+			}
 		}
-		// images/documents are out of scope for now
+	}
+	if len(parts) == 0 {
+		return c.PlainText()
 	}
 	return parts
+}
+
+func openAIContentFallbackText(block llm.ContentBlock) string {
+	switch strings.TrimSpace(block.Type) {
+	case "thinking", "redacted_thinking":
+		if strings.TrimSpace(block.Thinking) != "" {
+			return block.Thinking
+		}
+		if strings.TrimSpace(block.Text) != "" {
+			return block.Text
+		}
+		return "[thinking content omitted]"
+	case "document":
+		if block.Source != nil && strings.TrimSpace(block.Source.MediaType) != "" {
+			return "[document: " + strings.TrimSpace(block.Source.MediaType) + "]"
+		}
+		if strings.TrimSpace(block.Text) != "" {
+			return block.Text
+		}
+		return "[document]"
+	default:
+		if strings.TrimSpace(block.Text) != "" {
+			return block.Text
+		}
+		return ""
+	}
 }
 
 func cloneMap(in map[string]any) map[string]any {
@@ -880,7 +1048,8 @@ func makeStrictProperty(prop map[string]any, wasRequired bool) map[string]any {
 					return p
 				}
 			}
-			p["type"] = append(arr, "null")
+			types := append([]any(nil), arr...)
+			p["type"] = append(types, "null")
 			return p
 		}
 		// fallback
@@ -891,18 +1060,152 @@ func makeStrictProperty(prop map[string]any, wasRequired bool) map[string]any {
 
 // ---- response parsing ----
 
+type legacyFunctionCall struct {
+	Name      string `json:"name"`
+	Arguments string `json:"arguments"`
+}
+
 type chatCompletionResponse struct {
+	ID      string `json:"id"`
 	Choices []struct {
 		Message struct {
-			Role             string         `json:"role"`
-			Content          string         `json:"content"`
-			ReasoningContent string         `json:"reasoning_content"`
-			Thinking         string         `json:"thinking"`
-			ToolCalls        []llm.ToolCall `json:"tool_calls"`
+			Role             string              `json:"role"`
+			Content          json.RawMessage     `json:"content"`
+			Refusal          string              `json:"refusal"`
+			ReasoningContent string              `json:"reasoning_content"`
+			Thinking         string              `json:"thinking"`
+			FunctionCall     *legacyFunctionCall `json:"function_call"`
+			ToolCalls        []llm.ToolCall      `json:"tool_calls"`
 		} `json:"message"`
 		FinishReason string `json:"finish_reason"`
 	} `json:"choices"`
 	Usage map[string]any `json:"usage"`
+}
+
+func parseChatMessageContent(raw json.RawMessage, refusal string) (llm.Content, error) {
+	trimmed := bytes.TrimSpace(raw)
+	refusal = strings.TrimSpace(refusal)
+	if len(trimmed) == 0 || bytes.Equal(trimmed, []byte("null")) {
+		if refusal != "" {
+			return llm.TextContent(refusal), nil
+		}
+		return llm.Content{}, nil
+	}
+	var text string
+	if err := json.Unmarshal(trimmed, &text); err == nil {
+		return llm.TextContent(text), nil
+	}
+	var parts []map[string]any
+	if err := json.Unmarshal(trimmed, &parts); err == nil {
+		blocks := make([]llm.ContentBlock, 0, len(parts))
+		for _, part := range parts {
+			partType, _ := part["type"].(string)
+			switch partType {
+			case "", "text", "output_text":
+				if txt, ok := part["text"].(string); ok && txt != "" {
+					blocks = append(blocks, llm.ContentBlock{Type: "text", Text: txt})
+				}
+			default:
+				if fallback := chatResponseContentFallbackText(partType, part); fallback != "" {
+					blocks = append(blocks, llm.ContentBlock{Type: "text", Text: fallback})
+				}
+			}
+		}
+		if len(blocks) == 0 && refusal != "" {
+			return llm.TextContent(refusal), nil
+		}
+		return llm.Content{Blocks: blocks}, nil
+	}
+	var obj map[string]any
+	if err := json.Unmarshal(trimmed, &obj); err == nil {
+		if txt, ok := obj["text"].(string); ok {
+			return llm.TextContent(txt), nil
+		}
+		if txt, ok := obj["content"].(string); ok {
+			return llm.TextContent(txt), nil
+		}
+	}
+	if refusal != "" {
+		return llm.TextContent(refusal), nil
+	}
+	return llm.Content{}, fmt.Errorf("openai: unsupported assistant message content shape")
+}
+
+func legacyFunctionCallToToolCalls(call *legacyFunctionCall) []llm.ToolCall {
+	if call == nil {
+		return nil
+	}
+	name := strings.TrimSpace(call.Name)
+	args := call.Arguments
+	if name == "" && strings.TrimSpace(args) == "" {
+		return nil
+	}
+	return []llm.ToolCall{{
+		Type: "function",
+		Function: llm.FunctionCall{
+			Name:      name,
+			Arguments: args,
+		},
+	}}
+}
+
+func ensureChatToolCallIDs(toolCalls []llm.ToolCall) []llm.ToolCall {
+	if len(toolCalls) == 0 {
+		return toolCalls
+	}
+	out := append([]llm.ToolCall(nil), toolCalls...)
+	used := make(map[string]struct{}, len(out))
+	for _, tc := range out {
+		if id := strings.TrimSpace(tc.ID); id != "" {
+			used[id] = struct{}{}
+		}
+	}
+	nextIndex := 0
+	for i := range out {
+		if id := strings.TrimSpace(out[i].ID); id != "" {
+			out[i].ID = id
+			continue
+		}
+		for {
+			candidate := fmt.Sprintf("call_%d", nextIndex)
+			nextIndex++
+			if _, exists := used[candidate]; exists {
+				continue
+			}
+			out[i].ID = candidate
+			used[candidate] = struct{}{}
+			break
+		}
+	}
+	return out
+}
+
+func normalizeOpenAIStopReason(reason string) string {
+	switch strings.TrimSpace(reason) {
+	case "length":
+		return "max_tokens"
+	case "function_call":
+		return "tool_calls"
+	default:
+		return strings.TrimSpace(reason)
+	}
+}
+
+func chatResponseContentFallbackText(partType string, part map[string]any) string {
+	switch strings.TrimSpace(partType) {
+	case "image_url", "input_image", "image":
+		return "[image]"
+	case "document", "input_file", "file":
+		return "[document]"
+	case "reasoning", "reasoning_text", "thinking":
+		if txt, ok := part["text"].(string); ok && strings.TrimSpace(txt) != "" {
+			return txt
+		}
+		if txt, ok := part["content"].(string); ok && strings.TrimSpace(txt) != "" {
+			return txt
+		}
+	}
+	return ""
 }
 
 func parseChatCompletion(data []byte) (*llm.Completion, error) {
@@ -915,13 +1218,19 @@ func parseChatCompletion(data []byte) (*llm.Completion, error) {
 	}
 	msg := r.Choices[0].Message
 
+	content, err := parseChatMessageContent(msg.Content, msg.Refusal)
+	if err != nil {
+		return nil, err
+	}
+	toolCalls := append([]llm.ToolCall(nil), msg.ToolCalls...)
+	if len(toolCalls) == 0 {
+		toolCalls = legacyFunctionCallToToolCalls(msg.FunctionCall)
+	}
+	toolCalls = ensureChatToolCallIDs(toolCalls)
+
 	usage := parseUsage(r.Usage)
 
-	// Map OpenAI finish_reason to normalized stop reason
-	stopReason := r.Choices[0].FinishReason
-	if stopReason == "length" {
-		stopReason = "max_tokens"
-	}
+	stopReason := normalizeOpenAIStopReason(r.Choices[0].FinishReason)
 
 	thinking := strings.TrimSpace(msg.ReasoningContent)
 	if thinking == "" {
@@ -929,11 +1238,12 @@ func parseChatCompletion(data []byte) (*llm.Completion, error) {
 	}
 
 	return &llm.Completion{
-		Content:    llm.TextContent(msg.Content),
+		Content:    content,
 		Thinking:   thinking,
-		ToolCalls:  msg.ToolCalls,
+		ToolCalls:  toolCalls,
 		Usage:      usage,
 		StopReason: stopReason,
+		ResponseID: strings.TrimSpace(r.ID),
 		Raw:        append([]byte(nil), data...),
 	}, nil
 }
@@ -944,11 +1254,18 @@ func parseUsage(u map[string]any) *llm.Usage {
 	}
 	pt := intFromAny(u["prompt_tokens"])
 	ct := intFromAny(u["completion_tokens"])
-	// completion_tokens_details.reasoning_tokens
-	if det, ok := u["completion_tokens_details"].(map[string]any); ok {
-		ct += intFromAny(det["reasoning_tokens"])
-	}
 	tt := intFromAny(u["total_tokens"])
+
+	// Some OpenAI-compatible providers omit completion_tokens in chat responses.
+	// Infer it from total-prompt when possible, but never add reasoning_tokens
+	// from the breakdown because completion_tokens already includes them.
+	if ct == 0 && tt >= pt {
+		ct = tt - pt
+	}
+	if tt == 0 && (pt > 0 || ct > 0) {
+		tt = pt + ct
+	}
+
 	var cached *int
 	if det, ok := u["prompt_tokens_details"].(map[string]any); ok {
 		v := intFromAny(det["cached_tokens"])

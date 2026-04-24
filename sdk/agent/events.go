@@ -31,13 +31,25 @@ func (ThinkingDeltaEvent) isEvent() {}
 // ErrorEvent is emitted when the agent hits a fatal error (e.g. provider API error).
 // The stream will end after emitting this event.
 type ErrorEvent struct {
-	Provider   string
-	StatusCode int
-	Message    string
-	Kind       string // "rate_limit"|"provider"|"network"|"unknown"
+	Provider     string
+	StatusCode   int
+	Message      string
+	RetryAfterMS int64
+	Kind         string // "rate_limit"|"provider"|"network"|"timeout"|"canceled"|"auth"|"permission"|"invalid_request"|"decode"|"max_iterations"|"loop_guard"|"doom_loop"|"unknown"
+	// StallRecoveries records how many automatic stream-idle recoveries were
+	// applied earlier in the same turn before this terminal error surfaced.
+	StallRecoveries int
 }
 
 func (ErrorEvent) isEvent() {}
+
+// WarnEvent is emitted for non-fatal runtime warnings where the agent can continue.
+type WarnEvent struct {
+	Message string
+	Kind    string // "loop_guard"|"continuation"|"continuation_limit"|"early_stop"|"runtime"
+}
+
+func (WarnEvent) isEvent() {}
 
 type HiddenUserMessageEvent struct{ Content string }
 
@@ -81,13 +93,22 @@ type ToolResultEvent struct {
 
 func (ToolResultEvent) isEvent() {}
 
-type FinalResponseEvent struct{ Content string }
+type FinalResponseEvent struct {
+	Content    string
+	ResponseID string
+	// StallRecoveries records how many automatic stream-idle recoveries were
+	// applied earlier in the same turn before the final response completed.
+	StallRecoveries int
+}
 
 func (FinalResponseEvent) isEvent() {}
 
 // UsageEvent is emitted after each provider invocation.
 // It reflects the usage for the most recent LLM call (prompt ~= current context size).
-type UsageEvent struct{ Usage llm.Usage }
+type UsageEvent struct {
+	Usage      llm.Usage
+	ResponseID string
+}
 
 func (UsageEvent) isEvent() {}
 
@@ -109,3 +130,13 @@ type SteeringReceivedEvent struct {
 }
 
 func (SteeringReceivedEvent) isEvent() {}
+
+// AutoContinueEvent is emitted when the agent inserts an internal continuation
+// prompt after a max-token truncation. It is metadata-only and should not be
+// rendered as assistant text.
+type AutoContinueEvent struct {
+	Reason     string
+	ResponseID string
+}
+
+func (AutoContinueEvent) isEvent() {}

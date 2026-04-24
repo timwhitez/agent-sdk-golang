@@ -20,7 +20,7 @@ type Provider[T any] func(ctx context.Context) (T, error)
 type ctxKey string
 
 const (
-	toolCallIDKey ctxKey = "tools.tool_call_id"
+	toolCallIDKey     ctxKey = "tools.tool_call_id"
 	toolResultMetaKey ctxKey = "tools.tool_result_meta"
 )
 
@@ -160,10 +160,22 @@ type Container struct {
 	providers map[string]any
 	overrides map[string]any
 	cache     map[string]any
+	inflight  map[string]*inflightCall
 }
 
 func NewContainer() *Container {
-	return &Container{providers: map[string]any{}, overrides: map[string]any{}, cache: map[string]any{}}
+	return &Container{
+		providers: map[string]any{},
+		overrides: map[string]any{},
+		cache:     map[string]any{},
+		inflight:  map[string]*inflightCall{},
+	}
+}
+
+type inflightCall struct {
+	done chan struct{}
+	val  any
+	err  error
 }
 
 func (c *Container) ProvideAny(name string, provider any) {
@@ -194,24 +206,48 @@ func Get[T any](c *Container, ctx context.Context, key DepKey[T]) (T, error) {
 		}
 		return vv, nil
 	}
+	if in, ok := c.inflight[key.Name]; ok {
+		c.mu.Unlock()
+		<-in.done
+		if in.err != nil {
+			return zero, in.err
+		}
+		vv, ok := in.val.(T)
+		if !ok {
+			return zero, fmt.Errorf("dependency %q has unexpected type", key.Name)
+		}
+		return vv, nil
+	}
 	provAny, ok := c.overrides[key.Name]
 	if !ok {
 		provAny, ok = c.providers[key.Name]
 	}
-	c.mu.Unlock()
 	if !ok {
+		c.mu.Unlock()
 		return zero, fmt.Errorf("missing dependency provider: %q", key.Name)
 	}
 	prov, ok := provAny.(Provider[T])
 	if !ok {
+		c.mu.Unlock()
 		return zero, fmt.Errorf("dependency %q provider has incompatible type", key.Name)
 	}
+	in := &inflightCall{done: make(chan struct{})}
+	c.inflight[key.Name] = in
+	c.mu.Unlock()
 	v, err := prov(ctx)
 	if err != nil {
+		in.err = err
+		close(in.done)
+		c.mu.Lock()
+		delete(c.inflight, key.Name)
+		c.mu.Unlock()
 		return zero, err
 	}
+	in.val = v
+	close(in.done)
 	c.mu.Lock()
 	c.cache[key.Name] = v
+	delete(c.inflight, key.Name)
 	c.mu.Unlock()
 	return v, nil
 }

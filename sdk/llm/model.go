@@ -1,6 +1,9 @@
 package llm
 
-import "context"
+import (
+	"context"
+	"time"
+)
 
 // ChatModel is the provider-agnostic interface used by the Agent.
 // Implementations must support tool calling when tools are provided.
@@ -56,8 +59,23 @@ type StreamDoneEvent struct {
 
 func (StreamDoneEvent) isStreamEvent() {}
 
+// StreamResponseEvent carries response-level metadata (e.g., response_id).
+// It is emitted when providers surface a completed response object.
+type StreamResponseEvent struct {
+	ResponseID string
+}
+
+func (StreamResponseEvent) isStreamEvent() {}
+
 // StreamErrorEvent marks a fatal streaming error.
-type StreamErrorEvent struct{ Err error }
+// Provider/status/message metadata is optional and used when Err is nil.
+type StreamErrorEvent struct {
+	Err        error
+	Provider   string
+	StatusCode int
+	Message    string
+	RetryAfter time.Duration
+}
 
 func (StreamErrorEvent) isStreamEvent() {}
 
@@ -68,4 +86,7 @@ type InvokeRequest struct {
 
 	// Provider-specific knobs. Keep these minimal; wire more via concrete provider configs.
 	Temperature *float64
+
+	// Responses options (OpenAI Responses API). Ignored by providers that don't use it.
+	Responses *ResponsesOptions
 }
