@@ -23,6 +23,10 @@ type ChatClient struct {
 	BaseURL    string
 	APIKey     string
 
+	// ProviderLabel is returned by Provider and copied into provider errors.
+	// Empty preserves the generic SDK label "openai".
+	ProviderLabel string
+
 	ModelName string
 
 	// Extra request fields for OpenAI-compatible gateways.
@@ -48,7 +52,7 @@ type ChatClient struct {
 	ParallelToolCalls bool
 }
 
-func (c *ChatClient) Provider() string { return "openai" }
+func (c *ChatClient) Provider() string { return openAIProviderLabel(c.ProviderLabel) }
 
 func (c *ChatClient) Model() string { return c.ModelName }
 
@@ -91,7 +95,7 @@ func (c *ChatClient) Invoke(ctx context.Context, req llm.InvokeRequest) (*llm.Co
 			data, readErr := readResponseBodyLimited(resp.Body, endpoint)
 			if readErr != nil {
 				retryAfter := parseRetryAfter(resp.Header.Get("Retry-After"))
-				return nil, openAIReadBodyError(resp.StatusCode, retryAfter, readErr)
+				return nil, openAIReadBodyError(local.Provider(), resp.StatusCode, retryAfter, readErr)
 			}
 
 			if resp.StatusCode >= 200 && resp.StatusCode < 300 {
@@ -125,9 +129,9 @@ func (c *ChatClient) Invoke(ctx context.Context, req llm.InvokeRequest) (*llm.Co
 				continue
 			}
 			if resp.StatusCode == 429 {
-				lastErr = &llm.RateLimitError{Provider: "openai", Message: msg, RetryAfter: retryAfter}
+				lastErr = &llm.RateLimitError{Provider: local.Provider(), Message: msg, RetryAfter: retryAfter}
 			} else {
-				lastErr = &llm.ProviderError{Provider: "openai", StatusCode: resp.StatusCode, Message: msg, RetryAfter: retryAfter}
+				lastErr = &llm.ProviderError{Provider: local.Provider(), StatusCode: resp.StatusCode, Message: msg, RetryAfter: retryAfter}
 			}
 			if local.isRetryableStatus(resp.StatusCode) && attempt < retry.maxRetries-1 {
 				local.sleepBackoff(ctx, attempt, retry.baseDelay, retry.maxDelay, retryAfter)
@@ -219,7 +223,7 @@ func (c *ChatClient) InvokeStream(ctx context.Context, req llm.InvokeRequest) (<
 				data, readErr := readResponseBodyLimited(resp.Body, endpoint)
 				if readErr != nil {
 					retryAfter := parseRetryAfter(resp.Header.Get("Retry-After"))
-					out <- llm.StreamErrorEvent{Err: openAIReadBodyError(resp.StatusCode, retryAfter, readErr)}
+					out <- llm.StreamErrorEvent{Err: openAIReadBodyError(local.Provider(), resp.StatusCode, retryAfter, readErr)}
 					return
 				}
 				retryAfter := parseRetryAfter(resp.Header.Get("Retry-After"))
@@ -254,9 +258,9 @@ func (c *ChatClient) InvokeStream(ctx context.Context, req llm.InvokeRequest) (<
 
 				var lastErr error
 				if resp.StatusCode == 429 {
-					lastErr = &llm.RateLimitError{Provider: "openai", Message: msg, RetryAfter: retryAfter}
+					lastErr = &llm.RateLimitError{Provider: local.Provider(), Message: msg, RetryAfter: retryAfter}
 				} else {
-					lastErr = &llm.ProviderError{Provider: "openai", StatusCode: resp.StatusCode, Message: msg, RetryAfter: retryAfter}
+					lastErr = &llm.ProviderError{Provider: local.Provider(), StatusCode: resp.StatusCode, Message: msg, RetryAfter: retryAfter}
 				}
 				if local.isRetryableStatus(resp.StatusCode) && attempt < retry.maxRetries-1 {
 					local.sleepBackoff(ctx, attempt, retry.baseDelay, retry.maxDelay, retryAfter)

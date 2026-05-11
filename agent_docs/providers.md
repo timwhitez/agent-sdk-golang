@@ -17,6 +17,8 @@ stream normalization, and response metadata behavior.
 ## OpenAI Chat Completions
 - Non-stream Chat parsing now synthesizes stable `tool_call_id` values (`call_N`) when compatible gateways omit them, preserving existing IDs and preventing invalid follow-up `tool` messages in multi-turn tool loops.
 - Request building rejects invalid assistant tool-call/tool-result history locally with an `invalid tool history` error before sending to OpenAI-compatible endpoints.
+- `ChatClient.ProviderLabel` can override the default `"openai"` provider label;
+  `Provider()` and provider/rate-limit errors use the label when set.
 - Compatibility downgrade retries on 400/422 by disabling unsupported fields (`sdk/llm/openai/chat.go:119`, `sdk/llm/openai/chat.go:128`, `sdk/llm/openai/chat.go:134`)
 - Streaming parser emits normalized text/thinking/tool-call deltas plus usage and stop reason (`sdk/llm/openai/chat.go:285`, `sdk/llm/openai/chat.go:301`, `sdk/llm/openai/chat.go:313`, `sdk/llm/openai/chat.go:316`, `sdk/llm/openai/chat.go:322`)
 - OpenAI Chat + Responses now share one retry policy normalizer (default attempts/base/max) and crypto-random 10% jitter source for backoff timing consistency (`sdk/llm/openai/retry_policy.go:9`, `sdk/llm/openai/chat.go:64`, `sdk/llm/openai/responses.go:62`)
@@ -28,6 +30,8 @@ stream normalization, and response metadata behavior.
 
 ## OpenAI Responses API
 - Compatibility downgrade retries also strip unsupported extras and can force string `input.content` when content parts are rejected (`sdk/llm/openai/responses.go:126`, `sdk/llm/openai/responses.go:133`, `sdk/llm/openai/responses.go:139`, `sdk/llm/openai/responses.go:144`, `sdk/llm/openai/responses.go:151`)
+- `ResponsesClient.ProviderLabel` mirrors Chat behavior so callers can preserve
+  transport-specific labels such as `openai-responses` in diagnostics.
 - Request building shares the same local tool-history validation as Chat, preventing orphan `function_call_output` items from being sent.
 - Auto-compat mode uses staged fallback between full and legacy request shapes (`sdk/llm/openai/responses.go:77`, `sdk/llm/openai/responses.go:420`)
 - Streaming parser supports output-text deltas, reasoning deltas, function-call argument deltas, usage, completion, and response metadata (`sdk/llm/openai/responses.go:568`, `sdk/llm/openai/responses.go:580`, `sdk/llm/openai/responses.go:628`, `sdk/llm/openai/responses.go:642`, `sdk/llm/openai/responses.go:651`, `sdk/llm/openai/responses.go:655`, `sdk/llm/openai/responses.go:660`, `sdk/llm/openai/responses.go:675`)

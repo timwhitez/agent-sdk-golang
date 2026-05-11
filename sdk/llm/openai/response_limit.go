@@ -5,12 +5,21 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/timwhitez/agent-sdk-golang/sdk/llm"
 )
 
 var maxProviderResponseBytes int64 = 8 * 1024 * 1024
+
+func openAIProviderLabel(label string) string {
+	label = strings.TrimSpace(label)
+	if label == "" {
+		return "openai"
+	}
+	return label
+}
 
 type oversizedResponseBodyError struct {
 	Endpoint string
@@ -53,7 +62,7 @@ func readResponseBodyLimited(body io.ReadCloser, endpoint string) ([]byte, error
 	return data, nil
 }
 
-func openAIReadBodyError(statusCode int, retryAfter time.Duration, err error) error {
+func openAIReadBodyError(provider string, statusCode int, retryAfter time.Duration, err error) error {
 	if err == nil {
 		return nil
 	}
@@ -62,8 +71,9 @@ func openAIReadBodyError(statusCode int, retryAfter time.Duration, err error) er
 		return err
 	}
 	msg := oversized.Error()
+	provider = openAIProviderLabel(provider)
 	if statusCode == http.StatusTooManyRequests {
-		return &llm.RateLimitError{Provider: "openai", Message: msg, RetryAfter: retryAfter}
+		return &llm.RateLimitError{Provider: provider, Message: msg, RetryAfter: retryAfter}
 	}
-	return &llm.ProviderError{Provider: "openai", StatusCode: statusCode, Message: msg, RetryAfter: retryAfter}
+	return &llm.ProviderError{Provider: provider, StatusCode: statusCode, Message: msg, RetryAfter: retryAfter}
 }

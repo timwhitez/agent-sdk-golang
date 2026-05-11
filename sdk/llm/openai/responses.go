@@ -21,6 +21,10 @@ type ResponsesClient struct {
 	BaseURL    string
 	APIKey     string
 
+	// ProviderLabel is returned by Provider and copied into provider errors.
+	// Empty preserves the generic SDK label "openai".
+	ProviderLabel string
+
 	ModelName string
 
 	// Extra request fields for OpenAI-compatible gateways.
@@ -47,7 +51,7 @@ type ResponsesClient struct {
 	ForceStringInput bool
 }
 
-func (c *ResponsesClient) Provider() string { return "openai" }
+func (c *ResponsesClient) Provider() string { return openAIProviderLabel(c.ProviderLabel) }
 
 func (c *ResponsesClient) Model() string { return c.ModelName }
 
@@ -97,7 +101,7 @@ func (c *ResponsesClient) Invoke(ctx context.Context, req llm.InvokeRequest) (*l
 			data, readErr := readResponseBodyLimited(resp.Body, endpoint)
 			if readErr != nil {
 				retryAfter := parseRetryAfter(resp.Header.Get("Retry-After"))
-				return nil, openAIReadBodyError(resp.StatusCode, retryAfter, readErr)
+				return nil, openAIReadBodyError(local.Provider(), resp.StatusCode, retryAfter, readErr)
 			}
 
 			if resp.StatusCode >= 200 && resp.StatusCode < 300 {
@@ -139,9 +143,9 @@ func (c *ResponsesClient) Invoke(ctx context.Context, req llm.InvokeRequest) (*l
 				continue
 			}
 			if resp.StatusCode == 429 {
-				lastErr = &llm.RateLimitError{Provider: "openai", Message: msg, RetryAfter: retryAfter}
+				lastErr = &llm.RateLimitError{Provider: local.Provider(), Message: msg, RetryAfter: retryAfter}
 			} else {
-				lastErr = &llm.ProviderError{Provider: "openai", StatusCode: resp.StatusCode, Message: msg, RetryAfter: retryAfter}
+				lastErr = &llm.ProviderError{Provider: local.Provider(), StatusCode: resp.StatusCode, Message: msg, RetryAfter: retryAfter}
 			}
 			if local.isRetryableStatus(resp.StatusCode) && attempt < retry.maxRetries-1 {
 				local.sleepBackoff(ctx, attempt, retry.baseDelay, retry.maxDelay, retryAfter)
@@ -426,7 +430,7 @@ func (c *ResponsesClient) InvokeStream(ctx context.Context, req llm.InvokeReques
 				data, readErr := readResponseBodyLimited(resp.Body, endpoint)
 				if readErr != nil {
 					retryAfter := parseRetryAfter(resp.Header.Get("Retry-After"))
-					out <- llm.StreamErrorEvent{Err: openAIReadBodyError(resp.StatusCode, retryAfter, readErr)}
+					out <- llm.StreamErrorEvent{Err: openAIReadBodyError(local.Provider(), resp.StatusCode, retryAfter, readErr)}
 					return
 				}
 				retryAfter := parseRetryAfter(resp.Header.Get("Retry-After"))
@@ -465,9 +469,9 @@ func (c *ResponsesClient) InvokeStream(ctx context.Context, req llm.InvokeReques
 
 				var lastErr error
 				if resp.StatusCode == 429 {
-					lastErr = &llm.RateLimitError{Provider: "openai", Message: msg, RetryAfter: retryAfter}
+					lastErr = &llm.RateLimitError{Provider: local.Provider(), Message: msg, RetryAfter: retryAfter}
 				} else {
-					lastErr = &llm.ProviderError{Provider: "openai", StatusCode: resp.StatusCode, Message: msg, RetryAfter: retryAfter}
+					lastErr = &llm.ProviderError{Provider: local.Provider(), StatusCode: resp.StatusCode, Message: msg, RetryAfter: retryAfter}
 				}
 				if local.isRetryableStatus(resp.StatusCode) && attempt < retry.maxRetries-1 {
 					local.sleepBackoff(ctx, attempt, retry.baseDelay, retry.maxDelay, retryAfter)
@@ -849,7 +853,7 @@ func (c *ResponsesClient) InvokeStream(ctx context.Context, req llm.InvokeReques
 						}
 					}
 				case "response.error", "error":
-					if streamErr := parseResponsesStreamEventError(root); streamErr != nil {
+					if streamErr := parseResponsesStreamEventError(local.Provider(), root); streamErr != nil {
 						return streamErr
 					}
 					return errors.New("openai responses stream error")
@@ -872,7 +876,7 @@ func (c *ResponsesClient) InvokeStream(ctx context.Context, req llm.InvokeReques
 	return out, nil
 }
 
-func parseResponsesStreamEventError(root map[string]any) error {
+func parseResponsesStreamEventError(provider string, root map[string]any) error {
 	errObj, _ := root["error"].(map[string]any)
 	msg := firstNonEmptyString(
 		stringFromAny(errObj["message"]),
@@ -902,10 +906,11 @@ func parseResponsesStreamEventError(root map[string]any) error {
 	if statusCode == 0 && rateLimited {
 		statusCode = http.StatusTooManyRequests
 	}
+	provider = openAIProviderLabel(provider)
 	if rateLimited {
-		return &llm.RateLimitError{Provider: "openai", Message: msg, RetryAfter: retryAfter}
+		return &llm.RateLimitError{Provider: provider, Message: msg, RetryAfter: retryAfter}
 	}
-	return &llm.ProviderError{Provider: "openai", StatusCode: statusCode, Message: msg, RetryAfter: retryAfter}
+	return &llm.ProviderError{Provider: provider, StatusCode: statusCode, Message: msg, RetryAfter: retryAfter}
 }
 
 func stringFromAny(v any) string {
