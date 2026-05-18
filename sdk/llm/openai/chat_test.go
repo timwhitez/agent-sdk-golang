@@ -172,6 +172,160 @@ func TestMakeStrictSchemaDoesNotMutateTypeBackingArray(t *testing.T) {
 	}
 }
 
+func TestMakeStrictSchemaRecursesArrayObjectItems(t *testing.T) {
+	schema := map[string]any{
+		"type": "object",
+		"properties": map[string]any{
+			"questions": map[string]any{
+				"type": "array",
+				"items": map[string]any{
+					"type": "object",
+					"properties": map[string]any{
+						"header": map[string]any{"type": "string"},
+						"options": map[string]any{
+							"type": "array",
+							"items": map[string]any{
+								"type": "object",
+								"properties": map[string]any{
+									"label":       map[string]any{"type": "string"},
+									"description": map[string]any{"type": "string"},
+								},
+								"required": []any{"label"},
+							},
+						},
+					},
+					"required": []any{"header", "options"},
+				},
+			},
+		},
+		"required": []any{"questions"},
+	}
+
+	strict := makeStrictSchema(schema)
+	props := strict["properties"].(map[string]any)
+	questions := props["questions"].(map[string]any)
+	questionItems := questions["items"].(map[string]any)
+	if questionItems["additionalProperties"] != false {
+		t.Fatalf("question item additionalProperties = %#v, want false", questionItems["additionalProperties"])
+	}
+	questionProps := questionItems["properties"].(map[string]any)
+	options := questionProps["options"].(map[string]any)
+	optionItems := options["items"].(map[string]any)
+	if optionItems["additionalProperties"] != false {
+		t.Fatalf("option item additionalProperties = %#v, want false", optionItems["additionalProperties"])
+	}
+	if !requiredContainsAll(t, optionItems["required"], "label", "description") {
+		t.Fatalf("option item required = %#v, want label and description", optionItems["required"])
+	}
+	optionProps := optionItems["properties"].(map[string]any)
+	description := optionProps["description"].(map[string]any)
+	if !typeAllowsNull(description["type"]) {
+		t.Fatalf("optional nested array item property was not nullable: %#v", description["type"])
+	}
+
+	origProps := schema["properties"].(map[string]any)
+	origQuestions := origProps["questions"].(map[string]any)
+	origQuestionItems := origQuestions["items"].(map[string]any)
+	origQuestionProps := origQuestionItems["properties"].(map[string]any)
+	origOptions := origQuestionProps["options"].(map[string]any)
+	origOptionItems := origOptions["items"].(map[string]any)
+	if requiredContainsAll(t, origOptionItems["required"], "description") {
+		t.Fatalf("original nested item schema was mutated: %#v", origOptionItems["required"])
+	}
+}
+
+func TestMakeStrictSchemaAddsTypeForFreeformMapValues(t *testing.T) {
+	schema := map[string]any{
+		"type": "object",
+		"properties": map[string]any{
+			"tool_calls": map[string]any{
+				"type": "array",
+				"items": map[string]any{
+					"type": "object",
+					"properties": map[string]any{
+						"tool": map[string]any{"type": "string"},
+						"parameters": map[string]any{
+							"type":                 "object",
+							"additionalProperties": map[string]any{},
+						},
+					},
+					"required": []any{"tool", "parameters"},
+				},
+			},
+		},
+		"required": []any{"tool_calls"},
+	}
+
+	strict := makeStrictSchema(schema)
+	props := strict["properties"].(map[string]any)
+	toolCalls := props["tool_calls"].(map[string]any)
+	callItem := toolCalls["items"].(map[string]any)
+	callProps := callItem["properties"].(map[string]any)
+	parameters := callProps["parameters"].(map[string]any)
+	additional, ok := parameters["additionalProperties"].(map[string]any)
+	if !ok {
+		t.Fatalf("additionalProperties = %#v, want schema", parameters["additionalProperties"])
+	}
+	if !typeContains(additional["type"], "object") || !typeContains(additional["type"], "array") || !typeContains(additional["type"], "null") {
+		t.Fatalf("additionalProperties type = %#v, want any JSON type set", additional["type"])
+	}
+	if additional["additionalProperties"] != false {
+		t.Fatalf("additionalProperties nested object guard = %#v, want false", additional["additionalProperties"])
+	}
+	if _, ok := additional["items"].(map[string]any); !ok {
+		t.Fatalf("additionalProperties array items schema = %#v, want schema", additional["items"])
+	}
+
+	origProps := schema["properties"].(map[string]any)
+	origToolCalls := origProps["tool_calls"].(map[string]any)
+	origCallItem := origToolCalls["items"].(map[string]any)
+	origCallProps := origCallItem["properties"].(map[string]any)
+	origParameters := origCallProps["parameters"].(map[string]any)
+	origAdditional := origParameters["additionalProperties"].(map[string]any)
+	if len(origAdditional) != 0 {
+		t.Fatalf("original additionalProperties was mutated: %#v", origAdditional)
+	}
+}
+
+func requiredContainsAll(t *testing.T, raw any, names ...string) bool {
+	t.Helper()
+	required, ok := raw.([]any)
+	if !ok {
+		return false
+	}
+	set := map[string]bool{}
+	for _, item := range required {
+		name, ok := item.(string)
+		if !ok {
+			return false
+		}
+		set[name] = true
+	}
+	for _, name := range names {
+		if !set[name] {
+			return false
+		}
+	}
+	return true
+}
+
+func typeAllowsNull(raw any) bool {
+	return typeContains(raw, "null")
+}
+
+func typeContains(raw any, want string) bool {
+	types, ok := raw.([]any)
+	if !ok {
+		return false
+	}
+	for _, item := range types {
+		if item == want {
+			return true
+		}
+	}
+	return false
+}
+
 func TestParseUsageDoesNotDoubleCountReasoningTokens(t *testing.T) {
 	usage := parseUsage(map[string]any{
 		"prompt_tokens":     120.0,

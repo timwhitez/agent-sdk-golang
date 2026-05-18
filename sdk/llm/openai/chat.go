@@ -1036,9 +1036,18 @@ func makeStrictSchema(schema map[string]any) map[string]any {
 
 func makeStrictProperty(prop map[string]any, wasRequired bool) map[string]any {
 	p := cloneMap(prop)
+	if len(p) == 0 {
+		p = anyJSONSchema()
+	}
 	// recurse nested objects
 	if t, _ := p["type"].(string); t == "object" {
 		p = makeStrictSchema(p)
+	}
+	if items, ok := p["items"].(map[string]any); ok {
+		p["items"] = makeStrictArrayItemSchema(items)
+	}
+	if additional, ok := p["additionalProperties"].(map[string]any); ok {
+		p["additionalProperties"] = makeStrictAdditionalPropertiesSchema(additional)
 	}
 	if !wasRequired {
 		// allow null
@@ -1060,6 +1069,59 @@ func makeStrictProperty(prop map[string]any, wasRequired bool) map[string]any {
 		p["nullable"] = true
 	}
 	return p
+}
+
+func makeStrictArrayItemSchema(item map[string]any) map[string]any {
+	out := cloneMap(item)
+	if len(out) == 0 {
+		return anyJSONSchema()
+	}
+	if t, _ := out["type"].(string); t == "object" {
+		out = makeStrictSchema(out)
+	}
+	if items, ok := out["items"].(map[string]any); ok {
+		out["items"] = makeStrictArrayItemSchema(items)
+	}
+	if additional, ok := out["additionalProperties"].(map[string]any); ok {
+		out["additionalProperties"] = makeStrictAdditionalPropertiesSchema(additional)
+	}
+	return out
+}
+
+func makeStrictAdditionalPropertiesSchema(schema map[string]any) map[string]any {
+	out := cloneMap(schema)
+	if len(out) == 0 {
+		return anyJSONSchema()
+	}
+	if t, _ := out["type"].(string); t == "object" {
+		out = makeStrictSchema(out)
+	}
+	if items, ok := out["items"].(map[string]any); ok {
+		out["items"] = makeStrictArrayItemSchema(items)
+	}
+	if additional, ok := out["additionalProperties"].(map[string]any); ok {
+		out["additionalProperties"] = makeStrictAdditionalPropertiesSchema(additional)
+	}
+	if _, ok := out["type"]; !ok {
+		if _, hasProperties := out["properties"]; !hasProperties {
+			if _, hasItems := out["items"]; !hasItems {
+				if _, hasAdditional := out["additionalProperties"]; !hasAdditional {
+					return anyJSONSchema()
+				}
+			}
+		}
+	}
+	return out
+}
+
+func anyJSONSchema() map[string]any {
+	return map[string]any{
+		"type":                 []any{"string", "number", "integer", "boolean", "object", "array", "null"},
+		"additionalProperties": false,
+		"items": map[string]any{
+			"type": []any{"string", "number", "integer", "boolean", "null"},
+		},
+	}
 }
 
 // ---- response parsing ----

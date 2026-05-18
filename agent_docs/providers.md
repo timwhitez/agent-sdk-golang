@@ -24,6 +24,7 @@ stream normalization, and response metadata behavior.
 - OpenAI Chat + Responses now share one retry policy normalizer (default attempts/base/max) and crypto-random 10% jitter source for backoff timing consistency (`sdk/llm/openai/retry_policy.go:9`, `sdk/llm/openai/chat.go:64`, `sdk/llm/openai/responses.go:62`)
 - Stream decode failures now include provider, HTTP status, model, and endpoint context for easier multi-provider debugging (`sdk/llm/openai/chat.go:296`)
 - `parallel_tool_calls` is omitted unless explicitly enabled on the chat client, improving compatibility with strict OpenAI-compatible gateways (`sdk/llm/openai/chat.go:783`)
+- Strict tool schema conversion recurses through nested object properties and array item schemas, including arrays of objects and nested arrays, before Chat or Responses sends tool definitions to OpenAI-compatible gateways (`sdk/llm/openai/chat.go:1009`, `sdk/llm/openai/responses.go:1506`)
 - Endpoint resolution now only treats `/api/vN` (numeric version segment) as pre-versioned, so paths like `/api/openai` or `/api/v2beta` still receive `/v1/` (`sdk/llm/openai/chat.go:445`, `sdk/llm/openai/chat.go:466`)
 - Tool choice mapping supports auto/none/required and explicit forced function name (`sdk/llm/openai/chat.go:733`)
 - Content serialization for chat requests is text-focused (`sdk/llm/openai/chat.go:791`)
