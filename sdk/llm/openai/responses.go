@@ -1331,8 +1331,9 @@ func responsesToolOutput(content llm.Content, isError bool) any {
 	if isError {
 		if text == "" {
 			text = "(error)"
+		} else {
+			text = "(error) " + text
 		}
-		return map[string]any{"content": text, "success": false}
 	}
 	return text
 }

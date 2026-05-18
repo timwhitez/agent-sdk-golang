@@ -849,6 +849,57 @@ func TestResponsesBuildRequestItemsAssistantContentUsesOutputText(t *testing.T) 
 	}
 }
 
+func TestResponsesBuildRequestItemsToolErrorOutputIsString(t *testing.T) {
+	t.Parallel()
+
+	useItems := true
+	useInstructions := false
+	c := &ResponsesClient{ModelName: "test-model"}
+	req := llm.InvokeRequest{
+		Messages: []llm.Message{
+			llm.NewUserMessage("hello"),
+			llm.NewAssistantMessage("using tool", []llm.ToolCall{{
+				ID:   "call-1",
+				Type: "function",
+				Function: llm.FunctionCall{
+					Name:      "bash",
+					Arguments: `{"command":"false"}`,
+				},
+			}}),
+			llm.NewToolMessage("call-1", "bash", llm.TextContent(`{"title":"failed","output":"boom"}`), true),
+		},
+		Responses: &llm.ResponsesOptions{
+			UseResponseItems: &useItems,
+			UseInstructions:  &useInstructions,
+		},
+	}
+	built, err := c.buildRequest(req)
+	if err != nil {
+		t.Fatalf("build request: %v", err)
+	}
+	items, ok := built.Input.([]responsesInputItem)
+	if !ok {
+		t.Fatalf("expected []responsesInputItem input, got %T", built.Input)
+	}
+	var found bool
+	for _, item := range items {
+		if item.Type != "function_call_output" {
+			continue
+		}
+		found = true
+		out, ok := item.Output.(string)
+		if !ok {
+			t.Fatalf("function_call_output output type = %T, want string", item.Output)
+		}
+		if !strings.Contains(out, "(error)") || !strings.Contains(out, "boom") {
+			t.Fatalf("unexpected tool error output: %q", out)
+		}
+	}
+	if !found {
+		t.Fatalf("missing function_call_output item: %#v", items)
+	}
+}
+
 func TestIsRetryableNetErr(t *testing.T) {
 	t.Parallel()
 

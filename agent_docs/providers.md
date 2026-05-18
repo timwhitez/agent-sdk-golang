@@ -34,6 +34,7 @@ stream normalization, and response metadata behavior.
 - `ResponsesClient.ProviderLabel` mirrors Chat behavior so callers can preserve
   transport-specific labels such as `openai-responses` in diagnostics.
 - Request building shares the same local tool-history validation as Chat, preventing orphan `function_call_output` items from being sent.
+- Responses item mode serializes tool-error `function_call_output.output` as a string with an error marker. The API accepts strings or content-part arrays there, not structured `{content, success}` objects.
 - Auto-compat mode uses staged fallback between full and legacy request shapes (`sdk/llm/openai/responses.go:77`, `sdk/llm/openai/responses.go:420`)
 - Streaming parser supports output-text deltas, reasoning deltas, function-call argument deltas, usage, completion, and response metadata (`sdk/llm/openai/responses.go:568`, `sdk/llm/openai/responses.go:580`, `sdk/llm/openai/responses.go:628`, `sdk/llm/openai/responses.go:642`, `sdk/llm/openai/responses.go:651`, `sdk/llm/openai/responses.go:655`, `sdk/llm/openai/responses.go:660`, `sdk/llm/openai/responses.go:675`)
 - Tool choice intentionally omits explicit `auto` for compatibility, while preserving `none`/`required`/forced tool modes (`sdk/llm/openai/responses.go:1085`)
