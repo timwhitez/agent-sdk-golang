@@ -314,6 +314,17 @@ func TestRepeatToolSignatureGuardInjectsReminderAndContinuesUntilDone(t *testing
 	if !foundReminder {
 		t.Fatalf("expected loop-guard reminder in history")
 	}
+	assertContiguousToolResults(t, history)
+	foundSkippedResult := false
+	for _, msg := range history {
+		if msg.Role == llm.RoleTool && msg.ToolCallID == "call-3" && msg.IsError && strings.Contains(msg.Content.PlainText(), "Tool call skipped by loop guard") {
+			foundSkippedResult = true
+			break
+		}
+	}
+	if !foundSkippedResult {
+		t.Fatalf("expected synthetic skipped tool result for blocked repeated call in history")
+	}
 }
 
 func TestRepeatToolSignatureGuardAbortsAfterStrikeThreshold(t *testing.T) {
@@ -433,5 +444,30 @@ func TestRepeatToolSignatureGuardStrikePersistsAcrossInterveningTurns(t *testing
 	}
 	if strings.TrimSpace(final) != doomLoopFinalResponse {
 		t.Fatalf("expected doom loop final response %q, got %q", doomLoopFinalResponse, final)
+	}
+}
+
+func assertContiguousToolResults(t *testing.T, messages []llm.Message) {
+	t.Helper()
+	for i, msg := range messages {
+		if msg.Role != llm.RoleAssistant || len(msg.ToolCalls) == 0 {
+			continue
+		}
+		if i+len(msg.ToolCalls) >= len(messages)+1 {
+			t.Fatalf("assistant tool calls at index %d exceed message history length", i)
+		}
+		for j, tc := range msg.ToolCalls {
+			nextIdx := i + 1 + j
+			if nextIdx >= len(messages) {
+				t.Fatalf("assistant tool call %q at index %d is missing tool result", tc.ID, i)
+			}
+			next := messages[nextIdx]
+			if next.Role != llm.RoleTool {
+				t.Fatalf("message after assistant tool call %q at index %d has role %q, want tool", tc.ID, nextIdx, next.Role)
+			}
+			if next.ToolCallID != tc.ID {
+				t.Fatalf("tool result at index %d has id %q, want %q", nextIdx, next.ToolCallID, tc.ID)
+			}
+		}
 	}
 }

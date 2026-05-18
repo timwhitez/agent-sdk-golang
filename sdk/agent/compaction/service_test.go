@@ -169,6 +169,75 @@ func TestPrepareForSummary_AddsFallbackWhenEverythingFiltered(t *testing.T) {
 	}
 }
 
+func TestPrepareForSummary_StripsAssistantToolCallsWhenDestroyedResultFiltered(t *testing.T) {
+	messages := []llm.Message{
+		llm.NewSystemMessage("system"),
+		llm.NewUserMessage("write file"),
+		{
+			Role:    llm.RoleAssistant,
+			Content: llm.TextContent("I will write the file."),
+			ToolCalls: []llm.ToolCall{{
+				ID:       "call-write",
+				Type:     "function",
+				Function: llm.FunctionCall{Name: "write", Arguments: `{"filePath":"x"}`},
+			}},
+		},
+		{
+			Role:       llm.RoleTool,
+			ToolCallID: "call-write",
+			ToolName:   "write",
+			Content:    llm.TextContent("[destroyed tool result]"),
+			Destroyed:  true,
+		},
+	}
+
+	prepared := prepareForSummary(messages)
+	if len(prepared) != 3 {
+		t.Fatalf("prepared message count = %d, want 3 (%#v)", len(prepared), prepared)
+	}
+	last := prepared[2]
+	if last.Role != llm.RoleAssistant {
+		t.Fatalf("last role = %s, want assistant", last.Role)
+	}
+	if len(last.ToolCalls) != 0 {
+		t.Fatalf("expected stripped tool calls after destroyed result filtering, got %#v", last.ToolCalls)
+	}
+	if got := last.Content.PlainText(); !strings.Contains(got, "write the file") {
+		t.Fatalf("assistant text should be preserved, got %q", got)
+	}
+}
+
+func TestPrepareForSummary_KeepsCompleteToolCallResultBlock(t *testing.T) {
+	messages := []llm.Message{
+		llm.NewUserMessage("read file"),
+		{
+			Role: llm.RoleAssistant,
+			ToolCalls: []llm.ToolCall{{
+				ID:       "call-read",
+				Type:     "function",
+				Function: llm.FunctionCall{Name: "read", Arguments: `{"filePath":"x"}`},
+			}},
+		},
+		{
+			Role:       llm.RoleTool,
+			ToolCallID: "call-read",
+			ToolName:   "read",
+			Content:    llm.TextContent("ok"),
+		},
+	}
+
+	prepared := prepareForSummary(messages)
+	if len(prepared) != 3 {
+		t.Fatalf("prepared message count = %d, want 3 (%#v)", len(prepared), prepared)
+	}
+	if len(prepared[1].ToolCalls) != 1 {
+		t.Fatalf("expected assistant tool call to remain, got %#v", prepared[1].ToolCalls)
+	}
+	if prepared[2].Role != llm.RoleTool || prepared[2].ToolCallID != "call-read" {
+		t.Fatalf("expected contiguous tool result to remain, got %#v", prepared[2])
+	}
+}
+
 func TestIsOverflow_UsesContextWindowMinusReserve(t *testing.T) {
 	svc := NewService(&Config{
 		Enabled:             true,

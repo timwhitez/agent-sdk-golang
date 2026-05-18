@@ -221,10 +221,78 @@ func prepareForSummary(messages []llm.Message) []llm.Message {
 		}
 		out = append(out, m)
 	}
+	out = repairSummaryToolCallPairs(out)
 	if len(out) == 0 {
 		return []llm.Message{llm.NewUserMessage(fallbackSummaryContext)}
 	}
 	return out
+}
+
+func repairSummaryToolCallPairs(messages []llm.Message) []llm.Message {
+	if len(messages) == 0 {
+		return messages
+	}
+	out := make([]llm.Message, 0, len(messages))
+	for i := 0; i < len(messages); i++ {
+		m := messages[i]
+		if m.Role == llm.RoleTool {
+			continue
+		}
+		if m.Role != llm.RoleAssistant || len(m.ToolCalls) == 0 {
+			out = append(out, m)
+			continue
+		}
+
+		expected, validCalls := summaryToolCallIDs(m.ToolCalls)
+		j := i + 1
+		for j < len(messages) && messages[j].Role == llm.RoleTool {
+			j++
+		}
+		if validCalls && summaryToolResultBlockCompletes(messages[i+1:j], expected) {
+			out = append(out, m)
+			out = append(out, messages[i+1:j]...)
+		} else {
+			m.ToolCalls = nil
+			out = append(out, m)
+		}
+		i = j - 1
+	}
+	return out
+}
+
+func summaryToolCallIDs(calls []llm.ToolCall) (map[string]bool, bool) {
+	ids := make(map[string]bool, len(calls))
+	for _, call := range calls {
+		id := strings.TrimSpace(call.ID)
+		if id == "" {
+			return nil, false
+		}
+		if _, ok := ids[id]; ok {
+			return nil, false
+		}
+		ids[id] = false
+	}
+	return ids, len(ids) > 0
+}
+
+func summaryToolResultBlockCompletes(results []llm.Message, expected map[string]bool) bool {
+	if len(expected) == 0 {
+		return false
+	}
+	for _, m := range results {
+		id := strings.TrimSpace(m.ToolCallID)
+		seen, ok := expected[id]
+		if !ok || seen {
+			return false
+		}
+		expected[id] = true
+	}
+	for _, seen := range expected {
+		if !seen {
+			return false
+		}
+	}
+	return true
 }
 
 // WithSummaryPrefix prepends DefaultSummaryPrefix to the summary text.

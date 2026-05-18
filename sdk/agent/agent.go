@@ -692,10 +692,9 @@ func (a *Agent) QueryStreamWithSteering(ctx context.Context, input llm.Content, 
 			}
 
 			// Execute tool calls with alias resolution and unknown-tool fallback.
-			step := 0
 			loopGuardTriggered := false
-			for _, tc := range comp.ToolCalls {
-				step++
+			for idx, tc := range comp.ToolCalls {
+				step := idx + 1
 				originalName := tc.Function.Name
 
 				// Resolve tool: exact match → normalized/alias match → fallback
@@ -730,6 +729,7 @@ func (a *Agent) QueryStreamWithSteering(ctx context.Context, input llm.Content, 
 					if seen, blocked := repeatGuard.observe(signature); blocked {
 						loopGuardTriggered = true
 						loopGuardStrikes++
+						a.appendLoopGuardSkippedToolResults(comp.ToolCalls[idx:], resolvedName)
 						reminder := strings.TrimSpace(a.loopGuardUserMsg)
 						if reminder != "" {
 							a.mu.Lock()
@@ -1419,6 +1419,36 @@ func stopTimerDrain(t *time.Timer) {
 		default:
 		}
 	}
+}
+
+func (a *Agent) appendLoopGuardSkippedToolResults(calls []llm.ToolCall, currentResolvedName string) {
+	if len(calls) == 0 {
+		return
+	}
+	content := llm.TextContent("[ERROR] Tool call skipped by loop guard - Repeated identical tool call blocked before execution. Reuse previous results, change arguments, or call done if the task is complete.")
+	msgs := make([]llm.Message, 0, len(calls))
+	for i, tc := range calls {
+		id := strings.TrimSpace(tc.ID)
+		if id == "" {
+			continue
+		}
+		name := strings.TrimSpace(tc.Function.Name)
+		if i == 0 {
+			if resolved := strings.TrimSpace(currentResolvedName); resolved != "" {
+				name = resolved
+			}
+		}
+		if name == "" {
+			name = "unknown"
+		}
+		msgs = append(msgs, llm.NewToolMessage(id, name, content, true))
+	}
+	if len(msgs) == 0 {
+		return
+	}
+	a.mu.Lock()
+	a.messages = append(a.messages, msgs...)
+	a.mu.Unlock()
 }
 
 func (a *Agent) executeToolSafely(ctx context.Context, tool tools.Tool, raw string) (content llm.Content, err error) {

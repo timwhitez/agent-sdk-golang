@@ -49,6 +49,11 @@ Entry point: `QueryStreamWithSteering` (`sdk/agent/agent.go:197`).
 8. **Execute tool calls and emit tool lifecycle events**
    - Resolve tool name, normalize args, execute handler, append tool output.
    - Emit step/tool-call/tool-result/step-complete events.
+   - If the repeated-tool loop guard skips a call, the agent appends synthetic
+     error tool results for the skipped call and any remaining calls in that
+     assistant message before injecting the loop-break user reminder. This keeps
+     OpenAI-style assistant tool-call/tool-result history contiguous even when
+     execution is intentionally skipped.
    - References: `sdk/agent/agent.go:340`, `sdk/agent/agent.go:382`, `sdk/agent/agent.go:396`, `sdk/agent/agent.go:440`, `sdk/agent/agent.go:380`, `sdk/agent/agent.go:387`, `sdk/agent/agent.go:445`, `sdk/agent/agent.go:446`
 
 9. **Boundary B: apply steering after each tool execution**
@@ -276,6 +281,7 @@ Mapping details:
 - Tool snapshot generation is still skipped for short summaries (threshold evaluated by rune count), and protected tool names can be prioritized via `ProtectedTools` (`sdk/agent/compaction/models.go:118`, `sdk/agent/compaction/service.go:124`, `sdk/agent/compaction/service.go:223`)
 - Compaction summaries are tagged via message-name metadata so recent-user retention skips only SDK-authored summaries (`sdk/agent/compaction/service.go:154`, `sdk/agent/compaction/service.go:166`)
 - Summary extraction is strict: it selects the last `<summary>`/`<compaction_summary>` block, and missing/empty blocks are treated as failures instead of silently compacting on raw text (`sdk/agent/compaction/models.go:132`, `sdk/agent/compaction/service.go:115`)
+- Before invoking the summary model, compaction repairs assistant tool-call/tool-result pairs after destroyed ephemeral tool outputs are filtered. Incomplete assistant tool calls are stripped while preserving assistant text, and complete contiguous tool-result blocks are kept so OpenAI-style providers do not reject compaction requests as invalid tool history (`sdk/agent/compaction/service.go`).
 - When all candidate messages are filtered, compaction injects a minimal fallback context message to keep summary input non-empty (`sdk/agent/compaction/service.go:139`)
 - Compaction emits `CompactionEvent` when pending results are applied, and re-prepends deduplicated preserved system messages (`sdk/agent/agent.go:770`, `sdk/agent/agent.go:699`, `sdk/agent/agent.go:891`)
 - `CompactNow` forces a compaction run regardless of thresholds (unless another compaction is already in-flight) (`sdk/agent/agent.go:777`)
