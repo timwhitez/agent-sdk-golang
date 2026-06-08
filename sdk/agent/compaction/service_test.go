@@ -238,6 +238,88 @@ func TestPrepareForSummary_KeepsCompleteToolCallResultBlock(t *testing.T) {
 	}
 }
 
+func TestPrepareForSummary_ProducesProviderValidHistoryWhenToolPairsAreInvalid(t *testing.T) {
+	messages := []llm.Message{
+		llm.NewToolMessage("orphan-before", "read", llm.TextContent("orphan result"), false),
+		llm.NewUserMessage("inspect files"),
+		{
+			Role:    llm.RoleAssistant,
+			Content: llm.TextContent("I will inspect two files."),
+			ToolCalls: []llm.ToolCall{
+				{ID: "call-read-a", Type: "function", Function: llm.FunctionCall{Name: "read", Arguments: `{"filePath":"a.go"}`}},
+				{ID: "call-read-b", Type: "function", Function: llm.FunctionCall{Name: "read", Arguments: `{"filePath":"b.go"}`}},
+			},
+		},
+		llm.NewToolMessage("call-read-a", "read", llm.TextContent("a.go contents"), false),
+		{
+			Role: llm.RoleAssistant,
+			ToolCalls: []llm.ToolCall{
+				{ID: "call-grep", Type: "function", Function: llm.FunctionCall{Name: "grep", Arguments: `{"pattern":"needle"}`}},
+			},
+		},
+		llm.NewToolMessage("call-grep", "grep", llm.TextContent("needle hit"), false),
+	}
+
+	prepared := prepareForSummary(messages)
+	assertProviderValidSummaryHistory(t, prepared)
+
+	if len(prepared) != 4 {
+		t.Fatalf("prepared message count = %d, want 4 (%#v)", len(prepared), prepared)
+	}
+	if prepared[0].Role == llm.RoleTool {
+		t.Fatalf("orphan tool result should be dropped, got %#v", prepared[0])
+	}
+	if len(prepared[1].ToolCalls) != 0 {
+		t.Fatalf("incomplete assistant tool call block should be stripped, got %#v", prepared[1].ToolCalls)
+	}
+	if len(prepared[2].ToolCalls) == 0 {
+		t.Fatalf("complete assistant tool call should remain, got no tool calls")
+	}
+	if prepared[2].ToolCalls[0].ID != "call-grep" || prepared[3].ToolCallID != "call-grep" {
+		t.Fatalf("complete tool call/result block should remain, got %#v %#v", prepared[2], prepared[3])
+	}
+}
+
+func assertProviderValidSummaryHistory(t *testing.T, messages []llm.Message) {
+	t.Helper()
+	pending := map[string]bool{}
+	for i, msg := range messages {
+		if msg.Role == llm.RoleTool {
+			if _, ok := pending[msg.ToolCallID]; !ok {
+				t.Fatalf("message %d is orphan tool result %#v", i, msg)
+			}
+			if pending[msg.ToolCallID] {
+				t.Fatalf("message %d duplicates tool result id %q", i, msg.ToolCallID)
+			}
+			pending[msg.ToolCallID] = true
+			continue
+		}
+		for id, seen := range pending {
+			if !seen {
+				t.Fatalf("assistant tool call %q missing result before message %d", id, i)
+			}
+			delete(pending, id)
+		}
+		if msg.Role != llm.RoleAssistant || len(msg.ToolCalls) == 0 {
+			continue
+		}
+		for _, call := range msg.ToolCalls {
+			if strings.TrimSpace(call.ID) == "" {
+				t.Fatalf("message %d has empty tool call id", i)
+			}
+			if _, exists := pending[call.ID]; exists {
+				t.Fatalf("message %d duplicates tool call id %q", i, call.ID)
+			}
+			pending[call.ID] = false
+		}
+	}
+	for id, seen := range pending {
+		if !seen {
+			t.Fatalf("assistant tool call %q missing trailing result", id)
+		}
+	}
+}
+
 func TestIsOverflow_UsesContextWindowMinusReserve(t *testing.T) {
 	svc := NewService(&Config{
 		Enabled:             true,
