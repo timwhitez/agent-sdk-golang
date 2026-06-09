@@ -39,6 +39,9 @@ This document summarizes recommended test commands and current coverage focus.
 - `sdk/agent/compaction/prune_test.go` - prune watermark behavior, monotonic
   tool-result replacement upgrades, assistant-text compaction, assistant
   tool-call preservation, and user-message preservation.
+- `sdk/agent/compaction/incremental_summary_test.go` - ledger-backed summary
+  metadata, second-pass previous-summary-plus-delta prompt construction, and
+  summary extraction failure atomicity.
 - `sdk/agent/compaction/models_test.go` - compaction prompt contract checks plus summary-prompt resolver behavior for model-aware and fallback paths (`sdk/agent/compaction/models_test.go:8`, `sdk/agent/compaction/models_test.go:21`, `sdk/agent/compaction/models_test.go:46`, `sdk/agent/compaction/models_test.go:60`)
 - `sdk/tools/args_normalize_test.go` - arg normalization/repair pipeline, metadata tagging, and tool-specific offset/line alias handling (`sdk/tools/args_normalize_test.go:12`, `sdk/tools/args_normalize_test.go:154`, `sdk/tools/args_normalize_test.go:277`)
 - `sdk/tools/schema_test.go` - schema alias repair and tool execute decode behavior (`sdk/tools/schema_test.go:74`, `sdk/tools/schema_test.go:113`)

@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"strings"
+	"time"
 	"unicode/utf8"
 
 	"github.com/timwhitez/agent-sdk-golang/sdk/llm"
@@ -251,11 +252,23 @@ func (s *Service) Compact(ctx context.Context, model llm.ChatModel, messages []l
 	}
 
 	originalTokens := approximateMessageTokens(messages)
+	sessionID := strings.TrimSpace(s.Config.SessionID)
+	ledger, ledgerWarnings, err := s.loadLedger(ctx, sessionID)
+	if err != nil {
+		return messages, Result{Compacted: false}, err
+	}
 	prepared := prepareForSummary(messages)
 	modelID := stringsTrim(model.Model())
 	summaryPrompt := DefaultSummaryPrompt
 	if s.summaryPromptFn != nil {
 		summaryPrompt = s.summaryPromptFn(modelID)
+	}
+	keepCount := s.Config.KeepRecentUserMessages
+	if keepCount <= 0 {
+		keepCount = DefaultKeepRecentUserMessages
+	}
+	if inc := incrementalSummaryContext(messages, ledger, keepCount); inc != "" {
+		prepared = []llm.Message{llm.NewUserMessage(inc)}
 	}
 	prepared = append(prepared, llm.NewUserMessage(summaryPrompt))
 	invokeCtx := ctx
@@ -286,15 +299,23 @@ func (s *Service) Compact(ctx context.Context, model llm.ChatModel, messages []l
 	prefixed := WithSummaryPrefix(sum)
 
 	// Keep recent user messages for immediate context.
-	keepCount := s.Config.KeepRecentUserMessages
-	if keepCount <= 0 {
-		keepCount = DefaultKeepRecentUserMessages
-	}
 	recent := SelectRecentUserMessages(messages, keepCount)
 
 	newMessages = make([]llm.Message, 0, 1+len(recent))
 	newMessages = append(newMessages, newCompactionSummaryMessage(prefixed))
 	newMessages = append(newMessages, recent...)
+
+	if ledger != nil {
+		ledger.Summary = nextLedgerSummary(ledger.Summary, messages, sum)
+		ledger.UpdatedAt = time.Now().UTC()
+		ledger.ContextWindow = s.contextWindow()
+		if err := ledger.Validate(sessionID); err != nil {
+			return messages, Result{Compacted: false}, err
+		}
+		if err := s.saveLedger(ctx, sessionID, ledger); err != nil {
+			return messages, Result{Compacted: false}, err
+		}
+	}
 
 	res = Result{
 		Compacted:      true,
@@ -304,6 +325,8 @@ func (s *Service) Compact(ctx context.Context, model llm.ChatModel, messages []l
 		OriginalTokens: originalTokens,
 		NewTokens:      approximateMessageTokens(newMessages),
 		TiersApplied:   []string{"summarize"},
+		LedgerPath:     strings.TrimSpace(s.Config.LedgerPath),
+		Warnings:       ledgerWarnings,
 		Summary:        sum,
 	}
 	return newMessages, res, nil

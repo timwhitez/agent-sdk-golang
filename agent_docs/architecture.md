@@ -294,6 +294,10 @@ Mapping details:
   placeholders and compacts old assistant text messages that have no tool calls.
   Assistant tool-call messages and all user messages remain untouched
   (`sdk/agent/compaction/local_reduce.go`).
+- Summary compaction writes ledger summary metadata and becomes incremental when
+  a prior ledger summary and current `compaction_summary` message exist: the
+  prompt uses previous summary plus delta messages instead of all covered raw
+  history (`sdk/agent/compaction/summary.go`).
 - When all candidate messages are filtered, compaction injects a minimal fallback context message to keep summary input non-empty (`sdk/agent/compaction/service.go:139`)
 - Compaction emits `CompactionEvent` when pending results are applied, and re-prepends deduplicated preserved system messages (`sdk/agent/agent.go:770`, `sdk/agent/agent.go:699`, `sdk/agent/agent.go:891`)
 - `compaction.Result` is the structured telemetry carrier for compaction
