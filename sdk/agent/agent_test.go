@@ -532,17 +532,42 @@ func TestAgentAutoContinueRunsCompactionAsyncAndAppliesOnNextTurn(t *testing.T) 
 
 	events2 := collectEvents(ag.QueryStream(context.Background(), llm.TextContent("continue")))
 	sawCompaction = false
+	var compactionResult compaction.Result
+	var compactionTriggerUsage *llm.Usage
 	final = ""
 	for _, ev := range events2 {
 		switch e := ev.(type) {
 		case CompactionEvent:
 			sawCompaction = true
+			compactionResult = e.Result
+			compactionTriggerUsage = e.TriggerUsage
 		case FinalResponseEvent:
 			final = e.Content
 		}
 	}
 	if !sawCompaction {
 		t.Fatalf("expected pending compaction to apply on next turn")
+	}
+	if compactionResult.Trigger != "usage" {
+		t.Fatalf("compaction trigger = %q, want usage", compactionResult.Trigger)
+	}
+	if compactionResult.Watermark != "summarize" {
+		t.Fatalf("compaction watermark = %q, want summarize", compactionResult.Watermark)
+	}
+	if len(compactionResult.TiersApplied) != 1 || compactionResult.TiersApplied[0] != "summarize" {
+		t.Fatalf("compaction tiers = %#v, want [summarize]", compactionResult.TiersApplied)
+	}
+	if compactionResult.Usage == nil || compactionResult.Usage.PromptTokens != 90 || compactionResult.Usage.TotalTokens != 100 {
+		t.Fatalf("compaction result usage = %#v, want trigger usage", compactionResult.Usage)
+	}
+	if compactionTriggerUsage == nil || compactionTriggerUsage.PromptTokens != 90 {
+		t.Fatalf("legacy trigger usage = %#v, want prompt tokens 90", compactionTriggerUsage)
+	}
+	if compactionResult.OriginalTokens != 100 {
+		t.Fatalf("original tokens = %d, want trigger total tokens 100", compactionResult.OriginalTokens)
+	}
+	if compactionResult.NewTokens <= 0 {
+		t.Fatalf("new tokens should be populated, got %d", compactionResult.NewTokens)
 	}
 	if final != "follow up" {
 		t.Fatalf("expected follow-up final response, got %q", final)

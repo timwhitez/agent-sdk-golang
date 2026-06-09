@@ -1667,11 +1667,12 @@ func (a *Agent) checkAndCompact(ctx context.Context, last *llm.Completion, out c
 	a.mu.Unlock()
 	snapshotLen := len(messages)
 	triggerUsage := cloneUsage(last.Usage)
+	trigger, watermark := a.compactionTriggerAndWatermark(last)
 	compactCtx := context.WithoutCancel(ctx)
-	go a.runCompactionAsync(compactCtx, messages, snapshotLen, triggerUsage)
+	go a.runCompactionAsync(compactCtx, messages, snapshotLen, triggerUsage, trigger, watermark)
 }
 
-func (a *Agent) runCompactionAsync(ctx context.Context, snapshot []llm.Message, snapshotLen int, triggerUsage *llm.Usage) {
+func (a *Agent) runCompactionAsync(ctx context.Context, snapshot []llm.Message, snapshotLen int, triggerUsage *llm.Usage, trigger string, watermark string) {
 	defer a.compactionInFlight.Store(false)
 
 	newMsgs, res, err := a.compactWithRetry(ctx, snapshot)
@@ -1687,7 +1688,7 @@ func (a *Agent) runCompactionAsync(ctx context.Context, snapshot []llm.Message, 
 	a.pendingCompaction = &pendingCompaction{
 		messages:     newMsgs,
 		snapshotLen:  snapshotLen,
-		result:       res,
+		result:       a.withCompactionTelemetry(res, trigger, watermark, triggerUsage),
 		triggerUsage: triggerUsage,
 	}
 	a.pendingCompactionMu.Unlock()
@@ -1757,6 +1758,7 @@ func (a *Agent) CompactNow(ctx context.Context) (compaction.Result, error) {
 	if err != nil {
 		return res, err
 	}
+	res = a.withCompactionTelemetry(res, "manual", "summarize", res.Usage)
 	a.todoCompactionPending.Store(false)
 	newMsgs = a.withPreservedSystem(orig, newMsgs)
 	a.mu.Lock()
@@ -1786,6 +1788,57 @@ func (a *Agent) shouldAttemptCompaction(ctx context.Context, last *llm.Completio
 		return false
 	}
 	return a.compactor.PromptTokens(last.Usage) > 0
+}
+
+func (a *Agent) compactionTriggerAndWatermark(last *llm.Completion) (string, string) {
+	if a.compactor == nil || last == nil {
+		return "usage", "summarize"
+	}
+	if a.compactor.IsOverflow(last.Usage) {
+		return "overflow", "overflow"
+	}
+	if a.compactor.ShouldCompact(last.Usage) {
+		return "usage", "summarize"
+	}
+	if a.todoCompactionPending.Load() && a.compactor.PromptTokens(last.Usage) > 0 {
+		return "todo", "summarize"
+	}
+	return "usage", "summarize"
+}
+
+func (a *Agent) withCompactionTelemetry(res compaction.Result, trigger string, watermark string, usage *llm.Usage) compaction.Result {
+	if strings.TrimSpace(trigger) != "" {
+		res.Trigger = strings.TrimSpace(trigger)
+	}
+	if strings.TrimSpace(res.Trigger) == "" {
+		res.Trigger = "manual"
+	}
+	if strings.TrimSpace(watermark) != "" {
+		res.Watermark = strings.TrimSpace(watermark)
+	}
+	if strings.TrimSpace(res.Watermark) == "" {
+		res.Watermark = "summarize"
+	}
+	if len(res.TiersApplied) == 0 {
+		res.TiersApplied = []string{"summarize"}
+	}
+	if usage != nil {
+		res.Usage = cloneUsage(usage)
+	}
+	if usage != nil && strings.TrimSpace(res.Trigger) != "manual" {
+		if total := a.compactor.TotalTokens(usage); total > 0 {
+			res.OriginalTokens = total
+		}
+	}
+	if res.OriginalTokens <= 0 && usage != nil {
+		if total := a.compactor.TotalTokens(usage); total > 0 {
+			res.OriginalTokens = total
+		}
+	}
+	if res.NewTokens <= 0 {
+		res.NewTokens = res.OriginalTokens
+	}
+	return res
 }
 
 func (a *Agent) compactionMaxAttempts() int {

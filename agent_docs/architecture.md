@@ -284,6 +284,10 @@ Mapping details:
 - Before invoking the summary model, compaction repairs assistant tool-call/tool-result pairs after destroyed ephemeral tool outputs are filtered. Incomplete assistant tool calls are stripped while preserving assistant text, and complete contiguous tool-result blocks are kept so OpenAI-style providers do not reject compaction requests as invalid tool history (`sdk/agent/compaction/service.go`).
 - When all candidate messages are filtered, compaction injects a minimal fallback context message to keep summary input non-empty (`sdk/agent/compaction/service.go:139`)
 - Compaction emits `CompactionEvent` when pending results are applied, and re-prepends deduplicated preserved system messages (`sdk/agent/agent.go:770`, `sdk/agent/agent.go:699`, `sdk/agent/agent.go:891`)
+- `compaction.Result` is the structured telemetry carrier for compaction
+  consumers. Current summary compaction fills `trigger`, `watermark`, `usage`,
+  `original_tokens`, `new_tokens`, and `tiers_applied=["summarize"]`; adapters
+  may reshape field names but should preserve these meanings.
 - `CompactNow` forces a compaction run regardless of thresholds (unless another compaction is already in-flight) (`sdk/agent/agent.go:777`)
 
 ## Event and Error Contract

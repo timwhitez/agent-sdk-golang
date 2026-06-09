@@ -390,6 +390,44 @@ func TestCompact_KeepsRecentUsersAndPrefix(t *testing.T) {
 	}
 }
 
+func TestCompact_PopulatesSummaryTelemetry(t *testing.T) {
+	model := mockCompactModel{response: "<summary>test summary</summary>"}
+	svc := NewService(&Config{
+		Enabled:                true,
+		ContextWindow:          128000,
+		ThresholdRatio:         0.85,
+		SummaryPrompt:          DefaultSummaryPrompt,
+		KeepRecentUserMessages: 1,
+	})
+
+	_, res, err := svc.Compact(context.Background(), model, []llm.Message{
+		llm.NewUserMessage("old question"),
+		llm.NewAssistantMessage("old answer", nil),
+		llm.NewUserMessage("recent question"),
+	})
+	if err != nil {
+		t.Fatalf("Compact: %v", err)
+	}
+	if res.Trigger != "manual" {
+		t.Fatalf("trigger = %q, want manual", res.Trigger)
+	}
+	if res.Watermark != "summarize" {
+		t.Fatalf("watermark = %q, want summarize", res.Watermark)
+	}
+	if len(res.TiersApplied) != 1 || res.TiersApplied[0] != "summarize" {
+		t.Fatalf("tiers = %#v, want [summarize]", res.TiersApplied)
+	}
+	if res.Usage == nil || res.Usage.CompletionTokens != 100 {
+		t.Fatalf("usage = %#v, want completion tokens from compaction model", res.Usage)
+	}
+	if res.OriginalTokens <= 0 {
+		t.Fatalf("original tokens should be populated, got %d", res.OriginalTokens)
+	}
+	if res.NewTokens <= 0 {
+		t.Fatalf("new tokens should be populated, got %d", res.NewTokens)
+	}
+}
+
 func TestCompact_AppendsToolContext(t *testing.T) {
 	model := mockCompactModel{response: "<summary>tool summary</summary>"}
 	svc := NewService(&Config{

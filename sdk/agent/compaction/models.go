@@ -4,6 +4,8 @@ import (
 	"log"
 	"regexp"
 	"time"
+
+	"github.com/timwhitez/agent-sdk-golang/sdk/llm"
 )
 
 const (
@@ -151,10 +153,17 @@ func DefaultConfig() Config {
 }
 
 type Result struct {
-	Compacted      bool
-	OriginalTokens int
-	NewTokens      int
-	Summary        string
+	Compacted      bool       `json:"compacted"`
+	Trigger        string     `json:"trigger,omitempty"`
+	Watermark      string     `json:"watermark,omitempty"`
+	Usage          *llm.Usage `json:"usage,omitempty"`
+	OriginalTokens int        `json:"original_tokens,omitempty"`
+	NewTokens      int        `json:"new_tokens,omitempty"`
+	TiersApplied   []string   `json:"tiers_applied,omitempty"`
+	SnapshotPath   string     `json:"snapshot_path,omitempty"`
+	LedgerPath     string     `json:"ledger_path,omitempty"`
+	Warnings       []string   `json:"warnings,omitempty"`
+	Summary        string     `json:"summary,omitempty"`
 }
 
 var (

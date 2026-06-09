@@ -144,6 +144,7 @@ func (s *Service) Compact(ctx context.Context, model llm.ChatModel, messages []l
 		return messages, Result{Compacted: false}, nil
 	}
 
+	originalTokens := approximateMessageTokens(messages)
 	prepared := prepareForSummary(messages)
 	modelID := stringsTrim(model.Model())
 	summaryPrompt := DefaultSummaryPrompt
@@ -189,11 +190,64 @@ func (s *Service) Compact(ctx context.Context, model llm.ChatModel, messages []l
 	newMessages = append(newMessages, newCompactionSummaryMessage(prefixed))
 	newMessages = append(newMessages, recent...)
 
-	res = Result{Compacted: true, Summary: sum, NewTokens: 0}
-	if comp.Usage != nil {
-		res.NewTokens = comp.Usage.CompletionTokens
+	res = Result{
+		Compacted:      true,
+		Trigger:        "manual",
+		Watermark:      "summarize",
+		Usage:          cloneUsage(comp.Usage),
+		OriginalTokens: originalTokens,
+		NewTokens:      approximateMessageTokens(newMessages),
+		TiersApplied:   []string{"summarize"},
+		Summary:        sum,
 	}
 	return newMessages, res, nil
+}
+
+func approximateMessageTokens(messages []llm.Message) int {
+	total := 0
+	for _, msg := range messages {
+		total += approximateTextTokens(string(msg.Role))
+		total += approximateTextTokens(msg.Name)
+		total += approximateTextTokens(msg.ToolCallID)
+		total += approximateTextTokens(msg.ToolName)
+		total += approximateTextTokens(msg.Content.PlainText())
+		for _, call := range msg.ToolCalls {
+			total += approximateTextTokens(call.ID)
+			total += approximateTextTokens(call.Type)
+			total += approximateTextTokens(call.Function.Name)
+			total += approximateTextTokens(call.Function.Arguments)
+		}
+		total += 4
+	}
+	return total
+}
+
+func approximateTextTokens(text string) int {
+	text = strings.TrimSpace(text)
+	if text == "" {
+		return 0
+	}
+	return (len(text) + 3) / 4
+}
+
+func cloneUsage(u *llm.Usage) *llm.Usage {
+	if u == nil {
+		return nil
+	}
+	cpy := *u
+	if u.PromptCachedTokens != nil {
+		v := *u.PromptCachedTokens
+		cpy.PromptCachedTokens = &v
+	}
+	if u.PromptCacheCreationTokens != nil {
+		v := *u.PromptCacheCreationTokens
+		cpy.PromptCacheCreationTokens = &v
+	}
+	if u.PromptImageTokens != nil {
+		v := *u.PromptImageTokens
+		cpy.PromptImageTokens = &v
+	}
+	return &cpy
 }
 
 func summaryCharCount(summary string) int {

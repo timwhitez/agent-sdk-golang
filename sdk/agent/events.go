@@ -112,8 +112,10 @@ type UsageEvent struct {
 
 func (UsageEvent) isEvent() {}
 
-// CompactionEvent is emitted when the agent automatically compacts the conversation history.
-// TriggerUsage is the usage from the LLM call that caused compaction.
+// CompactionEvent is emitted when the agent applies a compacted conversation
+// history. Result carries the structured compaction telemetry. TriggerUsage is
+// retained as the legacy usage snapshot from the LLM call that caused automatic
+// compaction.
 type CompactionEvent struct {
 	Result       compaction.Result
 	TriggerUsage *llm.Usage
