@@ -1675,7 +1675,11 @@ func (a *Agent) checkAndCompact(ctx context.Context, last *llm.Completion, out c
 func (a *Agent) runCompactionAsync(ctx context.Context, snapshot []llm.Message, snapshotLen int, triggerUsage *llm.Usage, trigger string, watermark string) {
 	defer a.compactionInFlight.Store(false)
 
-	newMsgs, res, err := a.compactWithRetry(ctx, snapshot)
+	compactUsage := triggerUsage
+	if strings.TrimSpace(trigger) == "todo" {
+		compactUsage = nil
+	}
+	newMsgs, res, err := a.compactWithRetry(ctx, snapshot, compactUsage, watermark)
 	if err != nil {
 		log.Printf("compaction failed after %d attempt(s): %v", a.compactionMaxAttempts(), err)
 		a.todoCompactionPending.Store(true)
@@ -1754,7 +1758,7 @@ func (a *Agent) CompactNow(ctx context.Context) (compaction.Result, error) {
 	copy(orig, a.messages)
 	a.mu.Unlock()
 
-	newMsgs, res, err := a.compactWithRetry(ctx, orig)
+	newMsgs, res, err := a.compactWithRetry(ctx, orig, nil, "summarize")
 	if err != nil {
 		return res, err
 	}
@@ -1797,8 +1801,8 @@ func (a *Agent) compactionTriggerAndWatermark(last *llm.Completion) (string, str
 	if a.compactor.IsOverflow(last.Usage) {
 		return "overflow", "overflow"
 	}
-	if a.compactor.ShouldCompact(last.Usage) {
-		return "usage", "summarize"
+	if watermark := a.compactor.WatermarkForUsage(last.Usage); strings.TrimSpace(watermark) != "" {
+		return "usage", watermark
 	}
 	if a.todoCompactionPending.Load() && a.compactor.PromptTokens(last.Usage) > 0 {
 		return "todo", "summarize"
@@ -1813,7 +1817,7 @@ func (a *Agent) withCompactionTelemetry(res compaction.Result, trigger string, w
 	if strings.TrimSpace(res.Trigger) == "" {
 		res.Trigger = "manual"
 	}
-	if strings.TrimSpace(watermark) != "" {
+	if strings.TrimSpace(res.Watermark) == "" && strings.TrimSpace(watermark) != "" {
 		res.Watermark = strings.TrimSpace(watermark)
 	}
 	if strings.TrimSpace(res.Watermark) == "" {
@@ -1877,15 +1881,16 @@ func (a *Agent) compactionRetryDelay(attempt int) time.Duration {
 	return delay
 }
 
-func (a *Agent) compactWithRetry(ctx context.Context, messages []llm.Message) ([]llm.Message, compaction.Result, error) {
+func (a *Agent) compactWithRetry(ctx context.Context, messages []llm.Message, usage *llm.Usage, watermark string) ([]llm.Message, compaction.Result, error) {
 	attempts := a.compactionMaxAttempts()
 	if attempts <= 0 {
 		attempts = 1
 	}
+	requestedWatermark := strings.TrimSpace(watermark)
 	var lastErr error
 	var lastRes compaction.Result
 	for attempt := 1; attempt <= attempts; attempt++ {
-		newMsgs, res, err := a.compactor.Compact(ctx, a.llm, messages)
+		newMsgs, res, err := a.compactor.CompactAuto(ctx, a.llm, messages, usage, requestedWatermark)
 		if err == nil {
 			return newMsgs, res, nil
 		}

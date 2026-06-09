@@ -11,6 +11,7 @@ import (
 const (
 	DefaultContextWindow          = 128_000
 	DefaultThresholdRatio         = 0.85
+	DefaultSnipThresholdRatio     = 0.70
 	DefaultKeepRecentUserMessages = 3
 	DefaultToolSnapshotMaxEntries = 6
 	DefaultToolSnapshotMaxChars   = 2000
@@ -131,6 +132,18 @@ type Config struct {
 	// ToolSnapshotMaxChars caps the total byte length of the tool snapshot section.
 	// Values <= 0 use DefaultToolSnapshotMaxChars.
 	ToolSnapshotMaxChars int
+	// SnipThresholdRatio is the local Tier 1 watermark for tool-result snipping.
+	// If <=0, DefaultSnipThresholdRatio is used. It is capped below ThresholdRatio.
+	SnipThresholdRatio float64
+	// ProtectedRecentMessages excludes the last N messages from local reducers.
+	// If <=0, DefaultKeepRecentUserMessages is used as a conservative message-zone fallback.
+	ProtectedRecentMessages int
+	// SessionID and LedgerStore allow compaction replacements to be stable across turns/resume.
+	SessionID   string
+	LedgerStore LedgerStore
+	LedgerPath  string
+	// ToolArtifactWriter persists full tool outputs before local replacement.
+	ToolArtifactWriter ArtifactWriter
 }
 
 // SummaryPromptFunc resolves a compaction summary prompt from the active model ID.
@@ -149,6 +162,8 @@ func DefaultConfig() Config {
 		MinSummaryCharsForToolContext: DefaultMinSummaryCharsForToolContext,
 		ToolSnapshotMaxEntries:        DefaultToolSnapshotMaxEntries,
 		ToolSnapshotMaxChars:          DefaultToolSnapshotMaxChars,
+		SnipThresholdRatio:            DefaultSnipThresholdRatio,
+		ProtectedRecentMessages:       DefaultKeepRecentUserMessages,
 	}
 }
 

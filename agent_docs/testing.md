@@ -17,6 +17,9 @@ This document summarizes recommended test commands and current coverage focus.
 
 ## Coverage Map (Representative)
 - `sdk/agent/agent_test.go` - max-token auto-continue metadata emission, overflow-triggered compaction checks, async compaction apply-on-next-turn behavior, structured compaction telemetry, compaction system-message deduplication, tool-call delta merge behavior, and truncation metadata/path persistence (`sdk/agent/agent_test.go:180`, `sdk/agent/agent_test.go:402`, `sdk/agent/agent_test.go:271`, `sdk/agent/agent_test.go:210`, `sdk/agent/agent_test.go:421`)
+- `sdk/agent/agent_compaction_local_test.go` - automatic Tier 1 local snip
+  compaction runs without invoking the summary model and applies through the
+  same pending-compaction boundary.
 - `sdk/agent/agent_stream_response_test.go` - stream response metadata is preserved into `Completion.ResponseID` and propagated into `UsageEvent` / `FinalResponseEvent` for stream consumers (`sdk/agent/agent_stream_response_test.go:31`, `sdk/agent/agent_stream_response_test.go:56`)
 - `sdk/agent/agent_steering_test.go` - steering channel lifecycle under cancellation (`sdk/agent/agent_steering_test.go:31`)
 - `sdk/agent/agent_max_iterations_test.go` - max-iteration error/final event contract (`sdk/agent/agent_max_iterations_test.go:23`)
@@ -30,6 +33,9 @@ This document summarizes recommended test commands and current coverage focus.
 - `sdk/agent/compaction/ledger_test.go` - compaction ledger schema validation,
   replacement hash checks, duplicate replacement rejection, stable message-key
   normalization, and `LedgerStore` interface compile coverage.
+- `sdk/agent/compaction/local_reduce_test.go` - tool-result snip replacements,
+  stable ledger reuse, protected-zone and protected-tool skips, artifact-write
+  failure warnings, no user-message rewriting, and provider-valid history.
 - `sdk/agent/compaction/models_test.go` - compaction prompt contract checks plus summary-prompt resolver behavior for model-aware and fallback paths (`sdk/agent/compaction/models_test.go:8`, `sdk/agent/compaction/models_test.go:21`, `sdk/agent/compaction/models_test.go:46`, `sdk/agent/compaction/models_test.go:60`)
 - `sdk/tools/args_normalize_test.go` - arg normalization/repair pipeline, metadata tagging, and tool-specific offset/line alias handling (`sdk/tools/args_normalize_test.go:12`, `sdk/tools/args_normalize_test.go:154`, `sdk/tools/args_normalize_test.go:277`)
 - `sdk/tools/schema_test.go` - schema alias repair and tool execute decode behavior (`sdk/tools/schema_test.go:74`, `sdk/tools/schema_test.go:113`)

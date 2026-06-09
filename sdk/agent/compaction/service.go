@@ -54,6 +54,15 @@ func NewService(cfg *Config) *Service {
 	if c.ToolSnapshotMaxChars <= 0 {
 		c.ToolSnapshotMaxChars = DefaultToolSnapshotMaxChars
 	}
+	if c.SnipThresholdRatio <= 0 {
+		c.SnipThresholdRatio = DefaultSnipThresholdRatio
+	}
+	if c.SnipThresholdRatio >= c.ThresholdRatio {
+		c.SnipThresholdRatio = c.ThresholdRatio
+	}
+	if c.ProtectedRecentMessages <= 0 {
+		c.ProtectedRecentMessages = DefaultKeepRecentUserMessages
+	}
 	return &Service{
 		Config:          c,
 		ContextWindow:   ctxWindow,
@@ -65,6 +74,11 @@ func NewService(cfg *Config) *Service {
 func (s *Service) threshold() int {
 	window := s.contextWindow()
 	return int(float64(window) * s.Config.ThresholdRatio)
+}
+
+func (s *Service) snipThreshold() int {
+	window := s.contextWindow()
+	return int(float64(window) * s.Config.SnipThresholdRatio)
 }
 
 func (s *Service) contextWindow() int {
@@ -136,7 +150,82 @@ func (s *Service) ShouldCompact(u *llm.Usage) bool {
 	if !s.Config.Enabled {
 		return false
 	}
-	return s.TotalTokens(u) >= s.threshold()
+	total := s.TotalTokens(u)
+	return total >= s.snipThreshold() || total >= s.threshold()
+}
+
+func (s *Service) WatermarkForUsage(u *llm.Usage) string {
+	if s == nil || !s.Config.Enabled {
+		return ""
+	}
+	if s.IsOverflow(u) {
+		return "overflow"
+	}
+	total := s.TotalTokens(u)
+	if total >= s.threshold() {
+		return "summarize"
+	}
+	if total >= s.snipThreshold() {
+		return "snip"
+	}
+	return ""
+}
+
+func (s *Service) CompactAuto(ctx context.Context, model llm.ChatModel, messages []llm.Message, usage *llm.Usage, watermark string) ([]llm.Message, Result, error) {
+	watermark = strings.TrimSpace(watermark)
+	if watermark == "" {
+		watermark = s.WatermarkForUsage(usage)
+	}
+	if watermark == "snip" {
+		return s.CompactLocal(ctx, messages, usage)
+	}
+	if usage != nil && (watermark == "summarize" || watermark == "overflow") {
+		localMsgs, localRes, err := s.CompactLocal(ctx, messages, usage)
+		if err != nil {
+			return messages, localRes, err
+		}
+		if localRes.Compacted {
+			limit := s.threshold()
+			if watermark == "overflow" {
+				limit = s.overflowLimit()
+			}
+			if limit <= 0 || localRes.NewTokens < limit {
+				return localMsgs, localRes, nil
+			}
+			summaryMsgs, summaryRes, err := s.Compact(ctx, model, localMsgs)
+			summaryRes = mergeLocalSummaryResult(localRes, summaryRes)
+			return summaryMsgs, summaryRes, err
+		}
+		summaryMsgs, summaryRes, err := s.Compact(ctx, model, messages)
+		summaryRes.Warnings = append(localRes.Warnings, summaryRes.Warnings...)
+		return summaryMsgs, summaryRes, err
+	}
+	return s.Compact(ctx, model, messages)
+}
+
+func mergeLocalSummaryResult(localRes Result, summaryRes Result) Result {
+	if !localRes.Compacted {
+		summaryRes.Warnings = append(localRes.Warnings, summaryRes.Warnings...)
+		return summaryRes
+	}
+	summaryRes.OriginalTokens = localRes.OriginalTokens
+	if strings.TrimSpace(summaryRes.LedgerPath) == "" {
+		summaryRes.LedgerPath = strings.TrimSpace(localRes.LedgerPath)
+	}
+	summaryRes.Warnings = append(localRes.Warnings, summaryRes.Warnings...)
+	summaryRes.TiersApplied = append([]string{"snip"}, withoutTier(summaryRes.TiersApplied, "snip")...)
+	return summaryRes
+}
+
+func withoutTier(tiers []string, tier string) []string {
+	out := make([]string, 0, len(tiers))
+	for _, t := range tiers {
+		if strings.TrimSpace(t) == "" || strings.TrimSpace(t) == tier {
+			continue
+		}
+		out = append(out, strings.TrimSpace(t))
+	}
+	return out
 }
 
 func (s *Service) Compact(ctx context.Context, model llm.ChatModel, messages []llm.Message) (newMessages []llm.Message, res Result, err error) {

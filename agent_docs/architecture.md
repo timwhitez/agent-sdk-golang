@@ -273,7 +273,10 @@ Mapping details:
 
 ## Compaction Architecture
 - Threshold calculation includes prompt, cached-prompt, and image tokens (`sdk/agent/compaction/service.go:72`, `sdk/agent/compaction/service.go:82`, `sdk/agent/compaction/service.go:89`)
-- Trigger policy now combines ratio threshold checks with a hard overflow guard (`prompt_tokens >= context_window - reserve_output_tokens`) to force compaction before the model context is exceeded (`sdk/agent/compaction/service.go:99`, `sdk/agent/compaction/service.go:123`, `sdk/agent/agent.go:818`)
+- Trigger policy now combines an internal Tier 1 snip watermark, the legacy
+  summary ratio threshold, and a hard overflow guard
+  (`prompt_tokens >= context_window - reserve_output_tokens`) to force
+  compaction before the model context is exceeded (`sdk/agent/compaction/service.go`).
 - Agent caches `hasCompactor` and skips compaction callsites entirely when compaction is disabled (`sdk/agent/agent.go:50`, `sdk/agent/agent.go:312`, `sdk/agent/agent.go:443`)
 - `checkAndCompact` is async: compaction runs in background on a context detached from the caller's turn cancellation, pending results are atomically applied at turn boundaries, and post-snapshot messages are appended to preserve work done during compaction.
 - Compaction LLM invoke remains timeout-bounded via `CompactionTimeout`, with configurable retry/backoff before giving up (`sdk/agent/compaction/service.go:104`, `sdk/agent/agent.go:823`, `sdk/agent/agent.go:842`)
@@ -282,6 +285,11 @@ Mapping details:
 - Compaction summaries are tagged via message-name metadata so recent-user retention skips only SDK-authored summaries (`sdk/agent/compaction/service.go:154`, `sdk/agent/compaction/service.go:166`)
 - Summary extraction is strict: it selects the last `<summary>`/`<compaction_summary>` block, and missing/empty blocks are treated as failures instead of silently compacting on raw text (`sdk/agent/compaction/models.go:132`, `sdk/agent/compaction/service.go:115`)
 - Before invoking the summary model, compaction repairs assistant tool-call/tool-result pairs after destroyed ephemeral tool outputs are filtered. Incomplete assistant tool calls are stripped while preserving assistant text, and complete contiguous tool-result blocks are kept so OpenAI-style providers do not reject compaction requests as invalid tool history (`sdk/agent/compaction/service.go`).
+- Tier 1 local compaction snips old eligible tool-result messages without
+  invoking the summary model. It preserves tool role/linkage, stores or reuses a
+  full-output artifact path, writes a monotonic ledger replacement, skips
+  protected tools and protected recent messages, and leaves user messages
+  untouched (`sdk/agent/compaction/local_reduce.go`).
 - When all candidate messages are filtered, compaction injects a minimal fallback context message to keep summary input non-empty (`sdk/agent/compaction/service.go:139`)
 - Compaction emits `CompactionEvent` when pending results are applied, and re-prepends deduplicated preserved system messages (`sdk/agent/agent.go:770`, `sdk/agent/agent.go:699`, `sdk/agent/agent.go:891`)
 - `compaction.Result` is the structured telemetry carrier for compaction
@@ -289,9 +297,9 @@ Mapping details:
   `original_tokens`, `new_tokens`, and `tiers_applied=["summarize"]`; adapters
   may reshape field names but should preserve these meanings.
 - `compaction.Ledger`, `LedgerReplacement`, stable message keys, content hashes,
-  and `LedgerStore` are the portable persistence contract for future local
-  replacement reuse. The SDK defines schema and validation only; repository
-  adapters provide the file store.
+  `LedgerStore`, and `ArtifactWriter` are the portable persistence contract for
+  local replacement reuse. The SDK defines schema, validation, and reduction
+  behavior; repository adapters provide the file store and artifact writer.
 - `CompactNow` forces a compaction run regardless of thresholds (unless another compaction is already in-flight) (`sdk/agent/agent.go:777`)
 
 ## Event and Error Contract
