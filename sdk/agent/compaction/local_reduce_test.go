@@ -3,6 +3,7 @@ package compaction
 import (
 	"context"
 	"errors"
+	"fmt"
 	"strings"
 	"testing"
 
@@ -143,6 +144,114 @@ func TestCompactLocalSkipsProtectedRecentAndUserMessages(t *testing.T) {
 	}
 	if got[4].Content.PlainText() != recentTool {
 		t.Fatal("protected recent tool result was snipped")
+	}
+}
+
+func TestCompactLocalMicrocompactsOldUserCodeBlockWhenEnabled(t *testing.T) {
+	store := &memoryLedgerStore{ledger: NewLedger("sess-local")}
+	artifactWrites := 0
+	var savedContent string
+	svc := NewService(&Config{
+		Enabled:                    true,
+		ContextWindow:              2000,
+		LedgerStore:                store,
+		SessionID:                  "sess-local",
+		EnableUserCodeMicrocompact: true,
+		ProtectedRecentMessages:    1,
+		ToolArtifactWriter: ArtifactWriterFunc(func(_ context.Context, req ArtifactRequest) (ArtifactResult, error) {
+			artifactWrites++
+			savedContent = req.Content
+			return ArtifactResult{Path: ".goode/truncated/user_code_1.md"}, nil
+		}),
+	})
+	oldUser := "Please inspect this file and keep the imports.\n\n```go cmd/main.go\n" + numberedLines("line-", 120) + "```\n"
+	messages := []llm.Message{
+		llm.NewUserMessage(oldUser),
+		llm.NewAssistantMessage("noted", nil),
+		llm.NewUserMessage("latest must remain verbatim"),
+	}
+
+	got, res, err := svc.CompactLocal(context.Background(), messages, &llm.Usage{TotalTokens: 1600})
+	if err != nil {
+		t.Fatalf("CompactLocal: %v", err)
+	}
+	if !res.Compacted {
+		t.Fatalf("expected microcompact result: %#v", res)
+	}
+	if !containsTier(res.TiersApplied, "microcompact") {
+		t.Fatalf("tiers = %#v, want microcompact", res.TiersApplied)
+	}
+	if artifactWrites != 1 {
+		t.Fatalf("artifact writes = %d, want 1", artifactWrites)
+	}
+	if savedContent != oldUser {
+		t.Fatalf("artifact content was not the original user message")
+	}
+	text := got[0].Content.PlainText()
+	for _, want := range []string{"Please inspect this file", "[User code block compacted:", "language=go", "hint=cmd/main.go", "lines=120", "full_output=.goode/truncated/user_code_1.md", "line-0", "line-119"} {
+		if !strings.Contains(text, want) {
+			t.Fatalf("microcompact text missing %q:\n%s", want, text)
+		}
+	}
+	if strings.Contains(text, "line-60") {
+		t.Fatalf("microcompact retained middle bulk code:\n%s", text)
+	}
+	if got[2].Content.PlainText() != "latest must remain verbatim" {
+		t.Fatalf("latest user changed: %#v", got[2])
+	}
+	if store.ledger == nil || len(store.ledger.Replacements) != 1 {
+		t.Fatalf("ledger replacements = %#v", store.ledger)
+	}
+	repl := store.ledger.Replacements[0]
+	if repl.Role != string(llm.RoleUser) || repl.Tier != "microcompact" || repl.FullArtifact != ".goode/truncated/user_code_1.md" {
+		t.Fatalf("ledger replacement = %#v", repl)
+	}
+
+	second, _, err := svc.CompactLocal(context.Background(), messages, &llm.Usage{TotalTokens: 1600})
+	if err != nil {
+		t.Fatalf("CompactLocal second: %v", err)
+	}
+	if artifactWrites != 1 {
+		t.Fatalf("artifact writes after reuse = %d, want still 1", artifactWrites)
+	}
+	if second[0].Content.PlainText() != text {
+		t.Fatalf("replacement not reused byte-for-byte")
+	}
+}
+
+func TestCompactLocalMicrocompactKeepsPlainTextAndLatestUser(t *testing.T) {
+	store := &memoryLedgerStore{ledger: NewLedger("sess-local")}
+	svc := NewService(&Config{
+		Enabled:                    true,
+		ContextWindow:              2000,
+		LedgerStore:                store,
+		SessionID:                  "sess-local",
+		EnableUserCodeMicrocompact: true,
+		ProtectedRecentMessages:    1,
+		ToolArtifactWriter: ArtifactWriterFunc(func(context.Context, ArtifactRequest) (ArtifactResult, error) {
+			return ArtifactResult{Path: ".goode/truncated/user_code.md"}, nil
+		}),
+	})
+	plain := strings.Repeat("plain user instruction only\n", 200)
+	latestCode := "latest code must stay\n```go\n" + numberedLines("latest-", 120) + "```\n"
+	messages := []llm.Message{
+		llm.NewUserMessage(plain),
+		llm.NewAssistantMessage("ok", nil),
+		llm.NewUserMessage(latestCode),
+	}
+
+	got, res, err := svc.CompactLocal(context.Background(), messages, &llm.Usage{TotalTokens: 1600})
+	if err != nil {
+		t.Fatalf("CompactLocal: %v", err)
+	}
+	if res.Compacted {
+		t.Fatalf("expected no user microcompact, got %#v", res)
+	}
+	if got[0].Content.PlainText() != plain {
+		t.Fatal("plain user text was compacted")
+	}
+	if got[2].Content.PlainText() != latestCode {
+		t.Fatal("latest user code was compacted")
 	}
 }
 
@@ -300,4 +409,14 @@ func assertLocalHistoryProviderValid(t *testing.T, messages []llm.Message) {
 			t.Fatalf("assistant tool call %q missing trailing result", id)
 		}
 	}
+}
+
+func numberedLines(prefix string, count int) string {
+	var b strings.Builder
+	for i := 0; i < count; i++ {
+		b.WriteString(prefix)
+		b.WriteString(fmt.Sprint(i))
+		b.WriteByte('\n')
+	}
+	return b.String()
 }

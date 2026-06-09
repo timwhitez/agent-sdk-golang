@@ -142,6 +142,9 @@ type Config struct {
 	// ProtectedRecentMessages excludes the last N messages from local reducers.
 	// If <=0, DefaultKeepRecentUserMessages is used as a conservative message-zone fallback.
 	ProtectedRecentMessages int
+	// EnableUserCodeMicrocompact allows local reducers to compact old markdown
+	// fenced code blocks inside user messages outside the protected zone.
+	EnableUserCodeMicrocompact bool
 	// SessionID and LedgerStore allow compaction replacements to be stable across turns/resume.
 	SessionID   string
 	LedgerStore LedgerStore

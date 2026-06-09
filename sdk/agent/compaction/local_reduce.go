@@ -11,9 +11,13 @@ import (
 )
 
 const (
-	tierSnip             = "snip"
-	tierPrune            = "prune"
-	defaultSnipMinTokens = 64
+	tierSnip                             = "snip"
+	tierPrune                            = "prune"
+	tierMicrocompact                     = "microcompact"
+	defaultSnipMinTokens                 = 64
+	defaultUserCodeMicrocompactMinTokens = 96
+	userCodePreviewHeadLines             = 12
+	userCodePreviewTailLines             = 8
 )
 
 var truncationArtifactRe = regexp.MustCompile(`(?i)(?:saved to|full output:|full_output=)\s+([^\]\s]+(?:/|\\)truncated(?:/|\\)[^\]\s]+)`)
@@ -48,6 +52,7 @@ func (s *Service) CompactLocal(ctx context.Context, messages []llm.Message, usag
 		ledger:        ledger,
 		replacements:  ledgerReplacementIndex(ledger),
 		protectedFrom: protectedMessageStart(len(messages), s.protectedRecentMessages()),
+		latestUser:    latestRealUserIndex(messages),
 		watermark:     watermark,
 	}
 	out, warnings, createdOrReused, tiers := reducer.reduce(messages)
@@ -93,6 +98,7 @@ type localReducer struct {
 	ledger        *Ledger
 	replacements  map[string]LedgerReplacement
 	protectedFrom int
+	latestUser    int
 	watermark     string
 }
 
@@ -111,6 +117,8 @@ func (r *localReducer) reduce(messages []llm.Message) ([]llm.Message, []string, 
 			repl, warning, ok = r.reduceToolMessage(i, msg)
 		case r.isPrune() && msg.Role == llm.RoleAssistant:
 			repl, warning, ok = r.reduceAssistantMessage(i, msg)
+		case r.isPrune() && msg.Role == llm.RoleUser:
+			repl, warning, ok = r.reduceUserCodeMessage(i, msg)
 		default:
 			continue
 		}
@@ -283,6 +291,73 @@ func (r *localReducer) eligibleAssistantMessage(index int, msg llm.Message) bool
 	return approximateTextTokens(text) >= defaultSnipMinTokens
 }
 
+func (r *localReducer) reduceUserCodeMessage(index int, msg llm.Message) (LedgerReplacement, string, bool) {
+	if !r.eligibleUserCodeMessage(index, msg) {
+		return LedgerReplacement{}, "", false
+	}
+	original := msg.Content.PlainText()
+	key := StableMessageKey(MessageKeyInput{
+		Role:           string(msg.Role),
+		OriginalText:   original,
+		FirstSeenIndex: index,
+	})
+	partKey := "content-0"
+	lookupKey := replacementLookupKey(key, partKey)
+	if repl, ok := r.replacements[lookupKey]; ok {
+		return repl, "", true
+	}
+	if r.service.Config.ToolArtifactWriter == nil {
+		return LedgerReplacement{}, userCodeArtifactWarning(r.sessionID, "write", "no artifact writer configured"), false
+	}
+	artifact, err := r.service.Config.ToolArtifactWriter.SaveCompactionArtifact(r.ctx, ArtifactRequest{
+		SessionID:  r.sessionID,
+		MessageKey: key,
+		PartKey:    partKey,
+		ToolName:   "user_code",
+		Content:    original,
+	})
+	if err != nil {
+		return LedgerReplacement{}, userCodeArtifactWarning(r.sessionID, "write", err.Error()), false
+	}
+	artifactPath := strings.TrimSpace(artifact.Path)
+	if artifactPath == "" {
+		return LedgerReplacement{}, userCodeArtifactWarning(r.sessionID, "write", "artifact writer returned empty path"), false
+	}
+	text, ok := userCodeMicrocompactReplacementText(original, artifactPath)
+	if !ok {
+		return LedgerReplacement{}, "", false
+	}
+	repl := LedgerReplacement{
+		MessageKey:      key,
+		PartKey:         partKey,
+		Role:            string(msg.Role),
+		Tier:            tierMicrocompact,
+		OriginalHash:    ContentHash(original),
+		ReplacementHash: ContentHash(text),
+		ReplacementText: text,
+		FullArtifact:    artifactPath,
+		CreatedAt:       time.Now().UTC(),
+		OriginalText:    original,
+	}
+	r.ledger.Replacements = append(r.ledger.Replacements, repl)
+	r.replacements[lookupKey] = repl
+	return repl, "", true
+}
+
+func (r *localReducer) eligibleUserCodeMessage(index int, msg llm.Message) bool {
+	if !r.service.Config.EnableUserCodeMicrocompact {
+		return false
+	}
+	if index >= r.protectedFrom || index == r.latestUser || msg.Destroyed || msg.Role != llm.RoleUser || isCompactionSummaryMessage(msg) {
+		return false
+	}
+	text := msg.Content.PlainText()
+	if strings.TrimSpace(text) == "" {
+		return false
+	}
+	return userCodeMicrocompactCandidate(text)
+}
+
 func (r *localReducer) createSnipReplacement(msg llm.Message, messageKey, partKey, original string) (LedgerReplacement, string, bool) {
 	artifactPath := extractTruncationArtifactPath(original)
 	if artifactPath == "" {
@@ -368,6 +443,111 @@ func assistantPruneReplacementText(original, artifactPath string) string {
 	return fmt.Sprintf("[Assistant text compacted: lines=%d bytes=%d full_output=%s]\n%s", countTextLines(original), len(original), strings.TrimSpace(artifactPath), assistantPreview(original))
 }
 
+type fencedCodeBlock struct {
+	startLine int
+	endLine   int
+	info      string
+	language  string
+	hint      string
+	lines     []string
+}
+
+func userCodeMicrocompactCandidate(text string) bool {
+	block, ok := largestFencedCodeBlock(text)
+	if !ok {
+		return false
+	}
+	return approximateTextTokens(strings.Join(block.lines, "\n")) >= defaultUserCodeMicrocompactMinTokens
+}
+
+func userCodeMicrocompactReplacementText(original, artifactPath string) (string, bool) {
+	block, ok := largestFencedCodeBlock(original)
+	if !ok {
+		return "", false
+	}
+	if approximateTextTokens(strings.Join(block.lines, "\n")) < defaultUserCodeMicrocompactMinTokens {
+		return "", false
+	}
+	allLines := strings.Split(strings.ReplaceAll(original, "\r\n", "\n"), "\n")
+	out := make([]string, 0, len(allLines)-len(block.lines)+userCodePreviewHeadLines+userCodePreviewTailLines+4)
+	out = append(out, allLines[:block.startLine]...)
+	out = append(out, userCodeBlockReplacementLines(block, artifactPath)...)
+	if block.endLine+1 < len(allLines) {
+		out = append(out, allLines[block.endLine+1:]...)
+	}
+	return strings.TrimSpace(strings.Join(out, "\n")), true
+}
+
+func largestFencedCodeBlock(text string) (fencedCodeBlock, bool) {
+	lines := strings.Split(strings.ReplaceAll(text, "\r\n", "\n"), "\n")
+	best := fencedCodeBlock{}
+	haveBest := false
+	open := -1
+	info := ""
+	for i, line := range lines {
+		trimmed := strings.TrimSpace(line)
+		if !strings.HasPrefix(trimmed, "```") {
+			continue
+		}
+		if open < 0 {
+			open = i
+			info = strings.TrimSpace(strings.TrimPrefix(trimmed, "```"))
+			continue
+		}
+		blockLines := append([]string(nil), lines[open+1:i]...)
+		candidate := fencedCodeBlock{
+			startLine: open,
+			endLine:   i,
+			info:      info,
+			lines:     blockLines,
+		}
+		candidate.language, candidate.hint = parseFenceInfo(info)
+		if !haveBest || len(candidate.lines) > len(best.lines) {
+			best = candidate
+			haveBest = true
+		}
+		open = -1
+		info = ""
+	}
+	return best, haveBest
+}
+
+func parseFenceInfo(info string) (string, string) {
+	fields := strings.Fields(strings.TrimSpace(info))
+	if len(fields) == 0 {
+		return "", ""
+	}
+	lang := fields[0]
+	hint := ""
+	if len(fields) > 1 {
+		hint = strings.Join(fields[1:], " ")
+	}
+	return lang, hint
+}
+
+func userCodeBlockReplacementLines(block fencedCodeBlock, artifactPath string) []string {
+	lang := strings.TrimSpace(block.language)
+	if lang == "" {
+		lang = "-"
+	}
+	hint := strings.TrimSpace(block.hint)
+	if hint == "" {
+		hint = "-"
+	}
+	header := fmt.Sprintf("[User code block compacted: language=%s hint=%s lines=%d bytes=%d full_output=%s]", lang, hint, len(block.lines), len(strings.Join(block.lines, "\n")), strings.TrimSpace(artifactPath))
+	out := []string{header}
+	out = append(out, "Preview:")
+	switch {
+	case len(block.lines) <= userCodePreviewHeadLines+userCodePreviewTailLines:
+		out = append(out, block.lines...)
+	default:
+		out = append(out, block.lines[:userCodePreviewHeadLines]...)
+		out = append(out, fmt.Sprintf("[...%d middle lines omitted; full code: %s]", len(block.lines)-userCodePreviewHeadLines-userCodePreviewTailLines, strings.TrimSpace(artifactPath)))
+		out = append(out, block.lines[len(block.lines)-userCodePreviewTailLines:]...)
+	}
+	return out
+}
+
 func assistantPreview(text string) string {
 	text = strings.TrimSpace(text)
 	if text == "" {
@@ -431,6 +611,10 @@ func compactionArtifactWarning(sessionID, toolName, toolCallID, stage, detail st
 	return fmt.Sprintf("[WARN] Compaction artifact not saved - session=%s stage=%s tool=%s tool_call_id=%s action=leaving original tool result in context: %s", strings.TrimSpace(sessionID), strings.TrimSpace(stage), strings.TrimSpace(toolName), strings.TrimSpace(toolCallID), strings.TrimSpace(detail))
 }
 
+func userCodeArtifactWarning(sessionID, stage, detail string) string {
+	return fmt.Sprintf("[WARN] Compaction artifact not saved - session=%s stage=%s role=user action=leaving original user code in context: %s", strings.TrimSpace(sessionID), strings.TrimSpace(stage), strings.TrimSpace(detail))
+}
+
 func protectedMessageStart(length int, protected int) int {
 	if protected <= 0 {
 		return length
@@ -440,6 +624,16 @@ func protectedMessageStart(length int, protected int) int {
 		return 0
 	}
 	return start
+}
+
+func latestRealUserIndex(messages []llm.Message) int {
+	for i := len(messages) - 1; i >= 0; i-- {
+		msg := messages[i]
+		if msg.Role == llm.RoleUser && !msg.Destroyed && !isCompactionSummaryMessage(msg) {
+			return i
+		}
+	}
+	return -1
 }
 
 func (s *Service) protectedRecentMessages() int {
@@ -475,6 +669,9 @@ func orderedLocalTiers(applied map[string]struct{}) []string {
 	}
 	if _, ok := applied[tierPrune]; ok {
 		out = append(out, tierPrune)
+	}
+	if _, ok := applied[tierMicrocompact]; ok {
+		out = append(out, tierMicrocompact)
 	}
 	return out
 }
