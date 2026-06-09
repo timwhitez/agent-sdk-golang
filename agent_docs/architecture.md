@@ -288,6 +288,10 @@ Mapping details:
   consumers. Current summary compaction fills `trigger`, `watermark`, `usage`,
   `original_tokens`, `new_tokens`, and `tiers_applied=["summarize"]`; adapters
   may reshape field names but should preserve these meanings.
+- `compaction.Ledger`, `LedgerReplacement`, stable message keys, content hashes,
+  and `LedgerStore` are the portable persistence contract for future local
+  replacement reuse. The SDK defines schema and validation only; repository
+  adapters provide the file store.
 - `CompactNow` forces a compaction run regardless of thresholds (unless another compaction is already in-flight) (`sdk/agent/agent.go:777`)
 
 ## Event and Error Contract
