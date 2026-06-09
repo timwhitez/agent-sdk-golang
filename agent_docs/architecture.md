@@ -290,6 +290,10 @@ Mapping details:
   full-output artifact path, writes a monotonic ledger replacement, skips
   protected tools and protected recent messages, and leaves user messages
   untouched (`sdk/agent/compaction/local_reduce.go`).
+- Tier 2 local compaction prunes already-snipped tool results to shorter
+  placeholders and compacts old assistant text messages that have no tool calls.
+  Assistant tool-call messages and all user messages remain untouched
+  (`sdk/agent/compaction/local_reduce.go`).
 - When all candidate messages are filtered, compaction injects a minimal fallback context message to keep summary input non-empty (`sdk/agent/compaction/service.go:139`)
 - Compaction emits `CompactionEvent` when pending results are applied, and re-prepends deduplicated preserved system messages (`sdk/agent/agent.go:770`, `sdk/agent/agent.go:699`, `sdk/agent/agent.go:891`)
 - `compaction.Result` is the structured telemetry carrier for compaction

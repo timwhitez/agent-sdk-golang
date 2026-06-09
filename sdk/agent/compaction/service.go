@@ -60,6 +60,15 @@ func NewService(cfg *Config) *Service {
 	if c.SnipThresholdRatio >= c.ThresholdRatio {
 		c.SnipThresholdRatio = c.ThresholdRatio
 	}
+	if c.PruneThresholdRatio <= 0 {
+		c.PruneThresholdRatio = DefaultPruneThresholdRatio
+	}
+	if c.PruneThresholdRatio >= c.ThresholdRatio {
+		c.PruneThresholdRatio = c.ThresholdRatio
+	}
+	if c.PruneThresholdRatio < c.SnipThresholdRatio {
+		c.PruneThresholdRatio = c.SnipThresholdRatio
+	}
 	if c.ProtectedRecentMessages <= 0 {
 		c.ProtectedRecentMessages = DefaultKeepRecentUserMessages
 	}
@@ -79,6 +88,11 @@ func (s *Service) threshold() int {
 func (s *Service) snipThreshold() int {
 	window := s.contextWindow()
 	return int(float64(window) * s.Config.SnipThresholdRatio)
+}
+
+func (s *Service) pruneThreshold() int {
+	window := s.contextWindow()
+	return int(float64(window) * s.Config.PruneThresholdRatio)
 }
 
 func (s *Service) contextWindow() int {
@@ -151,7 +165,7 @@ func (s *Service) ShouldCompact(u *llm.Usage) bool {
 		return false
 	}
 	total := s.TotalTokens(u)
-	return total >= s.snipThreshold() || total >= s.threshold()
+	return total >= s.snipThreshold() || total >= s.pruneThreshold() || total >= s.threshold()
 }
 
 func (s *Service) WatermarkForUsage(u *llm.Usage) string {
@@ -165,6 +179,9 @@ func (s *Service) WatermarkForUsage(u *llm.Usage) string {
 	if total >= s.threshold() {
 		return "summarize"
 	}
+	if total >= s.pruneThreshold() {
+		return "prune"
+	}
 	if total >= s.snipThreshold() {
 		return "snip"
 	}
@@ -176,7 +193,7 @@ func (s *Service) CompactAuto(ctx context.Context, model llm.ChatModel, messages
 	if watermark == "" {
 		watermark = s.WatermarkForUsage(usage)
 	}
-	if watermark == "snip" {
+	if watermark == "snip" || watermark == "prune" {
 		return s.CompactLocal(ctx, messages, usage)
 	}
 	if usage != nil && (watermark == "summarize" || watermark == "overflow") {

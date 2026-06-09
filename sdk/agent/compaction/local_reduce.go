@@ -12,6 +12,7 @@ import (
 
 const (
 	tierSnip             = "snip"
+	tierPrune            = "prune"
 	defaultSnipMinTokens = 64
 )
 
@@ -36,6 +37,10 @@ func (s *Service) CompactLocal(ctx context.Context, messages []llm.Message, usag
 	if originalTokens <= 0 {
 		originalTokens = approximateMessageTokens(messages)
 	}
+	watermark := s.WatermarkForUsage(usage)
+	if watermark == "" || watermark == "overflow" || watermark == "summarize" {
+		watermark = tierSnip
+	}
 	reducer := localReducer{
 		service:       s,
 		ctx:           ctx,
@@ -43,14 +48,15 @@ func (s *Service) CompactLocal(ctx context.Context, messages []llm.Message, usag
 		ledger:        ledger,
 		replacements:  ledgerReplacementIndex(ledger),
 		protectedFrom: protectedMessageStart(len(messages), s.protectedRecentMessages()),
+		watermark:     watermark,
 	}
-	out, warnings, createdOrReused := reducer.snip(messages)
+	out, warnings, createdOrReused, tiers := reducer.reduce(messages)
 	warnings = append(loadWarnings, warnings...)
 	if createdOrReused == 0 {
 		return messages, Result{
 			Compacted:      false,
 			Trigger:        "usage",
-			Watermark:      tierSnip,
+			Watermark:      watermark,
 			Usage:          cloneUsage(usage),
 			OriginalTokens: originalTokens,
 			NewTokens:      originalTokens,
@@ -69,11 +75,11 @@ func (s *Service) CompactLocal(ctx context.Context, messages []llm.Message, usag
 	res := Result{
 		Compacted:      true,
 		Trigger:        "usage",
-		Watermark:      tierSnip,
+		Watermark:      watermark,
 		Usage:          cloneUsage(usage),
 		OriginalTokens: originalTokens,
 		NewTokens:      newTokens,
-		TiersApplied:   []string{tierSnip},
+		TiersApplied:   tiers,
 		Warnings:       warnings,
 	}
 	res.LedgerPath = strings.TrimSpace(s.Config.LedgerPath)
@@ -87,45 +93,113 @@ type localReducer struct {
 	ledger        *Ledger
 	replacements  map[string]LedgerReplacement
 	protectedFrom int
+	watermark     string
 }
 
-func (r *localReducer) snip(messages []llm.Message) ([]llm.Message, []string, int) {
+func (r *localReducer) reduce(messages []llm.Message) ([]llm.Message, []string, int, []string) {
 	out := make([]llm.Message, len(messages))
 	copy(out, messages)
 	warnings := []string{}
 	changed := 0
+	applied := map[string]struct{}{}
 	for i, msg := range messages {
-		if !r.eligibleToolMessage(i, msg) {
+		var repl LedgerReplacement
+		var warning string
+		var ok bool
+		switch {
+		case msg.Role == llm.RoleTool:
+			repl, warning, ok = r.reduceToolMessage(i, msg)
+		case r.isPrune() && msg.Role == llm.RoleAssistant:
+			repl, warning, ok = r.reduceAssistantMessage(i, msg)
+		default:
 			continue
 		}
-		original := msg.Content.PlainText()
-		key := StableMessageKey(MessageKeyInput{
-			Role:           string(msg.Role),
-			ToolCallID:     msg.ToolCallID,
-			ToolName:       msg.ToolName,
-			OriginalText:   original,
-			FirstSeenIndex: i,
-		})
-		partKey := "content-0"
-		lookupKey := replacementLookupKey(key, partKey)
-		repl, ok := r.replacements[lookupKey]
+		if warning != "" {
+			warnings = append(warnings, warning)
+		}
 		if !ok {
-			created, warning, ok := r.createSnipReplacement(msg, key, partKey, original)
-			if warning != "" {
-				warnings = append(warnings, warning)
-			}
-			if !ok {
-				continue
-			}
-			repl = created
-			r.ledger.Replacements = append(r.ledger.Replacements, repl)
-			r.replacements[lookupKey] = repl
+			continue
 		}
 		msg.Content = llm.TextContent(repl.ReplacementText)
 		out[i] = msg
 		changed++
+		applied[repl.Tier] = struct{}{}
 	}
-	return out, warnings, changed
+	return out, warnings, changed, orderedLocalTiers(applied)
+}
+
+func (r *localReducer) isPrune() bool {
+	return r.watermark == tierPrune
+}
+
+func (r *localReducer) reduceToolMessage(index int, msg llm.Message) (LedgerReplacement, string, bool) {
+	if r.isPrune() {
+		text := msg.Content.PlainText()
+		if parent, ok := r.findReplacementByText(text, msg); ok {
+			if parent.Tier == tierPrune {
+				return parent, "", true
+			}
+			pruned := r.createToolPruneReplacement(msg, parent)
+			pruneKey := replacementLookupKey(pruned.MessageKey, pruned.PartKey)
+			if existing, exists := r.replacements[pruneKey]; exists && existing.Tier == tierPrune {
+				return existing, "", true
+			}
+			r.ledger.Replacements = append(r.ledger.Replacements, pruned)
+			r.replacements[pruneKey] = pruned
+			return pruned, "", true
+		}
+	}
+	if !r.eligibleToolMessage(index, msg) {
+		return LedgerReplacement{}, "", false
+	}
+	original := msg.Content.PlainText()
+	key := StableMessageKey(MessageKeyInput{
+		Role:           string(msg.Role),
+		ToolCallID:     msg.ToolCallID,
+		ToolName:       msg.ToolName,
+		OriginalText:   original,
+		FirstSeenIndex: index,
+	})
+	partKey := "content-0"
+	lookupKey := replacementLookupKey(key, partKey)
+	repl, ok := r.replacements[lookupKey]
+	if !ok {
+		created, warning, ok := r.createSnipReplacement(msg, key, partKey, original)
+		if !ok {
+			return LedgerReplacement{}, warning, false
+		}
+		repl = created
+		r.ledger.Replacements = append(r.ledger.Replacements, repl)
+		r.replacements[lookupKey] = repl
+	}
+	if r.isPrune() && repl.Tier == tierSnip {
+		pruned := r.createToolPruneReplacement(msg, repl)
+		pruneKey := replacementLookupKey(pruned.MessageKey, pruned.PartKey)
+		if existing, exists := r.replacements[pruneKey]; exists && existing.Tier == tierPrune {
+			return existing, "", true
+		}
+		r.ledger.Replacements = append(r.ledger.Replacements, pruned)
+		r.replacements[pruneKey] = pruned
+		return pruned, "", true
+	}
+	return repl, "", true
+}
+
+func (r *localReducer) findReplacementByText(text string, msg llm.Message) (LedgerReplacement, bool) {
+	hash := ContentHash(text)
+	for _, repl := range r.ledger.Replacements {
+		if repl.ReplacementHash != hash {
+			continue
+		}
+		if repl.Role != string(msg.Role) {
+			continue
+		}
+		if strings.TrimSpace(repl.ToolName) != "" && strings.TrimSpace(repl.ToolName) != strings.TrimSpace(msg.ToolName) {
+			continue
+		}
+		return repl, true
+	}
+	return LedgerReplacement{}, false
 }
 
 func (r *localReducer) eligibleToolMessage(index int, msg llm.Message) bool {
@@ -136,6 +210,70 @@ func (r *localReducer) eligibleToolMessage(index int, msg llm.Message) bool {
 		return false
 	}
 	if isProtectedTool(msg.ToolName, r.service.protectedTools) {
+		return false
+	}
+	text := msg.Content.PlainText()
+	if strings.TrimSpace(text) == "" {
+		return false
+	}
+	return approximateTextTokens(text) >= defaultSnipMinTokens
+}
+
+func (r *localReducer) reduceAssistantMessage(index int, msg llm.Message) (LedgerReplacement, string, bool) {
+	if !r.eligibleAssistantMessage(index, msg) {
+		return LedgerReplacement{}, "", false
+	}
+	original := msg.Content.PlainText()
+	key := StableMessageKey(MessageKeyInput{
+		Role:           string(msg.Role),
+		OriginalText:   original,
+		FirstSeenIndex: index,
+	})
+	partKey := "content-0"
+	lookupKey := replacementLookupKey(key, partKey)
+	if repl, ok := r.replacements[lookupKey]; ok {
+		return repl, "", true
+	}
+	if r.service.Config.ToolArtifactWriter == nil {
+		return LedgerReplacement{}, compactionArtifactWarning(r.sessionID, "assistant", "", "write", "no artifact writer configured"), false
+	}
+	artifact, err := r.service.Config.ToolArtifactWriter.SaveCompactionArtifact(r.ctx, ArtifactRequest{
+		SessionID:  r.sessionID,
+		MessageKey: key,
+		PartKey:    partKey,
+		ToolName:   "assistant",
+		Content:    original,
+	})
+	if err != nil {
+		return LedgerReplacement{}, compactionArtifactWarning(r.sessionID, "assistant", "", "write", err.Error()), false
+	}
+	artifactPath := strings.TrimSpace(artifact.Path)
+	if artifactPath == "" {
+		return LedgerReplacement{}, compactionArtifactWarning(r.sessionID, "assistant", "", "write", "artifact writer returned empty path"), false
+	}
+	text := assistantPruneReplacementText(original, artifactPath)
+	repl := LedgerReplacement{
+		MessageKey:      key,
+		PartKey:         partKey,
+		Role:            string(msg.Role),
+		Tier:            tierPrune,
+		OriginalHash:    ContentHash(original),
+		ReplacementHash: ContentHash(text),
+		ReplacementText: text,
+		FullArtifact:    artifactPath,
+		CreatedAt:       time.Now().UTC(),
+		OriginalText:    original,
+	}
+	r.ledger.Replacements = append(r.ledger.Replacements, repl)
+	r.replacements[lookupKey] = repl
+	return repl, "", true
+}
+
+func (r *localReducer) eligibleAssistantMessage(index int, msg llm.Message) bool {
+	if index >= r.protectedFrom {
+		return false
+	}
+	if msg.Destroyed || len(msg.ToolCalls) > 0 {
 		return false
 	}
 	text := msg.Content.PlainText()
@@ -184,6 +322,23 @@ func (r *localReducer) createSnipReplacement(msg llm.Message, messageKey, partKe
 	}, "", true
 }
 
+func (r *localReducer) createToolPruneReplacement(msg llm.Message, parent LedgerReplacement) LedgerReplacement {
+	text := toolPruneReplacementText(msg, parent.FullArtifact)
+	return LedgerReplacement{
+		MessageKey:            parent.MessageKey + "/tier:prune",
+		PartKey:               parent.PartKey,
+		Role:                  string(msg.Role),
+		ToolName:              strings.TrimSpace(msg.ToolName),
+		Tier:                  tierPrune,
+		OriginalHash:          parent.ReplacementHash,
+		ReplacementHash:       ContentHash(text),
+		ReplacementText:       text,
+		FullArtifact:          strings.TrimSpace(parent.FullArtifact),
+		ParentReplacementHash: parent.ReplacementHash,
+		CreatedAt:             time.Now().UTC(),
+	}
+}
+
 func snipReplacementText(msg llm.Message, original, artifactPath string) string {
 	tool := strings.TrimSpace(msg.ToolName)
 	if tool == "" {
@@ -195,6 +350,66 @@ func snipReplacementText(msg llm.Message, original, artifactPath string) string 
 	}
 	lines := countTextLines(original)
 	return fmt.Sprintf("[Tool result snipped: %s tool_call_id=%s lines=%d bytes=%d full_output=%s]", tool, id, lines, len(original), strings.TrimSpace(artifactPath))
+}
+
+func toolPruneReplacementText(msg llm.Message, artifactPath string) string {
+	tool := strings.TrimSpace(msg.ToolName)
+	if tool == "" {
+		tool = "tool"
+	}
+	id := strings.TrimSpace(msg.ToolCallID)
+	if id == "" {
+		id = "-"
+	}
+	return fmt.Sprintf("[Tool result pruned: %s tool_call_id=%s full_output=%s]", tool, id, strings.TrimSpace(artifactPath))
+}
+
+func assistantPruneReplacementText(original, artifactPath string) string {
+	return fmt.Sprintf("[Assistant text compacted: lines=%d bytes=%d full_output=%s]\n%s", countTextLines(original), len(original), strings.TrimSpace(artifactPath), assistantPreview(original))
+}
+
+func assistantPreview(text string) string {
+	text = strings.TrimSpace(text)
+	if text == "" {
+		return ""
+	}
+	const maxPreview = 220
+	preview := text
+	if len(preview) > maxPreview {
+		preview = strings.TrimSpace(preview[:maxPreview]) + "..."
+	}
+	tokens := extractKeyTokens(text, 6)
+	if len(tokens) == 0 {
+		return preview
+	}
+	return preview + "\nKey tokens: " + strings.Join(tokens, " ")
+}
+
+func extractKeyTokens(text string, maxTokens int) []string {
+	raw := strings.FieldsFunc(text, func(r rune) bool {
+		return r == ' ' || r == '\n' || r == '\t' || r == ',' || r == ';' || r == ':' || r == ')' || r == '(' || r == '[' || r == ']'
+	})
+	out := []string{}
+	seen := map[string]struct{}{}
+	for _, tok := range raw {
+		tok = strings.Trim(tok, "\"'`")
+		if tok == "" {
+			continue
+		}
+		isKey := strings.Contains(tok, "/") || strings.Contains(tok, "\\") || strings.Contains(tok, ".") || strings.Contains(tok, "=") || strings.Contains(strings.ToLower(tok), "error")
+		if !isKey {
+			continue
+		}
+		if _, ok := seen[tok]; ok {
+			continue
+		}
+		seen[tok] = struct{}{}
+		out = append(out, tok)
+		if len(out) >= maxTokens {
+			break
+		}
+	}
+	return out
 }
 
 func countTextLines(text string) int {
@@ -251,6 +466,17 @@ func ledgerReplacementIndex(ledger *Ledger) map[string]LedgerReplacement {
 
 func replacementLookupKey(messageKey, partKey string) string {
 	return strings.TrimSpace(messageKey) + "\x00" + strings.TrimSpace(partKey)
+}
+
+func orderedLocalTiers(applied map[string]struct{}) []string {
+	out := []string{}
+	if _, ok := applied[tierSnip]; ok {
+		out = append(out, tierSnip)
+	}
+	if _, ok := applied[tierPrune]; ok {
+		out = append(out, tierPrune)
+	}
+	return out
 }
 
 type warningLedgerStore interface {

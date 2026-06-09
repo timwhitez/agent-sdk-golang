@@ -12,6 +12,7 @@ const (
 	DefaultContextWindow          = 128_000
 	DefaultThresholdRatio         = 0.85
 	DefaultSnipThresholdRatio     = 0.70
+	DefaultPruneThresholdRatio    = 0.80
 	DefaultKeepRecentUserMessages = 3
 	DefaultToolSnapshotMaxEntries = 6
 	DefaultToolSnapshotMaxChars   = 2000
@@ -135,6 +136,9 @@ type Config struct {
 	// SnipThresholdRatio is the local Tier 1 watermark for tool-result snipping.
 	// If <=0, DefaultSnipThresholdRatio is used. It is capped below ThresholdRatio.
 	SnipThresholdRatio float64
+	// PruneThresholdRatio is the local Tier 2 watermark for tool-result and assistant-text pruning.
+	// If <=0, DefaultPruneThresholdRatio is used. It is capped below ThresholdRatio.
+	PruneThresholdRatio float64
 	// ProtectedRecentMessages excludes the last N messages from local reducers.
 	// If <=0, DefaultKeepRecentUserMessages is used as a conservative message-zone fallback.
 	ProtectedRecentMessages int
@@ -163,6 +167,7 @@ func DefaultConfig() Config {
 		ToolSnapshotMaxEntries:        DefaultToolSnapshotMaxEntries,
 		ToolSnapshotMaxChars:          DefaultToolSnapshotMaxChars,
 		SnipThresholdRatio:            DefaultSnipThresholdRatio,
+		PruneThresholdRatio:           DefaultPruneThresholdRatio,
 		ProtectedRecentMessages:       DefaultKeepRecentUserMessages,
 	}
 }

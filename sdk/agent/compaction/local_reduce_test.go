@@ -51,7 +51,7 @@ func TestCompactLocalSnipsOldToolResultAndReusesLedger(t *testing.T) {
 	})
 	messages := snipTestMessages(strings.Repeat("hit\n", 400))
 
-	first, firstRes, err := svc.CompactLocal(ctx, messages, &llm.Usage{TotalTokens: 1600})
+	first, firstRes, err := svc.CompactLocal(ctx, messages, &llm.Usage{TotalTokens: 1500})
 	if err != nil {
 		t.Fatalf("CompactLocal first: %v", err)
 	}
@@ -92,7 +92,7 @@ func TestCompactLocalSnipsOldToolResultAndReusesLedger(t *testing.T) {
 	}
 	assertLocalHistoryProviderValid(t, first)
 
-	second, secondRes, err := svc.CompactLocal(ctx, messages, &llm.Usage{TotalTokens: 1600})
+	second, secondRes, err := svc.CompactLocal(ctx, messages, &llm.Usage{TotalTokens: 1500})
 	if err != nil {
 		t.Fatalf("CompactLocal second: %v", err)
 	}
@@ -131,7 +131,7 @@ func TestCompactLocalSkipsProtectedRecentAndUserMessages(t *testing.T) {
 		llm.NewUserMessage("latest"),
 	}
 
-	got, _, err := svc.CompactLocal(context.Background(), messages, &llm.Usage{TotalTokens: 1600})
+	got, _, err := svc.CompactLocal(context.Background(), messages, &llm.Usage{TotalTokens: 1500})
 	if err != nil {
 		t.Fatalf("CompactLocal: %v", err)
 	}
@@ -165,7 +165,7 @@ func TestCompactLocalSkipsProtectedTools(t *testing.T) {
 		llm.NewUserMessage("latest"),
 	}
 
-	got, res, err := svc.CompactLocal(context.Background(), messages, &llm.Usage{TotalTokens: 1600})
+	got, res, err := svc.CompactLocal(context.Background(), messages, &llm.Usage{TotalTokens: 1500})
 	if err != nil {
 		t.Fatalf("CompactLocal: %v", err)
 	}
@@ -191,7 +191,7 @@ func TestCompactLocalArtifactFailureLeavesContentAndWarns(t *testing.T) {
 	})
 	messages := snipTestMessages(original)
 
-	got, res, err := svc.CompactLocal(context.Background(), messages, &llm.Usage{TotalTokens: 1600})
+	got, res, err := svc.CompactLocal(context.Background(), messages, &llm.Usage{TotalTokens: 1500})
 	if err != nil {
 		t.Fatalf("CompactLocal: %v", err)
 	}
