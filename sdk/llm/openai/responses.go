@@ -187,7 +187,7 @@ func (c *ResponsesClient) baseURL() string {
 
 func (c *ResponsesClient) isRetryableStatus(code int) bool {
 	if c.RetryableStatusCodes == nil {
-		return code == 429 || code == 500 || code == 502 || code == 503 || code == 504
+		return defaultRetryableStatus(code)
 	}
 	_, ok := c.RetryableStatusCodes[code]
 	return ok

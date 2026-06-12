@@ -1140,6 +1140,60 @@ func hasVisiblePartialCompletion(comp *llm.Completion) bool {
 	return len(comp.ToolCalls) > 0
 }
 
+type streamMetadataBuffer struct {
+	events     []llm.StreamEvent
+	usage      *llm.Usage
+	responseID string
+}
+
+func (b *streamMetadataBuffer) add(ev llm.StreamEvent) bool {
+	switch e := ev.(type) {
+	case llm.StreamUsageEvent:
+		u := e.Usage
+		b.usage = &u
+		b.events = append(b.events, ev)
+		return true
+	case llm.StreamResponseEvent:
+		if id := strings.TrimSpace(e.ResponseID); id != "" {
+			b.responseID = id
+		}
+		b.events = append(b.events, ev)
+		return true
+	case llm.StreamDoneEvent:
+		b.events = append(b.events, ev)
+		return true
+	default:
+		return false
+	}
+}
+
+func (b *streamMetadataBuffer) flush(process func(llm.StreamEvent) error) error {
+	if b == nil || len(b.events) == 0 {
+		return nil
+	}
+	events := b.events
+	b.events = nil
+	for _, ev := range events {
+		if err := process(ev); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func isVisibleProviderStreamEvent(ev llm.StreamEvent) bool {
+	switch e := ev.(type) {
+	case llm.StreamTextDeltaEvent:
+		return e.Delta != ""
+	case llm.StreamThinkingDeltaEvent:
+		return e.Delta != ""
+	case llm.StreamToolCallDeltaEvent:
+		return strings.TrimSpace(e.ID) != "" || e.NameDelta != "" || e.ArgumentsDelta != ""
+	default:
+		return false
+	}
+}
+
 // invokeCompletion calls the provider using streaming when available.
 // It returns the completion (possibly partial on error), whether text was streamed, and error.
 // On streaming errors, the partial completion contains whatever text/tools were accumulated
@@ -1170,14 +1224,28 @@ func (a *Agent) invokeCompletionWithSteering(ctx context.Context, req llm.Invoke
 		stopReason := ""
 		responseID := ""
 		streamedText := false
+		emittedVisible := false
+		metadata := &streamMetadataBuffer{}
 		partialCompletion := func() *llm.Completion {
+			content := llm.TextContent(text.String())
+			thinkingText := strings.TrimSpace(thinking.String())
+			toolCalls := acc.finalize()
+			visible := !content.IsEmpty() || thinkingText != "" || len(toolCalls) > 0
+			completionUsage := usage
+			if completionUsage == nil && !visible {
+				completionUsage = metadata.usage
+			}
+			completionResponseID := responseID
+			if strings.TrimSpace(completionResponseID) == "" && !visible {
+				completionResponseID = metadata.responseID
+			}
 			return &llm.Completion{
-				Content:    llm.TextContent(text.String()),
-				Thinking:   strings.TrimSpace(thinking.String()),
-				ToolCalls:  acc.finalize(),
-				Usage:      usage,
+				Content:    content,
+				Thinking:   thinkingText,
+				ToolCalls:  toolCalls,
+				Usage:      completionUsage,
 				StopReason: stopReason,
-				ResponseID: responseID,
+				ResponseID: completionResponseID,
 			}
 		}
 		processStreamEvent := func(ev llm.StreamEvent) error {
@@ -1246,9 +1314,21 @@ func (a *Agent) invokeCompletionWithSteering(ctx context.Context, req llm.Invoke
 			select {
 			case ev, ok := <-ch:
 				if !ok {
+					if err := metadata.flush(processStreamEvent); err != nil {
+						return partialCompletion(), streamedText, err
+					}
 					return partialCompletion(), streamedText, nil
 				}
 				resetIdleTimer()
+				if !emittedVisible && metadata.add(ev) {
+					continue
+				}
+				if isVisibleProviderStreamEvent(ev) {
+					if err := metadata.flush(processStreamEvent); err != nil {
+						return partialCompletion(), streamedText, err
+					}
+					emittedVisible = true
+				}
 				if err := processStreamEvent(ev); err != nil {
 					return partialCompletion(), streamedText, err
 				}
@@ -1365,21 +1445,26 @@ func (a *Agent) transientInvokeRetryDelay(err error, partial *llm.Completion, st
 	if !transient {
 		var pe *llm.ProviderError
 		if errors.As(err, &pe) {
-			switch pe.StatusCode {
-			case 408, 409, 425, 429:
-				transient = true
-			default:
-				transient = pe.StatusCode >= 500
-			}
+			transient = retryableProviderStatus(pe.StatusCode)
 			if pe.RetryAfter > 0 {
 				retryAfter = pe.RetryAfter
 			}
 		}
 	}
 	if !transient {
-		switch classifyGenericErrorKind(err) {
+		if status, ok := statusCodeInText(strings.ToLower(strings.TrimSpace(err.Error()))); ok && retryableProviderStatus(status) {
+			transient = true
+		}
+	}
+	if !transient {
+		kind := classifyGenericErrorKind(err)
+		switch kind {
 		case "network", "timeout", "rate_limit":
 			transient = true
+		case "provider":
+			if status, ok := statusCodeInText(strings.ToLower(strings.TrimSpace(err.Error()))); !ok || retryableProviderStatus(status) {
+				transient = true
+			}
 		}
 	}
 	if !transient {
@@ -2039,6 +2124,65 @@ func providerErrorKind(status int) string {
 	return "provider"
 }
 
+func retryableProviderStatus(status int) bool {
+	switch status {
+	case 401, 403, 408, 409, 425, 429:
+		return true
+	default:
+		return status >= 500 && status <= 599
+	}
+}
+
+func statusCodeInText(msg string) (int, bool) {
+	if msg == "" {
+		return 0, false
+	}
+	for _, code := range []int{400, 401, 403, 408, 409, 422, 425, 429, 500, 501, 502, 503, 504, 529} {
+		codeText := fmt.Sprint(code)
+		if !containsDelimitedNumber(msg, codeText) {
+			continue
+		}
+		if strings.Contains(msg, "("+codeText+")") ||
+			strings.Contains(msg, "["+codeText+"]") ||
+			strings.Contains(msg, "status") ||
+			strings.Contains(msg, "status_code") ||
+			strings.Contains(msg, "statuscode") ||
+			strings.Contains(msg, "http") ||
+			strings.Contains(msg, "response code") ||
+			strings.Contains(msg, "error code") ||
+			strings.Contains(msg, "code="+codeText) ||
+			strings.Contains(msg, "code "+codeText) {
+			return code, true
+		}
+	}
+	return 0, false
+}
+
+func containsDelimitedNumber(text, number string) bool {
+	if text == "" || number == "" {
+		return false
+	}
+	offset := 0
+	for {
+		idx := strings.Index(text[offset:], number)
+		if idx < 0 {
+			return false
+		}
+		start := offset + idx
+		end := start + len(number)
+		beforeOK := start == 0 || !isASCIIDigit(text[start-1])
+		afterOK := end == len(text) || !isASCIIDigit(text[end])
+		if beforeOK && afterOK {
+			return true
+		}
+		offset = start + 1
+	}
+}
+
+func isASCIIDigit(b byte) bool {
+	return b >= '0' && b <= '9'
+}
+
 func classifyGenericErrorKind(err error) string {
 	if err == nil {
 		return "unknown"
@@ -2075,6 +2219,13 @@ func classifyGenericErrorKind(err error) string {
 	if msg == "" {
 		return "unknown"
 	}
+	if strings.Contains(msg, "rate limit") ||
+		strings.Contains(msg, "too many requests") {
+		return "rate_limit"
+	}
+	if status, ok := statusCodeInText(msg); ok {
+		return providerErrorKind(status)
+	}
 	switch {
 	case strings.Contains(msg, "context canceled"):
 		return "canceled"
@@ -2101,6 +2252,16 @@ func classifyGenericErrorKind(err error) string {
 		strings.Contains(msg, "dial tcp") ||
 		strings.Contains(msg, "eof"):
 		return "network"
+	case strings.Contains(msg, "bad gateway") ||
+		strings.Contains(msg, "gateway timeout") ||
+		strings.Contains(msg, "internal server error") ||
+		strings.Contains(msg, "server error") ||
+		strings.Contains(msg, "service unavailable") ||
+		strings.Contains(msg, "temporarily unavailable") ||
+		strings.Contains(msg, "overloaded") ||
+		strings.Contains(msg, "try again later") ||
+		strings.Contains(msg, "please retry"):
+		return "provider"
 	default:
 		return "unknown"
 	}

@@ -732,6 +732,33 @@ func TestIsRetryableNetErr(t *testing.T) {
 	}
 }
 
+func TestDefaultRetryableStatus(t *testing.T) {
+	t.Parallel()
+
+	client := &Client{}
+	tests := []struct {
+		code int
+		want bool
+	}{
+		{code: 400, want: false},
+		{code: 401, want: true},
+		{code: 403, want: true},
+		{code: 404, want: false},
+		{code: 408, want: true},
+		{code: 409, want: true},
+		{code: 422, want: false},
+		{code: 425, want: true},
+		{code: 429, want: true},
+		{code: 500, want: true},
+		{code: 529, want: true},
+	}
+	for _, tt := range tests {
+		if got := client.isRetryableStatus(tt.code); got != tt.want {
+			t.Fatalf("status %d retryable=%v, want %v", tt.code, got, tt.want)
+		}
+	}
+}
+
 func TestConsumeSSEWithBodyCloseClosesOnPanic(t *testing.T) {
 	body := &closeTrackingReadCloser{Reader: strings.NewReader("data: {\"type\":\"message_stop\"}\n\n")}
 	defer func() {

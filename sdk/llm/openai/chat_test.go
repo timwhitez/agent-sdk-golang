@@ -922,6 +922,37 @@ func TestIsRetryableNetErr(t *testing.T) {
 	}
 }
 
+func TestOpenAIDefaultRetryableStatus(t *testing.T) {
+	t.Parallel()
+
+	chat := &ChatClient{}
+	responses := &ResponsesClient{}
+	tests := []struct {
+		code int
+		want bool
+	}{
+		{code: 400, want: false},
+		{code: 401, want: true},
+		{code: 403, want: true},
+		{code: 404, want: false},
+		{code: 408, want: true},
+		{code: 409, want: true},
+		{code: 422, want: false},
+		{code: 425, want: true},
+		{code: 429, want: true},
+		{code: 500, want: true},
+		{code: 529, want: true},
+	}
+	for _, tt := range tests {
+		if got := chat.isRetryableStatus(tt.code); got != tt.want {
+			t.Fatalf("chat status %d retryable=%v, want %v", tt.code, got, tt.want)
+		}
+		if got := responses.isRetryableStatus(tt.code); got != tt.want {
+			t.Fatalf("responses status %d retryable=%v, want %v", tt.code, got, tt.want)
+		}
+	}
+}
+
 func TestOpenAIChatRejectsOversizedResponseBody(t *testing.T) {
 	prevLimit := maxProviderResponseBytes
 	maxProviderResponseBytes = 64

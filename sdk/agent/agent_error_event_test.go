@@ -98,6 +98,11 @@ func TestErrEventClassifiesGenericFailures(t *testing.T) {
 		{name: "timeout", err: context.DeadlineExceeded, wantKind: "timeout"},
 		{name: "network", err: &net.DNSError{Err: "no such host", Name: "example.invalid"}, wantKind: "network"},
 		{name: "decode", err: errors.New("invalid character x looking for beginning of value"), wantKind: "decode"},
+		{name: "textual_rate_limit", err: errors.New("openai-responses (429): Too Many Requests"), wantKind: "rate_limit"},
+		{name: "textual_provider", err: errors.New("provider failed with HTTP status 529 overloaded"), wantKind: "provider"},
+		{name: "textual_auth", err: errors.New("provider failed with HTTP status 401 unauthorized"), wantKind: "auth"},
+		{name: "textual_permission", err: errors.New("provider failed with HTTP status 403 forbidden"), wantKind: "permission"},
+		{name: "textual_invalid_request", err: errors.New("provider failed with HTTP status 400 invalid request"), wantKind: "invalid_request"},
 		{name: "unknown", err: errors.New("boom"), wantKind: "unknown"},
 	}
 

@@ -188,10 +188,19 @@ func (c *Client) baseURL() string {
 
 func (c *Client) isRetryableStatus(code int) bool {
 	if c.RetryableStatusCodes == nil {
-		return code == 429 || code == 500 || code == 502 || code == 503 || code == 504
+		return defaultRetryableStatus(code)
 	}
 	_, ok := c.RetryableStatusCodes[code]
 	return ok
+}
+
+func defaultRetryableStatus(code int) bool {
+	switch code {
+	case 401, 403, 408, 409, 425, 429:
+		return true
+	default:
+		return code >= 500 && code <= 599
+	}
 }
 
 func (c *Client) sleepBackoff(ctx context.Context, attempt int, baseDelay, maxDelay time.Duration, retryAfter time.Duration) {

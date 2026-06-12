@@ -51,6 +51,35 @@ func (m *streamingTransientErrorModel) InvokeStream(_ context.Context, _ llm.Inv
 	return ch, nil
 }
 
+type streamingMetadataTransientErrorModel struct {
+	streamCalls int
+}
+
+func (m *streamingMetadataTransientErrorModel) Provider() string { return "stub" }
+func (m *streamingMetadataTransientErrorModel) Model() string    { return "stub" }
+
+func (m *streamingMetadataTransientErrorModel) Invoke(_ context.Context, _ llm.InvokeRequest) (*llm.Completion, error) {
+	return nil, errors.New("invoke should not be called")
+}
+
+func (m *streamingMetadataTransientErrorModel) InvokeStream(_ context.Context, _ llm.InvokeRequest) (<-chan llm.StreamEvent, error) {
+	m.streamCalls++
+	ch := make(chan llm.StreamEvent, 4)
+	go func() {
+		defer close(ch)
+		if m.streamCalls == 1 {
+			ch <- llm.StreamResponseEvent{ResponseID: "resp_failed"}
+			ch <- llm.StreamUsageEvent{Usage: llm.Usage{PromptTokens: 1, CompletionTokens: 0, TotalTokens: 1}}
+			ch <- llm.StreamErrorEvent{Err: &llm.RateLimitError{Provider: "stub", Message: "Too Many Requests"}}
+			return
+		}
+		ch <- llm.StreamResponseEvent{ResponseID: "resp_ok"}
+		ch <- llm.StreamTextDeltaEvent{Delta: "ok"}
+		ch <- llm.StreamDoneEvent{StopReason: "stop"}
+	}()
+	return ch, nil
+}
+
 type repeatedSignatureModel struct {
 	calls int
 }
@@ -155,6 +184,76 @@ func TestInvokeRetryRetriesTransientErrorsAndSucceeds(t *testing.T) {
 	}
 }
 
+func TestInvokeRetryRetriesTextualRateLimitAndServerErrors(t *testing.T) {
+	tests := []struct {
+		name string
+		err  error
+	}{
+		{name: "auth_401", err: errors.New("provider failed with HTTP status 401 unauthorized")},
+		{name: "permission_403", err: errors.New("provider failed with HTTP status 403 permission denied")},
+		{name: "rate_limit_429", err: errors.New("openai-responses (429): Too Many Requests")},
+		{name: "server_status_529", err: errors.New("provider failed with HTTP status 529 overloaded")},
+		{name: "server_text", err: errors.New("upstream service unavailable, please retry")},
+	}
+
+	for _, tc := range tests {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			model := &transientInvokeModel{failFor: 1, err: tc.err}
+			ag, err := New(Config{LLM: model, InvokeRetryMaxAttempts: 2})
+			if err != nil {
+				t.Fatalf("new agent: %v", err)
+			}
+
+			events := collectEvents(ag.QueryStream(context.Background(), llm.TextContent("hello")))
+			if model.calls != 2 {
+				t.Fatalf("expected 2 invoke attempts, got %d", model.calls)
+			}
+			for _, ev := range events {
+				if e, ok := ev.(ErrorEvent); ok {
+					t.Fatalf("did not expect terminal error event after retry success: %#v", e)
+				}
+			}
+		})
+	}
+}
+
+func TestInvokeRetrySkipsTextualNonRetryableProviderErrors(t *testing.T) {
+	tests := []struct {
+		name string
+		err  error
+	}{
+		{name: "bad_request_400", err: errors.New("provider failed with HTTP status 400 invalid request")},
+		{name: "invalid_request_422", err: errors.New("provider failed with HTTP status 422 invalid request")},
+	}
+
+	for _, tc := range tests {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			model := &transientInvokeModel{failFor: 1, err: tc.err}
+			ag, err := New(Config{LLM: model, InvokeRetryMaxAttempts: 3})
+			if err != nil {
+				t.Fatalf("new agent: %v", err)
+			}
+
+			events := collectEvents(ag.QueryStream(context.Background(), llm.TextContent("hello")))
+			if model.calls != 1 {
+				t.Fatalf("expected non-retryable failure to skip retries, got %d invoke calls", model.calls)
+			}
+			var foundErr bool
+			for _, ev := range events {
+				if _, ok := ev.(ErrorEvent); ok {
+					foundErr = true
+					break
+				}
+			}
+			if !foundErr {
+				t.Fatal("expected terminal error event")
+			}
+		})
+	}
+}
+
 func TestInvokeRetrySkipsNonTransientErrors(t *testing.T) {
 	model := &transientInvokeModel{failFor: 1, err: errors.New("invalid payload")}
 	ag, err := New(Config{LLM: model, InvokeRetryMaxAttempts: 3})
@@ -213,6 +312,43 @@ func TestInvokeRetryDoesNotRetryAfterStreamingPartialOutput(t *testing.T) {
 	}
 	if !errSeen {
 		t.Fatal("expected terminal error event from streaming failure")
+	}
+}
+
+func TestInvokeRetryRetriesAfterMetadataOnlyStreamingError(t *testing.T) {
+	model := &streamingMetadataTransientErrorModel{}
+	ag, err := New(Config{LLM: model, InvokeRetryMaxAttempts: 2})
+	if err != nil {
+		t.Fatalf("new agent: %v", err)
+	}
+
+	events := collectEvents(ag.QueryStream(context.Background(), llm.TextContent("hello")))
+	if model.streamCalls != 2 {
+		t.Fatalf("expected metadata-only stream failure to retry, got %d stream calls", model.streamCalls)
+	}
+
+	usageEvents := 0
+	finalText := ""
+	finalResponseID := ""
+	for _, ev := range events {
+		switch e := ev.(type) {
+		case UsageEvent:
+			usageEvents++
+		case FinalResponseEvent:
+			finalText = e.Content
+			finalResponseID = e.ResponseID
+		case ErrorEvent:
+			t.Fatalf("did not expect terminal error event after metadata-only retry success: %#v", e)
+		}
+	}
+	if usageEvents != 0 {
+		t.Fatalf("expected failed attempt usage metadata not to leak into events, got %d usage events", usageEvents)
+	}
+	if finalText != "ok" {
+		t.Fatalf("final text = %q, want ok", finalText)
+	}
+	if finalResponseID != "resp_ok" {
+		t.Fatalf("final response id = %q, want resp_ok", finalResponseID)
 	}
 }
 
