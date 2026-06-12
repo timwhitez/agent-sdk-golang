@@ -52,6 +52,8 @@ stream normalization, and response metadata behavior.
 ## Agent-Side Stream Normalization
 - `invokeCompletion` in the agent consumes provider-specific stream events, emits provider-agnostic agent events, and preserves stream response metadata (`sdk/agent/agent.go:597`, `sdk/agent/agent.go:616`, `sdk/agent/agent.go:644`)
 - Response-level provider metadata is captured into `Completion.ResponseID` and surfaced to downstream consumers via `UsageEvent` / `AutoContinueEvent` / `FinalResponseEvent` (`sdk/agent/agent.go:255`, `sdk/agent/agent.go:285`, `sdk/agent/agent.go:348`, `sdk/agent/events.go:83`)
+- `StreamRetryEvent` is non-terminal retry progress; the agent converts it to
+  `WarnEvent{Kind:"rate_limit_retry"}` and continues consuming the same stream.
 
 ## Response ID Semantics
 - `Completion.ResponseID` is optional at the shared type level (`sdk/llm/types.go:139`)

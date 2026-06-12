@@ -67,6 +67,20 @@ type StreamResponseEvent struct {
 
 func (StreamResponseEvent) isStreamEvent() {}
 
+// StreamRetryEvent reports a non-fatal provider retry that is about to wait.
+// It lets interactive clients surface backoff progress without treating the
+// transient failure as a terminal stream error.
+type StreamRetryEvent struct {
+	Provider   string
+	StatusCode int
+	Message    string
+	RetryAfter time.Duration
+	Attempt    int
+	MaxRetries int
+}
+
+func (StreamRetryEvent) isStreamEvent() {}
+
 // StreamErrorEvent marks a fatal streaming error.
 // Provider/status/message metadata is optional and used when Err is nil.
 type StreamErrorEvent struct {

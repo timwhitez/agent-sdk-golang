@@ -1207,6 +1207,18 @@ func (a *Agent) invokeCompletionWithSteering(ctx context.Context, req llm.Invoke
 				if id := strings.TrimSpace(e.ResponseID); id != "" {
 					responseID = id
 				}
+			case llm.StreamRetryEvent:
+				msg := strings.TrimSpace(e.Message)
+				if msg == "" {
+					msg = "provider request was rate limited"
+				}
+				if e.Attempt > 0 && e.MaxRetries > 0 {
+					msg = fmt.Sprintf("%s; retry %d/%d", msg, e.Attempt, e.MaxRetries)
+				}
+				if e.RetryAfter > 0 {
+					msg = fmt.Sprintf("%s in %s", msg, e.RetryAfter.Round(time.Second))
+				}
+				a.emitEvent(out, WarnEvent{Kind: "rate_limit_retry", Message: msg})
 			case llm.StreamErrorEvent:
 				return e.AsError()
 			case llm.StreamDoneEvent:
