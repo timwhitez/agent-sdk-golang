@@ -306,3 +306,55 @@ func TestQueryStreamBackpressureBlocksUntilErrorEventIsConsumed(t *testing.T) {
 		}
 	}
 }
+
+type diagnosticCompletionModel struct{}
+
+func (m *diagnosticCompletionModel) Provider() string { return "stub" }
+func (m *diagnosticCompletionModel) Model() string    { return "stub" }
+func (m *diagnosticCompletionModel) Invoke(_ context.Context, _ llm.InvokeRequest) (*llm.Completion, error) {
+	return &llm.Completion{
+		Content: llm.TextContent("done"),
+		Diagnostics: []llm.Diagnostic{
+			{Kind: "provider_compatibility_downgrade", Message: "retrying without unsupported option"},
+			{Message: "diagnostic without kind"},
+			{Kind: "empty", Message: "   "},
+		},
+	}, nil
+}
+
+func TestQueryStreamEmitsCompletionDiagnosticsAsWarnings(t *testing.T) {
+	ag, err := New(Config{LLM: &diagnosticCompletionModel{}})
+	if err != nil {
+		t.Fatalf("new agent: %v", err)
+	}
+
+	events := ag.QueryStream(context.Background(), llm.TextContent("hi"))
+	warnings := []WarnEvent{}
+	finalSeen := false
+	for ev := range events {
+		switch e := ev.(type) {
+		case WarnEvent:
+			warnings = append(warnings, e)
+		case FinalResponseEvent:
+			finalSeen = true
+		}
+	}
+	if !finalSeen {
+		t.Fatal("expected final response")
+	}
+	if len(warnings) != 2 {
+		t.Fatalf("warning count = %d, want 2 (%#v)", len(warnings), warnings)
+	}
+	if warnings[0].Kind != "provider_compatibility_downgrade" || !strings.Contains(warnings[0].Message, "unsupported option") {
+		t.Fatalf("unexpected first warning: %#v", warnings[0])
+	}
+	if warnings[1].Kind != "provider_diagnostic" || warnings[1].Message != "diagnostic without kind" {
+		t.Fatalf("unexpected default-kind warning: %#v", warnings[1])
+	}
+}
+
+func TestTerminalEventPriorityKeepsErrorsAboveFinalResponses(t *testing.T) {
+	if terminalEventPriority(ErrorEvent{}) <= terminalEventPriority(FinalResponseEvent{}) {
+		t.Fatalf("ErrorEvent priority should be higher than FinalResponseEvent")
+	}
+}

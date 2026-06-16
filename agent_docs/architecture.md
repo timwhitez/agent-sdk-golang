@@ -54,6 +54,14 @@ Entry point: `QueryStreamWithSteering` (`sdk/agent/agent.go:197`).
      assistant message before injecting the loop-break user reminder. This keeps
      OpenAI-style assistant tool-call/tool-result history contiguous even when
      execution is intentionally skipped.
+   - The loop guard is non-fatal. When repeated-signature strikes reach
+     `LoopGuardStrikeThreshold` the guard *retreats*: it emits a `loop_guard`
+     warning, disables itself, and lets subsequent tool calls execute, rather
+     than aborting the run with a `doom_loop` error. This mirrors Codex's turn
+     loop, which has no repeated-call abort and converges via
+     iteration/idle/auto-compaction/cancellation. Aborting here previously
+     killed legitimate long turns that re-read a file after context compaction
+     evicted the earlier result.
    - References: `sdk/agent/agent.go:340`, `sdk/agent/agent.go:382`, `sdk/agent/agent.go:396`, `sdk/agent/agent.go:440`, `sdk/agent/agent.go:380`, `sdk/agent/agent.go:387`, `sdk/agent/agent.go:445`, `sdk/agent/agent.go:446`
 
 9. **Boundary B: apply steering after each tool execution**

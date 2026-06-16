@@ -463,7 +463,7 @@ func TestRepeatToolSignatureGuardInjectsReminderAndContinuesUntilDone(t *testing
 	}
 }
 
-func TestRepeatToolSignatureGuardAbortsAfterStrikeThreshold(t *testing.T) {
+func TestRepeatToolSignatureGuardRetreatsAfterStrikeThreshold(t *testing.T) {
 	model := &repeatedSignatureModel{}
 	toolCalls := 0
 	echoTool := tools.Func[struct {
@@ -495,15 +495,20 @@ func TestRepeatToolSignatureGuardAbortsAfterStrikeThreshold(t *testing.T) {
 		t.Fatalf("new agent: %v", err)
 	}
 
+	// When the strike threshold is exhausted the guard retreats (disables
+	// itself) instead of aborting the run, so the model continues and the
+	// done tool is eventually reached. This matches Codex's loop, which has
+	// no repeated-call abort.
 	events := collectEvents(ag.QueryStream(context.Background(), llm.TextContent("loop")))
-	if model.calls != 3 {
-		t.Fatalf("expected doom loop abort before done tool, got %d model calls", model.calls)
+	if model.calls != 4 {
+		t.Fatalf("expected run to continue to done tool after retreat, got %d model calls", model.calls)
 	}
 	if toolCalls != 2 {
-		t.Fatalf("expected only pre-strike tool calls to execute, got %d", toolCalls)
+		t.Fatalf("expected only pre-strike tool calls to execute (strike call is skipped), got %d", toolCalls)
 	}
 
 	doomLoopErrors := 0
+	retreatWarnings := 0
 	final := ""
 	for _, ev := range events {
 		switch e := ev.(type) {
@@ -511,15 +516,22 @@ func TestRepeatToolSignatureGuardAbortsAfterStrikeThreshold(t *testing.T) {
 			if e.Kind == "doom_loop" {
 				doomLoopErrors++
 			}
+		case WarnEvent:
+			if e.Kind == "loop_guard" && strings.Contains(e.Message, "protection exhausted") {
+				retreatWarnings++
+			}
 		case FinalResponseEvent:
 			final = e.Content
 		}
 	}
-	if doomLoopErrors != 1 {
-		t.Fatalf("expected one doom_loop error, got %d", doomLoopErrors)
+	if doomLoopErrors != 0 {
+		t.Fatalf("expected no doom_loop error after retreat, got %d", doomLoopErrors)
 	}
-	if strings.TrimSpace(final) != doomLoopFinalResponse {
-		t.Fatalf("expected doom loop final response %q, got %q", doomLoopFinalResponse, final)
+	if retreatWarnings != 1 {
+		t.Fatalf("expected one loop_guard retreat warning, got %d", retreatWarnings)
+	}
+	if strings.TrimSpace(final) != "finished" {
+		t.Fatalf("expected done tool final response %q, got %q", "finished", final)
 	}
 }
 
@@ -555,15 +567,19 @@ func TestRepeatToolSignatureGuardStrikePersistsAcrossInterveningTurns(t *testing
 		t.Fatalf("new agent: %v", err)
 	}
 
+	// Strikes persist across intervening turns until the threshold is
+	// exhausted, at which point the guard retreats and the run continues to
+	// the done tool instead of aborting.
 	events := collectEvents(ag.QueryStream(context.Background(), llm.TextContent("loop")))
-	if model.calls != 7 {
-		t.Fatalf("expected second strike to abort before done call, got model calls=%d", model.calls)
+	if model.calls != 8 {
+		t.Fatalf("expected run to continue to done call after retreat, got model calls=%d", model.calls)
 	}
 	if toolCalls != 5 {
-		t.Fatalf("expected 5 executed echo calls before abort, got %d", toolCalls)
+		t.Fatalf("expected 5 executed echo calls before retreat, got %d", toolCalls)
 	}
 
 	doomLoopErrors := 0
+	retreatWarnings := 0
 	final := ""
 	for _, ev := range events {
 		switch e := ev.(type) {
@@ -571,15 +587,22 @@ func TestRepeatToolSignatureGuardStrikePersistsAcrossInterveningTurns(t *testing
 			if e.Kind == "doom_loop" {
 				doomLoopErrors++
 			}
+		case WarnEvent:
+			if e.Kind == "loop_guard" && strings.Contains(e.Message, "protection exhausted") {
+				retreatWarnings++
+			}
 		case FinalResponseEvent:
 			final = e.Content
 		}
 	}
-	if doomLoopErrors != 1 {
-		t.Fatalf("expected one doom_loop error, got %d", doomLoopErrors)
+	if doomLoopErrors != 0 {
+		t.Fatalf("expected no doom_loop error after retreat, got %d", doomLoopErrors)
 	}
-	if strings.TrimSpace(final) != doomLoopFinalResponse {
-		t.Fatalf("expected doom loop final response %q, got %q", doomLoopFinalResponse, final)
+	if retreatWarnings != 1 {
+		t.Fatalf("expected one loop_guard retreat warning, got %d", retreatWarnings)
+	}
+	if strings.TrimSpace(final) != "finished" {
+		t.Fatalf("expected done tool final response %q, got %q", "finished", final)
 	}
 }
 

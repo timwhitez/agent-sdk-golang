@@ -363,6 +363,33 @@ func TestSerializeMessagesKeepsNonCachedSystemTextWithCachedBlocks(t *testing.T)
 	}
 }
 
+func TestBuildRequestSerializesImageURLBlocks(t *testing.T) {
+	client := &Client{ModelName: "claude-test"}
+	req := llm.InvokeRequest{Messages: []llm.Message{{
+		Role: llm.RoleUser,
+		Content: llm.Content{Blocks: []llm.ContentBlock{
+			{Type: "image_url", ImageURL: &llm.ImageURL{URL: "https://example.com/image.png"}},
+			{Type: "image_url", ImageURL: &llm.ImageURL{URL: "data:image/png;base64,abc123"}},
+		}},
+	}}}
+
+	payload, err := client.buildRequest(req, nil)
+	if err != nil {
+		t.Fatalf("buildRequest: %v", err)
+	}
+	if len(payload.Messages) != 1 || len(payload.Messages[0].Content) != 2 {
+		t.Fatalf("unexpected messages: %#v", payload.Messages)
+	}
+	urlBlock := payload.Messages[0].Content[0]
+	if urlBlock.Type != "image" || urlBlock.Source == nil || urlBlock.Source.Type != "url" || urlBlock.Source.URL != "https://example.com/image.png" {
+		t.Fatalf("unexpected URL image block: %#v", urlBlock)
+	}
+	dataBlock := payload.Messages[0].Content[1]
+	if dataBlock.Type != "image" || dataBlock.Source == nil || dataBlock.Source.Type != "base64" || dataBlock.Source.MediaType != "image/png" || dataBlock.Source.Data != "abc123" {
+		t.Fatalf("unexpected data URL image block: %#v", dataBlock)
+	}
+}
+
 func TestClientBetaDowngradeDoesNotMutateConfig(t *testing.T) {
 	t.Parallel()
 	calls := 0
@@ -393,8 +420,12 @@ func TestClientBetaDowngradeDoesNotMutateConfig(t *testing.T) {
 	req := llm.InvokeRequest{
 		Messages: []llm.Message{{Role: llm.RoleUser, Content: llm.TextContent("hi")}},
 	}
-	if _, err := client.Invoke(context.Background(), req); err != nil {
+	comp, err := client.Invoke(context.Background(), req)
+	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(comp.Diagnostics) != 1 || comp.Diagnostics[0].Kind != "provider_compatibility_downgrade" || !strings.Contains(comp.Diagnostics[0].Message, "beta headers") {
+		t.Fatalf("unexpected diagnostics: %#v", comp.Diagnostics)
 	}
 	if calls != 2 {
 		t.Fatalf("expected 2 attempts, got %d", calls)
@@ -477,8 +508,12 @@ func TestClientThinkingDowngradeDoesNotMutateConfig(t *testing.T) {
 	req := llm.InvokeRequest{
 		Messages: []llm.Message{{Role: llm.RoleUser, Content: llm.TextContent("hi")}},
 	}
-	if _, err := client.Invoke(context.Background(), req); err != nil {
+	comp, err := client.Invoke(context.Background(), req)
+	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(comp.Diagnostics) != 1 || comp.Diagnostics[0].Kind != "provider_compatibility_downgrade" || !strings.Contains(comp.Diagnostics[0].Message, "extended thinking") {
+		t.Fatalf("unexpected diagnostics: %#v", comp.Diagnostics)
 	}
 	if calls != 2 {
 		t.Fatalf("expected 2 attempts, got %d", calls)

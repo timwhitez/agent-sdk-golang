@@ -1356,6 +1356,52 @@ func TestChatInvokeAppliesAllCompatDowngradesBeforeSingleRetry(t *testing.T) {
 	if attempt != 2 {
 		t.Fatalf("attempts = %d, want 2", attempt)
 	}
+	if len(comp.Diagnostics) != 3 {
+		t.Fatalf("diagnostics = %#v, want three compatibility downgrade warnings", comp.Diagnostics)
+	}
+	for _, diag := range comp.Diagnostics {
+		if diag.Kind != "provider_compatibility_downgrade" || !strings.Contains(diag.Message, "retrying without") {
+			t.Fatalf("unexpected diagnostic: %#v", diag)
+		}
+	}
+}
+
+func TestResponsesInvokeIncludesCompatibilityDowngradeDiagnostics(t *testing.T) {
+	attempt := 0
+	httpClient := &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		attempt++
+		body, _ := io.ReadAll(r.Body)
+		bodyText := string(body)
+		status := http.StatusOK
+		respBody := `{"id":"resp_ok","status":"completed","output_text":"ok"}`
+		if attempt == 1 {
+			status = http.StatusBadRequest
+			respBody = `unknown field reasoning_effort extra_body; unsupported thinking; MissingParameter input.content`
+		} else if strings.Contains(bodyText, "reasoning_effort") || strings.Contains(bodyText, "extra_body") || strings.Contains(bodyText, "enable_thinking") || strings.Contains(bodyText, `"thinking"`) || strings.Contains(bodyText, `"content":[`) {
+			status = http.StatusBadRequest
+			respBody = `still unsupported`
+		}
+		return &http.Response{StatusCode: status, Status: fmt.Sprintf("%d %s", status, http.StatusText(status)), Header: make(http.Header), Body: io.NopCloser(strings.NewReader(respBody)), Request: r}, nil
+	})}
+	client := &ResponsesClient{HTTPClient: httpClient, BaseURL: "https://example.com", ModelName: "test-model", MaxRetries: 2, ReasoningEffort: "medium", Extra: map[string]any{"thinking": true}, ExtraBody: map[string]any{"enable_thinking": true}}
+	comp, err := client.Invoke(context.Background(), llm.InvokeRequest{Messages: []llm.Message{{Role: llm.RoleUser, Content: llm.Content{Blocks: []llm.ContentBlock{{Type: "text", Text: "hi"}}}}}})
+	if err != nil {
+		t.Fatalf("Invoke: %v", err)
+	}
+	if comp.PlainText() != "ok" {
+		t.Fatalf("content = %q, want ok", comp.PlainText())
+	}
+	if attempt != 2 {
+		t.Fatalf("attempts = %d, want 2", attempt)
+	}
+	if len(comp.Diagnostics) != 5 {
+		t.Fatalf("diagnostics = %#v, want five compatibility downgrade warnings", comp.Diagnostics)
+	}
+	for _, diag := range comp.Diagnostics {
+		if diag.Kind != "provider_compatibility_downgrade" || !strings.Contains(diag.Message, "retrying") {
+			t.Fatalf("unexpected diagnostic: %#v", diag)
+		}
+	}
 }
 
 func TestChatStreamAppliesAllCompatDowngradesBeforeSingleRetry(t *testing.T) {

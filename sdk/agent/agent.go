@@ -65,7 +65,16 @@ type Config struct {
 	// EventDropLogEvery controls backpressure drop log frequency.
 	// Values <= 0 use a safe default.
 	EventDropLogEvery int
-	ToolChoice        llm.ToolChoice
+	// StreamIdleTimeout bounds how long a streaming response may go without any
+	// event before it is treated as stalled (and auto-recovered). Values <= 0
+	// use the package default (75s). Use a larger value for long single-step
+	// reasoning that can legitimately stay silent for extended periods.
+	StreamIdleTimeout time.Duration
+	// StreamIdleMaxRecoveries caps how many times a stalled stream is
+	// auto-recovered before surfacing an idle-timeout error. Values < 0 use the
+	// package default; 0 disables auto-recovery.
+	StreamIdleMaxRecoveries int
+	ToolChoice              llm.ToolChoice
 
 	Compaction *compaction.Config
 
@@ -89,6 +98,8 @@ type Agent struct {
 	eventBufferSize    int
 	eventSendTimeout   time.Duration
 	eventDropLogEvery  uint64
+	streamIdleTimeout  time.Duration
+	streamIdleMaxRecov int
 	toolChoice         llm.ToolChoice
 	requireDone        bool
 	hasCompactor       bool
@@ -154,7 +165,6 @@ const (
 	maxInvokeRetryDelay            = 2 * time.Second
 	requireDoneReminderText        = "Task completion must use the done tool. If the task is complete, call done with a concise completion message. Do not end with text-only completion claims."
 	defaultLoopGuardUserMsg        = "You are repeating the same tool call with identical arguments. Stop repeating, reuse prior results, adjust arguments, or call done if the task is complete."
-	doomLoopFinalResponse          = "[Loop guard stopped repeated tool loop]"
 	earlyStopReminderText          = "You already used tools in this run. Before stopping, verify the task is complete and call done with a concise completion message."
 	streamIdleRecoveryText         = "The previous response stream stalled before completion. Continue from the current conversation state. Do not repeat completed tool calls unless needed. If you were mid-analysis or mid-sentence, continue exactly where you left off. If enough information is already available, complete the task."
 )
@@ -167,7 +177,10 @@ func New(cfg Config) (*Agent, error) {
 	if cfg.LLM == nil {
 		return nil, fmt.Errorf("agent: LLM is required")
 	}
-	if cfg.MaxIterations <= 0 {
+	// A negative MaxIterations means "unlimited" (no per-turn iteration cap);
+	// the loop is then bounded only by tool-loop guards, idle detection, and
+	// context cancellation. Zero falls back to the conservative default.
+	if cfg.MaxIterations == 0 {
 		cfg.MaxIterations = 200
 	}
 	if cfg.InvokeRetryMaxAttempts <= 0 {
@@ -211,6 +224,12 @@ func New(cfg Config) (*Agent, error) {
 	if cfg.EventDropLogEvery <= 0 {
 		cfg.EventDropLogEvery = defaultEventDropLogEvery
 	}
+	if cfg.StreamIdleTimeout <= 0 {
+		cfg.StreamIdleTimeout = agentStreamIdleTimeout
+	}
+	if cfg.StreamIdleMaxRecoveries < 0 {
+		cfg.StreamIdleMaxRecoveries = agentStreamIdleMaxRecoveries
+	}
 	if cfg.Deps == nil {
 		cfg.Deps = tools.NewContainer()
 	}
@@ -244,6 +263,8 @@ func New(cfg Config) (*Agent, error) {
 		eventBufferSize:    cfg.EventBufferSize,
 		eventSendTimeout:   cfg.EventSendTimeout,
 		eventDropLogEvery:  uint64(cfg.EventDropLogEvery),
+		streamIdleTimeout:  cfg.StreamIdleTimeout,
+		streamIdleMaxRecov: cfg.StreamIdleMaxRecoveries,
 		toolChoice:         cfg.ToolChoice,
 		requireDone:        cfg.RequireDoneTool,
 		hasCompactor:       hasCompactor,
@@ -385,7 +406,10 @@ func (a *Agent) QueryStreamWithSteering(ctx context.Context, input llm.Content, 
 			a.emitEvent(out, e)
 		}
 
-		for iter := 0; iter < a.maxIterations; iter++ {
+		// maxIterations < 0 means unlimited: the loop is then bounded only by
+		// tool-loop guards, idle detection, and context cancellation.
+		unlimitedIter := a.maxIterations < 0
+		for iter := 0; unlimitedIter || iter < a.maxIterations; iter++ {
 			a.applyPendingCompaction(out)
 
 			// *** Boundary-aware steering: check for new user messages before each LLM call ***
@@ -433,7 +457,11 @@ func (a *Agent) QueryStreamWithSteering(ctx context.Context, input llm.Content, 
 
 				var idleErr *llm.StreamIdleTimeoutError
 				if errors.As(err, &idleErr) {
-					if streamIdleRecoveries < agentStreamIdleMaxRecoveries {
+					maxRecov := agentStreamIdleMaxRecoveries
+					if a != nil && a.streamIdleMaxRecov > 0 {
+						maxRecov = a.streamIdleMaxRecov
+					}
+					if streamIdleRecoveries < maxRecov {
 						streamIdleRecoveries++
 						streamIdleRecoveryTotal++
 						if comp != nil && !comp.Content.IsEmpty() {
@@ -451,7 +479,7 @@ func (a *Agent) QueryStreamWithSteering(ctx context.Context, input llm.Content, 
 							"warning: response stream idle-timed out after %s; auto-recovering (%d/%d)",
 							idleErr.Duration,
 							streamIdleRecoveries,
-							agentStreamIdleMaxRecoveries,
+							maxRecov,
 						)
 						continue
 					}
@@ -477,6 +505,17 @@ func (a *Agent) QueryStreamWithSteering(ctx context.Context, input llm.Content, 
 				lastResponseID = responseID
 			}
 			comp.ToolCalls = ensureSyntheticToolCallIDs(comp.ToolCalls)
+
+			for _, diag := range comp.Diagnostics {
+				if strings.TrimSpace(diag.Message) == "" {
+					continue
+				}
+				kind := strings.TrimSpace(diag.Kind)
+				if kind == "" {
+					kind = "provider_diagnostic"
+				}
+				a.emitEvent(out, WarnEvent{Kind: kind, Message: strings.TrimSpace(diag.Message)})
+			}
 
 			if comp.Usage != nil {
 				a.emitEvent(out, UsageEvent{Usage: *comp.Usage, ResponseID: responseID})
@@ -753,14 +792,22 @@ func (a *Agent) QueryStreamWithSteering(ctx context.Context, input llm.Content, 
 						})
 						repeatGuard.reset()
 						if a.loopGuardStrikeMax > 0 && loopGuardStrikes >= a.loopGuardStrikeMax {
-							msg := fmt.Sprintf("detected repeated tool-call loop after %d strike(s); aborting run", loopGuardStrikes)
-							emitErr(ErrorEvent{
-								Provider: a.llm.Provider(),
-								Message:  msg,
-								Kind:     "doom_loop",
+							// Repeat protection is exhausted. Rather than aborting
+							// the whole run (which kills legitimate work — e.g. a
+							// long research turn that re-reads a file after context
+							// compaction evicted the earlier result), retreat:
+							// disable the guard and let subsequent tool calls
+							// execute. The run is then bounded only by
+							// iteration/idle/compaction/cancel, matching Codex's
+							// loop, which has no repeated-call abort.
+							a.emitEvent(out, WarnEvent{
+								Message: fmt.Sprintf(
+									"repeated tool-call loop protection exhausted after %d strike(s); disabling repeat guard and allowing tool execution to proceed",
+									loopGuardStrikes,
+								),
+								Kind: "loop_guard",
 							})
-							emitFinal(doomLoopFinalResponse, responseID)
-							return
+							repeatGuard = nil
 						}
 						break
 					}
@@ -851,6 +898,7 @@ func (a *Agent) QueryStreamWithSteering(ctx context.Context, input llm.Content, 
 		}
 
 		// Max iterations reached — emit both error and final events.
+		// Unreachable when maxIterations < 0 (unlimited).
 		msg := fmt.Sprintf("Max iterations reached (%d)", a.maxIterations)
 		emitErr(ErrorEvent{Provider: a.llm.Provider(), Message: msg, Kind: "max_iterations"})
 		emitFinal(fmt.Sprintf("[Max iterations reached] %d", a.maxIterations), lastResponseID)
@@ -1295,6 +1343,9 @@ func (a *Agent) invokeCompletionWithSteering(ctx context.Context, req llm.Invoke
 			return nil
 		}
 		idleTimeout := agentStreamIdleTimeout
+		if a != nil && a.streamIdleTimeout > 0 {
+			idleTimeout = a.streamIdleTimeout
+		}
 		var idleTimer *time.Timer
 		var idleC <-chan time.Time
 		if idleTimeout > 0 {
@@ -1628,10 +1679,10 @@ func (a *Agent) tryEnqueueTerminalEvent(out chan Event, ev Event) bool {
 
 func terminalEventPriority(ev Event) int {
 	switch ev.(type) {
+	case ErrorEvent:
+		return 3
 	case FinalResponseEvent:
 		return 2
-	case ErrorEvent:
-		return 1
 	default:
 		return 0
 	}

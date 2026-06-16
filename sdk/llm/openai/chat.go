@@ -67,6 +67,7 @@ func (c *ChatClient) Invoke(ctx context.Context, req llm.InvokeRequest) (*llm.Co
 	lastErr := error(nil)
 
 	retry := resolveRetryPolicy(local.MaxRetries, local.RetryBaseDelay, local.RetryMaxDelay)
+	diagnostics := []llm.Diagnostic{}
 
 	for attempt := 0; attempt < retry.maxRetries; attempt++ {
 		if err := ctx.Err(); err != nil {
@@ -99,7 +100,12 @@ func (c *ChatClient) Invoke(ctx context.Context, req llm.InvokeRequest) (*llm.Co
 			}
 
 			if resp.StatusCode >= 200 && resp.StatusCode < 300 {
-				return parseChatCompletion(data)
+				comp, err := parseChatCompletion(data)
+				if err != nil {
+					return nil, err
+				}
+				comp.Diagnostics = append(comp.Diagnostics, diagnostics...)
+				return comp, nil
 			}
 
 			retryAfter := parseRetryAfter(resp.Header.Get("Retry-After"))
@@ -116,13 +122,16 @@ func (c *ChatClient) Invoke(ctx context.Context, req llm.InvokeRequest) (*llm.Co
 				if strings.TrimSpace(local.ReasoningEffort) != "" && looksLikeReasoningUnsupported(msg) {
 					local.ReasoningEffort = ""
 					compatChanged = true
+					diagnostics = append(diagnostics, llm.Diagnostic{Kind: "provider_compatibility_downgrade", Message: "OpenAI chat provider rejected reasoning_effort; retrying without reasoning_effort."})
 				}
 				if local.ExtraBody != nil && looksLikeExtraBodyUnsupported(msg) {
 					local.ExtraBody = nil
 					compatChanged = true
+					diagnostics = append(diagnostics, llm.Diagnostic{Kind: "provider_compatibility_downgrade", Message: "OpenAI chat provider rejected extra request body settings; retrying without extra_body."})
 				}
 				if hasThinkingExtra(local.Extra, local.ExtraBody) && looksLikeThinkingUnsupported(msg) && dropThinkingExtra(local.Extra, local.ExtraBody) {
 					compatChanged = true
+					diagnostics = append(diagnostics, llm.Diagnostic{Kind: "provider_compatibility_downgrade", Message: "OpenAI chat provider rejected thinking settings; retrying without thinking extras."})
 				}
 			}
 			if compatChanged && attempt < retry.maxRetries-1 {

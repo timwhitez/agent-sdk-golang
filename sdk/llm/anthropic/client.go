@@ -80,6 +80,7 @@ func (c *Client) Invoke(ctx context.Context, req llm.InvokeRequest) (*llm.Comple
 	localBeta := append([]string(nil), c.Beta...)
 	localThinking := c.ThinkingBudgetTokens
 	usedFinalDowngradeRetry := false
+	diagnostics := []llm.Diagnostic{}
 
 	for attempt := 0; attempt < maxRetries+1; attempt++ {
 		if err := ctx.Err(); err != nil {
@@ -120,7 +121,12 @@ func (c *Client) Invoke(ctx context.Context, req llm.InvokeRequest) (*llm.Comple
 			}
 
 			if resp.StatusCode >= 200 && resp.StatusCode < 300 {
-				return parseResponse(data)
+				comp, err := parseResponse(data)
+				if err != nil {
+					return nil, err
+				}
+				comp.Diagnostics = append(comp.Diagnostics, diagnostics...)
+				return comp, nil
 			}
 
 			retryAfter := parseRetryAfter(resp.Header.Get("Retry-After"))
@@ -131,12 +137,14 @@ func (c *Client) Invoke(ctx context.Context, req llm.InvokeRequest) (*llm.Comple
 			if (resp.StatusCode == 400 || resp.StatusCode == 422) && betaHeader != "" && looksLikeBetaUnsupported(msg) {
 				if setPromptCachingBeta(&localBeta) {
 					didDowngrade = true
+					diagnostics = append(diagnostics, llm.Diagnostic{Kind: "provider_compatibility_downgrade", Message: "Anthropic provider rejected beta headers; retrying with prompt-caching beta compatibility."})
 				}
 			}
 			// Automatic downgrade: disable extended thinking on models/endpoints that don't support it.
 			if (resp.StatusCode == 400 || resp.StatusCode == 422) && localThinking != nil && *localThinking > 0 && looksLikeThinkingUnsupported(msg) {
 				localThinking = nil
 				didDowngrade = true
+				diagnostics = append(diagnostics, llm.Diagnostic{Kind: "provider_compatibility_downgrade", Message: "Anthropic provider rejected extended thinking; retrying without thinking budget."})
 			}
 			if didDowngrade && allowDowngradeRetry(attempt, maxRetries, &usedFinalDowngradeRetry) {
 				continue
@@ -499,7 +507,8 @@ type toolChoiceParam struct {
 type contentBlockParam struct {
 	Type string `json:"type"`
 
-	Text string `json:"text,omitempty"`
+	Text   string              `json:"text,omitempty"`
+	Source *contentSourceParam `json:"source,omitempty"`
 
 	// tool_use
 	ID    string `json:"id,omitempty"`
@@ -517,6 +526,13 @@ type contentBlockParam struct {
 	Data      string `json:"data,omitempty"`
 
 	CacheCtrl *cacheControl `json:"cache_control,omitempty"`
+}
+
+type contentSourceParam struct {
+	Type      string `json:"type"`
+	URL       string `json:"url,omitempty"`
+	MediaType string `json:"media_type,omitempty"`
+	Data      string `json:"data,omitempty"`
 }
 
 type messageParam struct {
@@ -1160,6 +1176,22 @@ func toAnthropicBlock(b llm.ContentBlock, inheritCache bool) contentBlockParam {
 	switch b.Type {
 	case "text":
 		blk.Text = b.Text
+	case "image_url":
+		if b.ImageURL != nil {
+			if mediaType, data, ok := parseImageDataURL(b.ImageURL.URL); ok {
+				blk.Type = "image"
+				blk.Source = &contentSourceParam{Type: "base64", MediaType: mediaType, Data: data}
+			} else if url := strings.TrimSpace(b.ImageURL.URL); url != "" {
+				blk.Type = "image"
+				blk.Source = &contentSourceParam{Type: "url", URL: url}
+			} else {
+				blk.Type = "text"
+				blk.Text = "(unsupported image content omitted: empty image_url)"
+			}
+		} else {
+			blk.Type = "text"
+			blk.Text = "(unsupported image content omitted: missing image_url)"
+		}
 	case "thinking":
 		blk.Thinking = b.Thinking
 		blk.Signature = b.Signature
@@ -1171,6 +1203,32 @@ func toAnthropicBlock(b llm.ContentBlock, inheritCache bool) contentBlockParam {
 		blk.Text = "(unsupported content omitted)"
 	}
 	return blk
+}
+
+func parseImageDataURL(raw string) (mediaType string, data string, ok bool) {
+	raw = strings.TrimSpace(raw)
+	if !strings.HasPrefix(raw, "data:") {
+		return "", "", false
+	}
+	head, body, found := strings.Cut(raw[len("data:"):], ",")
+	if !found || strings.TrimSpace(body) == "" {
+		return "", "", false
+	}
+	parts := strings.Split(head, ";")
+	if len(parts) == 0 || !strings.HasPrefix(strings.ToLower(strings.TrimSpace(parts[0])), "image/") {
+		return "", "", false
+	}
+	hasBase64 := false
+	for _, part := range parts[1:] {
+		if strings.EqualFold(strings.TrimSpace(part), "base64") {
+			hasBase64 = true
+			break
+		}
+	}
+	if !hasBase64 {
+		return "", "", false
+	}
+	return strings.TrimSpace(parts[0]), strings.TrimSpace(body), true
 }
 
 // anthropicEndpoint builds an endpoint URL for the Anthropic Messages API.

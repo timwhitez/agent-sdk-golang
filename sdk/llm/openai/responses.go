@@ -66,6 +66,7 @@ func (c *ResponsesClient) Invoke(ctx context.Context, req llm.InvokeRequest) (*l
 	lastErr := error(nil)
 
 	retry := resolveRetryPolicy(local.MaxRetries, local.RetryBaseDelay, local.RetryMaxDelay)
+	diagnostics := []llm.Diagnostic{}
 
 	autoCompat := shouldAutoCompat(req)
 	compatStage := responsesCompatFull
@@ -105,7 +106,12 @@ func (c *ResponsesClient) Invoke(ctx context.Context, req llm.InvokeRequest) (*l
 			}
 
 			if resp.StatusCode >= 200 && resp.StatusCode < 300 {
-				return parseResponses(data)
+				comp, err := parseResponses(data)
+				if err != nil {
+					return nil, err
+				}
+				comp.Diagnostics = append(comp.Diagnostics, diagnostics...)
+				return comp, nil
 			}
 
 			retryAfter := parseRetryAfter(resp.Header.Get("Retry-After"))
@@ -122,21 +128,26 @@ func (c *ResponsesClient) Invoke(ctx context.Context, req llm.InvokeRequest) (*l
 				if strings.TrimSpace(local.ReasoningEffort) != "" && looksLikeReasoningUnsupported(msg) {
 					local.ReasoningEffort = ""
 					compatChanged = true
+					diagnostics = append(diagnostics, llm.Diagnostic{Kind: "provider_compatibility_downgrade", Message: "OpenAI Responses provider rejected reasoning_effort; retrying without reasoning_effort."})
 				}
 				if local.ExtraBody != nil && looksLikeExtraBodyUnsupported(msg) {
 					local.ExtraBody = nil
 					compatChanged = true
+					diagnostics = append(diagnostics, llm.Diagnostic{Kind: "provider_compatibility_downgrade", Message: "OpenAI Responses provider rejected extra request body settings; retrying without extra_body."})
 				}
 				if hasThinkingExtra(local.Extra, local.ExtraBody) && looksLikeThinkingUnsupported(msg) && dropThinkingExtra(local.Extra, local.ExtraBody) {
 					compatChanged = true
+					diagnostics = append(diagnostics, llm.Diagnostic{Kind: "provider_compatibility_downgrade", Message: "OpenAI Responses provider rejected thinking settings; retrying without thinking extras."})
 				}
 				if strings.Contains(msg, "MissingParameter") && strings.Contains(msg, "input.content") {
 					local.ForceStringInput = true
 					compatChanged = true
+					diagnostics = append(diagnostics, llm.Diagnostic{Kind: "provider_compatibility_downgrade", Message: "OpenAI Responses provider rejected content-array input; retrying with string input compatibility mode."})
 				}
 				if autoCompat && compatStage == responsesCompatFull && looksLikeResponsesInputUnsupported(msg) {
 					compatStage = responsesCompatLegacy
 					compatChanged = true
+					diagnostics = append(diagnostics, llm.Diagnostic{Kind: "provider_compatibility_downgrade", Message: "OpenAI Responses provider rejected Responses-style input; retrying with legacy chat-compatible input."})
 				}
 			}
 			if compatChanged && attempt < retry.maxRetries-1 {

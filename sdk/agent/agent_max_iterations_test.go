@@ -51,6 +51,82 @@ func (m *maxIterationsResponseIDModel) Invoke(_ context.Context, _ llm.InvokeReq
 	}, nil
 }
 
+// boundedToolThenDoneModel issues tool calls for the first N turns, then calls
+// done. Used to prove an unlimited (negative MaxIterations) agent keeps looping
+// past the legacy default cap without emitting a max_iterations error.
+type boundedToolThenDoneModel struct {
+	calls    int
+	toolRuns int
+}
+
+func (m *boundedToolThenDoneModel) Provider() string { return "stub" }
+func (m *boundedToolThenDoneModel) Model() string    { return "stub" }
+func (m *boundedToolThenDoneModel) Invoke(_ context.Context, _ llm.InvokeRequest) (*llm.Completion, error) {
+	m.calls++
+	if m.calls <= m.toolRuns {
+		return &llm.Completion{
+			StopReason: "tool_calls",
+			ToolCalls: []llm.ToolCall{
+				{ID: "echo_1", Type: "function", Function: llm.FunctionCall{Name: "echo", Arguments: `{"message":"go"}`}},
+			},
+		}, nil
+	}
+	return &llm.Completion{
+		StopReason: "stop",
+		ToolCalls: []llm.ToolCall{
+			{ID: "done_1", Type: "function", Function: llm.FunctionCall{Name: "done", Arguments: `{"message":"finished"}`}},
+		},
+	}, nil
+}
+
+func TestNegativeMaxIterationsRunsUnbounded(t *testing.T) {
+	echoTool := tools.Func[struct {
+		Message string `json:"message"`
+	}]("echo", "echo", func(_ context.Context, _ struct {
+		Message string `json:"message"`
+	}, _ *tools.Container) (any, error) {
+		return "ok", nil
+	})
+	doneTool := tools.Func[struct {
+		Message string `json:"message"`
+	}]("done", "complete task", func(_ context.Context, args struct {
+		Message string `json:"message"`
+	}, _ *tools.Container) (any, error) {
+		return nil, tools.TaskComplete(args.Message)
+	})
+
+	// 250 tool turns exceeds the legacy default cap of 200.
+	model := &boundedToolThenDoneModel{toolRuns: 250}
+	ag, err := New(Config{
+		LLM:             model,
+		Tools:           []tools.Tool{echoTool, doneTool},
+		MaxIterations:   -1,
+		RequireDoneTool: true,
+	})
+	if err != nil {
+		t.Fatalf("new agent: %v", err)
+	}
+
+	events := collectEvents(ag.QueryStream(context.Background(), llm.TextContent("run")))
+	var final string
+	for _, ev := range events {
+		switch e := ev.(type) {
+		case ErrorEvent:
+			if e.Kind == "max_iterations" {
+				t.Fatalf("unlimited agent should not emit max_iterations, got %#v", e)
+			}
+		case FinalResponseEvent:
+			final = e.Content
+		}
+	}
+	if model.calls != model.toolRuns+1 {
+		t.Fatalf("expected %d model calls, got %d", model.toolRuns+1, model.calls)
+	}
+	if strings.TrimSpace(final) != "finished" {
+		t.Fatalf("expected completion via done tool, got %q", final)
+	}
+}
+
 func TestAgentEmitsErrorOnMaxIterations(t *testing.T) {
 	model := &maxIterationsModel{}
 	ag, err := New(Config{LLM: model, MaxIterations: 1, RequireDoneTool: true})

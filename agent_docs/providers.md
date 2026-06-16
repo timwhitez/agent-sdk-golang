@@ -7,7 +7,7 @@ stream normalization, and response metadata behavior.
 - Provider-neutral interfaces: `ChatModel`, `StreamingChatModel` (`sdk/llm/model.go:8`, `sdk/llm/model.go:17`)
 - Unified request envelope: `InvokeRequest` (messages, tools, tool choice, temperature, responses options) (`sdk/llm/model.go:82`)
 - Unified stream event union: text/thinking/tool-call deltas, usage, done, response metadata, errors (`sdk/llm/model.go:24`, `sdk/llm/model.go:28`, `sdk/llm/model.go:33`, `sdk/llm/model.go:39`, `sdk/llm/model.go:50`, `sdk/llm/model.go:55`, `sdk/llm/model.go:62`, `sdk/llm/model.go:70`)
-- Shared message and completion model: `ToolChoice`, `ToolCall`, `Message`, `Completion`, `Usage` (`sdk/llm/types.go:17`, `sdk/llm/types.go:37`, `sdk/llm/types.go:100`, `sdk/llm/types.go:133`, `sdk/llm/types.go:124`)
+- Shared message and completion model: `ToolChoice`, `ToolCall`, `Message`, `Completion`, `Usage` (`sdk/llm/types.go:17`, `sdk/llm/types.go:37`, `sdk/llm/types.go:100`, `sdk/llm/types.go:133`, `sdk/llm/types.go:124`). `Completion.Diagnostics` carries non-fatal provider diagnostics such as compatibility downgrades.
 
 ## Responses API Option Model
 - `ResponsesOptions` carries response-item/instruction toggles, text formatting, reasoning controls, and behavior flags (`sdk/llm/responses_options.go:23`)
@@ -20,6 +20,9 @@ stream normalization, and response metadata behavior.
 - `ChatClient.ProviderLabel` can override the default `"openai"` provider label;
   `Provider()` and provider/rate-limit errors use the label when set.
 - Compatibility downgrade retries on 400/422 by disabling unsupported fields (`sdk/llm/openai/chat.go:119`, `sdk/llm/openai/chat.go:128`, `sdk/llm/openai/chat.go:134`)
+- Successful downgrade retries append `provider_compatibility_downgrade`
+  diagnostics to the returned `Completion`, so agent surfaces can warn that
+  reasoning/extra/thinking options were not honored.
 - Streaming parser emits normalized text/thinking/tool-call deltas plus usage and stop reason (`sdk/llm/openai/chat.go:285`, `sdk/llm/openai/chat.go:301`, `sdk/llm/openai/chat.go:313`, `sdk/llm/openai/chat.go:316`, `sdk/llm/openai/chat.go:322`)
 - OpenAI Chat + Responses now share one retry policy normalizer (default attempts/base/max) and crypto-random 10% jitter source for backoff timing consistency (`sdk/llm/openai/retry_policy.go:9`, `sdk/llm/openai/chat.go:64`, `sdk/llm/openai/responses.go:62`). The default provider retryable status set is 401, 403, 408, 409, 425, 429, and any 5xx status, with explicit per-client override through `RetryableStatusCodes`.
 - Stream decode failures now include provider, HTTP status, model, and endpoint context for easier multi-provider debugging (`sdk/llm/openai/chat.go:296`)
@@ -31,6 +34,8 @@ stream normalization, and response metadata behavior.
 
 ## OpenAI Responses API
 - Compatibility downgrade retries also strip unsupported extras and can force string `input.content` when content parts are rejected (`sdk/llm/openai/responses.go:126`, `sdk/llm/openai/responses.go:133`, `sdk/llm/openai/responses.go:139`, `sdk/llm/openai/responses.go:144`, `sdk/llm/openai/responses.go:151`)
+- Successful downgrade retries append `provider_compatibility_downgrade`
+  diagnostics to the returned `Completion`.
 - `ResponsesClient.ProviderLabel` mirrors Chat behavior so callers can preserve
   transport-specific labels such as `openai-responses` in diagnostics.
 - Request building shares the same local tool-history validation as Chat, preventing orphan `function_call_output` items from being sent.
@@ -42,6 +47,9 @@ stream normalization, and response metadata behavior.
 
 ## Anthropic Messages API
 - Compatibility retries on 400/422 downgrade unsupported beta/thinking options, including one final-attempt retry and structured code/param detection (`sdk/llm/anthropic/client.go:125`, `sdk/llm/anthropic/client.go:135`, `sdk/llm/anthropic/client.go:215`, `sdk/llm/anthropic/client.go:244`, `sdk/llm/anthropic/client.go:621`, `sdk/llm/anthropic/client.go:631`)
+- Successful beta/thinking downgrades append
+  `provider_compatibility_downgrade` diagnostics to the returned
+  `Completion`.
 - Backoff jitter now uses `crypto/rand` with a time-based fallback, avoiding deterministic jitter on older runtimes (`sdk/llm/anthropic/client.go:26`, `sdk/llm/anthropic/client.go:220`). The default retryable status set is 401, 403, 408, 409, 425, 429, and any 5xx status, with explicit per-client override through `RetryableStatusCodes`.
 - Streaming parser maps content-block events into normalized text/thinking/tool deltas, preserves whitespace-only thinking deltas, emits response metadata from `message_start` plus `message_delta/message_stop` fallback IDs, and emits usage on message completion (`sdk/llm/anthropic/client.go:718`, `sdk/llm/anthropic/client.go:739`, `sdk/llm/anthropic/client.go:754`)
 - SSE consumption now buffers malformed premature boundaries and surfaces malformed payload errors instead of silently dropping fragments (`sdk/llm/anthropic/client.go:757`)
@@ -63,6 +71,9 @@ stream normalization, and response metadata behavior.
 - Response-level provider metadata is captured into `Completion.ResponseID` and surfaced to downstream consumers via `UsageEvent` / `AutoContinueEvent` / `FinalResponseEvent` (`sdk/agent/agent.go:255`, `sdk/agent/agent.go:285`, `sdk/agent/agent.go:348`, `sdk/agent/events.go:83`)
 - `StreamRetryEvent` is non-terminal retry progress; the agent converts it to
   `WarnEvent{Kind:"rate_limit_retry"}` and continues consuming the same stream.
+- Completion diagnostics are emitted as `WarnEvent`s. Diagnostics without an
+  explicit kind use `provider_diagnostic`, while compatibility downgrades keep
+  their provider-specific kind for downstream UIs and protocol adapters.
 
 ## Response ID Semantics
 - `Completion.ResponseID` is optional at the shared type level (`sdk/llm/types.go:139`)
