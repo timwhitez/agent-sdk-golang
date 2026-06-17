@@ -73,6 +73,13 @@ func TestWithSummaryPrefix_NoDuplicate(t *testing.T) {
 	}
 }
 
+func TestDefaultConfigUsesFiveMinuteCompactionTimeout(t *testing.T) {
+	cfg := DefaultConfig()
+	if cfg.CompactionTimeout != 300*time.Second {
+		t.Fatalf("default compaction timeout = %s, want 300s", cfg.CompactionTimeout)
+	}
+}
+
 func TestSelectRecentUserMessages_SkipsCompactionSummaryMessage(t *testing.T) {
 	messages := []llm.Message{
 		llm.NewUserMessage("first real question"),

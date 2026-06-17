@@ -21,7 +21,7 @@ const (
 )
 
 const (
-	DefaultCompactionTimeout             = 30 * time.Second
+	DefaultCompactionTimeout             = 300 * time.Second
 	DefaultCompactionRetryBackoff        = 250 * time.Millisecond
 	DefaultMinSummaryCharsForToolContext = 120
 )
