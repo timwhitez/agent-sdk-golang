@@ -254,7 +254,8 @@ func (m *textAutoContinueCompactionModel) Invoke(_ context.Context, req llm.Invo
 
 	if len(req.Messages) > 0 {
 		last := req.Messages[len(req.Messages)-1]
-		if last.Role == llm.RoleUser && last.Content.PlainText() == summaryPrompt {
+		lastText := last.Content.PlainText()
+		if last.Role == llm.RoleUser && strings.Contains(lastText, summaryPrompt) && strings.Contains(lastText, "internal context compaction pipeline") {
 			m.mu.Lock()
 			m.compactionCalls++
 			if doneCh != nil {

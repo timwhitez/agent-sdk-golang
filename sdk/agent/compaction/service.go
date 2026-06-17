@@ -257,7 +257,6 @@ func (s *Service) Compact(ctx context.Context, model llm.ChatModel, messages []l
 	if err != nil {
 		return messages, Result{Compacted: false}, err
 	}
-	prepared := prepareForSummary(messages)
 	modelID := stringsTrim(model.Model())
 	summaryPrompt := DefaultSummaryPrompt
 	if s.summaryPromptFn != nil {
@@ -267,10 +266,7 @@ func (s *Service) Compact(ctx context.Context, model llm.ChatModel, messages []l
 	if keepCount <= 0 {
 		keepCount = DefaultKeepRecentUserMessages
 	}
-	if inc := incrementalSummaryContext(messages, ledger, keepCount); inc != "" {
-		prepared = []llm.Message{llm.NewUserMessage(inc)}
-	}
-	prepared = append(prepared, llm.NewUserMessage(summaryPrompt))
+	prepared := s.buildCompactionRequest(messages, ledger, keepCount, summaryPrompt)
 	invokeCtx := ctx
 	if s.Config.CompactionTimeout > 0 {
 		var cancel context.CancelFunc
@@ -349,6 +345,199 @@ func approximateMessageTokens(messages []llm.Message) int {
 		total += 4
 	}
 	return total
+}
+
+func (s *Service) buildCompactionRequest(messages []llm.Message, ledger *Ledger, keepCount int, summaryPrompt string) []llm.Message {
+	input := s.buildCompactionInput(messages, ledger, keepCount, summaryPrompt)
+	if strings.TrimSpace(input) == "" {
+		input = fallbackSummaryContext + "\n\n" + strings.TrimSpace(summaryPrompt)
+	}
+	return []llm.Message{llm.NewUserMessage(input)}
+}
+
+func (s *Service) buildCompactionInput(messages []llm.Message, ledger *Ledger, keepCount int, summaryPrompt string) string {
+	var b strings.Builder
+	b.WriteString("You are running Goode's internal context compaction pipeline. This is not a user conversation turn. Summarize only the compacted material below and return one updated summary in <summary></summary> tags.\n")
+	if prompt := strings.TrimSpace(summaryPrompt); prompt != "" {
+		b.WriteString("\n## Summary instructions\n")
+		b.WriteString(prompt)
+		b.WriteByte('\n')
+	}
+	if inc := incrementalSummaryContext(messages, ledger, keepCount); inc != "" {
+		b.WriteString("\n## Compact material\n")
+		b.WriteString(inc)
+		return b.String()
+	}
+	material := selectedCompactionMaterial(messages, keepCount, s.protectedTools, s.Config.ToolSnapshotMaxEntries, s.Config.ToolSnapshotMaxChars)
+	if strings.TrimSpace(material) == "" {
+		material = fallbackSummaryContext
+	}
+	b.WriteString("\n## Compact material\n")
+	b.WriteString(material)
+	return b.String()
+}
+
+func selectedCompactionMaterial(messages []llm.Message, keepCount int, protectedTools map[string]struct{}, maxToolEntries int, maxToolChars int) string {
+	var b strings.Builder
+	if system := currentSystemContext(messages); system != "" {
+		b.WriteString("## Current System / Developer Context\n")
+		b.WriteString(system)
+		b.WriteString("\n\n")
+	}
+	if summary := latestCompactionSummaryText(messages); summary != "" {
+		b.WriteString("## Previous Summary\n")
+		b.WriteString(summary)
+		b.WriteString("\n\n")
+	}
+	if users := SelectRecentUserMessages(messages, keepCount); len(users) > 0 {
+		b.WriteString("## Recent User Turns\n")
+		for _, msg := range users {
+			text := truncateCompactionMaterialText(msg.Content.PlainText(), 1600)
+			if text == "" {
+				continue
+			}
+			b.WriteString("- ")
+			b.WriteString(text)
+			b.WriteByte('\n')
+		}
+		b.WriteByte('\n')
+	}
+	if delta := selectedKeyEvents(messages, keepCount); strings.TrimSpace(delta) != "" {
+		b.WriteString("## Key Non-Retained Events\n")
+		b.WriteString(delta)
+		b.WriteString("\n\n")
+	}
+	if toolCtx := toolContextSnapshot(messages, protectedTools, maxToolEntries, maxToolChars); toolCtx != "" {
+		b.WriteString(toolCtx)
+		b.WriteByte('\n')
+	}
+	return strings.TrimSpace(b.String())
+}
+
+func selectedKeyEvents(messages []llm.Message, keepCount int) string {
+	if len(messages) == 0 {
+		return ""
+	}
+	protectedUsers := recentUserIndexes(messages, 0, keepCount)
+	const maxEvents = 24
+	start := 0
+	if len(messages) > 96 {
+		start = len(messages) - 96
+	}
+	events := make([]string, 0, maxEvents)
+	for i := start; i < len(messages); i++ {
+		if len(events) >= maxEvents {
+			break
+		}
+		msg := messages[i]
+		if msg.Destroyed || isCompactionSummaryMessage(msg) {
+			continue
+		}
+		if _, ok := protectedUsers[i]; ok {
+			continue
+		}
+		line := keyEventLine(msg)
+		if line == "" {
+			continue
+		}
+		events = append(events, line)
+	}
+	return strings.Join(events, "\n")
+}
+
+func keyEventLine(msg llm.Message) string {
+	text := strings.TrimSpace(msg.Content.PlainText())
+	switch msg.Role {
+	case llm.RoleUser:
+		if text == "" || !isImportantCompactionText(text) {
+			return ""
+		}
+		return "- user: " + truncateCompactionMaterialText(text, 800)
+	case llm.RoleTool:
+		if text == "" && strings.TrimSpace(msg.ToolName) == "" {
+			return ""
+		}
+		label := strings.TrimSpace(msg.ToolName)
+		if label == "" {
+			label = "tool"
+		}
+		if msg.IsError {
+			return "- tool error " + label + ": " + truncateCompactionMaterialText(text, 600)
+		}
+	case llm.RoleAssistant:
+		if len(msg.ToolCalls) > 0 {
+			return "- assistant tool calls: " + compactToolCallList(msg.ToolCalls)
+		}
+		if isImportantCompactionText(text) {
+			return "- assistant: " + truncateCompactionMaterialText(text, 600)
+		}
+	}
+	return ""
+}
+
+func compactToolCallList(calls []llm.ToolCall) string {
+	parts := make([]string, 0, len(calls))
+	for _, call := range calls {
+		name := strings.TrimSpace(call.Function.Name)
+		if name == "" {
+			name = "tool"
+		}
+		id := strings.TrimSpace(call.ID)
+		if id != "" {
+			name += "/" + id
+		}
+		parts = append(parts, name)
+	}
+	return strings.Join(parts, ", ")
+}
+
+func isImportantCompactionText(text string) bool {
+	low := strings.ToLower(strings.TrimSpace(text))
+	if low == "" {
+		return false
+	}
+	markers := []string{"error", "failed", "blocked", "todo", "remaining", "commit", "test", "verify", "path", "goal", "request", "/mnt/", "/root/", "/repo/", "c:\\", "http://", "https://"}
+	for _, marker := range markers {
+		if strings.Contains(low, marker) {
+			return true
+		}
+	}
+	return false
+}
+
+func currentSystemContext(messages []llm.Message) string {
+	for i := len(messages) - 1; i >= 0; i-- {
+		msg := messages[i]
+		if msg.Destroyed || msg.Role != llm.RoleSystem {
+			continue
+		}
+		if text := truncateCompactionMaterialText(msg.Content.PlainText(), 2000); text != "" {
+			return text
+		}
+	}
+	return ""
+}
+
+func latestCompactionSummaryText(messages []llm.Message) string {
+	for i := len(messages) - 1; i >= 0; i-- {
+		msg := messages[i]
+		if !isCompactionSummaryMessage(msg) {
+			continue
+		}
+		return truncateCompactionMaterialText(stripSummaryPrefix(msg.Content.PlainText()), 4000)
+	}
+	return ""
+}
+
+func truncateCompactionMaterialText(text string, max int) string {
+	text = strings.TrimSpace(text)
+	if text == "" {
+		return ""
+	}
+	if max <= 0 || len(text) <= max {
+		return text
+	}
+	return strings.TrimSpace(text[:max]) + "..."
 }
 
 func approximateTextTokens(text string) int {

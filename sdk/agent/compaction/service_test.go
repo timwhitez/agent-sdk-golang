@@ -39,6 +39,7 @@ type promptCaptureModel struct {
 	modelID    string
 	response   string
 	lastPrompt string
+	lastRoles  []llm.Role
 }
 
 func (m *promptCaptureModel) Provider() string { return "mock" }
@@ -49,6 +50,10 @@ func (m *promptCaptureModel) Model() string {
 	return m.modelID
 }
 func (m *promptCaptureModel) Invoke(_ context.Context, req llm.InvokeRequest) (*llm.Completion, error) {
+	m.lastRoles = m.lastRoles[:0]
+	for _, msg := range req.Messages {
+		m.lastRoles = append(m.lastRoles, msg.Role)
+	}
 	if n := len(req.Messages); n > 0 {
 		m.lastPrompt = req.Messages[n-1].Content.PlainText()
 	}
@@ -428,6 +433,61 @@ func TestCompact_PopulatesSummaryTelemetry(t *testing.T) {
 	}
 }
 
+func TestCompact_UsesDedicatedCompactionRequestInsteadOfRawHistory(t *testing.T) {
+	model := &promptCaptureModel{response: "<summary>dedicated summary</summary>"}
+	svc := NewService(&Config{
+		Enabled:                true,
+		ContextWindow:          128000,
+		ThresholdRatio:         0.85,
+		SummaryPrompt:          "summarize retained material",
+		KeepRecentUserMessages: 1,
+	})
+
+	messages := []llm.Message{
+		llm.NewSystemMessage("system contract: preserve cwd /repo and tests"),
+		llm.NewUserMessage("old original goal with /repo/main.go"),
+		llm.NewAssistantMessage("I am going to inspect files and then continue", nil),
+		llm.NewToolMessage("call-read", "read", llm.TextContent(strings.Repeat("large raw output ", 200)+"/repo/main.go"), false),
+		llm.NewAssistantMessage("routine narration with no durable fact", nil),
+		llm.NewToolMessage("call-test", "bash", llm.TextContent("go test ./... failed: exit code 1 at /repo/main.go"), true),
+		llm.NewUserMessage("latest user goal"),
+	}
+
+	_, _, err := svc.Compact(context.Background(), model, messages)
+	if err != nil {
+		t.Fatalf("Compact: %v", err)
+	}
+	if got := len(model.lastRoles); got != 1 {
+		t.Fatalf("compaction model received %d messages, want dedicated single request", got)
+	}
+	if model.lastRoles[0] != llm.RoleUser {
+		t.Fatalf("compaction request role = %s, want user", model.lastRoles[0])
+	}
+	prompt := model.lastPrompt
+	for _, want := range []string{
+		"internal context compaction pipeline",
+		"summarize retained material",
+		"system contract: preserve cwd /repo and tests",
+		"latest user goal",
+		"tool error bash",
+		"go test ./... failed: exit code 1 at /repo/main.go",
+		"Recent Tool Results",
+	} {
+		if !strings.Contains(prompt, want) {
+			t.Fatalf("compaction prompt missing %q:\n%s", want, prompt)
+		}
+	}
+	for _, forbidden := range []string{
+		"I am going to inspect files and then continue",
+		"routine narration with no durable fact",
+		strings.Repeat("large raw output ", 20),
+	} {
+		if strings.Contains(prompt, forbidden) {
+			t.Fatalf("compaction prompt included raw/non-durable history %q:\n%s", forbidden, prompt)
+		}
+	}
+}
+
 func TestCompact_AppendsToolContext(t *testing.T) {
 	model := mockCompactModel{response: "<summary>tool summary</summary>"}
 	svc := NewService(&Config{
@@ -588,8 +648,11 @@ func TestCompact_UsesModelAwareSummaryPrompt(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Compact: %v", err)
 	}
-	if model.lastPrompt != "short prompt" {
+	if !strings.Contains(model.lastPrompt, "short prompt") {
 		t.Fatalf("expected model-aware prompt, got %q", model.lastPrompt)
+	}
+	if !strings.Contains(model.lastPrompt, "internal context compaction pipeline") {
+		t.Fatalf("expected dedicated compaction request, got %q", model.lastPrompt)
 	}
 }
 
