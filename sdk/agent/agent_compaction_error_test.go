@@ -189,6 +189,52 @@ func TestCheckAndCompactUsesConfiguredWarningSink(t *testing.T) {
 	}
 }
 
+func TestCheckAndCompactCancelsAsyncCompactionWithTurn(t *testing.T) {
+	model := &cancelAwareCompactionModel{
+		entered: make(chan struct{}),
+		release: make(chan struct{}),
+	}
+	var warnings lockedBuffer
+	ag, err := New(Config{
+		LLM: model,
+		Compaction: &compaction.Config{
+			Enabled:                true,
+			ContextWindow:          100,
+			ThresholdRatio:         0.5,
+			SummaryPrompt:          "summarize",
+			KeepRecentUserMessages: 1,
+			CompactionRetryBackoff: 5 * time.Millisecond,
+		},
+		Warningf: func(format string, args ...any) {
+			_, _ = warnings.Write([]byte(fmt.Sprintf(format, args...) + "\n"))
+		},
+	})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	ag.ReplaceHistory([]llm.Message{llm.NewUserMessage("hello")})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	comp := &llm.Completion{Usage: &llm.Usage{TotalTokens: 100, PromptTokens: 80}}
+	ag.checkAndCompact(ctx, comp, nil)
+	select {
+	case <-model.entered:
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for compaction to start")
+	}
+	cancel()
+	waitFor(t, time.Second, func() bool {
+		return !ag.compactionInFlight.Load()
+	}, "async compaction cancellation")
+
+	if got := warnings.String(); got != "" {
+		t.Fatalf("expected no warning for canceled async compaction, got %q", got)
+	}
+	if ag.todoCompactionPending.Load() {
+		t.Fatal("canceled turn should not schedule a compaction retry")
+	}
+}
+
 func TestCheckAndCompactRetriesOnceByDefault(t *testing.T) {
 	model := &flakyCompactionModel{failFor: 1}
 	ag, err := New(Config{

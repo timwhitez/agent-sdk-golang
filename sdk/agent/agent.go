@@ -1828,8 +1828,7 @@ func (a *Agent) checkAndCompact(ctx context.Context, last *llm.Completion, out c
 	snapshotLen := len(messages)
 	triggerUsage := cloneUsage(last.Usage)
 	trigger, watermark := a.compactionTriggerAndWatermark(last)
-	compactCtx := context.WithoutCancel(ctx)
-	go a.runCompactionAsync(compactCtx, messages, snapshotLen, triggerUsage, trigger, watermark)
+	go a.runCompactionAsync(ctx, messages, snapshotLen, triggerUsage, trigger, watermark)
 }
 
 func (a *Agent) runCompactionAsync(ctx context.Context, snapshot []llm.Message, snapshotLen int, triggerUsage *llm.Usage, trigger string, watermark string) {
@@ -1841,6 +1840,9 @@ func (a *Agent) runCompactionAsync(ctx context.Context, snapshot []llm.Message, 
 	}
 	newMsgs, res, err := a.compactWithRetry(ctx, snapshot, compactUsage, watermark)
 	if err != nil {
+		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+			return
+		}
 		a.warnf("compaction failed after %d attempt(s): %v", a.compactionMaxAttempts(), err)
 		a.todoCompactionPending.Store(true)
 		return
@@ -2050,12 +2052,21 @@ func (a *Agent) compactWithRetry(ctx context.Context, messages []llm.Message, us
 	var lastErr error
 	var lastRes compaction.Result
 	for attempt := 1; attempt <= attempts; attempt++ {
+		if err := ctx.Err(); err != nil {
+			return messages, lastRes, err
+		}
 		newMsgs, res, err := a.compactor.CompactAuto(ctx, a.llm, messages, usage, requestedWatermark)
 		if err == nil {
 			return newMsgs, res, nil
 		}
 		lastErr = err
 		lastRes = res
+		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) || ctx.Err() != nil {
+			if ctxErr := ctx.Err(); ctxErr != nil {
+				return messages, lastRes, ctxErr
+			}
+			return messages, lastRes, err
+		}
 		if attempt >= attempts {
 			break
 		}
