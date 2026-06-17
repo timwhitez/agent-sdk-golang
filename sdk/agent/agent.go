@@ -24,6 +24,8 @@ type Config struct {
 	LLM          llm.ChatModel
 	Tools        []tools.Tool
 	SystemPrompt string
+	// Warningf receives non-fatal runtime diagnostics. Empty uses log.Printf.
+	Warningf func(format string, args ...any)
 
 	// InitialMessages restores a previous conversation history.
 	// If provided, the agent will not auto-insert SystemPrompt on first query unless you include it here.
@@ -102,6 +104,7 @@ type Agent struct {
 	streamIdleMaxRecov int
 	toolChoice         llm.ToolChoice
 	requireDone        bool
+	warningf           func(format string, args ...any)
 	hasCompactor       bool
 
 	tools             []tools.Tool
@@ -267,6 +270,7 @@ func New(cfg Config) (*Agent, error) {
 		streamIdleMaxRecov: cfg.StreamIdleMaxRecoveries,
 		toolChoice:         cfg.ToolChoice,
 		requireDone:        cfg.RequireDoneTool,
+		warningf:           cfg.Warningf,
 		hasCompactor:       hasCompactor,
 		tools:              append([]tools.Tool(nil), cfg.Tools...),
 		toolMap:            toolMap,
@@ -281,6 +285,14 @@ func New(cfg Config) (*Agent, error) {
 	}
 	ag.initToolResultDumpLifecycle(toolResultDumpNow())
 	return ag, nil
+}
+
+func (a *Agent) warnf(format string, args ...any) {
+	if a != nil && a.warningf != nil {
+		a.warningf(format, args...)
+		return
+	}
+	log.Printf(format, args...)
 }
 
 // UpdateCompactionConfig replaces the compaction service used for subsequent turns.
@@ -1829,7 +1841,7 @@ func (a *Agent) runCompactionAsync(ctx context.Context, snapshot []llm.Message, 
 	}
 	newMsgs, res, err := a.compactWithRetry(ctx, snapshot, compactUsage, watermark)
 	if err != nil {
-		log.Printf("compaction failed after %d attempt(s): %v", a.compactionMaxAttempts(), err)
+		a.warnf("compaction failed after %d attempt(s): %v", a.compactionMaxAttempts(), err)
 		a.todoCompactionPending.Store(true)
 		return
 	}
@@ -1875,7 +1887,7 @@ func (a *Agent) applyPendingCompaction(out chan Event) {
 	merged := make([]llm.Message, 0, len(pending.messages)+tailCap)
 	merged = append(merged, pending.messages...)
 	if currentLen < pending.snapshotLen {
-		log.Printf("compaction apply skipped: history shrank (%d < %d); scheduling retry", currentLen, pending.snapshotLen)
+		a.warnf("compaction apply skipped: history shrank (%d < %d); scheduling retry", currentLen, pending.snapshotLen)
 		a.mu.Unlock()
 		a.todoCompactionPending.Store(true)
 		return
@@ -2048,7 +2060,7 @@ func (a *Agent) compactWithRetry(ctx context.Context, messages []llm.Message, us
 			break
 		}
 		delay := a.compactionRetryDelay(attempt)
-		log.Printf("compaction failed (attempt %d/%d): %v", attempt, attempts, err)
+		a.warnf("compaction failed (attempt %d/%d): %v", attempt, attempts, err)
 		if delay <= 0 {
 			continue
 		}

@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"log"
 	"strings"
 	"sync"
@@ -153,6 +154,38 @@ func TestCheckAndCompactLogsError(t *testing.T) {
 
 	if got := buf.String(); !strings.Contains(got, "compaction failed") {
 		t.Fatalf("expected compaction error to be logged, got %q", got)
+	}
+}
+
+func TestCheckAndCompactUsesConfiguredWarningSink(t *testing.T) {
+	var warnings lockedBuffer
+	ag, err := New(Config{
+		LLM: compactionErrorModel{},
+		Warningf: func(format string, args ...any) {
+			_, _ = warnings.Write([]byte(fmt.Sprintf(format, args...) + "\n"))
+		},
+	})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+
+	comp := &llm.Completion{
+		Usage: &llm.Usage{
+			TotalTokens:      200_000,
+			CompletionTokens: 0,
+		},
+	}
+
+	ag.checkAndCompact(context.Background(), comp, nil)
+	waitFor(t, time.Second, func() bool {
+		return strings.Contains(warnings.String(), "compaction failed")
+	}, "compaction failure warning")
+	waitFor(t, time.Second, func() bool {
+		return !ag.compactionInFlight.Load()
+	}, "async compaction completion")
+
+	if got := warnings.String(); !strings.Contains(got, "compaction failed") {
+		t.Fatalf("expected compaction warning in configured sink, got %q", got)
 	}
 }
 
