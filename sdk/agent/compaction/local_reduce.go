@@ -23,6 +23,10 @@ const (
 var truncationArtifactRe = regexp.MustCompile(`(?i)(?:saved to|full output:|full_output=)\s+([^\]\s]+(?:/|\\)truncated(?:/|\\)[^\]\s]+)`)
 
 func (s *Service) CompactLocal(ctx context.Context, messages []llm.Message, usage *llm.Usage) ([]llm.Message, Result, error) {
+	return s.compactLocalWithWatermark(ctx, messages, usage, "")
+}
+
+func (s *Service) compactLocalWithWatermark(ctx context.Context, messages []llm.Message, usage *llm.Usage, forcedWatermark string) ([]llm.Message, Result, error) {
 	if s == nil || !s.Config.Enabled {
 		return messages, Result{Compacted: false}, nil
 	}
@@ -39,9 +43,12 @@ func (s *Service) CompactLocal(ctx context.Context, messages []llm.Message, usag
 	}
 	originalTokens := s.TotalTokens(usage)
 	if originalTokens <= 0 {
-		originalTokens = approximateMessageTokens(messages)
+		originalTokens = s.approximateMessageTokens(messages)
 	}
-	watermark := s.WatermarkForUsage(usage)
+	watermark := strings.TrimSpace(forcedWatermark)
+	if watermark == "" {
+		watermark = s.WatermarkForUsage(usage)
+	}
 	if watermark == "" || watermark == "overflow" || watermark == "summarize" {
 		watermark = tierSnip
 	}
@@ -76,7 +83,7 @@ func (s *Service) CompactLocal(ctx context.Context, messages []llm.Message, usag
 	if err := s.saveLedger(ctx, sessionID, ledger); err != nil {
 		return messages, Result{Compacted: false, Warnings: warnings}, err
 	}
-	newTokens := approximateMessageTokens(out)
+	newTokens := s.approximateMessageTokens(out)
 	res := Result{
 		Compacted:      true,
 		Trigger:        "usage",
@@ -224,7 +231,7 @@ func (r *localReducer) eligibleToolMessage(index int, msg llm.Message) bool {
 	if strings.TrimSpace(text) == "" {
 		return false
 	}
-	return approximateTextTokens(text) >= defaultSnipMinTokens
+	return r.service.estimateTextTokens(text) >= defaultSnipMinTokens
 }
 
 func (r *localReducer) reduceAssistantMessage(index int, msg llm.Message) (LedgerReplacement, string, bool) {
@@ -288,7 +295,7 @@ func (r *localReducer) eligibleAssistantMessage(index int, msg llm.Message) bool
 	if strings.TrimSpace(text) == "" {
 		return false
 	}
-	return approximateTextTokens(text) >= defaultSnipMinTokens
+	return r.service.estimateTextTokens(text) >= defaultSnipMinTokens
 }
 
 func (r *localReducer) reduceUserCodeMessage(index int, msg llm.Message) (LedgerReplacement, string, bool) {
@@ -323,7 +330,7 @@ func (r *localReducer) reduceUserCodeMessage(index int, msg llm.Message) (Ledger
 	if artifactPath == "" {
 		return LedgerReplacement{}, userCodeArtifactWarning(r.sessionID, "write", "artifact writer returned empty path"), false
 	}
-	text, ok := userCodeMicrocompactReplacementText(original, artifactPath)
+	text, ok := userCodeMicrocompactReplacementText(original, artifactPath, r.service.estimateTextTokens)
 	if !ok {
 		return LedgerReplacement{}, "", false
 	}
@@ -355,7 +362,7 @@ func (r *localReducer) eligibleUserCodeMessage(index int, msg llm.Message) bool 
 	if strings.TrimSpace(text) == "" {
 		return false
 	}
-	return userCodeMicrocompactCandidate(text)
+	return userCodeMicrocompactCandidate(text, r.service.estimateTextTokens)
 }
 
 func (r *localReducer) createSnipReplacement(msg llm.Message, messageKey, partKey, original string) (LedgerReplacement, string, bool) {
@@ -452,20 +459,20 @@ type fencedCodeBlock struct {
 	lines     []string
 }
 
-func userCodeMicrocompactCandidate(text string) bool {
+func userCodeMicrocompactCandidate(text string, estimate func(string) int) bool {
 	block, ok := largestFencedCodeBlock(text)
 	if !ok {
 		return false
 	}
-	return approximateTextTokens(strings.Join(block.lines, "\n")) >= defaultUserCodeMicrocompactMinTokens
+	return estimate(strings.Join(block.lines, "\n")) >= defaultUserCodeMicrocompactMinTokens
 }
 
-func userCodeMicrocompactReplacementText(original, artifactPath string) (string, bool) {
+func userCodeMicrocompactReplacementText(original, artifactPath string, estimate func(string) int) (string, bool) {
 	block, ok := largestFencedCodeBlock(original)
 	if !ok {
 		return "", false
 	}
-	if approximateTextTokens(strings.Join(block.lines, "\n")) < defaultUserCodeMicrocompactMinTokens {
+	if estimate(strings.Join(block.lines, "\n")) < defaultUserCodeMicrocompactMinTokens {
 		return "", false
 	}
 	allLines := strings.Split(strings.ReplaceAll(original, "\r\n", "\n"), "\n")

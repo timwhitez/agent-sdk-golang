@@ -304,7 +304,7 @@ func TestCheckAndCompactSkipsInvokeWhenContextCanceled(t *testing.T) {
 
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
-	comp := &llm.Completion{Usage: &llm.Usage{TotalTokens: 120, PromptTokens: 100}}
+	comp := &llm.Completion{Usage: &llm.Usage{TotalTokens: 120, PromptTokens: 99}}
 	ag.checkAndCompact(ctx, comp, nil)
 
 	if got := model.Calls(); got != 0 {
@@ -336,7 +336,7 @@ func TestCheckAndCompactAsyncSurvivesCallerCancelAfterStart(t *testing.T) {
 	ag.ReplaceHistory([]llm.Message{llm.NewUserMessage("hello")})
 
 	ctx, cancel := context.WithCancel(context.Background())
-	comp := &llm.Completion{Usage: &llm.Usage{TotalTokens: 120, PromptTokens: 100}}
+	comp := &llm.Completion{Usage: &llm.Usage{TotalTokens: 120, PromptTokens: 99}}
 	ag.checkAndCompact(ctx, comp, nil)
 
 	select {

@@ -151,6 +151,11 @@ type Config struct {
 	LedgerPath  string
 	// ToolArtifactWriter persists full tool outputs before local replacement.
 	ToolArtifactWriter ArtifactWriter
+	// TokenEstimator estimates prompt tokens for a text fragment. When nil, a
+	// naive (len+3)/4 heuristic is used. Hosts (e.g. Goode) inject a detailed
+	// estimator so tier eligibility and reported token counts match the same
+	// estimator used for prompt-budget decisions outside the compaction package.
+	TokenEstimator func(text string) int
 }
 
 // SummaryPromptFunc resolves a compaction summary prompt from the active model ID.

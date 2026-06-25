@@ -18,6 +18,7 @@ type Service struct {
 
 	summaryPromptFn SummaryPromptFunc
 	protectedTools  map[string]struct{}
+	estimateText    func(string) int
 }
 
 const fallbackSummaryContext = "[compaction] no eligible prior messages were available; summarize from available tool state only."
@@ -78,12 +79,48 @@ func NewService(cfg *Config) *Service {
 		ContextWindow:   ctxWindow,
 		summaryPromptFn: resolveSummaryPrompt(c.SummaryPrompt),
 		protectedTools:  normalizeToolSet(c.ProtectedTools),
+		estimateText:    resolveTokenEstimator(c.TokenEstimator),
 	}
+}
+
+// resolveTokenEstimator returns a safe estimator: it falls back to the naive
+// heuristic when no estimator is configured or when a configured estimator
+// returns a non-positive value for non-empty text.
+func resolveTokenEstimator(fn func(string) int) func(string) int {
+	if fn == nil {
+		return approximateTextTokens
+	}
+	return func(text string) int {
+		if strings.TrimSpace(text) == "" {
+			return 0
+		}
+		if n := fn(text); n > 0 {
+			return n
+		}
+		return approximateTextTokens(text)
+	}
+}
+
+func (s *Service) estimateTextTokens(text string) int {
+	if s == nil || s.estimateText == nil {
+		return approximateTextTokens(text)
+	}
+	return s.estimateText(text)
 }
 
 func (s *Service) threshold() int {
 	window := s.contextWindow()
 	return int(float64(window) * s.Config.ThresholdRatio)
+}
+
+// ThresholdTokens exposes the summarize-tier token threshold so hosts can
+// decide whether cheaper local tiers brought usage back under budget before
+// escalating to an LLM summary.
+func (s *Service) ThresholdTokens() int {
+	if s == nil {
+		return 0
+	}
+	return s.threshold()
 }
 
 func (s *Service) snipThreshold() int {
@@ -189,6 +226,23 @@ func (s *Service) WatermarkForUsage(u *llm.Usage) string {
 	return ""
 }
 
+// CompactLocalEstimated runs local snip/prune reducers using an estimated usage
+// value instead of provider-reported usage. It never invokes the model.
+func (s *Service) CompactLocalEstimated(ctx context.Context, messages []llm.Message, estimatedTokens int) ([]llm.Message, Result, error) {
+	if estimatedTokens < 0 {
+		estimatedTokens = 0
+	}
+	usage := &llm.Usage{
+		PromptTokens: estimatedTokens,
+		TotalTokens:  estimatedTokens,
+	}
+	watermark := s.WatermarkForUsage(usage)
+	if watermark == "summarize" || watermark == "overflow" {
+		watermark = "prune"
+	}
+	return s.compactLocalWithWatermark(ctx, messages, usage, watermark)
+}
+
 func (s *Service) CompactAuto(ctx context.Context, model llm.ChatModel, messages []llm.Message, usage *llm.Usage, watermark string) ([]llm.Message, Result, error) {
 	watermark = strings.TrimSpace(watermark)
 	if watermark == "" {
@@ -251,7 +305,7 @@ func (s *Service) Compact(ctx context.Context, model llm.ChatModel, messages []l
 		return messages, Result{Compacted: false}, nil
 	}
 
-	originalTokens := approximateMessageTokens(messages)
+	originalTokens := s.approximateMessageTokens(messages)
 	sessionID := strings.TrimSpace(s.Config.SessionID)
 	ledger, ledgerWarnings, err := s.loadLedger(ctx, sessionID)
 	if err != nil {
@@ -319,28 +373,48 @@ func (s *Service) Compact(ctx context.Context, model llm.ChatModel, messages []l
 		Watermark:      "summarize",
 		Usage:          cloneUsage(comp.Usage),
 		OriginalTokens: originalTokens,
-		NewTokens:      approximateMessageTokens(newMessages),
+		NewTokens:      s.approximateMessageTokens(newMessages),
 		TiersApplied:   []string{"summarize"},
 		LedgerPath:     strings.TrimSpace(s.Config.LedgerPath),
 		Warnings:       ledgerWarnings,
 		Summary:        sum,
 	}
+	if w := summaryQualityWarning(res.OriginalTokens, res.NewTokens, summaryCharCount(sum), s.Config.MinSummaryCharsForToolContext); w != "" {
+		res.Warnings = append(res.Warnings, w)
+	}
 	return newMessages, res, nil
 }
 
-func approximateMessageTokens(messages []llm.Message) int {
+// summaryQualityWarning returns a single, measurable diagnostic when a generated
+// summary looks low-value. It is deliberately one combined rule (drastic shrink
+// OR a sub-minimum-length summary) rather than many narrow heuristics, so it
+// stays model- and target-agnostic and does not accumulate guard sprawl.
+func summaryQualityWarning(origTokens, newTokens, summaryChars, minChars int) string {
+	if origTokens > 0 && newTokens > 0 {
+		ratio := float64(newTokens) / float64(origTokens)
+		if ratio < 0.05 {
+			return fmt.Sprintf("[WARN] Compaction summary very small relative to source (new=%d orig=%d ratio=%.1f%%); verify no critical context was lost - re-read from disk if needed", newTokens, origTokens, ratio*100)
+		}
+	}
+	if minChars > 0 && summaryChars > 0 && summaryChars < minChars {
+		return fmt.Sprintf("[WARN] Compaction summary below minimum useful length (chars=%d < %d); verify no critical context was lost - re-read from disk if needed", summaryChars, minChars)
+	}
+	return ""
+}
+
+func (s *Service) approximateMessageTokens(messages []llm.Message) int {
 	total := 0
 	for _, msg := range messages {
-		total += approximateTextTokens(string(msg.Role))
-		total += approximateTextTokens(msg.Name)
-		total += approximateTextTokens(msg.ToolCallID)
-		total += approximateTextTokens(msg.ToolName)
-		total += approximateTextTokens(msg.Content.PlainText())
+		total += s.estimateTextTokens(string(msg.Role))
+		total += s.estimateTextTokens(msg.Name)
+		total += s.estimateTextTokens(msg.ToolCallID)
+		total += s.estimateTextTokens(msg.ToolName)
+		total += s.estimateTextTokens(msg.Content.PlainText())
 		for _, call := range msg.ToolCalls {
-			total += approximateTextTokens(call.ID)
-			total += approximateTextTokens(call.Type)
-			total += approximateTextTokens(call.Function.Name)
-			total += approximateTextTokens(call.Function.Arguments)
+			total += s.estimateTextTokens(call.ID)
+			total += s.estimateTextTokens(call.Type)
+			total += s.estimateTextTokens(call.Function.Name)
+			total += s.estimateTextTokens(call.Function.Arguments)
 		}
 		total += 4
 	}

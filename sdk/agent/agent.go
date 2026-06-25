@@ -1815,6 +1815,10 @@ func (a *Agent) checkAndCompact(ctx context.Context, last *llm.Completion, out c
 		return
 	}
 	a.applyPendingCompaction(out)
+	if a.compactor.IsOverflow(last.Usage) {
+		_ = a.compactSyncOverflow(ctx, last, out)
+		return
+	}
 	if !a.shouldAttemptCompaction(ctx, last) {
 		return
 	}
@@ -1834,11 +1838,13 @@ func (a *Agent) checkAndCompact(ctx context.Context, last *llm.Completion, out c
 func (a *Agent) runCompactionAsync(ctx context.Context, snapshot []llm.Message, snapshotLen int, triggerUsage *llm.Usage, trigger string, watermark string) {
 	defer a.compactionInFlight.Store(false)
 
+	compactCtx, cancelCompact := asyncCompactionContext(ctx)
+	defer cancelCompact()
 	compactUsage := triggerUsage
 	if strings.TrimSpace(trigger) == "todo" {
 		compactUsage = nil
 	}
-	newMsgs, res, err := a.compactWithRetry(ctx, snapshot, compactUsage, watermark)
+	newMsgs, res, err := a.compactWithRetry(compactCtx, snapshot, compactUsage, watermark)
 	if err != nil {
 		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
 			return
@@ -1858,6 +1864,224 @@ func (a *Agent) runCompactionAsync(ctx context.Context, snapshot []llm.Message, 
 		triggerUsage: triggerUsage,
 	}
 	a.pendingCompactionMu.Unlock()
+}
+
+const asyncCompactionCancelGrace = 100 * time.Millisecond
+
+func asyncCompactionContext(parent context.Context) (context.Context, context.CancelFunc) {
+	if parent == nil {
+		return context.WithCancel(context.Background())
+	}
+	ctx, cancel := context.WithCancel(context.WithoutCancel(parent))
+	go func() {
+		select {
+		case <-parent.Done():
+		case <-ctx.Done():
+			return
+		}
+		timer := time.NewTimer(asyncCompactionCancelGrace)
+		defer timer.Stop()
+		select {
+		case <-timer.C:
+			cancel()
+		case <-ctx.Done():
+		}
+	}()
+	return ctx, cancel
+}
+
+func (a *Agent) compactSyncOverflow(ctx context.Context, last *llm.Completion, out chan Event) error {
+	if !a.hasCompactor || a.compactor == nil || last == nil {
+		return nil
+	}
+	if ctx != nil && ctx.Err() != nil {
+		return ctx.Err()
+	}
+	a.applyPendingCompaction(out)
+	if !a.compactionInFlight.CompareAndSwap(false, true) {
+		if err := a.waitForCompactionIdle(ctx); err != nil {
+			return err
+		}
+		a.applyPendingCompaction(out)
+		if !a.compactionInFlight.CompareAndSwap(false, true) {
+			return nil
+		}
+	}
+	defer a.compactionInFlight.Store(false)
+
+	a.mu.Lock()
+	messages := make([]llm.Message, len(a.messages))
+	copy(messages, a.messages)
+	a.mu.Unlock()
+
+	snapshotLen := len(messages)
+	triggerUsage := cloneUsage(last.Usage)
+	trigger, watermark := a.compactionTriggerAndWatermark(last)
+	newMsgs, res, err := a.compactOverflowWithRetry(ctx, messages, triggerUsage)
+	if err != nil {
+		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+			return err
+		}
+		a.warnf("compaction failed after %d attempt(s): %v", a.compactionMaxAttempts(), err)
+		a.todoCompactionPending.Store(true)
+		return err
+	}
+	if strings.TrimSpace(res.Watermark) == "summarize" {
+		a.todoCompactionPending.Store(false)
+	} else {
+		a.todoCompactionPending.Store(true)
+	}
+	newMsgs = a.withPreservedSystem(messages, newMsgs)
+
+	a.pendingCompactionMu.Lock()
+	a.pendingCompaction = &pendingCompaction{
+		messages:     newMsgs,
+		snapshotLen:  snapshotLen,
+		result:       a.withCompactionTelemetry(res, trigger, watermark, triggerUsage),
+		triggerUsage: triggerUsage,
+	}
+	a.pendingCompactionMu.Unlock()
+	a.applyPendingCompaction(out)
+	return nil
+}
+
+func (a *Agent) compactOverflowWithRetry(ctx context.Context, messages []llm.Message, usage *llm.Usage) ([]llm.Message, compaction.Result, error) {
+	attempts := a.compactionMaxAttempts()
+	if attempts <= 0 {
+		attempts = 1
+	}
+	var lastErr error
+	var lastRes compaction.Result
+	var fallbackMsgs []llm.Message
+	var fallbackRes compaction.Result
+	for attempt := 1; attempt <= attempts; attempt++ {
+		if err := ctx.Err(); err != nil {
+			return messages, lastRes, err
+		}
+		localMsgs, localRes, summaryMsgs, summaryRes, err := a.compactOverflowOnce(ctx, messages, usage)
+		if localRes.Compacted {
+			fallbackMsgs = localMsgs
+			fallbackRes = localRes
+		}
+		if err == nil {
+			return summaryMsgs, summaryRes, nil
+		}
+		lastErr = err
+		lastRes = summaryRes
+		if !lastRes.Compacted {
+			lastRes = localRes
+		}
+		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) || ctx.Err() != nil {
+			if ctxErr := ctx.Err(); ctxErr != nil {
+				return messages, lastRes, ctxErr
+			}
+			return messages, lastRes, err
+		}
+		if attempt >= attempts {
+			break
+		}
+		delay := a.compactionRetryDelay(attempt)
+		a.warnf("overflow summary compaction failed (attempt %d/%d): %v", attempt, attempts, err)
+		if delay <= 0 {
+			continue
+		}
+		t := time.NewTimer(delay)
+		select {
+		case <-ctx.Done():
+			if !t.Stop() {
+				<-t.C
+			}
+			return messages, lastRes, ctx.Err()
+		case <-t.C:
+		}
+	}
+	if len(fallbackMsgs) > 0 && fallbackRes.Compacted {
+		fallbackRes.Warnings = append(fallbackRes.Warnings, fmt.Sprintf("[WARN] Overflow summary compaction failed after local reduction - continuing with local compaction and scheduling retry: %v", lastErr))
+		a.todoCompactionPending.Store(true)
+		return fallbackMsgs, fallbackRes, nil
+	}
+	if lastErr == nil {
+		lastErr = errors.New("overflow summary compaction failed")
+	}
+	return messages, lastRes, lastErr
+}
+
+func (a *Agent) compactOverflowOnce(ctx context.Context, messages []llm.Message, usage *llm.Usage) ([]llm.Message, compaction.Result, []llm.Message, compaction.Result, error) {
+	estimated := 0
+	if a.compactor != nil {
+		estimated = a.compactor.TotalTokens(usage)
+	}
+	var localMsgs []llm.Message
+	var localRes compaction.Result
+	var err error
+	if estimated > 0 {
+		localMsgs, localRes, err = a.compactor.CompactLocalEstimated(ctx, messages, estimated)
+	} else {
+		localMsgs, localRes, err = a.compactor.CompactLocal(ctx, messages, usage)
+	}
+	if err != nil {
+		return messages, localRes, messages, compaction.Result{}, err
+	}
+	summaryInput := messages
+	if localRes.Compacted {
+		summaryInput = localMsgs
+	}
+	summaryMsgs, summaryRes, err := a.compactor.Compact(ctx, a.llm, summaryInput)
+	if localRes.Compacted {
+		summaryRes = mergeAgentLocalSummaryResult(localRes, summaryRes)
+	}
+	return localMsgs, localRes, summaryMsgs, summaryRes, err
+}
+
+func mergeAgentLocalSummaryResult(localRes compaction.Result, summaryRes compaction.Result) compaction.Result {
+	if !localRes.Compacted {
+		return summaryRes
+	}
+	if summaryRes.OriginalTokens <= 0 {
+		summaryRes.OriginalTokens = localRes.OriginalTokens
+	}
+	if strings.TrimSpace(summaryRes.LedgerPath) == "" {
+		summaryRes.LedgerPath = strings.TrimSpace(localRes.LedgerPath)
+	}
+	summaryRes.Warnings = append(localRes.Warnings, summaryRes.Warnings...)
+	summaryRes.TiersApplied = appendDistinctTiers(localRes.TiersApplied, summaryRes.TiersApplied)
+	return summaryRes
+}
+
+func appendDistinctTiers(first []string, rest []string) []string {
+	out := make([]string, 0, len(first)+len(rest))
+	seen := map[string]struct{}{}
+	add := func(tiers []string) {
+		for _, tier := range tiers {
+			tier = strings.TrimSpace(tier)
+			if tier == "" {
+				continue
+			}
+			if _, ok := seen[tier]; ok {
+				continue
+			}
+			seen[tier] = struct{}{}
+			out = append(out, tier)
+		}
+	}
+	add(first)
+	add(rest)
+	return out
+}
+
+func (a *Agent) waitForCompactionIdle(ctx context.Context) error {
+	for a.compactionInFlight.Load() {
+		if ctx != nil {
+			select {
+			case <-ctx.Done():
+				return ctx.Err()
+			case <-time.After(25 * time.Millisecond):
+			}
+			continue
+		}
+		time.Sleep(25 * time.Millisecond)
+	}
+	return nil
 }
 
 func (a *Agent) hasPendingCompaction() bool {
@@ -1925,6 +2149,37 @@ func (a *Agent) CompactNow(ctx context.Context) (compaction.Result, error) {
 		return res, err
 	}
 	res = a.withCompactionTelemetry(res, "manual", "summarize", res.Usage)
+	a.todoCompactionPending.Store(false)
+	newMsgs = a.withPreservedSystem(orig, newMsgs)
+	a.mu.Lock()
+	a.messages = newMsgs
+	a.resetEphemeralTrackingLocked()
+	a.mu.Unlock()
+	return res, nil
+}
+
+// CompactLocalNow forces the local snip/prune reducers using an estimated token
+// count. It never invokes the model and is intended for prompt preflight.
+func (a *Agent) CompactLocalNow(ctx context.Context, estimatedTokens int) (compaction.Result, error) {
+	if !a.hasCompactor || a.compactor == nil {
+		return compaction.Result{Compacted: false}, nil
+	}
+	a.applyPendingCompaction(nil)
+	if !a.compactionInFlight.CompareAndSwap(false, true) {
+		return compaction.Result{Compacted: false}, fmt.Errorf("compaction already in progress")
+	}
+	defer a.compactionInFlight.Store(false)
+
+	a.mu.Lock()
+	orig := make([]llm.Message, len(a.messages))
+	copy(orig, a.messages)
+	a.mu.Unlock()
+
+	newMsgs, res, err := a.compactor.CompactLocalEstimated(ctx, orig, estimatedTokens)
+	if err != nil {
+		return res, err
+	}
+	res = a.withCompactionTelemetry(res, "preflight", res.Watermark, res.Usage)
 	a.todoCompactionPending.Store(false)
 	newMsgs = a.withPreservedSystem(orig, newMsgs)
 	a.mu.Lock()

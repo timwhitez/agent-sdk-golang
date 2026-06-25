@@ -365,6 +365,34 @@ func TestCompactAutoUsesSnipBeforeSummaryWhenLocalReductionIsEnough(t *testing.T
 	}
 }
 
+func TestCompactLocalEstimatedUsesPruneAtSummaryThreshold(t *testing.T) {
+	store := &memoryLedgerStore{ledger: NewLedger("sess-local-estimated")}
+	svc := NewService(&Config{
+		Enabled:        true,
+		ContextWindow:  100,
+		ThresholdRatio: 0.85,
+		SessionID:      "sess-local-estimated",
+		LedgerStore:    store,
+		ToolArtifactWriter: ArtifactWriterFunc(func(context.Context, ArtifactRequest) (ArtifactResult, error) {
+			return ArtifactResult{Path: ".goode/truncated/tool_grep.txt"}, nil
+		}),
+		ProtectedRecentMessages: 1,
+	})
+	got, res, err := svc.CompactLocalEstimated(context.Background(), snipTestMessages(strings.Repeat("hit\n", 300)), 90)
+	if err != nil {
+		t.Fatalf("CompactLocalEstimated: %v", err)
+	}
+	if !res.Compacted || res.Watermark != "prune" {
+		t.Fatalf("result = %#v, want prune compaction", res)
+	}
+	if !containsTier(res.TiersApplied, "prune") {
+		t.Fatalf("tiers = %#v, want prune", res.TiersApplied)
+	}
+	if !strings.Contains(got[2].Content.PlainText(), "[Tool result pruned:") {
+		t.Fatalf("tool result was not locally reduced: %q", got[2].Content.PlainText())
+	}
+}
+
 func snipTestMessages(toolOutput string) []llm.Message {
 	return []llm.Message{
 		llm.NewUserMessage("search for hits"),

@@ -80,6 +80,35 @@ func TestDefaultConfigUsesFiveMinuteCompactionTimeout(t *testing.T) {
 	}
 }
 
+func TestTokenEstimatorInjectionAffectsReportedTokens(t *testing.T) {
+	svc := NewService(&Config{
+		Enabled:       true,
+		ContextWindow: 1000,
+		TokenEstimator: func(text string) int {
+			if strings.TrimSpace(text) == "" {
+				return 0
+			}
+			return len(text)
+		},
+	})
+	msgs := []llm.Message{llm.NewUserMessage("abc")}
+	if got := svc.approximateMessageTokens(msgs); got != 11 {
+		t.Fatalf("estimated message tokens = %d, want 11", got)
+	}
+}
+
+func TestSummaryQualityWarning(t *testing.T) {
+	if got := summaryQualityWarning(1000, 40, 500, 120); !strings.Contains(got, "very small") {
+		t.Fatalf("ratio warning = %q, want very small", got)
+	}
+	if got := summaryQualityWarning(1000, 100, 20, 120); !strings.Contains(got, "below minimum") {
+		t.Fatalf("length warning = %q, want below minimum", got)
+	}
+	if got := summaryQualityWarning(1000, 100, 500, 120); got != "" {
+		t.Fatalf("warning = %q, want empty", got)
+	}
+}
+
 func TestSelectRecentUserMessages_SkipsCompactionSummaryMessage(t *testing.T) {
 	messages := []llm.Message{
 		llm.NewUserMessage("first real question"),
