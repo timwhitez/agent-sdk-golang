@@ -33,31 +33,13 @@ new_wrap = '''func wrapUntrustedMaterial(material string) string {
 \t// Encode all source bytes as one JSON string. JSON escaping keeps embedded
 \t// newlines and marker strings off standalone lines, so untrusted content can
 \t// never terminate or create the framing used by the system instruction.
-\tencoded, err := json.Marshal(material)
-\tif err != nil {
-\t\t// A Go string is always JSON encodable. Keep a defensive fallback rather
-\t\t// than ever returning raw, delimiter-bearing source material.
-\t\tencoded = []byte(strconv.QuoteToASCII(material))
-\t}
+\tencoded, _ := json.Marshal(material)
 \treturn beginUntrustedMaterial + "\\n" + string(encoded) + "\\n" + endUntrustedMaterial
 }
 '''
 if text.count(old_wrap) != 1:
     raise SystemExit(f"wrap anchor count={text.count(old_wrap)}")
-text = text.replace(old_wrap, new_wrap)
-# strconv is needed only by the impossible defensive fallback.
-old_import = '''\t"sort"
-\t"strings"
-\t"time"
-'''
-new_import = '''\t"sort"
-\t"strconv"
-\t"strings"
-\t"time"
-'''
-if text.count(old_import) != 1:
-    raise SystemExit(f"import anchor count={text.count(old_import)}")
-path.write_text(text.replace(old_import, new_import))
+path.write_text(text.replace(old_wrap, new_wrap))
 
 Path("sdk/agent/compaction/untrusted_framing_test.go").write_text(r'''package compaction
 
