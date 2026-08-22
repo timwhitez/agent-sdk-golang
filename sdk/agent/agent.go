@@ -220,6 +220,9 @@ type Agent struct {
 	// only consulted on the slow path (channel already full), which is exactly
 	// where the bounded critical-event wait would otherwise be paid by a query
 	// whose caller has already gone away.
+	// turnActive is acquired synchronously before the turn goroutine starts,
+	// preventing overlapping submissions from mutating shared turn state.
+	turnActive      atomic.Bool
 	turnCancelMu    sync.Mutex
 	turnCancelByOut map[chan Event]*turnBackpressure
 }
@@ -520,9 +523,19 @@ func (a *Agent) QueryStreamWithSteering(ctx context.Context, input llm.Content, 
 		bufferSize = a.eventBufferSize
 	}
 	out := make(chan Event, bufferSize)
+	if !a.turnActive.CompareAndSwap(false, true) {
+		// Admission is synchronous and out is buffered, so callers receive a
+		// deterministic terminal rejection without scheduling another goroutine.
+		out <- ErrorEvent{Kind: "agent_busy", Message: ErrAgentBusy.Error()}
+		close(out)
+		return out
+	}
 	unregisterTurn := a.registerTurnCancellation(out, ctx)
 	go func() {
+		// Later defers execute first. By the time admission is released, all turn
+		// cleanup and cancellation bookkeeping have completed.
 		defer close(out)
+		defer a.turnActive.Store(false)
 		defer unregisterTurn()
 		a.cleanupToolResultDumps(toolResultDumpNow(), false)
 

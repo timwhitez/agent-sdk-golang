@@ -1,60 +1,4 @@
-from pathlib import Path
-
-Path("sdk/agent/turn_concurrency.go").write_text(r'''package agent
-
-import "errors"
-
-// ErrAgentBusy reports that a second turn was submitted while this Agent still
-// owns an active turn. Agent history, compaction, steering, and cancellation
-// state form one turn-scoped state machine and are not shared concurrently.
-var ErrAgentBusy = errors.New("agent: another query is already in progress")
-''')
-
-agent = Path("sdk/agent/agent.go")
-text = agent.read_text()
-field_old = '''\tturnCancelMu    sync.Mutex
-\tturnCancelByOut map[chan Event]*turnBackpressure
-}
-'''
-field_new = '''\t// turnActive is acquired synchronously before the turn goroutine starts,
-\t// preventing overlapping submissions from mutating shared turn state.
-\tturnActive      atomic.Bool
-\tturnCancelMu    sync.Mutex
-\tturnCancelByOut map[chan Event]*turnBackpressure
-}
-'''
-if text.count(field_old) != 1:
-    raise SystemExit(f"turn field anchor count={text.count(field_old)}")
-text = text.replace(field_old, field_new)
-start_old = '''\tout := make(chan Event, bufferSize)
-\tunregisterTurn := a.registerTurnCancellation(out, ctx)
-\tgo func() {
-\t\tdefer close(out)
-\t\tdefer unregisterTurn()
-\t\ta.cleanupToolResultDumps(toolResultDumpNow(), false)
-'''
-start_new = '''\tout := make(chan Event, bufferSize)
-\tif !a.turnActive.CompareAndSwap(false, true) {
-\t\t// Admission is synchronous and out is buffered, so callers receive a
-\t\t// deterministic terminal rejection without scheduling another goroutine.
-\t\tout <- ErrorEvent{Kind: "agent_busy", Message: ErrAgentBusy.Error()}
-\t\tclose(out)
-\t\treturn out
-\t}
-\tunregisterTurn := a.registerTurnCancellation(out, ctx)
-\tgo func() {
-\t\t// Later defers execute first. By the time admission is released, all turn
-\t\t// cleanup and cancellation bookkeeping have completed.
-\t\tdefer close(out)
-\t\tdefer a.turnActive.Store(false)
-\t\tdefer unregisterTurn()
-\t\ta.cleanupToolResultDumps(toolResultDumpNow(), false)
-'''
-if text.count(start_old) != 1:
-    raise SystemExit(f"turn start anchor count={text.count(start_old)}")
-agent.write_text(text.replace(start_old, start_new))
-
-Path("sdk/agent/agent_turn_concurrency_test.go").write_text(r'''package agent
+package agent
 
 import (
 	"context"
@@ -217,21 +161,3 @@ func TestAgentConcurrentSubmissionsAdmitAtMostOneTurn(t *testing.T) {
 	close(model.firstFinish)
 	collectTurnEvents(t, active)
 }
-''')
-
-docs = Path("agent_docs/architecture.md")
-source = docs.read_text()
-heading = "## Agent Turn Concurrency Contract"
-if heading not in source:
-    source = source.rstrip() + r'''
-
-## Agent Turn Concurrency Contract
-
-A single `Agent` owns one mutable conversation and permits exactly one active
-`QueryStream` / `QueryStreamWithSteering` turn. Admission is acquired before the
-turn goroutine starts. An overlapping submission receives an
-`ErrorEvent{Kind: "agent_busy"}` and does not append input, invoke a provider,
-or replace steering/cancellation state. Callers needing parallel turns must use
-separate `Agent` instances.
-'''
-    docs.write_text(source)
