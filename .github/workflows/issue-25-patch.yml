@@ -4,6 +4,9 @@ on:
   push:
     branches:
       - fix/issue-25-strict-schema-order
+  pull_request:
+    branches:
+      - main
 
 permissions:
   contents: write
@@ -16,11 +19,12 @@ jobs:
       - name: Check out branch
         env:
           GH_TOKEN: ${{ github.token }}
+          TARGET_BRANCH: ${{ github.head_ref || github.ref_name }}
         run: |
           set -euo pipefail
           git clone "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" repo
           cd repo
-          git checkout "$GITHUB_REF_NAME"
+          git checkout "$TARGET_BRANCH"
 
       - name: Apply deterministic strict-schema fix
         working-directory: repo
@@ -122,4 +126,4 @@ jobs:
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git add -A
           git commit -m "fix(openai): canonicalize strict schema required order"
-          git push origin HEAD:"$GITHUB_REF_NAME"
+          git push origin HEAD:"$TARGET_BRANCH"
