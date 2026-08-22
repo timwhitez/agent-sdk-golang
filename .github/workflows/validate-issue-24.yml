@@ -3,6 +3,8 @@ name: Validate issue 24 final patch
 on:
   push:
     branches: [fix/issue-24-anthropic-redirect]
+  pull_request:
+    branches: [main]
 
 permissions:
   contents: read
@@ -10,6 +12,7 @@ permissions:
 jobs:
   test:
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v5
       - uses: actions/setup-go@v6
