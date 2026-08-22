@@ -9,7 +9,6 @@ import (
 	"net/netip"
 	"net/url"
 	"strings"
-	"time"
 
 	"github.com/timwhitez/agent-sdk-golang/sdk/tools"
 )
@@ -67,9 +66,9 @@ func webfetchTool() tools.Tool {
 		if method != http.MethodGet && method != http.MethodHead {
 			return "", fmt.Errorf("only GET/HEAD is supported")
 		}
-		timeout := a.Timeout
-		if timeout <= 0 {
-			timeout = 30
+		timeout, timeoutDuration, err := checkedSandboxTimeout(a.Timeout, 30)
+		if err != nil {
+			return "", fmt.Errorf("invalid webfetch timeout: %w; use a timeout from 1 to %d seconds", err, maxSandboxTimeoutSeconds)
 		}
 		maxBytes := a.MaxBytes
 		if maxBytes <= 0 {
@@ -95,7 +94,7 @@ func webfetchTool() tools.Tool {
 		}
 
 		hc := &http.Client{
-			Timeout: time.Duration(timeout) * time.Second,
+			Timeout: timeoutDuration,
 			CheckRedirect: func(req *http.Request, via []*http.Request) error {
 				if len(via) >= webfetchMaxRedirects {
 					return fmt.Errorf("stopped after %d redirects", webfetchMaxRedirects)

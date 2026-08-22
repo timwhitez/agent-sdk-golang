@@ -7,7 +7,6 @@ import (
 	"os/exec"
 	"runtime"
 	"strings"
-	"time"
 
 	"github.com/timwhitez/agent-sdk-golang/sdk/llm"
 	"github.com/timwhitez/agent-sdk-golang/sdk/tools"
@@ -30,6 +29,11 @@ func bashTool() tools.Tool {
 		}
 		conf := getConfirmer(deps, ctx)
 		cmd0 := strings.TrimSpace(a.Command)
+		timeout, timeoutDuration, err := checkedSandboxTimeout(a.Timeout, 30)
+		if err != nil {
+			msg := formatErrorDiagnosticFromErr("Invalid bash timeout", err, fmt.Sprintf("Use a timeout from 1 to %d seconds and retry.", maxSandboxTimeoutSeconds))
+			return llm.TextContent(msg), err
+		}
 		meta := attachToolCallMeta(ctx, map[string]any{
 			"category": "exec",
 			"summary":  truncateForMeta(truncateOneLine(cmd0, 240), 400),
@@ -55,10 +59,6 @@ func bashTool() tools.Tool {
 		if !ok {
 			return denyToolResult(ctx, "bash", "user denied request")
 		}
-		timeout := a.Timeout
-		if timeout <= 0 {
-			timeout = 30
-		}
 		resolvedExecDir, err := s.RevalidateAccessPath(workdirAccessPath)
 		if err != nil {
 			var secErr *SecurityError
@@ -76,7 +76,7 @@ func bashTool() tools.Tool {
 			Args:           []string{shellArg, cmd0},
 			Dir:            execDir,
 			Env:            execenv.EnvFromDeps(ctx, deps),
-			Timeout:        time.Duration(timeout) * time.Second,
+			Timeout:        timeoutDuration,
 			MaxOutputBytes: execrunner.DefaultMaxOutputBytes,
 			ArtifactPrefix: "sdk-bash-output-*.log",
 		})
