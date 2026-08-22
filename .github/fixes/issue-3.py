@@ -50,7 +50,12 @@ anchor = '''// validateWebfetchDestinationURL validates that a URL destination i
 func validateWebfetchDestinationURL(ctx context.Context, target *url.URL, stage string) error {
 '''
 insert = '''func newWebfetchHTTPClient(timeout time.Duration) *http.Client {
-\ttransport := http.DefaultTransport.(*http.Transport).Clone()
+\tvar transport *http.Transport
+\tif base, ok := http.DefaultTransport.(*http.Transport); ok && base != nil {
+\t\ttransport = base.Clone()
+\t} else {
+\t\ttransport = &http.Transport{ForceAttemptHTTP2: true}
+\t}
 \t// A proxy would resolve the target independently and defeat destination
 \t// pinning. Webfetch therefore connects directly to the validated address.
 \ttransport.Proxy = nil
@@ -213,7 +218,7 @@ func TestWebfetchRejectsReboundAddressUsedForSocket(t *testing.T) {
 	tools.Provide(deps, ConfirmKey, func(context.Context) (Confirmer, error) {
 		return allowWebfetchConfirmer{}, nil
 	})
-	out, err := webfetchTool().Execute(context.Background(), string(mustJSON(t, map[string]any{"url": "http://rebind.example/"})), deps)
+	out, err := webfetchTool().Execute(context.Background(), string(marshalWebfetchRebindingJSON(t, map[string]any{"url": "http://rebind.example/"})), deps)
 	if err == nil || !strings.Contains(strings.ToLower(err.Error()), "loopback") {
 		t.Fatalf("webfetch error = %v, output=%q; want rebound loopback denial", err, out.PlainText())
 	}
@@ -225,7 +230,7 @@ func TestWebfetchRejectsReboundAddressUsedForSocket(t *testing.T) {
 	}
 }
 
-func mustJSON(t *testing.T, value any) []byte {
+func marshalWebfetchRebindingJSON(t *testing.T, value any) []byte {
 	t.Helper()
 	data, err := json.Marshal(value)
 	if err != nil {
