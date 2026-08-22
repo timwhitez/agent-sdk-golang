@@ -86,6 +86,18 @@ func (s *canonicalProcessStreams) finish(ctx context.Context) {
 	}
 }
 
+func (s *canonicalProcessStreams) abortIncomplete(ctx context.Context, cause error) {
+	if s == nil {
+		return
+	}
+	if s.stdout != nil {
+		s.stdout.abortIncomplete(ctx, cause)
+	}
+	if s.stderr != nil {
+		s.stderr.abortIncomplete(ctx, cause)
+	}
+}
+
 func (s *canonicalProcessStreams) manifests() []artifact.Manifest {
 	if s == nil {
 		return nil
@@ -217,6 +229,34 @@ func (c *canonicalStreamCapture) finish(ctx context.Context) {
 	c.manifest = manifest.Clone()
 	c.hasManifest = true
 	c.writer = nil
+}
+
+func (c *canonicalStreamCapture) abortIncomplete(ctx context.Context, cause error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.finished {
+		return
+	}
+	c.finished = true
+	c.failed = true
+	c.diagnostics = append(c.diagnostics, streamDiagnostic(
+		"artifact_stream_incomplete",
+		"wait_for_stream_eof_then_retry",
+		cause,
+	))
+	if c.writer != nil {
+		if ctx == nil {
+			ctx = c.ctx
+		}
+		if abortErr := c.writer.Abort(ctx); abortErr != nil {
+			c.diagnostics = append(c.diagnostics, streamDiagnostic(
+				"artifact_stream_abort",
+				"inspect_stream_store_cleanup",
+				abortErr,
+			))
+		}
+		c.writer = nil
+	}
 }
 
 func (c *canonicalStreamCapture) failLocked(stage, action string, err error) {
