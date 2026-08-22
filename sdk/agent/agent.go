@@ -363,10 +363,15 @@ func New(cfg Config) (*Agent, error) {
 	}
 
 	toolMap := map[string]tools.Tool{}
-	for _, t := range cfg.Tools {
+	toolPositions := map[string]int{}
+	for i, t := range cfg.Tools {
 		if t.Name == "" {
 			return nil, fmt.Errorf("agent: tool missing name")
 		}
+		if previous, exists := toolPositions[t.Name]; exists {
+			return nil, fmt.Errorf("agent: duplicate tool name %q at positions %d and %d", t.Name, previous+1, i+1)
+		}
+		toolPositions[t.Name] = i
 		toolMap[t.Name] = t
 	}
 
