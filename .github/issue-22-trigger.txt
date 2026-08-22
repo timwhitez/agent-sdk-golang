@@ -1,1 +1,0 @@
-Retrigger the validated issue #22 patch after fixing synchronous busy delivery and turn-release ordering.
