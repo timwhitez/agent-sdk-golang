@@ -1,0 +1,115 @@
+package agent
+
+import (
+	"context"
+	"testing"
+	"time"
+
+	"github.com/timwhitez/agent-sdk-golang/sdk/agent/compaction"
+	"github.com/timwhitez/agent-sdk-golang/sdk/llm"
+)
+
+type compactionCallbackModel struct{}
+
+func (compactionCallbackModel) Provider() string { return "stub" }
+func (compactionCallbackModel) Model() string    { return "stub" }
+func (compactionCallbackModel) Invoke(context.Context, llm.InvokeRequest) (*llm.Completion, error) {
+	return &llm.Completion{Content: llm.TextContent("ok")}, nil
+}
+
+func installPendingCompactionForCallbackTest(t *testing.T, writer compaction.CompactionCheckpointWriter) *Agent {
+	t.Helper()
+	agent, err := New(Config{
+		LLM: compactionCallbackModel{},
+		Compaction: &compaction.Config{
+			Enabled:          true,
+			ContextWindow:    4096,
+			CheckpointWriter: writer,
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	agent.mu.Lock()
+	agent.messages = []llm.Message{llm.NewUserMessage("before")}
+	agent.mu.Unlock()
+	agent.pendingCompactionMu.Lock()
+	agent.pendingCompaction = &pendingCompaction{
+		messages:    []llm.Message{llm.NewUserMessage("after")},
+		snapshotLen: 1,
+		result:      compaction.Result{Compacted: true},
+	}
+	agent.pendingCompactionMu.Unlock()
+	return agent
+}
+
+func TestApplyPendingCompactionWriterCanReadMessages(t *testing.T) {
+	var agent *Agent
+	writerEntered := make(chan struct{})
+	writer := compaction.CompactionCheckpointWriterFunc(func(context.Context, compaction.CompactionCheckpoint) error {
+		close(writerEntered)
+		_ = agent.Messages()
+		return nil
+	})
+	agent = installPendingCompactionForCallbackTest(t, writer)
+
+	done := make(chan struct{})
+	go func() {
+		agent.applyPendingCompaction(nil)
+		close(done)
+	}()
+
+	select {
+	case <-writerEntered:
+	case <-time.After(time.Second):
+		t.Fatal("checkpoint writer was not entered")
+	}
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("applyPendingCompaction deadlocked when writer called Messages")
+	}
+	messages := agent.Messages()
+	if len(messages) != 1 || messages[0].Content.PlainText() != "after" {
+		t.Fatalf("published messages = %#v", messages)
+	}
+}
+
+func TestBlockedCheckpointWriterDoesNotBlockHistoryReads(t *testing.T) {
+	writerEntered := make(chan struct{})
+	releaseWriter := make(chan struct{})
+	writer := compaction.CompactionCheckpointWriterFunc(func(context.Context, compaction.CompactionCheckpoint) error {
+		close(writerEntered)
+		<-releaseWriter
+		return nil
+	})
+	agent := installPendingCompactionForCallbackTest(t, writer)
+
+	done := make(chan struct{})
+	go func() {
+		agent.applyPendingCompaction(nil)
+		close(done)
+	}()
+	select {
+	case <-writerEntered:
+	case <-time.After(time.Second):
+		t.Fatal("checkpoint writer was not entered")
+	}
+
+	readDone := make(chan struct{})
+	go func() {
+		_ = agent.Messages()
+		close(readDone)
+	}()
+	select {
+	case <-readDone:
+	case <-time.After(250 * time.Millisecond):
+		t.Fatal("Messages blocked behind checkpoint persistence")
+	}
+	close(releaseWriter)
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("applyPendingCompaction did not finish")
+	}
+}
