@@ -204,7 +204,12 @@ func (c *ChatClient) Invoke(ctx context.Context, req llm.InvokeRequest) (*llm.Co
 // InvokeStream implements true SSE streaming for OpenAI chat/completions.
 // It emits text deltas and tool_call deltas.
 func (c *ChatClient) InvokeStream(ctx context.Context, req llm.InvokeRequest) (<-chan llm.StreamEvent, error) {
+	// Keep provider production separate from caller delivery. If a caller stops
+	// consuming, cancellation switches the forwarding goroutine to drain-and-drop
+	// mode so the producer can finish and close the response body.
 	out := make(chan llm.StreamEvent, 128)
+	forwarded := make(chan llm.StreamEvent, 128)
+	go forwardOpenAIStreamEvents(ctx, forwarded, out)
 	local := *c
 	local.Extra = cloneMap(c.Extra)
 	local.ExtraBody = cloneMap(c.ExtraBody)
@@ -462,7 +467,7 @@ func (c *ChatClient) InvokeStream(ctx context.Context, req llm.InvokeRequest) (<
 		}
 		out <- llm.StreamErrorEvent{Err: errors.New("openai stream: retry loop ended without result")}
 	}()
-	return out, nil
+	return forwarded, nil
 }
 
 type chatCompletionStreamResponse struct {

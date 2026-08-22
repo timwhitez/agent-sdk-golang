@@ -375,7 +375,12 @@ func looksLikeResponsesInputUnsupported(msg string) bool {
 // InvokeStream implements true SSE streaming for OpenAI responses.
 // It emits text deltas and basic tool-call deltas (best-effort).
 func (c *ResponsesClient) InvokeStream(ctx context.Context, req llm.InvokeRequest) (<-chan llm.StreamEvent, error) {
+	// Keep provider production separate from caller delivery. If a caller stops
+	// consuming, cancellation switches the forwarding goroutine to drain-and-drop
+	// mode so the producer can finish and close the response body.
 	out := make(chan llm.StreamEvent, 128)
+	forwarded := make(chan llm.StreamEvent, 128)
+	go forwardOpenAIStreamEvents(ctx, forwarded, out)
 	local := *c
 	local.Extra = cloneMap(c.Extra)
 	local.ExtraBody = cloneMap(c.ExtraBody)
@@ -884,7 +889,7 @@ func (c *ResponsesClient) InvokeStream(ctx context.Context, req llm.InvokeReques
 		}
 		out <- llm.StreamErrorEvent{Err: errors.New("openai responses stream: retry loop ended without result")}
 	}()
-	return out, nil
+	return forwarded, nil
 }
 
 func parseResponsesStreamEventError(provider string, root map[string]any) error {

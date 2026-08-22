@@ -1,6 +1,4 @@
-from pathlib import Path
-
-Path("sdk/llm/openai/stream_cancel_test.go").write_text(r'''package openai
+package openai
 
 import (
 	"context"
@@ -101,4 +99,3 @@ func TestOpenAIStreamsCloseWhenUnreadConsumerCancels(t *testing.T) {
 		})
 	}
 }
-''')
