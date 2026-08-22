@@ -1,0 +1,125 @@
+name: Apply issue 25 fix
+
+on:
+  push:
+    branches:
+      - fix/issue-25-strict-schema-order
+
+permissions:
+  contents: write
+
+jobs:
+  patch-and-test:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out branch
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          git clone "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" repo
+          cd repo
+          git checkout "$GITHUB_REF_NAME"
+
+      - name: Apply deterministic strict-schema fix
+        working-directory: repo
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+
+          path = Path("sdk/llm/openai/chat.go")
+          source = path.read_text(encoding="utf-8")
+
+          import_old = '\t"net/url"\n\t"strconv"\n'
+          import_new = '\t"net/url"\n\t"sort"\n\t"strconv"\n'
+          if source.count(import_old) != 1:
+              raise SystemExit("unexpected chat.go import shape")
+          source = source.replace(import_old, import_new, 1)
+
+          required_old = '\ts["properties"] = newProps\n\t// all required\n'
+          required_new = '\ts["properties"] = newProps\n\tsort.Strings(all)\n\t// all required\n'
+          if source.count(required_old) != 1:
+              raise SystemExit("unexpected makeStrictSchema shape")
+          source = source.replace(required_old, required_new, 1)
+          path.write_text(source, encoding="utf-8")
+          PY
+
+          cat > sdk/llm/openai/strict_schema_determinism_test.go <<'EOF'
+          package openai
+
+          import (
+           "fmt"
+           "reflect"
+           "testing"
+          )
+
+          func TestMakeStrictSchemaSortsRequiredPropertiesRecursively(t *testing.T) {
+           t.Parallel()
+
+           expectedTop := []any{"alpha", "beta", "delta", "nested"}
+           expectedNested := []any{"eta", "zeta"}
+
+           for i := 0; i < 512; i++ {
+            schema := map[string]any{
+             "type": "object",
+             "properties": map[string]any{
+              "delta": map[string]any{"type": "string"},
+              "alpha": map[string]any{"type": "integer"},
+              "nested": map[string]any{
+               "type": "object",
+               "properties": map[string]any{
+                "zeta": map[string]any{"type": "string"},
+                "eta":  map[string]any{"type": "boolean"},
+               },
+              },
+              "beta": map[string]any{"type": "number"},
+             },
+            }
+
+            strict := makeStrictSchema(schema)
+            if got := strict["required"]; !reflect.DeepEqual(got, expectedTop) {
+             t.Fatalf("iteration %d: top-level required = %#v, want %#v", i, got, expectedTop)
+            }
+
+            properties, ok := strict["properties"].(map[string]any)
+            if !ok {
+             t.Fatalf("iteration %d: properties type = %T", i, strict["properties"])
+            }
+            nested, ok := properties["nested"].(map[string]any)
+            if !ok {
+             t.Fatalf("iteration %d: nested schema type = %T", i, properties["nested"])
+            }
+            if got := nested["required"]; !reflect.DeepEqual(got, expectedNested) {
+             t.Fatalf("iteration %d: nested required = %#v, want %#v", i, got, expectedNested)
+            }
+
+            encoded := fmt.Sprint(strict["required"], nested["required"])
+            if encoded != "[alpha beta delta nested][eta zeta]" {
+             t.Fatalf("iteration %d: canonical order changed: %s", i, encoded)
+            }
+           }
+          }
+          EOF
+
+          gofmt -w sdk/llm/openai/chat.go sdk/llm/openai/strict_schema_determinism_test.go
+
+      - name: Run focused tests
+        working-directory: repo
+        run: go test ./sdk/llm/openai -count=1
+
+      - name: Run full test suite
+        working-directory: repo
+        run: go test ./... -count=1
+
+      - name: Commit validated fix and remove temporary workflow
+        working-directory: repo
+        run: |
+          set -euo pipefail
+          rm .github/workflows/issue-25-patch.yml
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          git commit -m "fix(openai): canonicalize strict schema required order"
+          git push origin HEAD:"$GITHUB_REF_NAME"
