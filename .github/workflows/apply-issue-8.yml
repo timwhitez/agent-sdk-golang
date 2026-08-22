@@ -1,0 +1,37 @@
+name: Apply and verify issue 8 fix
+
+on:
+  push:
+    branches: [fix/issue-8-agent-stream-terminal-contract]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: write
+
+jobs:
+  apply-test-commit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+      - run: python3 .github/fixes/issue-8.py
+      - run: rm -f .github/fixes/issue-8.py .github/workflows/apply-issue-8.yml
+      - run: gofmt -w sdk/llm/errors.go sdk/agent/agent.go sdk/agent/agent_stream_terminal_contract_test.go
+      - run: git diff --check
+      - name: Targeted terminal-contract tests
+        run: go test ./sdk/agent -run 'TestAgentRejectsTextStreamClosedWithoutDone|TestAgentRejectsIncompleteToolCallStreamClosedWithoutDone|TestAgentAcceptsExplicitDoneBeforeClose|TestAgentAcceptsMetadataOnlyStreamWithDone|TestAgentPreservesProviderStreamError' -count=1
+      - name: Agent tests
+        run: go test ./sdk/agent -count=1
+      - name: Full test suite
+        run: go test ./... -count=1
+      - name: Commit verified fix
+        if: github.event_name == 'push'
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          git commit -m "fix(agent): require explicit stream terminal events"
+          git push origin "HEAD:${GITHUB_REF_NAME}"
