@@ -1,0 +1,37 @@
+name: Apply and verify issue 5 fix
+
+on:
+  push:
+    branches: [fix/issue-5-timeout-overflow]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: write
+
+jobs:
+  apply-test-commit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+      - run: python3 .github/fixes/issue-5.py
+      - run: rm -f .github/fixes/issue-5.py .github/workflows/apply-issue-5.yml
+      - run: gofmt -w sdk/tools/sandbox/sandbox_timeout.go sdk/tools/sandbox/sandbox_bash.go sdk/tools/sandbox/sandbox_webfetch.go sdk/tools/sandbox/sandbox_timeout_test.go
+      - run: git diff --check
+      - name: Targeted timeout tests
+        run: go test ./sdk/tools/sandbox -run 'TestCheckedSandboxTimeoutBoundaries|TestBashRejectsOversizedTimeoutBeforeConfirmation|TestWebfetchRejectsOversizedTimeoutBeforeConfirmation' -count=1
+      - name: Sandbox tests
+        run: go test ./sdk/tools/sandbox -count=1
+      - name: Full test suite
+        run: go test ./... -count=1
+      - name: Commit verified fix
+        if: github.event_name == 'push'
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          git commit -m "fix(sandbox): reject overflowing tool timeouts"
+          git push origin "HEAD:${GITHUB_REF_NAME}"
