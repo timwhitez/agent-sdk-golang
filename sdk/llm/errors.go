@@ -101,3 +101,30 @@ func (e *StreamIdleTimeoutError) Error() string {
 func (e *StreamIdleTimeoutError) Timeout() bool { return true }
 
 func (e *StreamIdleTimeoutError) Temporary() bool { return true }
+
+// IncompleteStreamError reports that a streaming provider ended transport
+// delivery without the explicit terminal event required by the SDK contract.
+// Partial content may still be returned alongside this error.
+type IncompleteStreamError struct {
+	Provider string
+	Model    string
+	Message  string
+}
+
+func (e *IncompleteStreamError) Error() string {
+	if e == nil {
+		return "<nil>"
+	}
+	provider := e.Provider
+	if provider == "" {
+		provider = "provider"
+	}
+	message := e.Message
+	if message == "" {
+		message = "stream closed before terminal event"
+	}
+	if e.Model != "" {
+		return fmt.Sprintf("%s stream incomplete for model %s: %s", provider, e.Model, message)
+	}
+	return fmt.Sprintf("%s stream incomplete: %s", provider, message)
+}
