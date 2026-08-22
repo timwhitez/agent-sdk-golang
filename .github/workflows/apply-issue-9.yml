@@ -11,6 +11,7 @@ permissions:
 
 jobs:
   apply-test-commit:
+    if: github.actor != 'github-actions[bot]'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
@@ -22,10 +23,14 @@ jobs:
       - run: gofmt -w sdk/llm/openai/chat.go sdk/agent/agent.go sdk/llm/openai/auth_retry_test.go sdk/agent/agent_auth_retry_test.go
       - run: git diff --check
       - name: Direct-provider request-count tests
-        run: go test ./sdk/llm/openai -run 'TestOpenAIAuthFailuresAreNotRetriedByDefault|TestOpenAIAuthRetryCanBeExplicitlyEnabled' -count=1
+        run: go test ./sdk/llm/openai -run 'TestOpenAIAuthFailuresAreNotRetriedByDefault|TestOpenAIAuthRetryCanBeExplicitlyEnabled' -count=20
       - name: Agent integration request-count test
-        run: go test ./sdk/agent -run TestAgentDoesNotRetryOpenAIAuthFailures -count=1
-      - name: Full test suite
+        run: go test ./sdk/agent -run TestAgentDoesNotRetryOpenAIAuthFailures -count=20
+      - name: Recheck previously flaky unrelated compaction test
+        run: go test ./sdk/agent/compaction -run TestLocalPrunePreservesLastNonSavedToolResult -count=20
+      - name: Full test suite, first pass
+        run: go test ./... -count=1
+      - name: Full test suite, second pass
         run: go test ./... -count=1
       - name: Commit verified fix
         if: github.event_name == 'push'
