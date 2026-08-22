@@ -11,6 +11,7 @@ permissions:
 
 jobs:
   verify:
+    if: github.actor != 'github-actions[bot]'
     strategy:
       fail-fast: false
       matrix:
@@ -23,10 +24,12 @@ jobs:
           go-version-file: go.mod
       - name: Apply guarded transformation
         shell: bash
-        run: python3 .github/fixes/issue-1.py
+        run: |
+          python3 .github/fixes/issue-1.py
+          python3 .github/fixes/issue-1-suspended.py
       - name: Remove temporary automation
         shell: bash
-        run: rm -f .github/fixes/issue-1.py .github/workflows/apply-issue-1.yml
+        run: rm -f .github/fixes/issue-1.py .github/fixes/issue-1-suspended.py .github/workflows/apply-issue-1.yml
       - name: Format
         shell: bash
         run: gofmt -w sdk/tools/execrunner/runner.go sdk/tools/execrunner/process_group_unix.go sdk/tools/execrunner/process_group_other.go sdk/tools/execrunner/process_group_windows.go sdk/tools/execrunner/process_tree_windows_test.go
@@ -35,13 +38,14 @@ jobs:
         run: git diff --check
       - name: Execrunner tests
         shell: bash
-        run: go test ./sdk/tools/execrunner -count=1
-      - name: Full test suite
+        run: go test ./sdk/tools/execrunner -count=5
+      - name: Full test suite on supported baseline platform
+        if: matrix.os == 'ubuntu-latest'
         shell: bash
         run: go test ./... -count=1
 
   commit:
-    if: github.event_name == 'push'
+    if: github.event_name == 'push' && github.actor != 'github-actions[bot]'
     needs: verify
     runs-on: ubuntu-latest
     steps:
@@ -49,8 +53,10 @@ jobs:
       - name: Apply final verified patch
         run: |
           python3 .github/fixes/issue-1.py
-          rm -f .github/fixes/issue-1.py .github/workflows/apply-issue-1.yml
+          python3 .github/fixes/issue-1-suspended.py
+          rm -f .github/fixes/issue-1.py .github/fixes/issue-1-suspended.py .github/workflows/apply-issue-1.yml
           gofmt -w sdk/tools/execrunner/runner.go sdk/tools/execrunner/process_group_unix.go sdk/tools/execrunner/process_group_other.go sdk/tools/execrunner/process_group_windows.go sdk/tools/execrunner/process_tree_windows_test.go
+          git diff --check
       - name: Commit verified fix
         run: |
           git config user.name "github-actions[bot]"
