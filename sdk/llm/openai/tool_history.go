@@ -22,6 +22,9 @@ func validateOpenAIToolHistory(messages []llm.Message, provider string) error {
 			if id == "" {
 				return fmt.Errorf("%s: invalid tool history: assistant tool call at index %d has empty id", provider, i)
 			}
+			if _, exists := expected[id]; exists {
+				return fmt.Errorf("%s: invalid tool history: assistant tool call at index %d repeats id %q", provider, i, id)
+			}
 			expected[id] = false
 		}
 		j := i + 1
@@ -30,8 +33,12 @@ func validateOpenAIToolHistory(messages []llm.Message, provider string) error {
 			if id == "" {
 				return fmt.Errorf("%s: invalid tool history: tool message at index %d has empty tool_call_id", provider, j)
 			}
-			if _, ok := expected[id]; !ok {
+			seen, ok := expected[id]
+			if !ok {
 				return fmt.Errorf("%s: invalid tool history: tool message at index %d references unknown tool_call_id %q", provider, j, id)
+			}
+			if seen {
+				return fmt.Errorf("%s: invalid tool history: tool message at index %d repeats tool_call_id %q", provider, j, id)
 			}
 			expected[id] = true
 			j++
