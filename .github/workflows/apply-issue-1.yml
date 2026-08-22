@@ -1,0 +1,60 @@
+name: Apply and verify issue 1 fix
+
+on:
+  push:
+    branches: [fix/issue-1-windows-process-tree]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: write
+
+jobs:
+  verify:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+      - name: Apply guarded transformation
+        shell: bash
+        run: python3 .github/fixes/issue-1.py
+      - name: Remove temporary automation
+        shell: bash
+        run: rm -f .github/fixes/issue-1.py .github/workflows/apply-issue-1.yml
+      - name: Format
+        shell: bash
+        run: gofmt -w sdk/tools/execrunner/runner.go sdk/tools/execrunner/process_group_unix.go sdk/tools/execrunner/process_group_other.go sdk/tools/execrunner/process_group_windows.go sdk/tools/execrunner/process_tree_windows_test.go
+      - name: Check patch hygiene
+        shell: bash
+        run: git diff --check
+      - name: Execrunner tests
+        shell: bash
+        run: go test ./sdk/tools/execrunner -count=1
+      - name: Full test suite
+        shell: bash
+        run: go test ./... -count=1
+
+  commit:
+    if: github.event_name == 'push'
+    needs: verify
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - name: Apply final verified patch
+        run: |
+          python3 .github/fixes/issue-1.py
+          rm -f .github/fixes/issue-1.py .github/workflows/apply-issue-1.yml
+          gofmt -w sdk/tools/execrunner/runner.go sdk/tools/execrunner/process_group_unix.go sdk/tools/execrunner/process_group_other.go sdk/tools/execrunner/process_group_windows.go sdk/tools/execrunner/process_tree_windows_test.go
+      - name: Commit verified fix
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          git commit -m "fix(execrunner): terminate Windows process trees"
+          git push origin "HEAD:${GITHUB_REF_NAME}"
