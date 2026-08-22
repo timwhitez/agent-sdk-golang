@@ -81,6 +81,7 @@ if text.count(old) != 1:
     raise SystemExit(f"webfetch timeout block count={text.count(old)}")
 text = text.replace(old, new)
 text = text.replace('Timeout: time.Duration(timeout) * time.Second,', 'Timeout: timeoutDuration,')
+text = text.replace('\t"time"\n', '')
 web.write_text(text)
 
 Path("sdk/tools/sandbox/sandbox_timeout_test.go").write_text(r'''package sandbox
