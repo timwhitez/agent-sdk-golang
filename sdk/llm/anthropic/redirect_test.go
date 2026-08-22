@@ -95,15 +95,14 @@ func TestAnthropicInvokeStreamRejectsCrossOriginRedirectWithoutLeakingAPIKey(t *
 }
 
 func TestAnthropicInvokeAllowsSameOriginRedirect(t *testing.T) {
+	receivedAPIKey := make(chan string, 1)
 	var server *httptest.Server
 	server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != "/redirected" {
 			http.Redirect(w, r, server.URL+"/redirected", http.StatusTemporaryRedirect)
 			return
 		}
-		if got := r.Header.Get("X-Api-Key"); got != "secret-key" {
-			t.Fatalf("same-origin x-api-key = %q", got)
-		}
+		receivedAPIKey <- r.Header.Get("X-Api-Key")
 		w.Header().Set("Content-Type", "application/json")
 		_, _ = io.WriteString(w, `{"id":"msg_1","type":"message","role":"assistant","content":[{"type":"text","text":"ok"}],"model":"test-model","stop_reason":"end_turn","usage":{"input_tokens":1,"output_tokens":1}}`)
 	}))
@@ -123,6 +122,14 @@ func TestAnthropicInvokeAllowsSameOriginRedirect(t *testing.T) {
 	}
 	if got := completion.PlainText(); got != "ok" {
 		t.Fatalf("completion text = %q, want ok", got)
+	}
+	select {
+	case got := <-receivedAPIKey:
+		if got != "secret-key" {
+			t.Fatalf("same-origin x-api-key = %q, want secret-key", got)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("same-origin redirect destination was not reached")
 	}
 }
 
