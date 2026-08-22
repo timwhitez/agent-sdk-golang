@@ -100,7 +100,7 @@ jobs:
             }
 
             encoded := fmt.Sprint(strict["required"], nested["required"])
-            if encoded != "[alpha beta delta nested][eta zeta]" {
+            if encoded != "[alpha beta delta nested] [eta zeta]" {
              t.Fatalf("iteration %d: canonical order changed: %s", i, encoded)
             }
            }
