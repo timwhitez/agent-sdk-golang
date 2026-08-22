@@ -37,32 +37,38 @@ jobs:
           def extract(name: str) -> str:
               marker = f'      - name: {name}'
               try:
-                  index = lines.index(marker)
+                  index = lines.index(marker) + 1
               except ValueError as exc:
                   raise SystemExit(f'missing reviewed step: {name}') from exc
-              index += 1
-              while index < len(lines) and lines[index] != '        run: |':
-                  if lines[index].startswith('      - name: '):
-                      raise SystemExit(f'step {name} has no run block')
-                  index += 1
-              if index >= len(lines):
-                  raise SystemExit(f'step {name} has no run block')
-              index += 1
-              body = []
               while index < len(lines):
                   line = lines[index]
                   if line.startswith('      - name: '):
-                      break
-                  if line == '':
-                      body.append('')
-                  elif line.startswith('          '):
-                      body.append(line[10:])
-                  else:
-                      break
+                      raise SystemExit(f'step {name} has no run command')
+                  if line == '        run: |':
+                      index += 1
+                      body = []
+                      while index < len(lines):
+                          line = lines[index]
+                          if line.startswith('      - name: '):
+                              break
+                          if line == '':
+                              body.append('')
+                          elif line.startswith('          '):
+                              body.append(line[10:])
+                          else:
+                              break
+                          index += 1
+                      if not body:
+                          raise SystemExit(f'step {name} has an empty run block')
+                      return '\n'.join(body) + '\n'
+                  inline = '        run: '
+                  if line.startswith(inline):
+                      command = line[len(inline):]
+                      if not command:
+                          raise SystemExit(f'step {name} has an empty inline run command')
+                      return command + '\n'
                   index += 1
-              if not body:
-                  raise SystemExit(f'step {name} has an empty run block')
-              return '\n'.join(body) + '\n'
+              raise SystemExit(f'step {name} has no run command')
 
           for number, name in enumerate(names, start=1):
               Path(f'/tmp/issue-22-step-{number}.sh').write_text(
