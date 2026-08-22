@@ -1,0 +1,38 @@
+name: Apply and verify issue 11 fix
+
+on:
+  push:
+    branches: [fix/issue-11-compaction-framing]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: write
+
+jobs:
+  apply-test-commit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+      - run: python3 .github/fixes/issue-11.py
+      - run: rm -f .github/fixes/issue-11.py .github/workflows/apply-issue-11.yml
+      - run: gofmt -w sdk/agent/compaction/service.go sdk/agent/compaction/untrusted_framing_test.go
+      - run: git diff --check
+      - name: Targeted tests
+        run: go test ./sdk/agent/compaction -run 'TestWrapUntrustedMaterialPreventsDelimiterInjection|TestCompactionInstructionsDefineJSONWholeLineFraming' -count=1
+      - name: Full compaction tests
+        run: go test ./sdk/agent/compaction -count=1
+      - name: Full test suite
+        run: go test ./... -count=1
+      - name: Commit verified fix
+        if: github.event_name == 'push'
+        shell: bash
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          git commit -m "fix(compaction): make untrusted framing collision-safe"
+          git push origin "HEAD:${GITHUB_REF_NAME}"
