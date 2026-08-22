@@ -2,28 +2,23 @@ from pathlib import Path
 
 path = Path("sdk/tools/sandbox/sandbox_patch.go")
 text = path.read_text()
-old = '''\t\tif err := os.Rename(fromPath, toPath); err != nil {
-\t\t\treturn err
-\t\t}
-\t\treturn nil
+old = '''\t\treturn os.Rename(fromPath, toPath)
 '''
-new = '''\t\tif err := moveRegularFileNoReplace(fromPath, toPath); err != nil {
-\t\t\treturn err
-\t\t}
-\t\treturn nil
+new = '''\t\treturn moveRegularFileNoReplace(fromPath, toPath)
 '''
 if text.count(old) != 1:
     raise SystemExit(f"move commit anchor count={text.count(old)}")
 text = text.replace(old, new)
-anchor = '''// applyAddFile creates a new file and writes content.
+anchor = '''// applyAddFile creates a new file with the given content.
 func applyAddFile(s *Sandbox, relPath string, lines []string) error {
 '''
 insert = '''var beforePatchMoveNoReplace = func(string, string) {}
 
 // moveRegularFileNoReplace atomically creates the destination name without
 // replacing an existing path. Patch moves are limited to regular files, so a
-// hard link plus source unlink provides portable no-clobber semantics on the
-// filesystems where os.Rename would also be a same-filesystem operation.
+// hard link plus source unlink preserves file identity while avoiding the
+// replacement behavior of os.Rename on Unix. Filesystems without hard-link
+// support fail closed instead of risking destination data loss.
 func moveRegularFileNoReplace(fromPath, toPath string) error {
 \tif beforePatchMoveNoReplace != nil {
 \t\tbeforePatchMoveNoReplace(fromPath, toPath)
@@ -44,7 +39,7 @@ func moveRegularFileNoReplace(fromPath, toPath string) error {
 \treturn nil
 }
 
-// applyAddFile creates a new file and writes content.
+// applyAddFile creates a new file with the given content.
 func applyAddFile(s *Sandbox, relPath string, lines []string) error {
 '''
 if text.count(anchor) != 1:
@@ -53,7 +48,8 @@ path.write_text(text.replace(anchor, insert))
 
 test = Path("sdk/tools/sandbox/sandbox_patch_move_conflict_test.go")
 existing = test.read_text()
-existing += r'''
+if "TestPatchPlannerMoveRejectsDestinationCreatedAfterFinalCheck" not in existing:
+    existing += r'''
 
 func TestPatchPlannerMoveRejectsDestinationCreatedAfterFinalCheck(t *testing.T) {
 	root := t.TempDir()
