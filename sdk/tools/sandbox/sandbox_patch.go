@@ -609,7 +609,7 @@ func (p *patchPlanner) commitAction(a patchAction) error {
 		} else {
 			_ = dirFile.Close()
 		}
-		return os.Rename(fromPath, toPath)
+		return moveRegularFileNoReplace(fromPath, toPath)
 	default:
 		currentPath, err := p.s.revalidatePathForAccess(a.path)
 		if err != nil {
@@ -620,6 +620,33 @@ func (p *patchPlanner) commitAction(a patchAction) error {
 		}
 		return writeFilePreserveMode(currentPath, a.content, 0o644)
 	}
+}
+
+var beforePatchMoveNoReplace = func(string, string) {}
+
+// moveRegularFileNoReplace atomically creates the destination name without
+// replacing an existing path. Patch moves are limited to regular files, so a
+// hard link plus source unlink preserves file identity while avoiding the
+// replacement behavior of os.Rename on Unix. Filesystems without hard-link
+// support fail closed instead of risking destination data loss.
+func moveRegularFileNoReplace(fromPath, toPath string) error {
+	if beforePatchMoveNoReplace != nil {
+		beforePatchMoveNoReplace(fromPath, toPath)
+	}
+	if err := os.Link(fromPath, toPath); err != nil {
+		if os.IsExist(err) {
+			return fmt.Errorf("move destination already exists: %s", toPath)
+		}
+		return fmt.Errorf("create non-clobbering move destination %s: %w", toPath, err)
+	}
+	if err := os.Remove(fromPath); err != nil {
+		rollbackErr := os.Remove(toPath)
+		if rollbackErr != nil {
+			return fmt.Errorf("remove move source %s: %w (destination rollback failed: %v)", fromPath, err, rollbackErr)
+		}
+		return fmt.Errorf("remove move source %s: %w", fromPath, err)
+	}
+	return nil
 }
 
 // applyAddFile creates a new file with the given content.
