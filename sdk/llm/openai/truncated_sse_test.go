@@ -1,76 +1,4 @@
-from pathlib import Path
-
-chat = Path("sdk/llm/openai/chat.go")
-text = chat.read_text()
-old = '''\t\t\tif err != nil {
-\t\t\t\tout <- llm.StreamErrorEvent{Err: err}
-\t\t\t\treturn
-\t\t\t}
-\t\t\tout <- llm.StreamDoneEvent{StopReason: stopReason}
-\t\t\treturn
-'''
-new = '''\t\t\tif err != nil {
-\t\t\t\tout <- llm.StreamErrorEvent{Err: err}
-\t\t\t\treturn
-\t\t\t}
-\t\t\tout <- llm.StreamErrorEvent{Err: &llm.ProviderError{
-\t\t\t\tProvider: local.Provider(),
-\t\t\t\tMessage:  fmt.Sprintf("stream ended before [DONE]; response is incomplete (model=%q endpoint=%s)", local.ModelName, endpoint),
-\t\t\t}}
-\t\t\treturn
-'''
-if text.count(old) != 1:
-    raise SystemExit(f"chat EOF anchor count={text.count(old)}")
-chat.write_text(text.replace(old, new))
-
-responses = Path("sdk/llm/openai/responses.go")
-text = responses.read_text()
-old = '''\t\t\tstopReason := ""
-\t\t\tthinkingEmitted := false
-'''
-new = '''\t\t\tstopReason := ""
-\t\t\tsawCompleted := false
-\t\t\tthinkingEmitted := false
-'''
-if text.count(old) != 1:
-    raise SystemExit(f"responses terminal flag anchor count={text.count(old)}")
-text = text.replace(old, new)
-old = '''\t\t\t\tcase "response.completed":
-\t\t\t\t\trespObj, _ := root["response"].(map[string]any)
-'''
-new = '''\t\t\t\tcase "response.completed":
-\t\t\t\t\tsawCompleted = true
-\t\t\t\t\trespObj, _ := root["response"].(map[string]any)
-'''
-if text.count(old) != 1:
-    raise SystemExit(f"response.completed anchor count={text.count(old)}")
-text = text.replace(old, new)
-old = '''\t\t\tif err != nil {
-\t\t\t\tout <- llm.StreamErrorEvent{Err: err}
-\t\t\t\treturn
-\t\t\t}
-\t\t\tout <- llm.StreamDoneEvent{StopReason: stopReason}
-\t\t\treturn
-'''
-new = '''\t\t\tif err != nil {
-\t\t\t\tout <- llm.StreamErrorEvent{Err: err}
-\t\t\t\treturn
-\t\t\t}
-\t\t\tif !sawCompleted {
-\t\t\t\tout <- llm.StreamErrorEvent{Err: &llm.ProviderError{
-\t\t\t\t\tProvider: local.Provider(),
-\t\t\t\t\tMessage:  fmt.Sprintf("stream ended before response.completed or [DONE]; response is incomplete (model=%q endpoint=%s)", local.ModelName, endpoint),
-\t\t\t\t}}
-\t\t\t\treturn
-\t\t\t}
-\t\t\tout <- llm.StreamDoneEvent{StopReason: stopReason}
-\t\t\treturn
-'''
-if text.count(old) != 1:
-    raise SystemExit(f"responses EOF anchor count={text.count(old)}")
-responses.write_text(text.replace(old, new))
-
-Path("sdk/llm/openai/truncated_sse_test.go").write_text(r'''package openai
+package openai
 
 import (
 	"context"
@@ -207,4 +135,3 @@ func TestExplicitOpenAITerminalsStillComplete(t *testing.T) {
 		}
 	})
 }
-''')
