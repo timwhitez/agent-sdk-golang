@@ -1,0 +1,37 @@
+name: Apply and verify issue 19 fix
+
+on:
+  push:
+    branches: [fix/issue-19-unicode-bom-decoding]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: write
+
+jobs:
+  apply-test-commit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+      - run: python3 .github/fixes/issue-19.py
+      - run: rm -f .github/fixes/issue-19.py .github/workflows/apply-issue-19.yml
+      - run: gofmt -w sdk/tools/sandbox/sandbox_read.go sdk/tools/sandbox/sandbox_read_unicode_test.go
+      - run: git diff --check
+      - name: Targeted Unicode decoding tests
+        run: go test ./sdk/tools/sandbox -run 'TestReadDecodesUnicodeBOMVariants|TestReadUnicodeDecodingPreservesOffsetAndLimit|TestReadRejectsMalformedUnicodeSequences|TestReadToolAllowsUTF16WithBOM' -count=1
+      - name: Sandbox tests
+        run: go test ./sdk/tools/sandbox -count=1
+      - name: Full test suite
+        run: go test ./... -count=1
+      - name: Commit verified fix
+        if: github.event_name == 'push'
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          git commit -m "fix(sandbox): decode Unicode BOM text before reading"
+          git push origin "HEAD:${GITHUB_REF_NAME}"
