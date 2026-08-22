@@ -2,6 +2,7 @@ package agent
 
 import (
 	"context"
+	"sync"
 	"testing"
 	"time"
 
@@ -111,5 +112,100 @@ func TestBlockedCheckpointWriterDoesNotBlockHistoryReads(t *testing.T) {
 	case <-done:
 	case <-time.After(time.Second):
 		t.Fatal("applyPendingCompaction did not finish")
+	}
+}
+
+func TestApplyPendingCompactionWarningCallbackCanReadMessages(t *testing.T) {
+	var agent *Agent
+	warningEntered := make(chan struct{})
+	var once sync.Once
+	created, err := New(Config{
+		LLM: compactionCallbackModel{},
+		Warningf: func(string, ...any) {
+			once.Do(func() { close(warningEntered) })
+			_ = agent.Messages()
+		},
+		Compaction: &compaction.Config{Enabled: true, ContextWindow: 4096},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	agent = created
+	agent.mu.Lock()
+	agent.messages = []llm.Message{llm.NewUserMessage("short")}
+	agent.mu.Unlock()
+	agent.pendingCompactionMu.Lock()
+	agent.pendingCompaction = &pendingCompaction{
+		messages:    []llm.Message{llm.NewUserMessage("after")},
+		snapshotLen: 2,
+		result:      compaction.Result{Compacted: true},
+	}
+	agent.pendingCompactionMu.Unlock()
+
+	done := make(chan struct{})
+	go func() {
+		agent.applyPendingCompaction(nil)
+		close(done)
+	}()
+	select {
+	case <-warningEntered:
+	case <-time.After(time.Second):
+		t.Fatal("warning callback was not entered")
+	}
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("warning callback deadlocked while reading Messages")
+	}
+}
+
+func TestApplyPendingCompactionTokenEstimatorCanReadMessages(t *testing.T) {
+	var agent *Agent
+	estimatorEntered := make(chan struct{})
+	var once sync.Once
+	created, err := New(Config{
+		LLM: compactionCallbackModel{},
+		Compaction: &compaction.Config{
+			Enabled:       true,
+			ContextWindow: 4096,
+			TokenEstimator: func(text string) int {
+				once.Do(func() { close(estimatorEntered) })
+				_ = agent.Messages()
+				if text == "" {
+					return 0
+				}
+				return 1
+			},
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	agent = created
+	agent.mu.Lock()
+	agent.messages = []llm.Message{llm.NewUserMessage("before")}
+	agent.mu.Unlock()
+	agent.pendingCompactionMu.Lock()
+	agent.pendingCompaction = &pendingCompaction{
+		messages:    []llm.Message{llm.NewUserMessage("after")},
+		snapshotLen: 1,
+		result:      compaction.Result{Compacted: true},
+	}
+	agent.pendingCompactionMu.Unlock()
+
+	done := make(chan struct{})
+	go func() {
+		agent.applyPendingCompaction(nil)
+		close(done)
+	}()
+	select {
+	case <-estimatorEntered:
+	case <-time.After(time.Second):
+		t.Fatal("token estimator was not entered")
+	}
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("token estimator deadlocked while reading Messages")
 	}
 }

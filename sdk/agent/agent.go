@@ -3749,13 +3749,14 @@ func (a *Agent) applyPendingCompaction(out chan Event) {
 	source := llm.CloneMessages(a.messages)
 	currentLen := len(source)
 	if currentLen < pending.snapshotLen {
-		a.warnf("compaction apply skipped: history shrank (%d < %d); scheduling retry", currentLen, pending.snapshotLen)
 		a.mu.Unlock()
+		a.warnf("compaction apply skipped: history shrank (%d < %d); scheduling retry", currentLen, pending.snapshotLen)
 		a.requeuePendingCompaction(pending)
 		a.compactionRetryPending.Store(true)
 		return
 	}
 	tailCap := currentLen - pending.snapshotLen
+	pairingRepaired := false
 	merged := llm.CloneMessages(pending.messages)
 	if tailCap > 0 {
 		merged = append(merged, llm.CloneMessages(source[pending.snapshotLen:])...)
@@ -3764,13 +3765,18 @@ func (a *Agent) applyPendingCompaction(out chan Event) {
 		// onto the summary. Repair rather than trust the caller to compact only
 		// on user-message boundaries.
 		if repaired, changed := repairToolCallPairs(merged); changed {
-			a.warnf("compaction apply repaired tool-call pairing at the summary/tail splice point")
+			pairingRepaired = true
 			merged = repaired
 		}
 	}
-	pending.result = a.reconcileCompactionTelemetry(pending.result, source, merged, 0)
 	a.mu.Unlock()
 
+	if pairingRepaired {
+		a.warnf("compaction apply repaired tool-call pairing at the summary/tail splice point")
+	}
+	// Estimation may invoke a host-supplied TokenEstimator; keep it outside the
+	// history lock for the same re-entrancy reason as checkpoint persistence.
+	pending.result = a.reconcileCompactionTelemetry(pending.result, source, merged, 0)
 	commit, commitErr := a.persistCompactionCheckpoint(context.Background(), merged, pending.result)
 	if commitErr != nil {
 		a.requeuePendingCompaction(pending)
