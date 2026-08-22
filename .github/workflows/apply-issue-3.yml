@@ -18,7 +18,8 @@ jobs:
         with:
           go-version-file: go.mod
       - run: python3 .github/fixes/issue-3.py
-      - run: rm -f .github/fixes/issue-3.py .github/workflows/apply-issue-3.yml
+      - run: python3 .github/fixes/issue-3-compat.py
+      - run: rm -f .github/fixes/issue-3.py .github/fixes/issue-3-compat.py .github/workflows/apply-issue-3.yml
       - run: gofmt -w sdk/tools/sandbox/sandbox_webfetch.go sdk/tools/sandbox/sandbox_webfetch_rebinding_test.go
       - run: git diff --check
       - name: Targeted DNS-rebinding regression
