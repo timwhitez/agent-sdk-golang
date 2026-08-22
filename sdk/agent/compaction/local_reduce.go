@@ -7,6 +7,8 @@ import (
 	"strings"
 	"time"
 
+	"github.com/timwhitez/agent-sdk-golang/sdk/agent/messageorigin"
+	"github.com/timwhitez/agent-sdk-golang/sdk/artifact"
 	"github.com/timwhitez/agent-sdk-golang/sdk/llm"
 )
 
@@ -14,16 +16,189 @@ const (
 	tierSnip                             = "snip"
 	tierPrune                            = "prune"
 	tierMicrocompact                     = "microcompact"
+	tierPlaceholderCleanup               = "placeholder_cleanup"
 	defaultSnipMinTokens                 = 64
 	defaultUserCodeMicrocompactMinTokens = 96
 	userCodePreviewHeadLines             = 12
 	userCodePreviewTailLines             = 8
 )
 
-var truncationArtifactRe = regexp.MustCompile(`(?i)(?:saved to|full output:|full_output=)\s+([^\]\s]+(?:/|\\)truncated(?:/|\\)[^\]\s]+)`)
+var truncationArtifactRe = regexp.MustCompile(`(?i)(?:saved to\s+|full output:\s*|full_output=\s*)([^\]\s]+(?:/|\\)truncated(?:/|\\)[^\]\s]+)`)
 
 func (s *Service) CompactLocal(ctx context.Context, messages []llm.Message, usage *llm.Usage) ([]llm.Message, Result, error) {
 	return s.compactLocalWithWatermark(ctx, messages, usage, "")
+}
+
+// CompactDestroyedPlaceholders removes only already-destroyed tool-result
+// blocks and repairs the associated assistant tool-call topology. It is a
+// deterministic low-watermark cleanup: it never invokes the summary model and
+// never deletes a mixed block that still contains a live tool result.
+func (s *Service) CompactDestroyedPlaceholders(ctx context.Context, messages []llm.Message, usage *llm.Usage) ([]llm.Message, Result, error) {
+	if s == nil || !s.Config.Enabled || len(messages) == 0 {
+		return messages, Result{Compacted: false}, nil
+	}
+	if ctx != nil && ctx.Err() != nil {
+		return messages, Result{Compacted: false}, ctx.Err()
+	}
+	originalTokens := s.approximateMessageTokens(messages)
+	out, changed := removeDestroyedToolBlocks(messages)
+	if !changed {
+		return messages, Result{
+			Compacted:        false,
+			Watermark:        tierPlaceholderCleanup,
+			Usage:            cloneUsage(usage),
+			OriginalTokens:   originalTokens,
+			NewTokens:        originalTokens,
+			TokenCountSource: TokenCountSourceEstimate,
+		}, nil
+	}
+	return out, Result{
+		Compacted:        true,
+		Watermark:        tierPlaceholderCleanup,
+		Usage:            cloneUsage(usage),
+		OriginalTokens:   originalTokens,
+		NewTokens:        s.approximateMessageTokens(out),
+		TokenCountSource: TokenCountSourceEstimate,
+		TiersApplied:     []string{tierPlaceholderCleanup},
+	}, nil
+}
+
+// removeDestroyedToolBlocks drops the tool results that were already recycled to
+// the ephemeral placeholder and repairs the assistant tool-call topology that
+// referenced them.
+//
+// A block's results are located by tool_call_id rather than by positional
+// adjacency, and the search spans non-assistant messages: a framework-authored
+// user reminder can end up between two results of the same block, and a
+// positional scan would then stop halfway and treat the remaining results as
+// unrelated messages — dropping the destroyed ones while keeping the live ones,
+// which turns one malformed history into a second one (an assistant tool_use
+// without its result, or a tool_result without its tool_use).
+//
+// The invariants are: a block is cleaned up only when every one of its results
+// is destroyed, a block that still holds a live result is left completely
+// untouched, and no live tool result is ever removed. Pre-existing orphans that
+// belong to no block are not repaired here — the outgoing-request repair owns
+// that — except for destroyed placeholders, which carry no information.
+func removeDestroyedToolBlocks(messages []llm.Message) ([]llm.Message, bool) {
+	dropped := make([]bool, len(messages))
+	clearedCalls := make([]bool, len(messages))
+	owned := make([]bool, len(messages))
+	changed := false
+
+	for i := 0; i < len(messages); i++ {
+		msg := messages[i]
+		if msg.Role != llm.RoleAssistant || len(msg.ToolCalls) == 0 {
+			continue
+		}
+		members, destroyed, live := toolBlockMembers(messages, i)
+		for _, j := range members {
+			owned[j] = true
+		}
+		if destroyed == 0 || live > 0 {
+			// Nothing recycled, or the block still carries evidence: leave the
+			// whole block — assistant message and every result — as it is.
+			continue
+		}
+		changed = true
+		clearedCalls[i] = true
+		if msg.Content.IsEmpty() {
+			dropped[i] = true
+		}
+		for _, j := range members {
+			dropped[j] = true
+		}
+	}
+
+	for i, msg := range messages {
+		if owned[i] || dropped[i] {
+			continue
+		}
+		if msg.Role == llm.RoleTool && msg.Destroyed {
+			// A destroyed placeholder that no surviving tool-call block claims.
+			// It holds no information, so removing it cannot lose evidence.
+			dropped[i] = true
+			changed = true
+		}
+	}
+
+	if !changed {
+		return messages, false
+	}
+	out := make([]llm.Message, 0, len(messages))
+	for i, msg := range messages {
+		if dropped[i] {
+			continue
+		}
+		if clearedCalls[i] {
+			msg.ToolCalls = nil
+		}
+		out = append(out, msg)
+	}
+	return out, true
+}
+
+// toolBlockMembers returns the indexes of the tool results that answer the
+// assistant tool-call block at assistantIndex, plus how many of them are
+// destroyed and how many are still live. Results are matched by tool_call_id and
+// the search continues across interleaved non-assistant messages, stopping at
+// the next assistant or system message. Blocks whose tool calls cannot be
+// matched unambiguously (an empty or duplicated ID) fall back to the contiguous
+// positional run so that their historical handling is preserved.
+func toolBlockMembers(messages []llm.Message, assistantIndex int) ([]int, int, int) {
+	calls := messages[assistantIndex].ToolCalls
+	pending := make(map[string]bool, len(calls))
+	unambiguous := true
+	for _, call := range calls {
+		id := strings.TrimSpace(call.ID)
+		if id == "" {
+			unambiguous = false
+			break
+		}
+		if _, exists := pending[id]; exists {
+			unambiguous = false
+			break
+		}
+		pending[id] = false
+	}
+
+	members := make([]int, 0, len(calls))
+	destroyed := 0
+	live := 0
+	countMember := func(j int) {
+		members = append(members, j)
+		if messages[j].Destroyed {
+			destroyed++
+		} else {
+			live++
+		}
+	}
+
+	if !unambiguous {
+		for j := assistantIndex + 1; j < len(messages) && messages[j].Role == llm.RoleTool; j++ {
+			countMember(j)
+		}
+		return members, destroyed, live
+	}
+
+	for j := assistantIndex + 1; j < len(messages); j++ {
+		role := messages[j].Role
+		if role == llm.RoleAssistant || role == llm.RoleSystem {
+			break
+		}
+		if role != llm.RoleTool {
+			// An interleaved reminder does not close the block: the remaining
+			// results of this same block may still follow it.
+			continue
+		}
+		id := strings.TrimSpace(messages[j].ToolCallID)
+		if answered, ok := pending[id]; !ok || answered {
+			continue
+		}
+		pending[id] = true
+		countMember(j)
+	}
+	return members, destroyed, live
 }
 
 func (s *Service) compactLocalWithWatermark(ctx context.Context, messages []llm.Message, usage *llm.Usage, forcedWatermark string) ([]llm.Message, Result, error) {
@@ -41,10 +216,7 @@ func (s *Service) compactLocalWithWatermark(ctx context.Context, messages []llm.
 	if err != nil {
 		return messages, Result{Compacted: false}, err
 	}
-	originalTokens := s.TotalTokens(usage)
-	if originalTokens <= 0 {
-		originalTokens = s.approximateMessageTokens(messages)
-	}
+	originalTokens := s.approximateMessageTokens(messages)
 	watermark := strings.TrimSpace(forcedWatermark)
 	if watermark == "" {
 		watermark = s.WatermarkForUsage(usage)
@@ -58,41 +230,45 @@ func (s *Service) compactLocalWithWatermark(ctx context.Context, messages []llm.
 		sessionID:     sessionID,
 		ledger:        ledger,
 		replacements:  ledgerReplacementIndex(ledger),
-		protectedFrom: protectedMessageStart(len(messages), s.protectedRecentMessages()),
+		protectedFrom: s.protectedZoneStart(messages),
 		latestUser:    latestRealUserIndex(messages),
 		watermark:     watermark,
 	}
-	out, warnings, createdOrReused, tiers := reducer.reduce(messages)
+	out, warnings, changed, ledgerChanged, tiers := reducer.reduce(messages)
 	warnings = append(loadWarnings, warnings...)
-	if createdOrReused == 0 {
+	if changed == 0 {
 		return messages, Result{
-			Compacted:      false,
-			Trigger:        "usage",
-			Watermark:      watermark,
-			Usage:          cloneUsage(usage),
-			OriginalTokens: originalTokens,
-			NewTokens:      originalTokens,
-			Warnings:       warnings,
+			Compacted:        false,
+			Trigger:          "usage",
+			Watermark:        watermark,
+			Usage:            cloneUsage(usage),
+			OriginalTokens:   originalTokens,
+			NewTokens:        originalTokens,
+			TokenCountSource: TokenCountSourceEstimate,
+			Warnings:         warnings,
 		}, nil
 	}
-	ledger.UpdatedAt = time.Now().UTC()
-	ledger.ContextWindow = s.contextWindow()
-	if err := ledger.Validate(sessionID); err != nil {
-		return messages, Result{Compacted: false, Warnings: warnings}, err
-	}
-	if err := s.saveLedger(ctx, sessionID, ledger); err != nil {
-		return messages, Result{Compacted: false, Warnings: warnings}, err
+	if ledgerChanged {
+		ledger.UpdatedAt = time.Now().UTC()
+		ledger.ContextWindow = s.contextWindow()
+		if err := ledger.Validate(sessionID); err != nil {
+			return messages, Result{Compacted: false, Warnings: warnings}, err
+		}
+		if err := s.saveLedger(ctx, sessionID, ledger); err != nil {
+			return messages, Result{Compacted: false, Warnings: warnings}, err
+		}
 	}
 	newTokens := s.approximateMessageTokens(out)
 	res := Result{
-		Compacted:      true,
-		Trigger:        "usage",
-		Watermark:      watermark,
-		Usage:          cloneUsage(usage),
-		OriginalTokens: originalTokens,
-		NewTokens:      newTokens,
-		TiersApplied:   tiers,
-		Warnings:       warnings,
+		Compacted:        true,
+		Trigger:          "usage",
+		Watermark:        watermark,
+		Usage:            cloneUsage(usage),
+		OriginalTokens:   originalTokens,
+		NewTokens:        newTokens,
+		TokenCountSource: TokenCountSourceEstimate,
+		TiersApplied:     tiers,
+		Warnings:         warnings,
 	}
 	res.LedgerPath = strings.TrimSpace(s.Config.LedgerPath)
 	return out, res, nil
@@ -107,9 +283,10 @@ type localReducer struct {
 	protectedFrom int
 	latestUser    int
 	watermark     string
+	ledgerChanged bool
 }
 
-func (r *localReducer) reduce(messages []llm.Message) ([]llm.Message, []string, int, []string) {
+func (r *localReducer) reduce(messages []llm.Message) ([]llm.Message, []string, int, bool, []string) {
 	out := make([]llm.Message, len(messages))
 	copy(out, messages)
 	warnings := []string{}
@@ -135,12 +312,15 @@ func (r *localReducer) reduce(messages []llm.Message) ([]llm.Message, []string, 
 		if !ok {
 			continue
 		}
+		if repl.ReplacementText == msg.Content.PlainText() {
+			continue
+		}
 		msg.Content = llm.TextContent(repl.ReplacementText)
 		out[i] = msg
 		changed++
 		applied[repl.Tier] = struct{}{}
 	}
-	return out, warnings, changed, orderedLocalTiers(applied)
+	return out, warnings, changed, r.ledgerChanged, orderedLocalTiers(applied)
 }
 
 func (r *localReducer) isPrune() bool {
@@ -151,16 +331,22 @@ func (r *localReducer) reduceToolMessage(index int, msg llm.Message) (LedgerRepl
 	if r.isPrune() {
 		text := msg.Content.PlainText()
 		if parent, ok := r.findReplacementByText(text, msg); ok {
+			if r.canonicalArtifactsConfigured() {
+				validated, warning, valid := r.validateCanonicalReplacement(msg, parent)
+				if !valid {
+					return LedgerReplacement{}, warning, false
+				}
+				parent = validated
+			}
 			if parent.Tier == tierPrune {
 				return parent, "", true
 			}
 			pruned := r.createToolPruneReplacement(msg, parent)
 			pruneKey := replacementLookupKey(pruned.MessageKey, pruned.PartKey)
 			if existing, exists := r.replacements[pruneKey]; exists && existing.Tier == tierPrune {
-				return existing, "", true
+				return r.validateExistingPruneReplacement(msg, parent, existing)
 			}
-			r.ledger.Replacements = append(r.ledger.Replacements, pruned)
-			r.replacements[pruneKey] = pruned
+			r.recordReplacement(pruned)
 			return pruned, "", true
 		}
 	}
@@ -184,17 +370,30 @@ func (r *localReducer) reduceToolMessage(index int, msg llm.Message) (LedgerRepl
 			return LedgerReplacement{}, warning, false
 		}
 		repl = created
-		r.ledger.Replacements = append(r.ledger.Replacements, repl)
-		r.replacements[lookupKey] = repl
+		r.recordReplacement(repl)
+	} else if r.canonicalArtifactsConfigured() {
+		if repl.CanonicalArtifact == nil {
+			created, warning, migrated := r.createSnipReplacement(msg, key, partKey, original)
+			if !migrated {
+				return LedgerReplacement{}, warning, false
+			}
+			r.replaceReplacement(created)
+			repl = created
+		} else {
+			validated, warning, valid := r.validateCanonicalReplacement(msg, repl)
+			if !valid {
+				return LedgerReplacement{}, warning, false
+			}
+			repl = validated
+		}
 	}
 	if r.isPrune() && repl.Tier == tierSnip {
 		pruned := r.createToolPruneReplacement(msg, repl)
 		pruneKey := replacementLookupKey(pruned.MessageKey, pruned.PartKey)
 		if existing, exists := r.replacements[pruneKey]; exists && existing.Tier == tierPrune {
-			return existing, "", true
+			return r.validateExistingPruneReplacement(msg, repl, existing)
 		}
-		r.ledger.Replacements = append(r.ledger.Replacements, pruned)
-		r.replacements[pruneKey] = pruned
+		r.recordReplacement(pruned)
 		return pruned, "", true
 	}
 	return repl, "", true
@@ -231,6 +430,9 @@ func (r *localReducer) eligibleToolMessage(index int, msg llm.Message) bool {
 	if strings.TrimSpace(text) == "" {
 		return false
 	}
+	if isToolCompactionStub(text) {
+		return false
+	}
 	return r.service.estimateTextTokens(text) >= defaultSnipMinTokens
 }
 
@@ -247,6 +449,45 @@ func (r *localReducer) reduceAssistantMessage(index int, msg llm.Message) (Ledge
 	partKey := "content-0"
 	lookupKey := replacementLookupKey(key, partKey)
 	if repl, ok := r.replacements[lookupKey]; ok {
+		if !r.canonicalArtifactsConfigured() {
+			return repl, "", true
+		}
+		if repl.CanonicalArtifact != nil {
+			validated, warning, valid := r.validateCanonicalReplacement(msg, repl)
+			return validated, warning, valid
+		}
+		created, warning, migrated := r.createAssistantReplacement(msg, key, partKey, original)
+		if migrated {
+			r.replaceReplacement(created)
+		}
+		return created, warning, migrated
+	}
+	created, warning, ok := r.createAssistantReplacement(msg, key, partKey, original)
+	if ok {
+		r.recordReplacement(created)
+	}
+	return created, warning, ok
+}
+
+func (r *localReducer) createAssistantReplacement(msg llm.Message, key, partKey, original string) (LedgerReplacement, string, bool) {
+	if r.canonicalArtifactsConfigured() {
+		manifest, stage, err := r.canonicalArtifactForContent(msg, artifact.ObjectKindCompactionMaterial, original)
+		if err != nil {
+			return LedgerReplacement{}, canonicalCompactionArtifactWarning(r.sessionID, "assistant", "", stage, err.Error()), false
+		}
+		text := canonicalAssistantPruneReplacementText(original, manifest, r.service.estimateTextTokens)
+		repl := LedgerReplacement{
+			MessageKey:        key,
+			PartKey:           partKey,
+			Role:              string(msg.Role),
+			Tier:              tierPrune,
+			OriginalHash:      ContentHash(original),
+			ReplacementHash:   ContentHash(text),
+			ReplacementText:   text,
+			CanonicalArtifact: cloneCanonicalManifestPointer(manifest),
+			CreatedAt:         time.Now().UTC(),
+			OriginalText:      original,
+		}
 		return repl, "", true
 	}
 	if r.service.Config.ToolArtifactWriter == nil {
@@ -266,7 +507,7 @@ func (r *localReducer) reduceAssistantMessage(index int, msg llm.Message) (Ledge
 	if artifactPath == "" {
 		return LedgerReplacement{}, compactionArtifactWarning(r.sessionID, "assistant", "", "write", "artifact writer returned empty path"), false
 	}
-	text := assistantPruneReplacementText(original, artifactPath)
+	text := assistantPruneReplacementText(original, artifactPath, r.service.estimateTextTokens)
 	repl := LedgerReplacement{
 		MessageKey:      key,
 		PartKey:         partKey,
@@ -279,8 +520,6 @@ func (r *localReducer) reduceAssistantMessage(index int, msg llm.Message) (Ledge
 		CreatedAt:       time.Now().UTC(),
 		OriginalText:    original,
 	}
-	r.ledger.Replacements = append(r.ledger.Replacements, repl)
-	r.replacements[lookupKey] = repl
 	return repl, "", true
 }
 
@@ -293,6 +532,9 @@ func (r *localReducer) eligibleAssistantMessage(index int, msg llm.Message) bool
 	}
 	text := msg.Content.PlainText()
 	if strings.TrimSpace(text) == "" {
+		return false
+	}
+	if isAssistantCompactionStub(text) {
 		return false
 	}
 	return r.service.estimateTextTokens(text) >= defaultSnipMinTokens
@@ -311,6 +553,48 @@ func (r *localReducer) reduceUserCodeMessage(index int, msg llm.Message) (Ledger
 	partKey := "content-0"
 	lookupKey := replacementLookupKey(key, partKey)
 	if repl, ok := r.replacements[lookupKey]; ok {
+		if !r.canonicalArtifactsConfigured() {
+			return repl, "", true
+		}
+		if repl.CanonicalArtifact != nil {
+			validated, warning, valid := r.validateCanonicalReplacement(msg, repl)
+			return validated, warning, valid
+		}
+		created, warning, migrated := r.createUserCodeReplacement(msg, key, partKey, original)
+		if migrated {
+			r.replaceReplacement(created)
+		}
+		return created, warning, migrated
+	}
+	created, warning, ok := r.createUserCodeReplacement(msg, key, partKey, original)
+	if ok {
+		r.recordReplacement(created)
+	}
+	return created, warning, ok
+}
+
+func (r *localReducer) createUserCodeReplacement(msg llm.Message, key, partKey, original string) (LedgerReplacement, string, bool) {
+	if r.canonicalArtifactsConfigured() {
+		manifest, stage, err := r.canonicalArtifactForContent(msg, artifact.ObjectKindCompactionMaterial, original)
+		if err != nil {
+			return LedgerReplacement{}, canonicalCompactionArtifactWarning(r.sessionID, "user_code", "", stage, err.Error()), false
+		}
+		text, ok := canonicalUserCodeMicrocompactReplacementText(original, manifest, r.service.estimateTextTokens)
+		if !ok {
+			return LedgerReplacement{}, "", false
+		}
+		repl := LedgerReplacement{
+			MessageKey:        key,
+			PartKey:           partKey,
+			Role:              string(msg.Role),
+			Tier:              tierMicrocompact,
+			OriginalHash:      ContentHash(original),
+			ReplacementHash:   ContentHash(text),
+			ReplacementText:   text,
+			CanonicalArtifact: cloneCanonicalManifestPointer(manifest),
+			CreatedAt:         time.Now().UTC(),
+			OriginalText:      original,
+		}
 		return repl, "", true
 	}
 	if r.service.Config.ToolArtifactWriter == nil {
@@ -346,16 +630,50 @@ func (r *localReducer) reduceUserCodeMessage(index int, msg llm.Message) (Ledger
 		CreatedAt:       time.Now().UTC(),
 		OriginalText:    original,
 	}
-	r.ledger.Replacements = append(r.ledger.Replacements, repl)
-	r.replacements[lookupKey] = repl
 	return repl, "", true
+}
+
+func (r *localReducer) recordReplacement(repl LedgerReplacement) {
+	if r == nil || r.ledger == nil {
+		return
+	}
+	r.ledger.Replacements = append(r.ledger.Replacements, repl)
+	r.replacements[replacementLookupKey(repl.MessageKey, repl.PartKey)] = repl
+	r.ledgerChanged = true
+}
+
+func (r *localReducer) replaceReplacement(repl LedgerReplacement) {
+	if r == nil || r.ledger == nil {
+		return
+	}
+	key := replacementLookupKey(repl.MessageKey, repl.PartKey)
+	for i := range r.ledger.Replacements {
+		if replacementLookupKey(r.ledger.Replacements[i].MessageKey, r.ledger.Replacements[i].PartKey) != key {
+			continue
+		}
+		r.ledger.Replacements[i] = repl
+		r.replacements[key] = repl
+		r.ledgerChanged = true
+		return
+	}
+	r.recordReplacement(repl)
+}
+
+func isToolCompactionStub(text string) bool {
+	trimmed := strings.TrimSpace(text)
+	return strings.HasPrefix(trimmed, "[Tool result snipped:") ||
+		strings.HasPrefix(trimmed, "[Tool result pruned:")
+}
+
+func isAssistantCompactionStub(text string) bool {
+	return strings.HasPrefix(strings.TrimSpace(text), "[Assistant text compacted:")
 }
 
 func (r *localReducer) eligibleUserCodeMessage(index int, msg llm.Message) bool {
 	if !r.service.Config.EnableUserCodeMicrocompact {
 		return false
 	}
-	if index >= r.protectedFrom || index == r.latestUser || msg.Destroyed || msg.Role != llm.RoleUser || isCompactionSummaryMessage(msg) {
+	if index >= r.protectedFrom || index == r.latestUser || !messageorigin.IsRealUserMessage(msg) {
 		return false
 	}
 	text := msg.Content.PlainText()
@@ -366,6 +684,27 @@ func (r *localReducer) eligibleUserCodeMessage(index int, msg llm.Message) bool 
 }
 
 func (r *localReducer) createSnipReplacement(msg llm.Message, messageKey, partKey, original string) (LedgerReplacement, string, bool) {
+	if r.canonicalArtifactsConfigured() {
+		manifest, stage, err := r.canonicalArtifactForContent(msg, artifact.ObjectKindLogicalToolResult, original)
+		if err != nil {
+			return LedgerReplacement{}, canonicalCompactionArtifactWarning(r.sessionID, msg.ToolName, msg.ToolCallID, stage, err.Error()), false
+		}
+		replacementText := canonicalSnipReplacementText(msg, original, manifest)
+		now := time.Now().UTC()
+		return LedgerReplacement{
+			MessageKey:        messageKey,
+			PartKey:           partKey,
+			Role:              string(msg.Role),
+			ToolName:          strings.TrimSpace(msg.ToolName),
+			Tier:              tierSnip,
+			OriginalHash:      ContentHash(original),
+			ReplacementHash:   ContentHash(replacementText),
+			ReplacementText:   replacementText,
+			CanonicalArtifact: cloneCanonicalManifestPointer(manifest),
+			CreatedAt:         now,
+			OriginalText:      original,
+		}, "", true
+	}
 	artifactPath := extractTruncationArtifactPath(original)
 	if artifactPath == "" {
 		if r.service.Config.ToolArtifactWriter == nil {
@@ -406,6 +745,9 @@ func (r *localReducer) createSnipReplacement(msg llm.Message, messageKey, partKe
 
 func (r *localReducer) createToolPruneReplacement(msg llm.Message, parent LedgerReplacement) LedgerReplacement {
 	text := toolPruneReplacementText(msg, parent.FullArtifact)
+	if parent.CanonicalArtifact != nil {
+		text = canonicalToolPruneReplacementText(msg, *parent.CanonicalArtifact)
+	}
 	return LedgerReplacement{
 		MessageKey:            parent.MessageKey + "/tier:prune",
 		PartKey:               parent.PartKey,
@@ -415,6 +757,7 @@ func (r *localReducer) createToolPruneReplacement(msg llm.Message, parent Ledger
 		OriginalHash:          parent.ReplacementHash,
 		ReplacementHash:       ContentHash(text),
 		ReplacementText:       text,
+		CanonicalArtifact:     cloneCanonicalManifestPointerFrom(parent.CanonicalArtifact),
 		FullArtifact:          strings.TrimSpace(parent.FullArtifact),
 		ParentReplacementHash: parent.ReplacementHash,
 		CreatedAt:             time.Now().UTC(),
@@ -446,8 +789,8 @@ func toolPruneReplacementText(msg llm.Message, artifactPath string) string {
 	return fmt.Sprintf("[Tool result pruned: %s tool_call_id=%s full_output=%s]", tool, id, strings.TrimSpace(artifactPath))
 }
 
-func assistantPruneReplacementText(original, artifactPath string) string {
-	return fmt.Sprintf("[Assistant text compacted: lines=%d bytes=%d full_output=%s]\n%s", countTextLines(original), len(original), strings.TrimSpace(artifactPath), assistantPreview(original))
+func assistantPruneReplacementText(original, artifactPath string, estimate tokenEstimator) string {
+	return fmt.Sprintf("[Assistant text compacted: lines=%d bytes=%d full_output=%s]\n%s", countTextLines(original), len(original), strings.TrimSpace(artifactPath), assistantPreviewWithEstimator(original, estimate))
 }
 
 type fencedCodeBlock struct {
@@ -556,47 +899,11 @@ func userCodeBlockReplacementLines(block fencedCodeBlock, artifactPath string) [
 }
 
 func assistantPreview(text string) string {
-	text = strings.TrimSpace(text)
-	if text == "" {
-		return ""
-	}
-	const maxPreview = 220
-	preview := text
-	if len(preview) > maxPreview {
-		preview = strings.TrimSpace(preview[:maxPreview]) + "..."
-	}
-	tokens := extractKeyTokens(text, 6)
-	if len(tokens) == 0 {
-		return preview
-	}
-	return preview + "\nKey tokens: " + strings.Join(tokens, " ")
+	return assistantPreviewWithEstimator(text, approximateTextTokens)
 }
 
-func extractKeyTokens(text string, maxTokens int) []string {
-	raw := strings.FieldsFunc(text, func(r rune) bool {
-		return r == ' ' || r == '\n' || r == '\t' || r == ',' || r == ';' || r == ':' || r == ')' || r == '(' || r == '[' || r == ']'
-	})
-	out := []string{}
-	seen := map[string]struct{}{}
-	for _, tok := range raw {
-		tok = strings.Trim(tok, "\"'`")
-		if tok == "" {
-			continue
-		}
-		isKey := strings.Contains(tok, "/") || strings.Contains(tok, "\\") || strings.Contains(tok, ".") || strings.Contains(tok, "=") || strings.Contains(strings.ToLower(tok), "error")
-		if !isKey {
-			continue
-		}
-		if _, ok := seen[tok]; ok {
-			continue
-		}
-		seen[tok] = struct{}{}
-		out = append(out, tok)
-		if len(out) >= maxTokens {
-			break
-		}
-	}
-	return out
+func assistantPreviewWithEstimator(text string, estimate tokenEstimator) string {
+	return truncateTextToTokenBudget(text, assistantPreviewTokenBudget, estimate)
 }
 
 func countTextLines(text string) int {
@@ -636,11 +943,79 @@ func protectedMessageStart(length int, protected int) int {
 func latestRealUserIndex(messages []llm.Message) int {
 	for i := len(messages) - 1; i >= 0; i-- {
 		msg := messages[i]
-		if msg.Role == llm.RoleUser && !msg.Destroyed && !isCompactionSummaryMessage(msg) {
+		if messageorigin.IsRealUserMessage(msg) {
 			return i
 		}
 	}
 	return -1
+}
+
+func (s *Service) protectedZoneStart(messages []llm.Message) int {
+	start := protectedMessageStart(len(messages), s.protectedRecentMessages())
+	if latestUser := latestRealUserIndex(messages); latestUser >= 0 && latestUser < start {
+		start = latestUser
+	}
+	if openToolBlock := openToolBlockStart(messages); openToolBlock >= 0 && openToolBlock < start {
+		start = openToolBlock
+	}
+	if tokenStart := s.protectedRecentTokenStart(messages); tokenStart >= 0 && tokenStart < start {
+		start = tokenStart
+	}
+	return start
+}
+
+func (s *Service) protectedRecentTokenStart(messages []llm.Message) int {
+	budget := 0
+	if s != nil {
+		budget = s.Config.ProtectedRecentTokens
+	}
+	if budget <= 0 || len(messages) == 0 {
+		return len(messages)
+	}
+	total := 0
+	for i := len(messages) - 1; i >= 0; i-- {
+		total += s.approximateMessageTokens(messages[i : i+1])
+		if total >= budget {
+			return i
+		}
+	}
+	return 0
+}
+
+func openToolBlockStart(messages []llm.Message) int {
+	openStart := -1
+	pending := map[string]int{}
+	for i, msg := range messages {
+		if msg.Role == llm.RoleAssistant && len(msg.ToolCalls) > 0 {
+			if openStart < 0 {
+				openStart = i
+			}
+			for callIndex, call := range msg.ToolCalls {
+				id := strings.TrimSpace(call.ID)
+				if id == "" {
+					id = fmt.Sprintf("__missing_tool_call_id_%d_%d", i, callIndex)
+				}
+				pending[id]++
+			}
+			continue
+		}
+		if msg.Role != llm.RoleTool || len(pending) == 0 {
+			continue
+		}
+		id := strings.TrimSpace(msg.ToolCallID)
+		if count := pending[id]; count > 1 {
+			pending[id] = count - 1
+		} else {
+			delete(pending, id)
+		}
+		if len(pending) == 0 {
+			openStart = -1
+		}
+	}
+	if len(pending) == 0 {
+		return -1
+	}
+	return openStart
 }
 
 func (s *Service) protectedRecentMessages() int {
@@ -703,6 +1078,7 @@ func (s *Service) loadLedger(ctx context.Context, sessionID string) (*Ledger, []
 		if ledger == nil {
 			return NewLedger(sessionID), warnings, nil
 		}
+		ledger = ledger.Clone()
 		if err := ledger.Validate(sessionID); err != nil {
 			return nil, warnings, err
 		}
@@ -715,6 +1091,7 @@ func (s *Service) loadLedger(ctx context.Context, sessionID string) (*Ledger, []
 	if ledger == nil {
 		return NewLedger(sessionID), nil, nil
 	}
+	ledger = ledger.Clone()
 	if err := ledger.Validate(sessionID); err != nil {
 		return nil, nil, err
 	}

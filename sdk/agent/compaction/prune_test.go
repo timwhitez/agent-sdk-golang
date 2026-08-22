@@ -2,8 +2,10 @@ package compaction
 
 import (
 	"context"
+	"reflect"
 	"strings"
 	"testing"
+	"unicode/utf8"
 
 	"github.com/timwhitez/agent-sdk-golang/sdk/llm"
 )
@@ -51,6 +53,17 @@ func TestCompactLocalPruneUpgradesSnippedToolReplacement(t *testing.T) {
 	prune := store.ledger.Replacements[1]
 	if prune.Tier != "prune" || prune.ParentReplacementHash != snipHash {
 		t.Fatalf("prune replacement = %#v, want parent hash %q", prune, snipHash)
+	}
+
+	third, thirdRes, err := svc.CompactLocal(context.Background(), second, &llm.Usage{TotalTokens: 1600})
+	if err != nil {
+		t.Fatalf("third CompactLocal: %v", err)
+	}
+	if thirdRes.Compacted {
+		t.Fatalf("already-pruned history reported another compaction: %#v", thirdRes)
+	}
+	if !reflect.DeepEqual(third, second) || len(store.ledger.Replacements) != 2 || store.saves != 2 {
+		t.Fatalf("already-pruned history churned: equal=%t replacements=%d saves=%d", reflect.DeepEqual(third, second), len(store.ledger.Replacements), store.saves)
 	}
 }
 
@@ -102,6 +115,32 @@ func TestCompactLocalPrunesOldAssistantTextButNotToolCallsOrUsers(t *testing.T) 
 	}
 	if got[2].Content.PlainText() != assistantWithCall.Content.PlainText() || len(got[2].ToolCalls) != 1 {
 		t.Fatalf("assistant tool-call message changed: %#v", got[2])
+	}
+
+	again, againRes, err := svc.CompactLocal(context.Background(), got, &llm.Usage{TotalTokens: 3200})
+	if err != nil {
+		t.Fatalf("CompactLocal already-pruned assistant: %v", err)
+	}
+	if againRes.Compacted {
+		t.Fatalf("already-pruned assistant reported another compaction: %#v", againRes)
+	}
+	if !reflect.DeepEqual(again, got) || writes != 1 || store.saves != 1 || len(store.ledger.Replacements) != 1 {
+		t.Fatalf("already-pruned assistant churned: equal=%t writes=%d saves=%d replacements=%d", reflect.DeepEqual(again, got), writes, store.saves, len(store.ledger.Replacements))
+	}
+}
+
+func TestAssistantPreviewUsesSharedTokenTruncator(t *testing.T) {
+	const path = "/工作区/项目/文件.go"
+	text := strings.Repeat("背景", 300) + " " + path + " error=E42"
+	got := assistantPreview(text)
+	if !utf8.ValidString(got) || strings.ContainsRune(got, utf8.RuneError) {
+		t.Fatalf("assistant preview is not valid UTF-8: %q", got)
+	}
+	if !strings.Contains(strings.ToLower(got), "truncated") {
+		t.Fatalf("assistant preview is missing explicit truncation marker: %q", got)
+	}
+	if !strings.Contains(got, path) {
+		t.Fatalf("assistant preview lost exact path %q: %q", path, got)
 	}
 }
 

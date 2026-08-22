@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/timwhitez/agent-sdk-golang/sdk/agent/compaction"
+	"github.com/timwhitez/agent-sdk-golang/sdk/agent/messageorigin"
 	"github.com/timwhitez/agent-sdk-golang/sdk/llm"
 )
 
@@ -41,7 +42,7 @@ func (m *flakyCompactionModel) Invoke(_ context.Context, _ llm.InvokeRequest) (*
 	if call <= failFor {
 		return nil, errors.New("temporary compaction failure")
 	}
-	return &llm.Completion{Content: llm.TextContent("<summary>retry succeeded</summary>")}, nil
+	return &llm.Completion{Content: llm.TextContent(validCompactionSummary("retry succeeded"))}, nil
 }
 
 func (m *flakyCompactionModel) Calls() int {
@@ -61,7 +62,7 @@ func (m *countingCompactionModel) Invoke(_ context.Context, _ llm.InvokeRequest)
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.calls++
-	return &llm.Completion{Content: llm.TextContent("<summary>ok</summary>")}, nil
+	return &llm.Completion{Content: llm.TextContent(validCompactionSummary("ok"))}, nil
 }
 
 func (m *countingCompactionModel) Calls() int {
@@ -77,6 +78,40 @@ type cancelAwareCompactionModel struct {
 	once sync.Once
 }
 
+type overflowFailureBoundaryModel struct {
+	mu           sync.Mutex
+	normalCalls  int
+	summaryCalls int
+}
+
+func (m *overflowFailureBoundaryModel) Provider() string { return "stub" }
+func (m *overflowFailureBoundaryModel) Model() string    { return "stub" }
+func (m *overflowFailureBoundaryModel) Invoke(_ context.Context, req llm.InvokeRequest) (*llm.Completion, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	for _, message := range req.Messages {
+		if message.Role == llm.RoleSystem && strings.Contains(message.Content.PlainText(), "operational checkpoint") {
+			m.summaryCalls++
+			return nil, errors.New("injected overflow compaction failure")
+		}
+	}
+	m.normalCalls++
+	if m.normalCalls > 1 {
+		return nil, errors.New("provider crossed overflow boundary")
+	}
+	return &llm.Completion{
+		Content:    llm.TextContent("partial response"),
+		StopReason: "max_tokens",
+		Usage:      llm.NewProviderUsage(90, 10, 100),
+	}, nil
+}
+
+func (m *overflowFailureBoundaryModel) Counts() (normal, summary int) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.normalCalls, m.summaryCalls
+}
+
 func (m *cancelAwareCompactionModel) Provider() string { return "stub" }
 func (m *cancelAwareCompactionModel) Model() string    { return "stub" }
 func (m *cancelAwareCompactionModel) Invoke(ctx context.Context, _ llm.InvokeRequest) (*llm.Completion, error) {
@@ -89,7 +124,7 @@ func (m *cancelAwareCompactionModel) Invoke(ctx context.Context, _ llm.InvokeReq
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
-	return &llm.Completion{Content: llm.TextContent("<summary>completed after turn cancellation</summary>")}, nil
+	return &llm.Completion{Content: llm.TextContent(validCompactionSummary("completed after turn cancellation"))}, nil
 }
 
 type lockedBuffer struct {
@@ -269,6 +304,39 @@ func TestCheckAndCompactRetriesOnceByDefault(t *testing.T) {
 	}
 }
 
+func TestOverflowCompactionFailureStopsBeforeNextProviderCall(t *testing.T) {
+	model := &overflowFailureBoundaryModel{}
+	ag, err := New(Config{
+		LLM: model,
+		Compaction: &compaction.Config{
+			Enabled:                true,
+			ContextWindow:          100,
+			ThresholdRatio:         0.85,
+			CompactionRetryBackoff: time.Millisecond,
+		},
+	})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+
+	var sawError bool
+	for event := range ag.QueryStream(context.Background(), llm.TextContent("continue safely")) {
+		if _, ok := event.(ErrorEvent); ok {
+			sawError = true
+		}
+	}
+	normal, summary := model.Counts()
+	if !sawError {
+		t.Fatal("overflow compaction failure did not surface an error event")
+	}
+	if normal != 1 {
+		t.Fatalf("normal provider calls = %d, want 1; overflow failure must stop before the next provider request", normal)
+	}
+	if summary != 2 {
+		t.Fatalf("summary attempts = %d, want default two attempts", summary)
+	}
+}
+
 func TestCheckAndCompactSkipsInvokeWhenBelowThreshold(t *testing.T) {
 	model := &countingCompactionModel{}
 	ag, err := New(Config{LLM: model})
@@ -378,5 +446,187 @@ func TestNewCachesDisabledCompactorState(t *testing.T) {
 	ag.checkAndCompact(context.Background(), comp, nil)
 	if got := model.Calls(); got != 0 {
 		t.Fatalf("expected disabled compaction to skip model invoke, got %d", got)
+	}
+}
+
+// emergencyTrimTestAgent builds an agent whose emergency-trim budget equals the
+// configured context window, so trim decisions are easy to reason about in
+// tokens.
+func emergencyTrimTestAgent(t *testing.T, window int) *Agent {
+	t.Helper()
+	ag, err := New(Config{
+		LLM: &countingCompactionModel{},
+		Compaction: &compaction.Config{
+			Enabled:        true,
+			ContextWindow:  window,
+			ThresholdRatio: 1.0,
+		},
+	})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	return ag
+}
+
+// REG: reporting success for a history that still overflows made
+// applyEmergencyTrim publish Compacted:true and compactOverflow return nil, and
+// the turn then sent a request that was still over the window instead of
+// surfacing the overflow error. The guarantee is therefore "reported success
+// implies the result fits the budget".
+//
+// This fixture's newest block is itself oversized. The trim answers that by
+// giving the block up and keeping the older content that does fit - refusing the
+// whole trim here would abort the turn even though a legal in-budget history
+// exists (R4-CC-001). Either way it must never claim success for an over-budget
+// result; the genuinely irreducible case is covered by
+// TestEmergencyTrimStillRefusesGenuinelyIrreducibleHistory.
+func TestEmergencyTrimNeverReportsSuccessForResultOverBudget(t *testing.T) {
+	ag := emergencyTrimTestAgent(t, 1000)
+	messages := []llm.Message{
+		llm.NewSystemMessage("sys"),
+		llm.NewUserMessage("real request"),
+		llm.NewAssistantMessage(strings.Repeat("a ", 500), nil),
+		llm.NewAssistantMessage(strings.Repeat("b ", 500), nil),
+		llm.NewAssistantMessage(strings.Repeat("x ", 3000), nil),
+	}
+	budget := ag.compactor.ThresholdTokens()
+	if budget <= 0 {
+		t.Fatalf("expected a positive trim budget, got %d", budget)
+	}
+	if before := ag.compactor.EstimateMessages(messages); before <= budget {
+		t.Fatalf("test history must start over budget: estimate=%d budget=%d", before, budget)
+	}
+	trimmed, ok := ag.emergencyTrimHistory(messages)
+	if !ok {
+		t.Fatalf("emergency trim refused although dropping the oversized newest block leaves a legal %d-token history for a %d budget",
+			ag.compactor.EstimateMessages(messages[:len(messages)-1]), budget)
+	}
+	if estimate := ag.compactor.EstimateMessages(trimmed); estimate > budget {
+		t.Fatalf("emergency trim reported success while the retained history still needs %d tokens of a %d budget",
+			estimate, budget)
+	}
+	if len(trimmed) >= len(messages) {
+		t.Fatalf("an accepted trim must shrink history, got %d of %d messages", len(trimmed), len(messages))
+	}
+}
+
+// REG: a trim that does fit the budget must still be accepted, so the refusal
+// above cannot be satisfied by refusing everything.
+func TestEmergencyTrimStillAcceptsResultWithinBudget(t *testing.T) {
+	ag := emergencyTrimTestAgent(t, 1000)
+	messages := []llm.Message{
+		llm.NewSystemMessage("sys"),
+		llm.NewUserMessage("real request"),
+		llm.NewAssistantMessage(strings.Repeat("a ", 800), nil),
+		llm.NewAssistantMessage(strings.Repeat("b ", 800), nil),
+		llm.NewAssistantMessage(strings.Repeat("c ", 800), nil),
+	}
+	budget := ag.compactor.ThresholdTokens()
+	if before := ag.compactor.EstimateMessages(messages); before <= budget {
+		t.Fatalf("test history must start over budget: estimate=%d budget=%d", before, budget)
+	}
+	trimmed, ok := ag.emergencyTrimHistory(messages)
+	if !ok {
+		t.Fatal("emergency trim refused a history whose newest block fits the budget")
+	}
+	if estimate := ag.compactor.EstimateMessages(trimmed); estimate > budget {
+		t.Fatalf("accepted trim is over budget: estimate=%d budget=%d", estimate, budget)
+	}
+	if len(trimmed) >= len(messages) {
+		t.Fatalf("accepted trim did not shrink history: %d -> %d", len(messages), len(trimmed))
+	}
+}
+
+// emergencyTrimInflightHistory builds a history that ends with an assistant
+// tool_use whose arguments are still being accumulated by an in-flight tool-call
+// continuation: it has no tool_result yet. withReminder controls whether the
+// framework's continuation reminder has already been appended — compaction at
+// the overflow boundary can run either before or after that append.
+func emergencyTrimInflightHistory(withReminder bool) []llm.Message {
+	messages := []llm.Message{
+		llm.NewSystemMessage("sys"),
+		llm.NewUserMessage("do the work"),
+	}
+	for i := 0; i < 8; i++ {
+		id := fmt.Sprintf("call-%d", i)
+		messages = append(messages,
+			llm.NewAssistantMessage(strings.Repeat("step ", 40), []llm.ToolCall{{
+				ID:       id,
+				Type:     "function",
+				Function: llm.FunctionCall{Name: "read", Arguments: `{"path":"f.go"}`},
+			}}),
+			llm.NewToolMessage(id, "read", llm.TextContent(strings.Repeat("result ", 60)), false),
+		)
+	}
+	messages = append(messages, llm.NewAssistantMessage("partial", []llm.ToolCall{{
+		ID:       "call-inflight",
+		Type:     "function",
+		Function: llm.FunctionCall{Name: "write", Arguments: `{"path":"x.go","content":"package ma`},
+	}}))
+	if withReminder {
+		messages = append(messages, messageorigin.NewInternalUserMessage(
+			messageorigin.KindToolCallContinuation, messageorigin.ResponseTruncatedContinuationText))
+	}
+	return messages
+}
+
+// REG: the trim's repair pass used to clear ToolCalls on the trailing in-flight
+// tool_use, destroying the partial arguments the continuation has to merge the
+// next chunk into and leaving the continuation unable to ever complete.
+func TestEmergencyTrimPreservesInFlightToolCallContinuation(t *testing.T) {
+	for _, withReminder := range []bool{false, true} {
+		messages := emergencyTrimInflightHistory(withReminder)
+		ag := emergencyTrimTestAgent(t, 1200)
+		trimmed, ok := ag.emergencyTrimHistory(messages)
+		if !ok {
+			t.Fatalf("withReminder=%v: emergency trim refused a reducible history", withReminder)
+		}
+		args := ""
+		found := false
+		for _, m := range trimmed {
+			for _, call := range m.ToolCalls {
+				if call.ID == "call-inflight" {
+					found = true
+					args = call.Function.Arguments
+				}
+			}
+		}
+		if !found {
+			t.Fatalf("withReminder=%v: trim stripped the in-flight tool_use; the continuation can never complete", withReminder)
+		}
+		if args != `{"path":"x.go","content":"package ma` {
+			t.Fatalf("withReminder=%v: in-flight partial arguments were altered: %q", withReminder, args)
+		}
+	}
+}
+
+// REG: preserving the in-flight block must not turn into preserving genuinely
+// unpaired tool_use blocks — a trailing assistant tool_use that is followed by a
+// non-continuation message is still repaired.
+func TestEmergencyTrimStillRepairsUnpairedToolCallsBeforeTail(t *testing.T) {
+	messages := emergencyTrimInflightHistory(false)
+	// Drop one tool_result so an older block becomes genuinely unpaired.
+	broken := append([]llm.Message(nil), messages[:5]...)
+	broken = append(broken, messages[6:]...)
+	ag := emergencyTrimTestAgent(t, 1200)
+	trimmed, ok := ag.emergencyTrimHistory(broken)
+	if !ok {
+		t.Fatal("emergency trim refused a reducible history")
+	}
+	for i, m := range trimmed {
+		if m.Role != llm.RoleAssistant || len(m.ToolCalls) == 0 {
+			continue
+		}
+		if m.ToolCalls[0].ID == "call-inflight" {
+			continue
+		}
+		results := 0
+		for j := i + 1; j < len(trimmed) && trimmed[j].Role == llm.RoleTool; j++ {
+			results++
+		}
+		if results != len(m.ToolCalls) {
+			t.Fatalf("trimmed[%d] kept %d tool_use blocks with %d results; pairing was not repaired",
+				i, len(m.ToolCalls), results)
+		}
 	}
 }

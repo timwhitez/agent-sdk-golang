@@ -1,6 +1,14 @@
 package compaction
 
-import "context"
+import (
+	"context"
+
+	"github.com/timwhitez/agent-sdk-golang/sdk/artifact"
+)
+
+// ArtifactOwnerProvider resolves the execution subject that owns compaction
+// artifacts. The reducer adds the role/tool-call qualifiers for each object.
+type ArtifactOwnerProvider func(context.Context) (artifact.Owner, error)
 
 type ArtifactRequest struct {
 	SessionID  string

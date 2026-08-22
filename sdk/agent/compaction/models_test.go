@@ -5,11 +5,10 @@ import (
 	"testing"
 )
 
-func TestDefaultSummaryPromptIncludesToolStateCrossReferenceGuidance(t *testing.T) {
+func TestDefaultSummaryPromptIncludesEvidenceGuidance(t *testing.T) {
 	required := []string{
-		"Cross-reference tool results in Key Findings.",
-		"\"Used git status (see Recent Tool Results) to confirm...\"",
-		"\"The error in line X (from file read) indicates...\"",
+		"Successful tool results and current filesystem/repository state",
+		"Preserve exact paths, identifiers, commands, versions, error strings, status codes, and hashes when supplied",
 	}
 	for _, needle := range required {
 		if !strings.Contains(DefaultSummaryPrompt, needle) {
@@ -18,27 +17,75 @@ func TestDefaultSummaryPromptIncludesToolStateCrossReferenceGuidance(t *testing.
 	}
 }
 
-func TestDefaultSummaryPromptUsesTighterWordTarget(t *testing.T) {
-	if !strings.Contains(DefaultSummaryPrompt, "Target 300-700 words.") {
-		t.Fatal("expected DefaultSummaryPrompt to require 300-700 words")
+func TestDefaultSummaryPromptUsesAdaptiveTokenBudget(t *testing.T) {
+	if !strings.Contains(DefaultSummaryPrompt, "adaptive token budget supplied by the host") {
+		t.Fatal("expected DefaultSummaryPrompt to use the host token budget")
 	}
-	if strings.Contains(DefaultSummaryPrompt, "500–1000 words") || strings.Contains(DefaultSummaryPrompt, "500-1000 words") {
-		t.Fatal("expected previous 500-1000 word target to be removed")
+	for _, forbidden := range []string{"300-700 words", "500–1000 words", "500-1000 words"} {
+		if strings.Contains(DefaultSummaryPrompt, forbidden) {
+			t.Fatalf("fixed word target remains in prompt: %q", forbidden)
+		}
 	}
 }
 
-func TestDefaultSummaryPromptIncludesFailureFallbackAndExactValueExamples(t *testing.T) {
+func TestDefaultSummaryPromptRequiresExactSingleStructuredBlock(t *testing.T) {
 	required := []string{
-		"If unable to meaningfully summarize, respond with:",
-		"<summary>UNABLE_TO_SUMMARIZE: [brief reason]</summary>",
-		"File paths: /mnt/c/Users/.../file.go (not \"the file\")",
-		"Error codes: HTTP 429, exit code 127 (not \"error\")",
-		"Versions: v1.2.3, Python 3.10.5 (not \"latest\")",
-		"Command lines: git commit -m \"msg\" (not \"git commit\")",
+		"Required sections, in this exact order",
+		"exact level-2 Markdown heading",
+		"Current Objective and Latest User Request",
+		"Verification Already Run and Still Required",
+		"Return exactly one <summary>...</summary> block and no text outside it",
 	}
 	for _, needle := range required {
 		if !strings.Contains(DefaultSummaryPrompt, needle) {
 			t.Fatalf("expected DefaultSummaryPrompt to include %q", needle)
+		}
+	}
+}
+
+func TestDefaultSummaryPromptMatchesValidatorHeadingSyntax(t *testing.T) {
+	for _, section := range requiredSummarySections {
+		want := "\n## " + section + "\n"
+		if !strings.Contains(DefaultSummaryPrompt, want) {
+			t.Fatalf("DefaultSummaryPrompt is missing validator-compatible heading %q", want)
+		}
+	}
+}
+
+func TestCompactionPromptDoesNotRequireEveryAnalyzedFile(t *testing.T) {
+	if strings.Contains(strings.ToLower(DefaultSummaryPrompt), "list every file") {
+		t.Fatalf("summary prompt still requires unavailable every-file material:\n%s", DefaultSummaryPrompt)
+	}
+	for _, want := range []string{"successful write/edit/delete/diff/status evidence proves it", "do not list every read or every analyzed file"} {
+		if !strings.Contains(DefaultSummaryPrompt, want) {
+			t.Fatalf("summary prompt is missing evidence-first file guidance %q", want)
+		}
+	}
+}
+
+func TestCompactionPromptUsesEvidenceTrustOrder(t *testing.T) {
+	ordered := []string{
+		"Successful tool results and current filesystem/repository state",
+		"Explicit user messages and user-approved decisions",
+		"Assistant statements only when corroborated",
+	}
+	last := -1
+	for _, item := range ordered {
+		idx := strings.Index(DefaultSummaryPrompt, item)
+		if idx < 0 {
+			t.Fatalf("summary prompt is missing trust-order item %q", item)
+		}
+		if idx <= last {
+			t.Fatalf("trust-order item %q is out of order", item)
+		}
+		last = idx
+	}
+}
+
+func TestCompactionPromptAllowsUnknownAndUnverified(t *testing.T) {
+	for _, want := range []string{"UNKNOWN", "UNVERIFIED", "Do not infer missing facts"} {
+		if !strings.Contains(DefaultSummaryPrompt, want) {
+			t.Fatalf("summary prompt is missing uncertainty rule %q", want)
 		}
 	}
 }

@@ -350,6 +350,9 @@ func TestParseUsageDoesNotDoubleCountReasoningTokens(t *testing.T) {
 	if usage.PromptCachedTokens == nil || *usage.PromptCachedTokens != 12 {
 		t.Fatalf("expected cached prompt tokens 12, got %v", usage.PromptCachedTokens)
 	}
+	if usage.PromptTokens != 120 || !usage.PromptTokensValid || usage.PromptTokensSource != llm.PromptTokensSourceProvider || usage.PromptTokensSemantics != llm.PromptTokensSemanticsTotalInputV1 {
+		t.Fatalf("unexpected normalized prompt usage: %#v", usage)
+	}
 }
 
 func TestParseUsageInfersCompletionTokensFromTotalWithoutReasoningDoubleCount(t *testing.T) {

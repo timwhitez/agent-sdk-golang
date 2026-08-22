@@ -7,6 +7,8 @@ import (
 	"fmt"
 	"strings"
 	"time"
+
+	"github.com/timwhitez/agent-sdk-golang/sdk/artifact"
 )
 
 const (
@@ -35,18 +37,23 @@ type LedgerSummary struct {
 	SummaryHash     string `json:"summary_hash,omitempty"`
 	CoveredStartKey string `json:"covered_start_key,omitempty"`
 	CoveredEndKey   string `json:"covered_end_key,omitempty"`
+	CheckpointID    string `json:"checkpoint_id,omitempty"`
 	SourceSnapshot  string `json:"source_snapshot,omitempty"`
 }
 
 type LedgerReplacement struct {
-	MessageKey            string    `json:"message_key"`
-	PartKey               string    `json:"part_key"`
-	Role                  string    `json:"role,omitempty"`
-	ToolName              string    `json:"tool_name,omitempty"`
-	Tier                  string    `json:"tier,omitempty"`
-	OriginalHash          string    `json:"original_hash,omitempty"`
-	ReplacementHash       string    `json:"replacement_hash,omitempty"`
-	ReplacementText       string    `json:"replacement_text,omitempty"`
+	MessageKey        string             `json:"message_key"`
+	PartKey           string             `json:"part_key"`
+	Role              string             `json:"role,omitempty"`
+	ToolName          string             `json:"tool_name,omitempty"`
+	Tier              string             `json:"tier,omitempty"`
+	OriginalHash      string             `json:"original_hash,omitempty"`
+	ReplacementHash   string             `json:"replacement_hash,omitempty"`
+	ReplacementText   string             `json:"replacement_text,omitempty"`
+	CanonicalArtifact *artifact.Manifest `json:"canonical_artifact,omitempty"`
+	// FullArtifact is legacy path-only compatibility data. It is never a
+	// verified canonical artifact slot and is mutually exclusive with
+	// CanonicalArtifact.
 	FullArtifact          string    `json:"full_artifact,omitempty"`
 	ParentReplacementHash string    `json:"parent_replacement_hash,omitempty"`
 	CreatedAt             time.Time `json:"created_at,omitempty"`
@@ -80,6 +87,12 @@ func (l *Ledger) Clone() *Ledger {
 	}
 	if len(l.Replacements) > 0 {
 		out.Replacements = append([]LedgerReplacement(nil), l.Replacements...)
+		for i := range out.Replacements {
+			if l.Replacements[i].CanonicalArtifact != nil {
+				manifest := l.Replacements[i].CanonicalArtifact.Clone()
+				out.Replacements[i].CanonicalArtifact = &manifest
+			}
+		}
 	}
 	return &out
 }
@@ -114,9 +127,46 @@ func (l *Ledger) Validate(sessionID string) error {
 		if repl.ReplacementHash != "" && repl.ReplacementHash != ContentHash(repl.ReplacementText) {
 			return fmt.Errorf("replacement %d replacement hash mismatch", i)
 		}
+		if repl.CanonicalArtifact != nil {
+			if strings.TrimSpace(repl.FullArtifact) != "" {
+				return fmt.Errorf("replacement %d canonical_artifact and legacy full_artifact are mutually exclusive", i)
+			}
+			if err := validateLedgerCanonicalArtifact(*repl.CanonicalArtifact); err != nil {
+				return fmt.Errorf("replacement %d canonical_artifact invalid: %w", i, err)
+			}
+			text := repl.ReplacementText
+			if strings.TrimSpace(text) == "" {
+				return fmt.Errorf("replacement %d canonical replacement text is required", i)
+			}
+			if !strings.Contains(text, repl.CanonicalArtifact.ObjectRef) {
+				return fmt.Errorf("replacement %d text omits canonical object_ref", i)
+			}
+			if !strings.Contains(text, repl.CanonicalArtifact.Recovery.Tool) {
+				return fmt.Errorf("replacement %d text omits canonical recovery tool", i)
+			}
+		}
 	}
 	if l.Summary != nil && l.Summary.SummaryHash != "" && l.Summary.MessageName == "" {
 		return fmt.Errorf("summary message_name is required when summary_hash is set")
+	}
+	return nil
+}
+
+func validateLedgerCanonicalArtifact(manifest artifact.Manifest) error {
+	if err := manifest.Validate(); err != nil {
+		return err
+	}
+	if !manifest.Complete || !manifest.Recoverable {
+		return fmt.Errorf("manifest must be complete and recoverable")
+	}
+	if manifest.ObjectKind == artifact.ObjectKindProviderVisibleView {
+		return fmt.Errorf("provider-visible view cannot populate a verified canonical source slot")
+	}
+	if manifest.Retention.Class != artifact.RetentionDurable || manifest.Retention.ExpiresAt != nil {
+		return fmt.Errorf("manifest retention must be durable without expires_at")
+	}
+	if manifest.ObjectMeasurement.Bytes == nil || strings.TrimSpace(manifest.ObjectMeasurement.SHA256) == "" {
+		return fmt.Errorf("manifest must contain measured bytes and sha256")
 	}
 	return nil
 }

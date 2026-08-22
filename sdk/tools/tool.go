@@ -142,7 +142,11 @@ func isSeverityActionDiagnostic(text string) bool {
 	default:
 		return false
 	}
-	return strings.Contains(strings.TrimSpace(text[end+1:]), " - ")
+	body := strings.TrimSpace(text[end+1:])
+	if strings.Contains(body, " - ") {
+		return true
+	}
+	return strings.Contains(body, "stage=") && strings.Contains(body, "action=")
 }
 
 type schemaRepairOptions struct {

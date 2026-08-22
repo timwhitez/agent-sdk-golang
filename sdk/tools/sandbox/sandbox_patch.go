@@ -14,6 +14,12 @@ import (
 	"github.com/timwhitez/agent-sdk-golang/sdk/tools"
 )
 
+// maxHunkLineDrift bounds how far a fuzzy hunk match may sit from the line
+// number declared in the hunk header. Without this bound a hunk whose context
+// happens to be unique elsewhere in the file would be applied at that unrelated
+// position, producing a change that compiles but is semantically wrong.
+const maxHunkLineDrift = 500
+
 // applyPatchArgs holds the patch content.
 type applyPatchArgs struct {
 	Patch string `json:"patch"`
@@ -142,25 +148,29 @@ func applyPatchToSandbox(s *Sandbox, patch string) (string, error) {
 		return "", fmt.Errorf("patch contains no operations; include at least one *** Add File, *** Update File, or *** Delete File section")
 	}
 
+	// Validate and stage every operation in memory first so a patch that fails
+	// halfway (e.g. a hunk that no longer matches) leaves the filesystem
+	// untouched instead of half-applied.
+	planner := newPatchPlanner(s)
 	changed := 0
 	for _, op := range ops {
 		switch op.kind {
 		case "add":
-			if err := applyAddFile(s, op.path, op.addLines); err != nil {
+			if err := planner.planAdd(op.path, op.addLines); err != nil {
 				return "", err
 			}
 			changed++
 		case "delete":
-			if err := applyDeleteFile(s, op.path); err != nil {
+			if err := planner.planDelete(op.path); err != nil {
 				return "", err
 			}
 			changed++
 		case "update":
-			if err := applyUpdateFile(s, op.path, op.hunks); err != nil {
+			if err := planner.planUpdate(op.path, op.hunks); err != nil {
 				return "", err
 			}
 			if strings.TrimSpace(op.moveTo) != "" {
-				if err := applyMoveFile(s, op.path, op.moveTo); err != nil {
+				if err := planner.planMove(op.path, op.moveTo); err != nil {
 					return "", err
 				}
 			}
@@ -168,6 +178,9 @@ func applyPatchToSandbox(s *Sandbox, patch string) (string, error) {
 		default:
 			return "", fmt.Errorf("unknown patch op: %s", op.kind)
 		}
+	}
+	if err := planner.commit(); err != nil {
+		return "", err
 	}
 	return fmt.Sprintf("Applied patch: %d file(s) updated", changed), nil
 }
@@ -338,57 +351,122 @@ func parseHunkRange(tok string, prefix byte) (int, int, bool) {
 	return start, length, true
 }
 
-// applyAddFile creates a new file with the given content.
-func applyAddFile(s *Sandbox, relPath string, lines []string) error {
-	p, err := s.resolveForAccess(relPath)
+// patchAction is a single filesystem mutation staged by patchPlanner.
+type patchAction struct {
+	kind     string // write|delete|move
+	relPath  string
+	path     validatedSandboxPath
+	resolved string
+	// content holds the full target content for kind == "write".
+	content []byte
+	// moveTo/movePath describe the destination for kind == "move".
+	moveTo   string
+	movePath validatedSandboxPath
+}
+
+// describe renders an action for inclusion in error messages.
+func (a patchAction) describe() string {
+	switch a.kind {
+	case "delete":
+		return fmt.Sprintf("delete %s", a.relPath)
+	case "move":
+		return fmt.Sprintf("move %s -> %s", a.relPath, a.moveTo)
+	default:
+		return fmt.Sprintf("write %s", a.relPath)
+	}
+}
+
+// stagedFile is the in-memory state of a file touched by earlier patch ops.
+type stagedFile struct {
+	content []byte
+	deleted bool
+}
+
+// patchPlanner validates and stages every patch operation in memory so the
+// whole patch is known to be applicable before any of it reaches the disk.
+type patchPlanner struct {
+	s       *Sandbox
+	actions []patchAction
+	staged  map[string]*stagedFile
+}
+
+// newPatchPlanner creates an empty planner bound to a sandbox.
+func newPatchPlanner(s *Sandbox) *patchPlanner {
+	return &patchPlanner{s: s, staged: map[string]*stagedFile{}}
+}
+
+// planAdd stages creation of a new file, rejecting paths that already exist.
+func (p *patchPlanner) planAdd(relPath string, lines []string) error {
+	vp, err := p.s.resolveForAccess(relPath)
 	if err != nil {
+		return err
+	}
+	resolvedPath, err := p.s.revalidatePathForAccess(vp)
+	if err != nil {
+		return err
+	}
+	if staged, ok := p.staged[vp.resolved]; ok {
+		if !staged.deleted {
+			return fmt.Errorf("cannot add %s: file already exists in this patch; use '*** Update File: %s'", relPath, relPath)
+		}
+	} else if _, err := os.Lstat(resolvedPath); err == nil {
+		return fmt.Errorf("cannot add %s: file already exists; use '*** Update File: %s'", relPath, relPath)
+	} else if !os.IsNotExist(err) {
 		return err
 	}
 	content := strings.Join(lines, "\n")
 	if len(lines) > 0 {
 		content += "\n"
 	}
-	resolvedPath, err := s.revalidatePathForAccess(p)
-	if err != nil {
-		return err
-	}
-	if err := writeFilePreserveMode(resolvedPath, []byte(content), 0o644); err != nil {
-		return err
-	}
+	p.stage(vp.resolved, &stagedFile{content: []byte(content)})
+	p.actions = append(p.actions, patchAction{kind: "write", relPath: relPath, path: vp, resolved: resolvedPath, content: []byte(content)})
 	return nil
 }
 
-// applyDeleteFile removes a file from the sandbox.
-func applyDeleteFile(s *Sandbox, relPath string) error {
-	p, err := s.resolveForAccess(relPath)
+// planDelete stages removal of an existing regular file.
+func (p *patchPlanner) planDelete(relPath string) error {
+	vp, err := p.s.resolveForAccess(relPath)
 	if err != nil {
 		return err
 	}
-	resolvedPath, err := s.revalidatePathForAccess(p)
+	resolvedPath, err := p.s.revalidatePathForAccess(vp)
 	if err != nil {
 		return err
 	}
-	if err := os.Remove(resolvedPath); err != nil {
-		return err
+	if staged, ok := p.staged[vp.resolved]; ok {
+		if staged.deleted {
+			return fmt.Errorf("cannot delete %s: already deleted in this patch", relPath)
+		}
+	} else {
+		f, info, err := openFileNoFollow(resolvedPath)
+		if err != nil {
+			return err
+		}
+		_ = f.Close()
+		if !info.Mode().IsRegular() {
+			return fmt.Errorf("cannot delete %s: not a regular file", relPath)
+		}
 	}
+	p.stage(vp.resolved, &stagedFile{deleted: true})
+	p.actions = append(p.actions, patchAction{kind: "delete", relPath: relPath, path: vp, resolved: resolvedPath})
 	return nil
 }
 
-// applyMoveFile renames a file within the sandbox.
-func applyMoveFile(s *Sandbox, fromRel, toRel string) error {
-	fromAbs, err := s.resolveForAccess(fromRel)
+// planMove stages a rename, validating the destination directory up front.
+func (p *patchPlanner) planMove(fromRel, toRel string) error {
+	fromVP, err := p.s.resolveForAccess(fromRel)
 	if err != nil {
 		return err
 	}
-	toAbs, err := s.resolveForAccess(toRel)
+	toVP, err := p.s.resolveForAccess(toRel)
 	if err != nil {
 		return err
 	}
-	fromPath, err := s.revalidatePathForAccess(fromAbs)
+	fromPath, err := p.s.revalidatePathForAccess(fromVP)
 	if err != nil {
 		return err
 	}
-	toPath, err := s.revalidatePathForAccess(toAbs)
+	toPath, err := p.s.revalidatePathForAccess(toVP)
 	if err != nil {
 		return err
 	}
@@ -398,38 +476,176 @@ func applyMoveFile(s *Sandbox, fromRel, toRel string) error {
 	} else if err != nil && !os.IsNotExist(err) {
 		return err
 	}
-	if err := os.MkdirAll(toDir, 0o755); err != nil {
+	if staged, ok := p.staged[fromVP.resolved]; ok && !staged.deleted {
+		p.stage(toVP.resolved, &stagedFile{content: staged.content})
+		p.stage(fromVP.resolved, &stagedFile{deleted: true})
+	}
+	p.actions = append(p.actions, patchAction{kind: "move", relPath: fromRel, path: fromVP, resolved: fromPath, moveTo: toRel, movePath: toVP})
+	return nil
+}
+
+// planUpdate stages the result of applying hunks to an existing file.
+func (p *patchPlanner) planUpdate(relPath string, hunks []patchHunk) error {
+	vp, err := p.s.resolveForAccess(relPath)
+	if err != nil {
 		return err
 	}
-	if dirFile, _, err := openFileNoFollow(toDir); err != nil {
-		return err
+	var (
+		raw      []byte
+		resolved string
+	)
+	if staged, ok := p.staged[vp.resolved]; ok {
+		if staged.deleted {
+			return fmt.Errorf("cannot update %s: file was deleted earlier in this patch", relPath)
+		}
+		raw = staged.content
+		resolved, err = p.s.revalidatePathForAccess(vp)
+		if err != nil {
+			return err
+		}
 	} else {
-		_ = dirFile.Close()
+		b, st, resolvedPath, err := p.s.readAllPathBounded(vp, maxEditFileBytes)
+		if err != nil {
+			if errors.Is(err, errFileReadLimitReached) {
+				size := maxEditFileBytes + 1
+				if st != nil && st.Size() > 0 {
+					size = st.Size()
+				}
+				return fmt.Errorf("[ERROR] apply_patch refuses to load %s (%d bytes) - max %d bytes; patch smaller files or split changes", relPath, size, maxEditFileBytes)
+			}
+			return err
+		}
+		if st.IsDir() {
+			return fmt.Errorf("path is a directory: %s", relPath)
+		}
+		raw = b
+		resolved = resolvedPath
 	}
-	return os.Rename(fromPath, toPath)
+	out, err := applyHunksToContent(relPath, string(raw), hunks)
+	if err != nil {
+		return err
+	}
+	p.stage(vp.resolved, &stagedFile{content: []byte(out)})
+	p.actions = append(p.actions, patchAction{kind: "write", relPath: relPath, path: vp, resolved: resolved, content: []byte(out)})
+	return nil
+}
+
+// stage records the pending state of a file so later ops in the same patch
+// compose on top of earlier ones instead of reading stale bytes from disk.
+func (p *patchPlanner) stage(key string, state *stagedFile) {
+	if p.staged == nil {
+		p.staged = map[string]*stagedFile{}
+	}
+	p.staged[key] = state
+}
+
+// commit writes every staged action to disk. If an action fails after others
+// already landed, the error reports which files were applied and which were
+// not so the caller can recover instead of blindly retrying the whole patch.
+func (p *patchPlanner) commit() error {
+	applied := []string{}
+	for i, a := range p.actions {
+		if err := p.commitAction(a); err != nil {
+			if len(applied) == 0 {
+				return err
+			}
+			pending := []string{}
+			for _, rest := range p.actions[i:] {
+				pending = append(pending, rest.describe())
+			}
+			return fmt.Errorf("apply_patch partially applied: %s failed (%v); already applied: %s; not applied: %s", a.describe(), err, strings.Join(applied, ", "), strings.Join(pending, ", "))
+		}
+		applied = append(applied, a.describe())
+	}
+	return nil
+}
+
+// commitAction performs a single staged action, revalidating the path first.
+func (p *patchPlanner) commitAction(a patchAction) error {
+	switch a.kind {
+	case "delete":
+		resolvedPath, err := p.s.revalidatePathForAccess(a.path)
+		if err != nil {
+			return err
+		}
+		return os.Remove(resolvedPath)
+	case "move":
+		fromPath, err := p.s.revalidatePathForAccess(a.path)
+		if err != nil {
+			return err
+		}
+		toPath, err := p.s.revalidatePathForAccess(a.movePath)
+		if err != nil {
+			return err
+		}
+		toDir := filepath.Dir(toPath)
+		if info, err := os.Lstat(toDir); err == nil && info.Mode()&os.ModeSymlink != 0 {
+			return &SecurityError{Message: fmt.Sprintf("symlink target denied: %q", toDir)}
+		} else if err != nil && !os.IsNotExist(err) {
+			return err
+		}
+		if err := os.MkdirAll(toDir, 0o755); err != nil {
+			return err
+		}
+		if dirFile, _, err := openFileNoFollow(toDir); err != nil {
+			return err
+		} else {
+			_ = dirFile.Close()
+		}
+		return os.Rename(fromPath, toPath)
+	default:
+		currentPath, err := p.s.revalidatePathForAccess(a.path)
+		if err != nil {
+			return err
+		}
+		if !pathsEqual(currentPath, a.resolved) {
+			return &SecurityError{Message: fmt.Sprintf("path changed during patch apply: %q (was %q, now %q)", a.relPath, a.resolved, currentPath)}
+		}
+		return writeFilePreserveMode(currentPath, a.content, 0o644)
+	}
+}
+
+// applyAddFile creates a new file with the given content.
+func applyAddFile(s *Sandbox, relPath string, lines []string) error {
+	p := newPatchPlanner(s)
+	if err := p.planAdd(relPath, lines); err != nil {
+		return err
+	}
+	return p.commit()
+}
+
+// applyDeleteFile removes a file from the sandbox.
+func applyDeleteFile(s *Sandbox, relPath string) error {
+	p := newPatchPlanner(s)
+	if err := p.planDelete(relPath); err != nil {
+		return err
+	}
+	return p.commit()
+}
+
+// applyMoveFile renames a file within the sandbox.
+func applyMoveFile(s *Sandbox, fromRel, toRel string) error {
+	p := newPatchPlanner(s)
+	if err := p.planMove(fromRel, toRel); err != nil {
+		return err
+	}
+	return p.commit()
 }
 
 // applyUpdateFile applies hunks to an existing file.
 func applyUpdateFile(s *Sandbox, relPath string, hunks []patchHunk) error {
-	p, err := s.resolveForAccess(relPath)
-	if err != nil {
+	p := newPatchPlanner(s)
+	if err := p.planUpdate(relPath, hunks); err != nil {
 		return err
 	}
-	b, st, resolvedPath, err := s.readAllPathBounded(p, maxEditFileBytes)
-	if err != nil {
-		if errors.Is(err, errFileReadLimitReached) {
-			size := maxEditFileBytes + 1
-			if st != nil && st.Size() > 0 {
-				size = st.Size()
-			}
-			return fmt.Errorf("[ERROR] apply_patch refuses to load %s (%d bytes) - max %d bytes; patch smaller files or split changes", relPath, size, maxEditFileBytes)
-		}
-		return err
-	}
-	if st.IsDir() {
-		return fmt.Errorf("path is a directory: %s", relPath)
-	}
-	content := strings.ReplaceAll(string(b), "\r\n", "\n")
+	return p.commit()
+}
+
+// applyHunksToContent applies hunks to file content in memory and returns the
+// resulting content without touching the filesystem.
+func applyHunksToContent(relPath string, raw string, hunks []patchHunk) (string, error) {
+	lineEnding := consistentLineEnding(raw)
+	content := strings.ReplaceAll(raw, "\r\n", "\n")
 	content = strings.ReplaceAll(content, "\r", "\n")
 	hasTrailingNewline := strings.HasSuffix(content, "\n")
 	if hasTrailingNewline {
@@ -444,7 +660,7 @@ func applyUpdateFile(s *Sandbox, relPath string, hunks []patchHunk) error {
 		hunkNumber := hunkIdx + 1
 		oldLines, newLines := hunkLines(h)
 		if len(oldLines) == 0 && !h.hasLineNumbers {
-			return fmt.Errorf("hunk %d failed to apply to %s (no context)", hunkNumber, relPath)
+			return "", fmt.Errorf("hunk %d failed to apply to %s (no context)", hunkNumber, relPath)
 		}
 		matchIdx := -1
 		if h.hasLineNumbers {
@@ -462,12 +678,28 @@ func applyUpdateFile(s *Sandbox, relPath string, hunks []patchHunk) error {
 		}
 		if matchIdx == -1 {
 			matches := findHunkMatches(lines, oldLines)
-			if len(matches) == 1 {
+			if len(matches) == 0 {
+				return "", fmt.Errorf("hunk %d failed to apply to %s (context not found)", hunkNumber, relPath)
+			}
+			if h.hasLineNumbers {
+				// Anchor the fuzzy match near the declared @@ position so a
+				// unique-but-distant match cannot silently patch the wrong place.
+				expected := h.oldStart - 1 + offset
+				if expected < 0 {
+					expected = 0
+				}
+				best, dist, ambiguous := nearestHunkMatch(matches, expected)
+				if ambiguous {
+					return "", fmt.Errorf("hunk %d failed to apply to %s (context is ambiguous)", hunkNumber, relPath)
+				}
+				if dist > maxHunkLineDrift {
+					return "", fmt.Errorf("hunk %d failed to apply to %s (closest context match is %d lines away from declared line %d - max %d; re-read the file and rebuild the hunk)", hunkNumber, relPath, dist, h.oldStart, maxHunkLineDrift)
+				}
+				matchIdx = best
+			} else if len(matches) == 1 {
 				matchIdx = matches[0]
-			} else if len(matches) == 0 {
-				return fmt.Errorf("hunk %d failed to apply to %s (context not found)", hunkNumber, relPath)
 			} else {
-				return fmt.Errorf("hunk %d failed to apply to %s (context is ambiguous)", hunkNumber, relPath)
+				return "", fmt.Errorf("hunk %d failed to apply to %s (context is ambiguous)", hunkNumber, relPath)
 			}
 		}
 		lines = applyHunk(lines, matchIdx, oldLines, newLines)
@@ -477,14 +709,21 @@ func applyUpdateFile(s *Sandbox, relPath string, hunks []patchHunk) error {
 	if hasTrailingNewline {
 		out += "\n"
 	}
-	currentPath, err := s.revalidatePathForAccess(p)
-	if err != nil {
-		return err
+	if lineEnding == "\r\n" {
+		out = strings.ReplaceAll(out, "\n", "\r\n")
 	}
-	if !pathsEqual(currentPath, resolvedPath) {
-		return &SecurityError{Message: fmt.Sprintf("path changed during patch apply: %q (was %q, now %q)", relPath, resolvedPath, currentPath)}
+	return out, nil
+}
+
+func consistentLineEnding(content string) string {
+	if !strings.Contains(content, "\r\n") {
+		return "\n"
 	}
-	return writeFilePreserveMode(currentPath, []byte(out), 0o644)
+	withoutCRLF := strings.ReplaceAll(content, "\r\n", "")
+	if strings.ContainsAny(withoutCRLF, "\r\n") {
+		return "\n"
+	}
+	return "\r\n"
 }
 
 // hunkLines splits a hunk into old (removed/context) and new (added/context) lines.
@@ -535,6 +774,30 @@ func findHunkMatches(lines []string, oldLines []string) []int {
 		}
 	}
 	return matches
+}
+
+// nearestHunkMatch picks the candidate match closest to expected. It reports
+// the distance of that candidate and whether two candidates are equally close
+// (which makes the target position ambiguous).
+func nearestHunkMatch(matches []int, expected int) (int, int, bool) {
+	best := -1
+	bestDist := 0
+	ambiguous := false
+	for _, m := range matches {
+		dist := m - expected
+		if dist < 0 {
+			dist = -dist
+		}
+		switch {
+		case best == -1 || dist < bestDist:
+			best = m
+			bestDist = dist
+			ambiguous = false
+		case dist == bestDist && m != best:
+			ambiguous = true
+		}
+	}
+	return best, bestDist, ambiguous
 }
 
 // applyHunk applies a single hunk to lines at position start.

@@ -172,6 +172,30 @@ func NewContainer() *Container {
 	}
 }
 
+// Clone returns a point-in-time dependency snapshot with independent override,
+// memoization, and in-flight state. Provider functions and already-resolved
+// values are copied by reference; mutating the child container never changes
+// the parent container's binding maps. This is intended for execution-scoped
+// overlays such as child-agent identity bindings.
+func (c *Container) Clone() *Container {
+	if c == nil {
+		return NewContainer()
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	clone := NewContainer()
+	for name, provider := range c.providers {
+		clone.providers[name] = provider
+	}
+	for name, provider := range c.overrides {
+		clone.overrides[name] = provider
+	}
+	for name, value := range c.cache {
+		clone.cache[name] = value
+	}
+	return clone
+}
+
 type inflightCall struct {
 	done chan struct{}
 	val  any
@@ -194,6 +218,21 @@ func (c *Container) OverrideAny(name string, provider any) {
 func Provide[T any](c *Container, key DepKey[T], p Provider[T]) { c.ProvideAny(key.Name, p) }
 
 func Override[T any](c *Container, key DepKey[T], p Provider[T]) { c.OverrideAny(key.Name, p) }
+
+// Has reports whether the container currently has a provider or override for
+// key. It does not resolve the provider or inspect its cached value.
+func Has[T any](c *Container, key DepKey[T]) bool {
+	if c == nil {
+		return false
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if _, ok := c.overrides[key.Name]; ok {
+		return true
+	}
+	_, ok := c.providers[key.Name]
+	return ok
+}
 
 func Get[T any](c *Container, ctx context.Context, key DepKey[T]) (T, error) {
 	var zero T

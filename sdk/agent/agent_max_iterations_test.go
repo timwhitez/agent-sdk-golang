@@ -383,6 +383,7 @@ func TestEarlyStopReminderRunsWithoutTodoDependency(t *testing.T) {
 
 	earlyStopWarn := 0
 	final := ""
+	finalStatus := ""
 	for _, ev := range events {
 		switch e := ev.(type) {
 		case WarnEvent:
@@ -391,6 +392,7 @@ func TestEarlyStopReminderRunsWithoutTodoDependency(t *testing.T) {
 			}
 		case FinalResponseEvent:
 			final = e.Content
+			finalStatus = e.Status
 		}
 	}
 	if earlyStopWarn != 1 {
@@ -399,6 +401,10 @@ func TestEarlyStopReminderRunsWithoutTodoDependency(t *testing.T) {
 	if strings.TrimSpace(final) != "done after reminder" {
 		t.Fatalf("unexpected final response: %q", final)
 	}
+	if finalStatus != "complete" {
+		t.Fatalf("early-stop recovery final status = %q, want complete", finalStatus)
+	}
+	assertHistoryContainsNamedUserMessage(t, ag.Messages(), earlyStopReminderText, "sdk_internal_early_stop")
 }
 
 func TestRequireDoneReminderPreservesPriorAnswerOnDoneToolCompletion(t *testing.T) {
@@ -447,6 +453,7 @@ func TestRequireDoneReminderPreservesPriorAnswerOnDoneToolCompletion(t *testing.
 	if finalResponseID != "resp-looks-done" {
 		t.Fatalf("expected preserved prior response id, got %q", finalResponseID)
 	}
+	assertHistoryContainsNamedUserMessage(t, ag.Messages(), requireDoneReminderText, "sdk_internal_require_done")
 }
 
 // requireDoneSafetyValveModel: first call uses a tool, subsequent calls are text-only.
@@ -519,6 +526,8 @@ func TestRequireDoneSafetyValveAfterToolUsage(t *testing.T) {
 	var finalSeen bool
 	var finalContent string
 	var finalResponseID string
+	var finalStatus string
+	var finalReason string
 	var safetyWarnSeen bool
 	for _, ev := range events {
 		switch e := ev.(type) {
@@ -530,6 +539,8 @@ func TestRequireDoneSafetyValveAfterToolUsage(t *testing.T) {
 			finalSeen = true
 			finalContent = e.Content
 			finalResponseID = e.ResponseID
+			finalStatus = e.Status
+			finalReason = e.Reason
 		case ErrorEvent:
 			if e.Kind == "max_iterations" {
 				t.Fatalf("safety valve should fire before max_iterations")
@@ -539,13 +550,143 @@ func TestRequireDoneSafetyValveAfterToolUsage(t *testing.T) {
 	if !finalSeen {
 		t.Fatalf("expected FinalResponseEvent")
 	}
-	if strings.TrimSpace(finalContent) != "first post-tool answer" {
-		t.Fatalf("expected safety valve to preserve first post-tool answer, got %q", finalContent)
+	if strings.TrimSpace(finalContent) != "reminder answer 3" {
+		t.Fatalf("expected safety valve to preserve latest post-tool answer, got %q", finalContent)
 	}
-	if finalResponseID != "resp-first" {
-		t.Fatalf("expected safety valve to preserve first post-tool response_id, got %q", finalResponseID)
+	if finalResponseID != "resp-third" {
+		t.Fatalf("expected safety valve to preserve latest post-tool response_id, got %q", finalResponseID)
+	}
+	if finalStatus != "partial" || finalReason != "require_done_safety" {
+		t.Fatalf("safety final status/reason = %q/%q, want partial/require_done_safety", finalStatus, finalReason)
 	}
 	if !safetyWarnSeen {
 		t.Fatalf("expected require_done_safety WarnEvent after tool usage")
+	}
+}
+
+type requireDoneToolChoiceRecoveryModel struct {
+	calls                       int
+	recoveryToolChoice          llm.ToolChoice
+	recoveryDisableThinking     bool
+	postRecoveryToolChoice      llm.ToolChoice
+	postRecoveryDisableThinking bool
+}
+
+func (m *requireDoneToolChoiceRecoveryModel) Provider() string { return "stub" }
+func (m *requireDoneToolChoiceRecoveryModel) Model() string    { return "stub" }
+func (m *requireDoneToolChoiceRecoveryModel) Invoke(_ context.Context, req llm.InvokeRequest) (*llm.Completion, error) {
+	m.calls++
+	switch m.calls {
+	case 1:
+		return &llm.Completion{
+			StopReason: "tool_calls",
+			ToolCalls: []llm.ToolCall{{
+				ID:   "echo_1",
+				Type: "function",
+				Function: llm.FunctionCall{
+					Name:      "echo",
+					Arguments: `{"message":"first step"}`,
+				},
+			}},
+		}, nil
+	case 2:
+		return &llm.Completion{
+			Content:    llm.TextContent(""),
+			StopReason: "stop",
+		}, nil
+	case 3:
+		m.recoveryToolChoice = req.ToolChoice
+		m.recoveryDisableThinking = req.DisableThinking
+		return &llm.Completion{
+			StopReason: "tool_calls",
+			ToolCalls: []llm.ToolCall{{
+				ID:   "echo_2",
+				Type: "function",
+				Function: llm.FunctionCall{
+					Name:      "echo",
+					Arguments: `{"message":"continued work"}`,
+				},
+			}},
+		}, nil
+	default:
+		m.postRecoveryToolChoice = req.ToolChoice
+		m.postRecoveryDisableThinking = req.DisableThinking
+		return &llm.Completion{
+			StopReason: "tool_calls",
+			ToolCalls: []llm.ToolCall{{
+				ID:   "done_1",
+				Type: "function",
+				Function: llm.FunctionCall{
+					Name:      "done",
+					Arguments: `{"message":"finished after continued tool work"}`,
+				},
+			}},
+		}, nil
+	}
+}
+
+func TestRequireDoneEmptyStopForcesToolChoiceAndContinues(t *testing.T) {
+	echoTool := tools.Func[struct {
+		Message string `json:"message"`
+	}]("echo", "echo", func(_ context.Context, args struct {
+		Message string `json:"message"`
+	}, _ *tools.Container) (any, error) {
+		return args.Message, nil
+	})
+	doneTool := tools.Func[struct {
+		Message string `json:"message"`
+	}]("done", "complete task", func(_ context.Context, args struct {
+		Message string `json:"message"`
+	}, _ *tools.Container) (any, error) {
+		return nil, tools.TaskComplete(args.Message)
+	})
+
+	model := &requireDoneToolChoiceRecoveryModel{}
+	ag, err := New(Config{
+		LLM:             model,
+		Tools:           []tools.Tool{echoTool, doneTool},
+		ToolChoice:      llm.ToolChoice("auto"),
+		MaxIterations:   10,
+		RequireDoneTool: true,
+	})
+	if err != nil {
+		t.Fatalf("new agent: %v", err)
+	}
+
+	events := collectEvents(ag.QueryStream(context.Background(), llm.TextContent("continue until complete")))
+	if model.calls != 4 {
+		t.Fatalf("model calls = %d, want 4", model.calls)
+	}
+	if model.recoveryToolChoice != llm.ToolChoice("required") {
+		t.Fatalf("require-done recovery tool choice = %q, want required", model.recoveryToolChoice)
+	}
+	if !model.recoveryDisableThinking {
+		t.Fatalf("require-done recovery call should set DisableThinking so a forced tool_choice stays legal under extended thinking")
+	}
+	if model.postRecoveryToolChoice != llm.ToolChoice("auto") {
+		t.Fatalf("post-recovery tool choice = %q, want auto after ordinary recovery tool", model.postRecoveryToolChoice)
+	}
+	if !model.postRecoveryDisableThinking {
+		t.Fatalf("post-recovery call should keep DisableThinking active until the done tool completes")
+	}
+
+	final := ""
+	finalStatus := ""
+	for _, ev := range events {
+		switch e := ev.(type) {
+		case WarnEvent:
+			if e.Kind == "require_done_safety" {
+				t.Fatalf("tool-required recovery should avoid safety termination: %#v", e)
+			}
+		case FinalResponseEvent:
+			final = e.Content
+			finalStatus = e.Status
+		}
+	}
+	if final != "finished after continued tool work" {
+		t.Fatalf("final response = %q", final)
+	}
+	if finalStatus != "complete" {
+		t.Fatalf("normal done completion status = %q, want complete", finalStatus)
 	}
 }

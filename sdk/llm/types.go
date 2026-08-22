@@ -122,12 +122,27 @@ type Message struct {
 func (m Message) PlainText() string { return m.Content.PlainText() }
 
 type Usage struct {
-	PromptTokens              int  `json:"prompt_tokens"`
-	CompletionTokens          int  `json:"completion_tokens"`
-	TotalTokens               int  `json:"total_tokens"`
+	// PromptTokens is the effective total input size. Under total_input_v1 it
+	// already includes cache/image token subsets; consumers must not add the
+	// breakdown fields again.
+	PromptTokens     int `json:"prompt_tokens"`
+	CompletionTokens int `json:"completion_tokens"`
+	TotalTokens      int `json:"total_tokens"`
+
 	PromptCachedTokens        *int `json:"prompt_cached_tokens,omitempty"`
 	PromptCacheCreationTokens *int `json:"prompt_cache_creation_tokens,omitempty"`
 	PromptImageTokens         *int `json:"prompt_image_tokens,omitempty"`
+	PromptUncachedTokens      *int `json:"prompt_uncached_tokens,omitempty"`
+
+	// ProviderPromptTokens and ProviderTotalTokens retain the provider values
+	// when the SDK has to replace an invalid/missing zero prompt count with a
+	// local estimate.
+	ProviderPromptTokens *int `json:"provider_prompt_tokens,omitempty"`
+	ProviderTotalTokens  *int `json:"provider_total_tokens,omitempty"`
+
+	PromptTokensValid     bool   `json:"prompt_tokens_valid"`
+	PromptTokensSource    string `json:"prompt_tokens_source,omitempty"`
+	PromptTokensSemantics string `json:"prompt_tokens_semantics,omitempty"`
 }
 
 type Completion struct {
@@ -139,6 +154,12 @@ type Completion struct {
 	ResponseID  string          `json:"response_id,omitempty"`
 	Diagnostics []Diagnostic    `json:"diagnostics,omitempty"`
 	Raw         json.RawMessage `json:"-"`
+}
+
+// WarningSinkSetter lets runtime hosts route provider diagnostics without
+// allowing a client to write directly to a TUI or protocol stdout/stderr.
+type WarningSinkSetter interface {
+	SetWarningf(func(format string, args ...any))
 }
 
 type Diagnostic struct {

@@ -644,6 +644,33 @@ func TestExternalDirectoryTool_DeniedReturnsErrorAndMetadata(t *testing.T) {
 	assertDeniedMetadata(t, ctx, "external_directory")
 }
 
+func TestExternalDirectoryToolRequiresExplicitConfirmation(t *testing.T) {
+	root := t.TempDir()
+	s, err := New(root)
+	if err != nil {
+		t.Fatalf("new: %v", err)
+	}
+	outside := t.TempDir()
+	capture := &captureConfirmer{allow: false}
+	deps := tools.NewContainer()
+	tools.Provide(deps, Key, func(context.Context) (*Sandbox, error) { return s, nil })
+	tools.Provide(deps, ConfirmKey, func(context.Context) (Confirmer, error) { return capture, nil })
+
+	if _, err := externalDirectoryTool().Execute(context.Background(), fmt.Sprintf(`{"path":%q}`, outside), deps); !errors.Is(err, ErrToolDenied) {
+		t.Fatalf("execute error = %v, want ErrToolDenied", err)
+	}
+	if capture.action != "external_directory" {
+		t.Fatalf("confirmation action = %q", capture.action)
+	}
+	var meta map[string]any
+	if err := json.Unmarshal([]byte(capture.detail), &meta); err != nil {
+		t.Fatalf("decode confirmation detail: %v", err)
+	}
+	if force, _ := meta["force_confirm"].(bool); !force {
+		t.Fatalf("external boundary expansion must require explicit confirmation, meta=%#v", meta)
+	}
+}
+
 func assertSandboxSeverityActionDiagnostic(t *testing.T, text string) {
 	t.Helper()
 	trimmed := strings.TrimSpace(text)
@@ -3750,5 +3777,58 @@ func TestApplyPatch_RejectsLargeTargetFile(t *testing.T) {
 		if strings.Contains(err.Error(), "unexpected full read") {
 			t.Fatalf("expected size check before read, got %v", err)
 		}
+	}
+}
+
+func TestApplyPatchPreservesConsistentCRLF(t *testing.T) {
+	root := t.TempDir()
+	s, err := New(root)
+	if err != nil {
+		t.Fatalf("new: %v", err)
+	}
+	path := filepath.Join(root, "crlf.txt")
+	if err := os.WriteFile(path, []byte("alpha\r\nbeta\r\ngamma\r\n"), 0o644); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	patch := "*** Begin Patch\n" +
+		"*** Update File: crlf.txt\n" +
+		"@@\n" +
+		" alpha\n" +
+		"-beta\n" +
+		"+changed\n" +
+		" gamma\n" +
+		"*** End Patch\n"
+	if _, err := applyPatchToSandbox(s, patch); err != nil {
+		t.Fatalf("applyPatchToSandbox: %v", err)
+	}
+	got, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read: %v", err)
+	}
+	if want := "alpha\r\nchanged\r\ngamma\r\n"; string(got) != want {
+		t.Fatalf("content = %q, want %q", string(got), want)
+	}
+}
+
+func TestConsistentLineEndingRejectsMixedInput(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name    string
+		content string
+		want    string
+	}{
+		{name: "crlf", content: "a\r\nb\r\n", want: "\r\n"},
+		{name: "lf", content: "a\nb\n", want: "\n"},
+		{name: "mixed", content: "a\r\nb\n", want: "\n"},
+		{name: "bare cr", content: "a\rb\r", want: "\n"},
+	}
+	for _, tt := range tests {
+		tt := tt
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			if got := consistentLineEnding(tt.content); got != tt.want {
+				t.Fatalf("consistentLineEnding(%q) = %q, want %q", tt.content, got, tt.want)
+			}
+		})
 	}
 }

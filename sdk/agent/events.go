@@ -3,6 +3,7 @@ package agent
 import (
 	"encoding/json"
 
+	sdkaccounting "github.com/timwhitez/agent-sdk-golang/sdk/accounting"
 	"github.com/timwhitez/agent-sdk-golang/sdk/agent/compaction"
 	"github.com/timwhitez/agent-sdk-golang/sdk/llm"
 )
@@ -45,8 +46,9 @@ func (ErrorEvent) isEvent() {}
 
 // WarnEvent is emitted for non-fatal runtime warnings where the agent can continue.
 type WarnEvent struct {
-	Message string
-	Kind    string // "loop_guard"|"continuation"|"continuation_limit"|"early_stop"|"runtime"
+	Message  string
+	Kind     string // "loop_guard"|"continuation"|"continuation_limit"|"early_stop"|"runtime"
+	Metadata map[string]any
 }
 
 func (WarnEvent) isEvent() {}
@@ -96,9 +98,27 @@ func (ToolResultEvent) isEvent() {}
 type FinalResponseEvent struct {
 	Content    string
 	ResponseID string
+	// Status is "complete" for normal terminal answers and "partial" when the
+	// agent accepts a bounded fallback answer without satisfying the normal
+	// completion gate. Reason identifies the fallback (for example
+	// "require_done_safety"). Empty status from older producers means complete.
+	Status string
+	Reason string
 	// StallRecoveries records how many automatic stream-idle recoveries were
 	// applied earlier in the same turn before the final response completed.
 	StallRecoveries int
+	// DroppedEvents records how many events this turn were discarded because
+	// the consumer could not keep up with the event channel. A non-zero value
+	// means the delivered event stream (and any audit log derived from it) is
+	// an incomplete view of the turn, even though history stayed consistent.
+	DroppedEvents uint64
+	// DroppedCriticalEvents counts the subset of DroppedEvents whose loss makes
+	// the delivered stream contradict the history the agent actually mutated
+	// (tool results, step lifecycle, injected messages, compaction, usage and
+	// accounting). A non-zero value means the stream is not merely incomplete
+	// but inconsistent, so any audit log or ledger derived from it must be
+	// treated as unreliable for this turn.
+	DroppedCriticalEvents uint64
 }
 
 func (FinalResponseEvent) isEvent() {}
@@ -122,6 +142,20 @@ type CompactionEvent struct {
 }
 
 func (CompactionEvent) isEvent() {}
+
+// AccountingEvent carries a bounded, surface-neutral semantic projection for
+// the immediately preceding tool-result, usage, or compaction event. Runtime
+// hosts add session/run/surface identity and persistence policy.
+type AccountingEvent struct {
+	Payload         sdkaccounting.Payload
+	CorrelationKind string
+	ToolCallID      string
+	ResponseID      string
+	Sequence        uint64
+	DurationMS      int64
+}
+
+func (AccountingEvent) isEvent() {}
 
 // SteeringReceivedEvent is emitted when a steering message from the user
 // has been incorporated into the conversation history mid-turn.

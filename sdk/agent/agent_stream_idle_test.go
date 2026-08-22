@@ -103,6 +103,7 @@ func TestQueryStreamAutoRecoversFromIdleStream(t *testing.T) {
 	if got := model.calls.Load(); got != 2 {
 		t.Fatalf("expected 2 streaming attempts (idle recover + success), got %d", got)
 	}
+	assertHistoryContainsNamedUserMessage(t, ag.Messages(), streamIdleRecoveryText, "sdk_internal_stream_idle_recovery")
 }
 
 func TestQueryStreamAutoRecoversFromIdleStreamWithPartialText(t *testing.T) {

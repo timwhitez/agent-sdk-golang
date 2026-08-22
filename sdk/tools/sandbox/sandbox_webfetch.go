@@ -6,6 +6,7 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"net/netip"
 	"net/url"
 	"strings"
 	"time"
@@ -208,25 +209,178 @@ func parseWebfetchLiteralIP(host string) net.IP {
 	return net.ParseIP(host)
 }
 
-// classifyWebfetchAddress classifies an IP address for security filtering.
-// Returns a non-empty classification string if the address should be denied.
-func classifyWebfetchAddress(ip net.IP) string {
-	if ip == nil {
-		return ""
+// WebfetchAddressPolicy captures the host-configurable part of webfetch
+// destination filtering. The zero value is the fail-closed policy: every
+// non-public destination class is denied.
+//
+// It exists so hosts embedding this SDK share one destination classifier
+// instead of maintaining their own copy that can drift out of sync.
+type WebfetchAddressPolicy struct {
+	// AllowPrivateIPv4 permits RFC1918 IPv4 destinations (10/8, 172.16/12,
+	// 192.168/16). Only hosts that intentionally target local development
+	// services should opt in; the zero value denies them.
+	AllowPrivateIPv4 bool
+}
+
+// webfetchRestrictedAddrRules denies IANA special-purpose ranges that are
+// neither loopback, link-local nor private but must never be a webfetch
+// destination.
+var webfetchRestrictedAddrRules = []struct {
+	prefix netip.Prefix
+	class  string
+}{
+	{prefix: mustParseWebfetchPrefix("0.0.0.0/8"), class: "this-network"},
+	{prefix: mustParseWebfetchPrefix("100.64.0.0/10"), class: "carrier-grade nat"},
+	{prefix: mustParseWebfetchPrefix("192.0.0.0/24"), class: "iana special-purpose"},
+	{prefix: mustParseWebfetchPrefix("192.0.2.0/24"), class: "documentation test-net-1"},
+	{prefix: mustParseWebfetchPrefix("198.18.0.0/15"), class: "benchmark testing"},
+	{prefix: mustParseWebfetchPrefix("198.51.100.0/24"), class: "documentation test-net-2"},
+	{prefix: mustParseWebfetchPrefix("203.0.113.0/24"), class: "documentation test-net-3"},
+	{prefix: mustParseWebfetchPrefix("240.0.0.0/4"), class: "reserved"},
+}
+
+// webfetchMetadataAddrs are cloud instance-metadata endpoints. They are denied
+// independently of WebfetchAddressPolicy because some of them live inside
+// otherwise routable ranges, and because a host that allows private IPv4 must
+// still not be able to read instance credentials.
+var webfetchMetadataAddrs = []netip.Addr{
+	netip.MustParseAddr("169.254.169.254"), // AWS / GCP / Azure / OpenStack IMDS
+	netip.MustParseAddr("169.254.170.2"),   // AWS ECS task metadata
+	netip.MustParseAddr("168.63.129.16"),   // Azure platform (WireServer)
+	netip.MustParseAddr("100.100.100.200"), // Alibaba Cloud metadata
+	netip.MustParseAddr("192.0.0.192"),     // Oracle Cloud metadata
+	netip.MustParseAddr("fd00:ec2::254"),   // AWS IMDS over IPv6
+}
+
+// mustParseWebfetchPrefix parses static CIDR literals for package-level rules.
+// It must only be used with compile-time constants during initialization.
+func mustParseWebfetchPrefix(cidr string) netip.Prefix {
+	prefix, err := netip.ParsePrefix(cidr)
+	if err != nil {
+		panic(fmt.Sprintf("invalid webfetch prefix %q: %v", cidr, err))
 	}
-	if ip.IsLoopback() {
+	return prefix
+}
+
+// webfetchNAT64WellKnownPrefix is the RFC 6052 well-known NAT64 prefix.
+var webfetchNAT64WellKnownPrefix = mustParseWebfetchPrefix("64:ff9b::/96")
+
+// webfetchNAT64LocalUsePrefix is the RFC 8215 local-use NAT64 prefix. Any /96
+// inside it embeds an IPv4 address in its low 32 bits.
+var webfetchNAT64LocalUsePrefix = mustParseWebfetchPrefix("64:ff9b:1::/48")
+
+// webfetch6to4Prefix is the RFC 3056 6to4 prefix: bytes 2..5 hold the IPv4.
+var webfetch6to4Prefix = mustParseWebfetchPrefix("2002::/16")
+
+// webfetchTeredoPrefix is the RFC 4380 Teredo prefix: bytes 4..7 hold the
+// server IPv4 and bytes 12..15 the client IPv4, obfuscated by XOR with 0xff.
+var webfetchTeredoPrefix = mustParseWebfetchPrefix("2001::/32")
+
+// embeddedWebfetchIPv4Addrs returns the IPv4 addresses carried inside an IPv6
+// transitional address, together with a label naming the embedding form.
+//
+// IPv6 has several ways to tunnel an IPv4 destination. netip.Addr.Unmap only
+// undoes the ::ffff: (IPv4-mapped) form, so `64:ff9b::a9fe:a9fe` — the NAT64
+// spelling of the 169.254.169.254 instance-metadata endpoint — reached the
+// classifier as an ordinary global-unicast IPv6 address and was allowed. Every
+// embedded form must be unwrapped and the inner IPv4 classified on its own.
+func embeddedWebfetchIPv4Addrs(addr netip.Addr) []struct {
+	form string
+	ip   netip.Addr
+} {
+	var out []struct {
+		form string
+		ip   netip.Addr
+	}
+	if !addr.Is6() || addr.Is4In6() {
+		return out
+	}
+	b := addr.As16()
+	add := func(form string, v4 netip.Addr) {
+		if v4.IsValid() {
+			out = append(out, struct {
+				form string
+				ip   netip.Addr
+			}{form: form, ip: v4})
+		}
+	}
+	v4From := func(o0, o1, o2, o3 byte) netip.Addr {
+		return netip.AddrFrom4([4]byte{o0, o1, o2, o3})
+	}
+	switch {
+	case webfetchNAT64WellKnownPrefix.Contains(addr):
+		add("NAT64", v4From(b[12], b[13], b[14], b[15]))
+	case webfetchNAT64LocalUsePrefix.Contains(addr):
+		add("NAT64", v4From(b[12], b[13], b[14], b[15]))
+	case webfetch6to4Prefix.Contains(addr):
+		add("6to4", v4From(b[2], b[3], b[4], b[5]))
+	case webfetchTeredoPrefix.Contains(addr):
+		add("Teredo server", v4From(b[4], b[5], b[6], b[7]))
+		add("Teredo client", v4From(b[12]^0xff, b[13]^0xff, b[14]^0xff, b[15]^0xff))
+	}
+	return out
+}
+
+// ClassifyWebfetchAddress is the single webfetch destination classifier shared
+// by this SDK and its embedding hosts. It returns a non-empty classification
+// string when the address must be denied, and "" only for addresses that are
+// positively identified as acceptable public destinations — an address that
+// cannot be interpreted is denied rather than allowed.
+func ClassifyWebfetchAddress(ip net.IP, policy WebfetchAddressPolicy) string {
+	if ip == nil {
+		return "invalid address"
+	}
+	addr, ok := netip.AddrFromSlice(ip)
+	if !ok {
+		return "invalid address"
+	}
+	addr = addr.Unmap()
+	if !addr.IsValid() {
+		return "invalid address"
+	}
+	// Reject IPv6 forms that tunnel an IPv4 destination whose own class is
+	// denied. The embedded IPv4 is classified with the same policy, so a NAT64 /
+	// 6to4 / Teredo spelling of a metadata or loopback address is denied exactly
+	// like its plain IPv4 spelling.
+	for _, embedded := range embeddedWebfetchIPv4Addrs(addr) {
+		if class := ClassifyWebfetchAddress(embedded.ip.AsSlice(), policy); class != "" {
+			return embedded.form + " embedded " + class
+		}
+	}
+	for _, metadata := range webfetchMetadataAddrs {
+		if addr == metadata {
+			return "cloud instance metadata"
+		}
+	}
+	if addr.IsLoopback() {
 		return "loopback"
 	}
-	if ip.IsLinkLocalUnicast() || ip.IsLinkLocalMulticast() {
+	if addr.IsLinkLocalUnicast() || addr.IsLinkLocalMulticast() {
 		return "link-local"
 	}
-	if ip.IsPrivate() {
-		if ip.To4() != nil {
+	if addr.IsPrivate() {
+		if !addr.Is4() {
+			return "private IPv6 ULA"
+		}
+		if !policy.AllowPrivateIPv4 {
 			return "private RFC1918"
 		}
-		return "private"
+	}
+	for _, rule := range webfetchRestrictedAddrRules {
+		if rule.prefix.Contains(addr) {
+			return rule.class
+		}
+	}
+	if !addr.IsGlobalUnicast() {
+		return "non-global-unicast"
 	}
 	return ""
+}
+
+// classifyWebfetchAddress applies the fail-closed policy used by the SDK's own
+// webfetch tool.
+func classifyWebfetchAddress(ip net.IP) string {
+	return ClassifyWebfetchAddress(ip, WebfetchAddressPolicy{})
 }
 
 // webfetchDestinationDeniedError returns an error for a denied destination.
@@ -234,5 +388,5 @@ func webfetchDestinationDeniedError(stage, host, ip, class string) error {
 	if stage == "" {
 		stage = "request target"
 	}
-	return fmt.Errorf("blocked %s %q: resolved to %s (%s). Use a public internet URL (loopback/private/link-local destinations are denied)", stage, host, ip, class)
+	return fmt.Errorf("blocked %s %q: resolved to %s (%s). Use a public internet URL (loopback, private, link-local, cloud-metadata, and special-use destinations are denied)", stage, host, ip, class)
 }

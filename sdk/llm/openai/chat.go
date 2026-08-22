@@ -8,8 +8,10 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"net/url"
+	"strconv"
 	"strings"
 	"time"
 
@@ -50,7 +52,35 @@ type ChatClient struct {
 
 	// If true, include "parallel_tool_calls" when tools are provided.
 	ParallelToolCalls bool
+
+	// UseLegacyMaxTokens sends the output cap as "max_tokens" instead of
+	// "max_completion_tokens" for gateways that only accept the legacy field.
+	// It is also set automatically when a provider rejects
+	// max_completion_tokens.
+	UseLegacyMaxTokens bool
+
+	Warningf func(format string, args ...any)
 }
+
+func (c *ChatClient) SetWarningf(warnf func(format string, args ...any)) { c.Warningf = warnf }
+
+func (c *ChatClient) warnf(format string, args ...any) {
+	if c != nil && c.Warningf != nil {
+		c.Warningf(format, args...)
+		return
+	}
+	log.Printf(format, args...)
+}
+
+// Compatibility-downgrade messages shared by the buffered and streaming paths so
+// both report the same dropped setting.
+const (
+	downgradeReasoningEffortMessage = "OpenAI chat provider rejected reasoning_effort; retrying without reasoning_effort."
+	downgradeExtraBodyMessage       = "OpenAI chat provider rejected extra request body settings; retrying without extra_body."
+	downgradeThinkingMessage        = "OpenAI chat provider rejected thinking settings; retrying without thinking extras."
+	downgradeMaxTokensMessage       = "OpenAI chat provider rejected max_completion_tokens; retrying with legacy max_tokens."
+	downgradeStreamOptionsMessage   = "OpenAI chat provider rejected stream_options; retrying without stream usage reporting."
+)
 
 func (c *ChatClient) Provider() string { return openAIProviderLabel(c.ProviderLabel) }
 
@@ -122,16 +152,21 @@ func (c *ChatClient) Invoke(ctx context.Context, req llm.InvokeRequest) (*llm.Co
 				if strings.TrimSpace(local.ReasoningEffort) != "" && looksLikeReasoningUnsupported(msg) {
 					local.ReasoningEffort = ""
 					compatChanged = true
-					diagnostics = append(diagnostics, llm.Diagnostic{Kind: "provider_compatibility_downgrade", Message: "OpenAI chat provider rejected reasoning_effort; retrying without reasoning_effort."})
+					diagnostics = append(diagnostics, llm.Diagnostic{Kind: "provider_compatibility_downgrade", Message: downgradeReasoningEffortMessage})
 				}
 				if local.ExtraBody != nil && looksLikeExtraBodyUnsupported(msg) {
 					local.ExtraBody = nil
 					compatChanged = true
-					diagnostics = append(diagnostics, llm.Diagnostic{Kind: "provider_compatibility_downgrade", Message: "OpenAI chat provider rejected extra request body settings; retrying without extra_body."})
+					diagnostics = append(diagnostics, llm.Diagnostic{Kind: "provider_compatibility_downgrade", Message: downgradeExtraBodyMessage})
 				}
 				if hasThinkingExtra(local.Extra, local.ExtraBody) && looksLikeThinkingUnsupported(msg) && dropThinkingExtra(local.Extra, local.ExtraBody) {
 					compatChanged = true
-					diagnostics = append(diagnostics, llm.Diagnostic{Kind: "provider_compatibility_downgrade", Message: "OpenAI chat provider rejected thinking settings; retrying without thinking extras."})
+					diagnostics = append(diagnostics, llm.Diagnostic{Kind: "provider_compatibility_downgrade", Message: downgradeThinkingMessage})
+				}
+				if !local.UseLegacyMaxTokens && local.MaxCompletionTokens != nil && looksLikeMaxCompletionTokensUnsupported(msg) {
+					local.UseLegacyMaxTokens = true
+					compatChanged = true
+					diagnostics = append(diagnostics, llm.Diagnostic{Kind: "provider_compatibility_downgrade", Message: downgradeMaxTokensMessage})
 				}
 			}
 			if compatChanged && attempt < retry.maxRetries-1 {
@@ -243,22 +278,33 @@ func (c *ChatClient) InvokeStream(ctx context.Context, req llm.InvokeRequest) (<
 				msg = fmt.Sprintf("%s (POST %s)", msg, endpoint)
 
 				// Automatic downgrade: disable unsupported request settings in one retry step.
+				// Every downgrade is reported through the warning sink so a silently
+				// dropped setting stays visible on the streaming path too.
 				compatChanged := false
 				if resp.StatusCode == 400 || resp.StatusCode == 422 {
 					if strings.TrimSpace(local.ReasoningEffort) != "" && looksLikeReasoningUnsupported(msg) {
 						local.ReasoningEffort = ""
 						compatChanged = true
+						local.warnf("[WARN] %s", downgradeReasoningEffortMessage)
 					}
 					if local.ExtraBody != nil && looksLikeExtraBodyUnsupported(msg) {
 						local.ExtraBody = nil
 						compatChanged = true
+						local.warnf("[WARN] %s", downgradeExtraBodyMessage)
 					}
 					if hasThinkingExtra(local.Extra, local.ExtraBody) && looksLikeThinkingUnsupported(msg) && dropThinkingExtra(local.Extra, local.ExtraBody) {
 						compatChanged = true
+						local.warnf("[WARN] %s", downgradeThinkingMessage)
+					}
+					if !local.UseLegacyMaxTokens && local.MaxCompletionTokens != nil && looksLikeMaxCompletionTokensUnsupported(msg) {
+						local.UseLegacyMaxTokens = true
+						compatChanged = true
+						local.warnf("[WARN] %s", downgradeMaxTokensMessage)
 					}
 					if includeStreamOptions && looksLikeStreamOptionsUnsupported(msg) {
 						includeStreamOptions = false
 						compatChanged = true
+						local.warnf("[WARN] %s", downgradeStreamOptionsMessage)
 					}
 				}
 				if compatChanged && attempt < retry.maxRetries-1 {
@@ -281,6 +327,67 @@ func (c *ChatClient) InvokeStream(ctx context.Context, req llm.InvokeRequest) (<
 
 			stopReason := ""
 			responseID := ""
+
+			// Some OpenAI-compatible gateways omit "index" on tool_call deltas.
+			// Track slots by id (and by streaming order as a last resort) so
+			// parallel calls do not collapse into a single accumulator slot.
+			toolIndexByID := map[string]int{}
+			usedToolIndices := map[int]struct{}{}
+			toolSawArgs := map[int]bool{}
+			nextToolIndex := 0
+			lastToolIndex := -1
+			allocateToolIndex := func() int {
+				for {
+					if _, taken := usedToolIndices[nextToolIndex]; !taken {
+						idx := nextToolIndex
+						usedToolIndices[idx] = struct{}{}
+						nextToolIndex++
+						return idx
+					}
+					nextToolIndex++
+				}
+			}
+			claimToolIndex := func(idx int) int {
+				usedToolIndices[idx] = struct{}{}
+				if idx >= nextToolIndex {
+					nextToolIndex = idx + 1
+				}
+				lastToolIndex = idx
+				return idx
+			}
+			resolveToolIndex := func(rawIndex *int, id, name string) int {
+				id = strings.TrimSpace(id)
+				if rawIndex != nil {
+					idx := *rawIndex
+					if idx < 0 {
+						idx = 0
+					}
+					if id != "" {
+						toolIndexByID[id] = idx
+					}
+					return claimToolIndex(idx)
+				}
+				if id != "" {
+					if idx, ok := toolIndexByID[id]; ok {
+						lastToolIndex = idx
+						return idx
+					}
+					idx := allocateToolIndex()
+					toolIndexByID[id] = idx
+					lastToolIndex = idx
+					return idx
+				}
+				// Neither index nor id: continue the current slot, unless a new
+				// name arrives after that slot already streamed arguments, which
+				// means the gateway started another parallel call.
+				if lastToolIndex >= 0 && !(name != "" && toolSawArgs[lastToolIndex]) {
+					return lastToolIndex
+				}
+				idx := allocateToolIndex()
+				lastToolIndex = idx
+				return idx
+			}
+
 			err = consumeSSEWithBodyClose(resp.Body, func(data string) error {
 				data = strings.TrimSpace(data)
 				if data == "" {
@@ -330,9 +437,14 @@ func (c *ChatClient) InvokeStream(ctx context.Context, req llm.InvokeRequest) (<
 					for _, tc := range ch.Delta.ToolCalls {
 						name := strings.TrimSpace(tc.Function.Name)
 						args := tc.Function.Arguments
-						if name != "" || args != "" || strings.TrimSpace(tc.ID) != "" {
-							out <- llm.StreamToolCallDeltaEvent{Index: tc.Index, ID: tc.ID, NameDelta: name, ArgumentsDelta: args}
+						if name == "" && args == "" && strings.TrimSpace(tc.ID) == "" {
+							continue
 						}
+						idx := resolveToolIndex(tc.Index, tc.ID, name)
+						if args != "" {
+							toolSawArgs[idx] = true
+						}
+						out <- llm.StreamToolCallDeltaEvent{Index: idx, ID: tc.ID, NameDelta: name, ArgumentsDelta: args}
 					}
 				}
 				return nil
@@ -363,7 +475,10 @@ type chatCompletionStreamResponse struct {
 			Thinking         string              `json:"thinking"`
 			FunctionCall     *legacyFunctionCall `json:"function_call"`
 			ToolCalls        []struct {
-				Index    int    `json:"index"`
+				// Index is a pointer so an omitted "index" (common on
+				// OpenAI-compatible gateways) is distinguishable from a
+				// literal 0 and does not collapse parallel calls into one slot.
+				Index    *int   `json:"index"`
 				ID       string `json:"id"`
 				Type     string `json:"type"`
 				Function struct {
@@ -675,6 +790,33 @@ func looksLikeExtraBodyUnsupported(msg string) bool {
 	return false
 }
 
+// looksLikeMaxCompletionTokensUnsupported reports whether the provider rejected
+// max_completion_tokens, which older OpenAI-compatible gateways replace with
+// max_tokens.
+func looksLikeMaxCompletionTokensUnsupported(msg string) bool {
+	s := strings.ToLower(msg)
+	if !strings.Contains(s, "max_completion_tokens") {
+		return false
+	}
+	if strings.Contains(s, "unknown field") {
+		return true
+	}
+	if strings.Contains(s, "unrecognized field") {
+		return true
+	}
+	if strings.Contains(s, "invalid parameter") {
+		return true
+	}
+	if strings.Contains(s, "unexpected") && strings.Contains(s, "field") {
+		return true
+	}
+	if strings.Contains(s, "unsupported") {
+		return true
+	}
+	// Gateways that only know max_tokens often name it in the remedy text.
+	return strings.Contains(s, "max_tokens")
+}
+
 func hasThinkingExtra(extra, extraBody map[string]any) bool {
 	if extra != nil {
 		if _, ok := extra["thinking"]; ok {
@@ -725,11 +867,14 @@ func parseRetryAfter(v string) time.Duration {
 	if v == "" {
 		return 0
 	}
-	// Retry-After can be seconds or an HTTP date.
-	if secs, err := time.ParseDuration(v + "s"); err == nil {
+	// Retry-After is either a plain seconds count or an HTTP date. Parse the
+	// seconds form ourselves: appending "s" to an arbitrary token would let a
+	// unit-bearing value like "1m" become "1ms" and shrink the wait 60000x.
+	if secs, ok := parseRetryAfterSeconds(v); ok {
 		if secs > 0 {
 			return secs
 		}
+		return 0
 	}
 	if t, err := http.ParseTime(v); err == nil {
 		d := time.Until(t)
@@ -738,6 +883,37 @@ func parseRetryAfter(v string) time.Duration {
 		}
 	}
 	return 0
+}
+
+// parseRetryAfterSeconds parses the delay-seconds form of Retry-After (an
+// optionally signed number, without a unit suffix) and reports whether v had
+// that shape.
+func parseRetryAfterSeconds(v string) (time.Duration, bool) {
+	digits := v
+	if len(digits) > 0 && (digits[0] == '+' || digits[0] == '-') {
+		digits = digits[1:]
+	}
+	if digits == "" {
+		return 0, false
+	}
+	dots := 0
+	for i := 0; i < len(digits); i++ {
+		switch {
+		case digits[i] >= '0' && digits[i] <= '9':
+		case digits[i] == '.':
+			dots++
+			if dots > 1 {
+				return 0, false
+			}
+		default:
+			return 0, false
+		}
+	}
+	secs, err := strconv.ParseFloat(v, 64)
+	if err != nil {
+		return 0, false
+	}
+	return time.Duration(secs * float64(time.Second)), true
 }
 
 func isRetryableNetErr(err error) bool {
@@ -797,6 +973,7 @@ type chatRequest struct {
 	Seed        *int     `json:"seed,omitempty"`
 
 	MaxCompletionTokens *int   `json:"max_completion_tokens,omitempty"`
+	MaxTokens           *int   `json:"max_tokens,omitempty"`
 	ServiceTier         string `json:"service_tier,omitempty"`
 
 	ReasoningEffort string `json:"reasoning_effort,omitempty"`
@@ -895,6 +1072,14 @@ func (c *ChatClient) buildRequest(req llm.InvokeRequest) (*chatRequest, error) {
 	extra := cloneMap(c.Extra)
 	extraBody := cloneMap(c.ExtraBody)
 
+	// Gateways that predate max_completion_tokens only accept max_tokens.
+	maxCompletionTokens := c.MaxCompletionTokens
+	var maxTokens *int
+	if c.UseLegacyMaxTokens {
+		maxTokens = maxCompletionTokens
+		maxCompletionTokens = nil
+	}
+
 	return &chatRequest{
 		Model:               c.ModelName,
 		Messages:            msgs,
@@ -903,7 +1088,8 @@ func (c *ChatClient) buildRequest(req llm.InvokeRequest) (*chatRequest, error) {
 		Temperature:         temp,
 		TopP:                c.TopP,
 		Seed:                c.Seed,
-		MaxCompletionTokens: c.MaxCompletionTokens,
+		MaxCompletionTokens: maxCompletionTokens,
+		MaxTokens:           maxTokens,
 		ServiceTier:         strings.TrimSpace(c.ServiceTier),
 		ReasoningEffort:     c.ReasoningEffort,
 		ParallelToolCalls:   ptc,
@@ -1357,7 +1543,9 @@ func parseUsage(u map[string]any) *llm.Usage {
 			cached = &v
 		}
 	}
-	return &llm.Usage{PromptTokens: pt, CompletionTokens: ct, TotalTokens: tt, PromptCachedTokens: cached}
+	usage := llm.NewProviderUsage(pt, ct, tt)
+	usage.PromptCachedTokens = cached
+	return usage
 }
 
 func intFromAny(v any) int {

@@ -46,19 +46,38 @@ stream normalization, and response metadata behavior.
 - Parsed response IDs are attached to `Completion.ResponseID` (`sdk/llm/openai/responses.go:1272`)
 
 ## Anthropic Messages API
+- Extended thinking supports both manual budgets (`thinking.type="enabled"` +
+  `budget_tokens`) and adaptive mode (`thinking.type="adaptive"` + optional
+  `output_config.effort`). `InvokeRequest.DisableThinking` suppresses both
+  shapes for recovery calls.
+- While thinking is active, `tool_choice` is limited to `auto` or `none`.
+  Required/specific-tool conflicts return an actionable local error instead of
+  silently downgrading the caller's choice; agent-owned require-done recovery
+  sets `DisableThinking` before forcing a tool.
 - Compatibility retries on 400/422 downgrade unsupported beta/thinking options, including one final-attempt retry and structured code/param detection (`sdk/llm/anthropic/client.go:125`, `sdk/llm/anthropic/client.go:135`, `sdk/llm/anthropic/client.go:215`, `sdk/llm/anthropic/client.go:244`, `sdk/llm/anthropic/client.go:621`, `sdk/llm/anthropic/client.go:631`)
 - Successful beta/thinking downgrades append
   `provider_compatibility_downgrade` diagnostics to the returned
   `Completion`.
 - Backoff jitter now uses `crypto/rand` with a time-based fallback, avoiding deterministic jitter on older runtimes (`sdk/llm/anthropic/client.go:26`, `sdk/llm/anthropic/client.go:220`). The default retryable status set is 401, 403, 408, 409, 425, 429, and any 5xx status, with explicit per-client override through `RetryableStatusCodes`.
-- Streaming parser maps content-block events into normalized text/thinking/tool deltas, preserves whitespace-only thinking deltas, emits response metadata from `message_start` plus `message_delta/message_stop` fallback IDs, and emits usage on message completion (`sdk/llm/anthropic/client.go:718`, `sdk/llm/anthropic/client.go:739`, `sdk/llm/anthropic/client.go:754`)
+- Streaming parser maps content-block events into normalized text/thinking/tool
+  deltas, preserves whitespace-only thinking deltas, and carries Anthropic
+  thinking block indices, opaque `signature_delta` data, and redacted-thinking
+  data so the agent can persist replayable signed blocks. It also emits response
+  metadata from `message_start` plus `message_delta/message_stop` fallback IDs,
+  and emits usage on message completion.
 - SSE consumption now buffers malformed premature boundaries and surfaces malformed payload errors instead of silently dropping fragments (`sdk/llm/anthropic/client.go:757`)
 - Non-positive numeric `Retry-After` values are ignored with a warning hook instead of failing silently (`sdk/llm/anthropic/client.go:422`)
-- Tool choice mapping aligns `required` with Anthropic `any`, supports `auto`/`none`, and forced named tool mode (`sdk/llm/anthropic/client.go:887`)
+- Tool choice mapping aligns `required` with Anthropic `any`, supports `auto`/`none`, and forced named tool mode when thinking is disabled (`sdk/llm/anthropic/client.go:887`)
 - Tool-call ID normalization now logs both original and sanitized IDs when characters are rewritten for Anthropic compatibility (`sdk/llm/anthropic/client.go:521`)
 
 ## Agent-Side Stream Normalization
 - `invokeCompletion` in the agent consumes provider-specific stream events, emits provider-agnostic agent events, and preserves stream response metadata (`sdk/agent/agent.go:597`, `sdk/agent/agent.go:616`, `sdk/agent/agent.go:644`)
+- Structured thinking stream metadata is aggregated into provider-neutral
+  `ContentBlock{Type:"thinking", Thinking, Signature}` or
+  `redacted_thinking` blocks. Anthropic then serializes those blocks before the
+  associated assistant `tool_use` blocks on the next request; display-only
+  thinking events from other providers remain in `Completion.Thinking` without
+  changing their persisted content shape.
 - Agent-level invoke retry treats typed `RateLimitError`/`ProviderError`,
   transient network/timeout failures, and equivalent text-only gateway errors
   as retryable before visible output. Text-only status detection covers 401,
@@ -82,7 +101,13 @@ stream normalization, and response metadata behavior.
 - OpenAI Chat completions currently do not expose response IDs in parsed completion objects (`sdk/llm/openai/chat.go:904`)
 
 ## Usage and Optional Cost Calculation
-- Providers populate `Usage`; downstream cost calculation is optional (`sdk/llm/types.go:124`, `sdk/tokens/cost.go:80`)
+- Providers populate a versioned `Usage` contract; downstream cost calculation is optional (`sdk/llm/types.go`, `sdk/llm/usage.go`, `sdk/tokens/cost.go:80`).
+- Under `prompt_tokens_semantics=total_input_v1`, `PromptTokens` is the complete effective input size. `PromptCachedTokens`, `PromptCacheCreationTokens`, `PromptImageTokens`, and `PromptUncachedTokens` are breakdown fields and consumers must not add them to `PromptTokens` again.
+- Anthropic normalizes both streaming and non-streaming usage as `input_tokens + cache_read_input_tokens + cache_creation_input_tokens`. OpenAI Chat keeps `prompt_tokens` unchanged because cached tokens are already a subset; OpenAI Responses treats `input_tokens` the same way and preserves cached/image details as subsets.
+- `prompt_tokens_valid`, `prompt_tokens_source`, and `prompt_tokens_semantics` describe quality. Sources are `provider`, `estimate`, `missing`, or `legacy_or_unknown`. `ProviderPromptTokens` and `ProviderTotalTokens` retain raw gateway values when the agent substitutes an estimate.
+- When a compaction watermark decision adds a local history-growth estimate to an exact provider count, the decision total is an estimate rather than a measurement. The agent emits one `compaction_decision_estimate_mixed` warning carrying the exact provider base, the estimated delta, and the resulting decision value, so the estimator-versus-provider drift is observable for calibration.
+- If a provider returns a usage object with prompt tokens missing/zero for a non-empty request, the agent uses `EstimateMessagesTokens`, emits one `provider_usage_prompt_tokens_missing` warning per query, and sends the effective estimate to context, compaction, and budget consumers. A completely absent usage object remains absent; the SDK does not invent a usage event.
+- Positive custom/legacy usage remains usable but is explicitly labeled `legacy_or_unknown`, so adapters can render it as approximate instead of claiming v1 provider precision.
 - Cost helper fetches LiteLLM pricing data, caches for 24h, warns on pricing-init/cache-read/cache-parse/cache-write/cost-calc failures while keeping non-fatal usage-only fallback, and tracks usage history (`sdk/tokens/cost.go:20`, `sdk/tokens/cost.go:22`, `sdk/tokens/cost.go:99`, `sdk/tokens/cost.go:108`, `sdk/tokens/cost.go:126`, `sdk/tokens/cost.go:173`, `sdk/tokens/cost.go:217`)
 - Pricing lookup now supports case-insensitive names, common aliases, provider-prefix probing, and base-family fallback (choosing latest/date-tagged variants when exact names are unavailable) (`sdk/tokens/cost.go:292`, `sdk/tokens/cost.go:310`, `sdk/tokens/cost.go:392`)
 - Cost math separates cached vs non-cached prompt tokens and output tokens (`sdk/tokens/cost.go:243`, `sdk/tokens/cost.go:255`, `sdk/tokens/cost.go:263`)

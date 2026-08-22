@@ -66,11 +66,14 @@ func TestParseResponse_CacheReadTokensNotDoubleCounted(t *testing.T) {
 	if comp.Usage == nil {
 		t.Fatalf("expected usage data")
 	}
-	if comp.Usage.PromptTokens != 100 {
-		t.Fatalf("expected prompt tokens 100, got %d", comp.Usage.PromptTokens)
+	if comp.Usage.PromptTokens != 135 {
+		t.Fatalf("expected normalized prompt tokens 135, got %d", comp.Usage.PromptTokens)
 	}
-	if comp.Usage.TotalTokens != 120 {
-		t.Fatalf("expected total tokens 120, got %d", comp.Usage.TotalTokens)
+	if comp.Usage.TotalTokens != 155 {
+		t.Fatalf("expected normalized total tokens 155, got %d", comp.Usage.TotalTokens)
+	}
+	if !comp.Usage.PromptTokensValid || comp.Usage.PromptTokensSource != llm.PromptTokensSourceProvider || comp.Usage.PromptTokensSemantics != llm.PromptTokensSemanticsTotalInputV1 {
+		t.Fatalf("unexpected normalized usage quality: %#v", comp.Usage)
 	}
 	if comp.Usage.PromptCachedTokens == nil || *comp.Usage.PromptCachedTokens != 30 {
 		t.Fatalf("expected cached tokens 30, got %v", comp.Usage.PromptCachedTokens)
@@ -80,6 +83,36 @@ func TestParseResponse_CacheReadTokensNotDoubleCounted(t *testing.T) {
 	}
 	if comp.ResponseID != "msg_sync_123" {
 		t.Fatalf("expected response id msg_sync_123, got %q", comp.ResponseID)
+	}
+}
+
+func TestParseResponsePreservesThinkingSignatureBlock(t *testing.T) {
+	data := []byte(`{
+		"id":"msg_thinking_1",
+		"content":[
+			{"type":"thinking","thinking":"inspect exact state","signature":"sig_sync_abc"},
+			{"type":"tool_use","id":"tool_1","name":"echo","input":{"message":"work"}}
+		],
+		"stop_reason":"tool_use",
+		"usage":{"input_tokens":1,"output_tokens":1}
+	}`)
+
+	comp, err := parseResponse(data)
+	if err != nil {
+		t.Fatalf("parseResponse: %v", err)
+	}
+	if comp.Thinking != "inspect exact state" {
+		t.Fatalf("Thinking = %q", comp.Thinking)
+	}
+	if len(comp.Content.Blocks) != 1 {
+		t.Fatalf("content blocks = %#v, want one thinking block", comp.Content.Blocks)
+	}
+	block := comp.Content.Blocks[0]
+	if block.Type != "thinking" || block.Thinking != "inspect exact state" || block.Signature != "sig_sync_abc" {
+		t.Fatalf("thinking block = %#v", block)
+	}
+	if len(comp.ToolCalls) != 1 || comp.ToolCalls[0].ID != "tool_1" {
+		t.Fatalf("tool calls = %#v", comp.ToolCalls)
 	}
 }
 
@@ -129,14 +162,17 @@ func TestInvokeStreamUsageIncludesCacheTokenFields(t *testing.T) {
 	if usage == nil {
 		t.Fatalf("expected usage event")
 	}
-	if usage.PromptTokens != 100 {
-		t.Fatalf("expected prompt tokens 100, got %d", usage.PromptTokens)
+	if usage.PromptTokens != 135 {
+		t.Fatalf("expected normalized prompt tokens 135, got %d", usage.PromptTokens)
 	}
 	if usage.CompletionTokens != 20 {
 		t.Fatalf("expected completion tokens 20, got %d", usage.CompletionTokens)
 	}
-	if usage.TotalTokens != 120 {
-		t.Fatalf("expected total tokens 120, got %d", usage.TotalTokens)
+	if usage.TotalTokens != 155 {
+		t.Fatalf("expected normalized total tokens 155, got %d", usage.TotalTokens)
+	}
+	if !usage.PromptTokensValid || usage.PromptTokensSource != llm.PromptTokensSourceProvider || usage.PromptTokensSemantics != llm.PromptTokensSemanticsTotalInputV1 {
+		t.Fatalf("unexpected normalized stream usage quality: %#v", usage)
 	}
 	if usage.PromptCachedTokens == nil || *usage.PromptCachedTokens != 30 {
 		t.Fatalf("expected prompt cached tokens 30, got %v", usage.PromptCachedTokens)
@@ -146,6 +182,122 @@ func TestInvokeStreamUsageIncludesCacheTokenFields(t *testing.T) {
 	}
 	if responseID != "msg_stream_123" {
 		t.Fatalf("expected response id msg_stream_123, got %q", responseID)
+	}
+}
+
+func TestInvokeStreamRecoversPromptTokensFromMessageDelta(t *testing.T) {
+	t.Parallel()
+
+	// message_start omits usage entirely (e.g. interrupted stream or a gateway
+	// that strips the initial usage). The prompt-side tokens must be recovered
+	// from message_delta so prompt tokens are not reported as zero.
+	body := strings.Join([]string{
+		`data: {"type":"message_start","message":{"id":"msg_delta_usage"}}`,
+		"",
+		`data: {"type":"message_delta","usage":{"input_tokens":80,"cache_read_input_tokens":10,"cache_creation_input_tokens":2,"output_tokens":15}}`,
+		"",
+		`data: {"type":"message_stop"}`,
+		"",
+	}, "\n")
+
+	httpClient := &http.Client{
+		Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+			return httpResponse(http.StatusOK, body, r), nil
+		}),
+	}
+
+	client := &Client{
+		HTTPClient: httpClient,
+		BaseURL:    "https://example.com",
+		ModelName:  "test-model",
+	}
+
+	events, err := client.InvokeStream(context.Background(), llm.InvokeRequest{
+		Messages: []llm.Message{{Role: llm.RoleUser, Content: llm.TextContent("hi")}},
+	})
+	if err != nil {
+		t.Fatalf("invoke stream: %v", err)
+	}
+
+	var usage *llm.Usage
+	for ev := range events {
+		if e, ok := ev.(llm.StreamUsageEvent); ok {
+			u := e.Usage
+			usage = &u
+		}
+	}
+
+	if usage == nil {
+		t.Fatalf("expected usage event recovered from message_delta")
+	}
+	// promptTotal = input(80) + cache_read(10) + cache_creation(2) = 92.
+	if usage.PromptTokens != 92 {
+		t.Fatalf("expected recovered prompt tokens 92, got %d", usage.PromptTokens)
+	}
+	if usage.CompletionTokens != 15 {
+		t.Fatalf("expected completion tokens 15, got %d", usage.CompletionTokens)
+	}
+	if !usage.PromptTokensValid || usage.PromptTokensSource != llm.PromptTokensSourceProvider {
+		t.Fatalf("expected provider-valid prompt tokens (no estimate fallback), got %#v", usage)
+	}
+	if usage.PromptCachedTokens == nil || *usage.PromptCachedTokens != 10 {
+		t.Fatalf("expected prompt cached tokens 10, got %v", usage.PromptCachedTokens)
+	}
+	if usage.PromptCacheCreationTokens == nil || *usage.PromptCacheCreationTokens != 2 {
+		t.Fatalf("expected prompt cache creation tokens 2, got %v", usage.PromptCacheCreationTokens)
+	}
+}
+
+func TestInvokeStreamPrefersLargerMessageStartPromptTokens(t *testing.T) {
+	t.Parallel()
+
+	// When message_start already reports prompt tokens, a later message_delta
+	// that omits them must not clobber the larger value.
+	body := strings.Join([]string{
+		`data: {"type":"message_start","message":{"id":"msg_keep","usage":{"input_tokens":200,"cache_read_input_tokens":40}}}`,
+		"",
+		`data: {"type":"message_delta","usage":{"output_tokens":12}}`,
+		"",
+		`data: {"type":"message_stop"}`,
+		"",
+	}, "\n")
+
+	httpClient := &http.Client{
+		Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+			return httpResponse(http.StatusOK, body, r), nil
+		}),
+	}
+
+	client := &Client{
+		HTTPClient: httpClient,
+		BaseURL:    "https://example.com",
+		ModelName:  "test-model",
+	}
+
+	events, err := client.InvokeStream(context.Background(), llm.InvokeRequest{
+		Messages: []llm.Message{{Role: llm.RoleUser, Content: llm.TextContent("hi")}},
+	})
+	if err != nil {
+		t.Fatalf("invoke stream: %v", err)
+	}
+
+	var usage *llm.Usage
+	for ev := range events {
+		if e, ok := ev.(llm.StreamUsageEvent); ok {
+			u := e.Usage
+			usage = &u
+		}
+	}
+
+	if usage == nil {
+		t.Fatalf("expected usage event")
+	}
+	// promptTotal = input(200) + cache_read(40) = 240; delta must not zero it out.
+	if usage.PromptTokens != 240 {
+		t.Fatalf("expected prompt tokens 240 (message_start preserved), got %d", usage.PromptTokens)
+	}
+	if usage.PromptCachedTokens == nil || *usage.PromptCachedTokens != 40 {
+		t.Fatalf("expected prompt cached tokens 40 preserved, got %v", usage.PromptCachedTokens)
 	}
 }
 
@@ -234,6 +386,53 @@ func TestInvokeStreamPreservesWhitespaceThinkingDelta(t *testing.T) {
 
 	if len(deltas) != 1 || deltas[0] != "\n\n" {
 		t.Fatalf("expected whitespace thinking delta preserved, got %#v", deltas)
+	}
+}
+
+func TestInvokeStreamEmitsThinkingSignatureDelta(t *testing.T) {
+	t.Parallel()
+
+	body := strings.Join([]string{
+		`data: {"type":"content_block_start","index":0,"content_block":{"type":"thinking","thinking":""}}`,
+		"",
+		`data: {"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"inspect"}}`,
+		"",
+		`data: {"type":"content_block_delta","index":0,"delta":{"type":"signature_delta","signature":"sig_stream_abc"}}`,
+		"",
+		`data: {"type":"message_stop"}`,
+		"",
+	}, "\n")
+
+	client := &Client{
+		HTTPClient: &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+			return httpResponse(http.StatusOK, body, r), nil
+		})},
+		BaseURL:   "https://example.com",
+		ModelName: "test-model",
+	}
+	events, err := client.InvokeStream(context.Background(), llm.InvokeRequest{
+		Messages: []llm.Message{{Role: llm.RoleUser, Content: llm.TextContent("hi")}},
+	})
+	if err != nil {
+		t.Fatalf("InvokeStream: %v", err)
+	}
+
+	thinking := ""
+	signature := ""
+	for event := range events {
+		switch event := event.(type) {
+		case llm.StreamThinkingDeltaEvent:
+			if event.BlockType != "thinking" || event.Index != 0 {
+				t.Fatalf("thinking event metadata = %#v", event)
+			}
+			thinking += event.Delta
+			signature += event.SignatureDelta
+		case llm.StreamErrorEvent:
+			t.Fatalf("stream error: %v", event.Err)
+		}
+	}
+	if thinking != "inspect" || signature != "sig_stream_abc" {
+		t.Fatalf("streamed thinking/signature = %q/%q", thinking, signature)
 	}
 }
 
@@ -390,6 +589,97 @@ func TestBuildRequestSerializesImageURLBlocks(t *testing.T) {
 	}
 }
 
+func TestBuildRequestToolChoiceUnderThinking(t *testing.T) {
+	client := &Client{ModelName: "claude-test"}
+	budget := 8000
+	tool := llm.ToolDefinition{Name: "echo", Description: "echo", Parameters: map[string]any{"type": "object"}}
+	baseReq := func(tc llm.ToolChoice, disable bool) llm.InvokeRequest {
+		return llm.InvokeRequest{
+			Messages:        []llm.Message{{Role: llm.RoleUser, Content: llm.TextContent("hi")}},
+			Tools:           []llm.ToolDefinition{tool},
+			ToolChoice:      tc,
+			DisableThinking: disable,
+		}
+	}
+
+	// Thinking enabled + forced choice -> actionable error; do not silently
+	// weaken the caller's required/specific-tool semantics.
+	if _, err := client.buildRequest(baseReq("required", false), &budget); err == nil || !strings.Contains(err.Error(), "DisableThinking") {
+		t.Fatalf("expected forced tool_choice conflict error with DisableThinking action, got %v", err)
+	}
+	if _, err := client.buildRequest(baseReq("echo", false), &budget); err == nil || !strings.Contains(err.Error(), "DisableThinking") {
+		t.Fatalf("expected specific tool_choice conflict error with DisableThinking action, got %v", err)
+	}
+
+	// Thinking enabled + auto -> preserved.
+	payload, err := client.buildRequest(baseReq("auto", false), &budget)
+	if err != nil {
+		t.Fatalf("buildRequest: %v", err)
+	}
+	if payload.Thinking == nil || payload.ToolChoice == nil || payload.ToolChoice.Type != "auto" {
+		t.Fatalf("expected auto tool_choice and thinking preserved, got thinking=%#v tool_choice=%#v", payload.Thinking, payload.ToolChoice)
+	}
+
+	// Thinking enabled + none -> preserved (none is legal under thinking).
+	payload, err = client.buildRequest(baseReq("none", false), &budget)
+	if err != nil {
+		t.Fatalf("buildRequest: %v", err)
+	}
+	if payload.ToolChoice == nil || payload.ToolChoice.Type != "none" {
+		t.Fatalf("expected none tool_choice preserved under thinking, got %#v", payload.ToolChoice)
+	}
+
+	// DisableThinking=true + forced choice -> thinking suppressed, forcing honored.
+	payload, err = client.buildRequest(baseReq("required", true), &budget)
+	if err != nil {
+		t.Fatalf("buildRequest: %v", err)
+	}
+	if payload.Thinking != nil {
+		t.Fatalf("expected thinking suppressed when DisableThinking=true, got %#v", payload.Thinking)
+	}
+	if payload.ToolChoice == nil || payload.ToolChoice.Type != "any" {
+		t.Fatalf("expected forced tool_choice honored (any) when thinking disabled, got %#v", payload.ToolChoice)
+	}
+
+	// No thinking budget at all + forced choice -> forcing honored (legacy behavior).
+	payload, err = client.buildRequest(baseReq("required", false), nil)
+	if err != nil {
+		t.Fatalf("buildRequest: %v", err)
+	}
+	if payload.ToolChoice == nil || payload.ToolChoice.Type != "any" {
+		t.Fatalf("expected forced tool_choice honored (any) without thinking, got %#v", payload.ToolChoice)
+	}
+}
+
+func TestBuildRequestAdaptiveThinkingUsesOutputConfigEffort(t *testing.T) {
+	client := &Client{
+		ModelName:      "claude-opus-4-8",
+		ThinkingMode:   "adaptive",
+		ThinkingEffort: "max",
+	}
+	req := llm.InvokeRequest{Messages: []llm.Message{{Role: llm.RoleUser, Content: llm.TextContent("hi")}}}
+
+	payload, err := client.buildRequest(req, nil)
+	if err != nil {
+		t.Fatalf("buildRequest: %v", err)
+	}
+	if payload.Thinking == nil || payload.Thinking.Type != "adaptive" || payload.Thinking.BudgetTokens != 0 {
+		t.Fatalf("adaptive thinking payload = %#v", payload.Thinking)
+	}
+	if payload.OutputConfig == nil || payload.OutputConfig.Effort != "max" {
+		t.Fatalf("output_config = %#v, want effort=max", payload.OutputConfig)
+	}
+
+	req.DisableThinking = true
+	payload, err = client.buildRequest(req, nil)
+	if err != nil {
+		t.Fatalf("buildRequest with DisableThinking: %v", err)
+	}
+	if payload.Thinking != nil || payload.OutputConfig != nil {
+		t.Fatalf("DisableThinking should suppress adaptive thinking and effort: thinking=%#v output_config=%#v", payload.Thinking, payload.OutputConfig)
+	}
+}
+
 func TestClientBetaDowngradeDoesNotMutateConfig(t *testing.T) {
 	t.Parallel()
 	calls := 0
@@ -520,6 +810,61 @@ func TestClientThinkingDowngradeDoesNotMutateConfig(t *testing.T) {
 	}
 	if client.ThinkingBudgetTokens == nil || *client.ThinkingBudgetTokens != budget {
 		t.Fatalf("expected thinking budget unchanged, got %v", client.ThinkingBudgetTokens)
+	}
+}
+
+func TestClientAdaptiveThinkingDowngradeDoesNotMutateConfig(t *testing.T) {
+	t.Parallel()
+
+	calls := 0
+	httpClient := &http.Client{
+		Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+			calls++
+			data, _ := io.ReadAll(r.Body)
+			_ = r.Body.Close()
+			var payload map[string]any
+			if err := json.Unmarshal(data, &payload); err != nil {
+				t.Fatalf("unmarshal request: %v", err)
+			}
+			_, hasThinking := payload["thinking"]
+			_, hasOutputConfig := payload["output_config"]
+			if calls == 1 {
+				if !hasThinking || !hasOutputConfig {
+					t.Fatalf("expected adaptive thinking and output_config on first request: %#v", payload)
+				}
+				errBody := `{"error":{"type":"invalid_request_error","code":"unsupported_parameter","param":"output_config.effort","message":"unknown field"}}`
+				return httpResponse(http.StatusBadRequest, errBody, r), nil
+			}
+			if hasThinking || hasOutputConfig {
+				t.Fatalf("expected adaptive thinking fields removed on retry: %#v", payload)
+			}
+			body := `{"content":[{"type":"text","text":"ok"}],"stop_reason":"end","usage":{"input_tokens":1,"output_tokens":1}}`
+			return httpResponse(http.StatusOK, body, r), nil
+		}),
+	}
+
+	client := &Client{
+		HTTPClient:     httpClient,
+		BaseURL:        "https://example.com",
+		ModelName:      "claude-opus-4-8",
+		ThinkingMode:   "adaptive",
+		ThinkingEffort: "max",
+		MaxRetries:     2,
+	}
+	comp, err := client.Invoke(context.Background(), llm.InvokeRequest{
+		Messages: []llm.Message{{Role: llm.RoleUser, Content: llm.TextContent("hi")}},
+	})
+	if err != nil {
+		t.Fatalf("Invoke: %v", err)
+	}
+	if len(comp.Diagnostics) != 1 || comp.Diagnostics[0].Kind != "provider_compatibility_downgrade" {
+		t.Fatalf("unexpected diagnostics: %#v", comp.Diagnostics)
+	}
+	if calls != 2 {
+		t.Fatalf("calls = %d, want 2", calls)
+	}
+	if client.ThinkingMode != "adaptive" || client.ThinkingEffort != "max" {
+		t.Fatalf("adaptive thinking config mutated: mode=%q effort=%q", client.ThinkingMode, client.ThinkingEffort)
 	}
 }
 
@@ -776,11 +1121,12 @@ func TestDefaultRetryableStatus(t *testing.T) {
 		want bool
 	}{
 		{code: 400, want: false},
-		{code: 401, want: true},
-		{code: 403, want: true},
+		// Permanent auth failures and state conflicts must not be retried.
+		{code: 401, want: false},
+		{code: 403, want: false},
 		{code: 404, want: false},
 		{code: 408, want: true},
-		{code: 409, want: true},
+		{code: 409, want: false},
 		{code: 422, want: false},
 		{code: 425, want: true},
 		{code: 429, want: true},

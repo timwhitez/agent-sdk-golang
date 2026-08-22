@@ -39,8 +39,12 @@ type Client struct {
 	TopP        *float64
 	Seed        *int
 
-	// Thinking mode (Anthropic extended thinking). If nil or <=0, disabled.
+	// Thinking mode (Anthropic extended thinking). Manual mode uses
+	// ThinkingBudgetTokens. Adaptive mode uses ThinkingMode="adaptive" and may
+	// set ThinkingEffort for output_config.effort.
 	ThinkingBudgetTokens *int
+	ThinkingMode         string
+	ThinkingEffort       string
 
 	// Retry policy.
 	MaxRetries           int
@@ -53,6 +57,18 @@ type Client struct {
 
 	// Only the last N tool definitions get cache_control (Anthropic cache block limits).
 	MaxCachedToolDefinitions int
+
+	Warningf func(format string, args ...any)
+}
+
+func (c *Client) SetWarningf(warnf func(format string, args ...any)) { c.Warningf = warnf }
+
+func (c *Client) warnf(format string, args ...any) {
+	if c != nil && c.Warningf != nil {
+		c.Warningf(format, args...)
+		return
+	}
+	log.Printf(format, args...)
 }
 
 func (c *Client) Provider() string { return "anthropic" }
@@ -78,7 +94,7 @@ func (c *Client) Invoke(ctx context.Context, req llm.InvokeRequest) (*llm.Comple
 		maxDelay = 60 * time.Second
 	}
 	localBeta := append([]string(nil), c.Beta...)
-	localThinking := c.ThinkingBudgetTokens
+	localThinking := c.configuredThinking()
 	usedFinalDowngradeRetry := false
 	diagnostics := []llm.Diagnostic{}
 
@@ -86,7 +102,7 @@ func (c *Client) Invoke(ctx context.Context, req llm.InvokeRequest) (*llm.Comple
 		if err := ctx.Err(); err != nil {
 			return nil, err
 		}
-		payload, err := c.buildRequest(req, localThinking)
+		payload, err := c.buildRequestWithThinking(req, localThinking)
 		if err != nil {
 			return nil, err
 		}
@@ -116,7 +132,7 @@ func (c *Client) Invoke(ctx context.Context, req llm.InvokeRequest) (*llm.Comple
 		if err == nil {
 			data, readErr := readResponseBodyLimited(resp.Body, endpoint)
 			if readErr != nil {
-				retryAfter := parseRetryAfter(resp.Header.Get("Retry-After"))
+				retryAfter := parseRetryAfterWithWarning(resp.Header.Get("Retry-After"), c.warnf)
 				return nil, anthropicReadBodyError(resp.StatusCode, retryAfter, readErr)
 			}
 
@@ -129,7 +145,7 @@ func (c *Client) Invoke(ctx context.Context, req llm.InvokeRequest) (*llm.Comple
 				return comp, nil
 			}
 
-			retryAfter := parseRetryAfter(resp.Header.Get("Retry-After"))
+			retryAfter := parseRetryAfterWithWarning(resp.Header.Get("Retry-After"), c.warnf)
 			msg := strings.TrimSpace(string(data))
 
 			didDowngrade := false
@@ -141,10 +157,10 @@ func (c *Client) Invoke(ctx context.Context, req llm.InvokeRequest) (*llm.Comple
 				}
 			}
 			// Automatic downgrade: disable extended thinking on models/endpoints that don't support it.
-			if (resp.StatusCode == 400 || resp.StatusCode == 422) && localThinking != nil && *localThinking > 0 && looksLikeThinkingUnsupported(msg) {
+			if (resp.StatusCode == 400 || resp.StatusCode == 422) && localThinking != nil && looksLikeThinkingUnsupported(msg) {
 				localThinking = nil
 				didDowngrade = true
-				diagnostics = append(diagnostics, llm.Diagnostic{Kind: "provider_compatibility_downgrade", Message: "Anthropic provider rejected extended thinking; retrying without thinking budget."})
+				diagnostics = append(diagnostics, llm.Diagnostic{Kind: "provider_compatibility_downgrade", Message: "Anthropic provider rejected extended thinking; retrying without extended thinking."})
 			}
 			if didDowngrade && allowDowngradeRetry(attempt, maxRetries, &usedFinalDowngradeRetry) {
 				continue
@@ -180,11 +196,18 @@ func (c *Client) Invoke(ctx context.Context, req llm.InvokeRequest) (*llm.Comple
 	return nil, errors.New("anthropic: retry loop ended without result")
 }
 
+// defaultNonStreamTimeout bounds a single non-streaming Messages call. Long
+// generations regularly exceed a minute, so a tighter budget would cut a
+// perfectly healthy request (and bill it) before the model finishes. Streaming
+// clears the timeout entirely (see streamHTTPClient); callers that want a
+// stricter bound should pass their own HTTPClient or a ctx deadline.
+const defaultNonStreamTimeout = 10 * time.Minute
+
 func (c *Client) httpClient() *http.Client {
 	if c.HTTPClient != nil {
 		return c.HTTPClient
 	}
-	return &http.Client{Timeout: 60 * time.Second}
+	return &http.Client{Timeout: defaultNonStreamTimeout}
 }
 
 func (c *Client) baseURL() string {
@@ -204,7 +227,9 @@ func (c *Client) isRetryableStatus(code int) bool {
 
 func defaultRetryableStatus(code int) bool {
 	switch code {
-	case 401, 403, 408, 409, 425, 429:
+	// 401/403 are permanent auth failures and 409 is a state conflict: retrying
+	// them only delays the real error while hammering the auth endpoint.
+	case 408, 425, 429:
 		return true
 	default:
 		return code >= 500 && code <= 599
@@ -423,7 +448,7 @@ func containsAny(msg string, needles ...string) bool {
 
 func looksLikeThinkingUnsupported(msg string) bool {
 	parsed := parseCompatibilityError(msg)
-	thinkingFields := []string{"thinking", "budget_tokens", "redacted_thinking", "enable_thinking"}
+	thinkingFields := []string{"thinking", "budget_tokens", "redacted_thinking", "enable_thinking", "adaptive", "output_config", "effort"}
 
 	if containsAny(parsed.Param, thinkingFields...) && (looksLikeUnsupportedCode(parsed.Code) || looksLikeUnsupportedCode(parsed.Type) || looksLikeUnsupportedError(parsed.Message)) {
 		return true
@@ -448,6 +473,13 @@ func looksLikeBetaUnsupported(msg string) bool {
 }
 
 func parseRetryAfter(v string) time.Duration {
+	return parseRetryAfterWithWarning(v, retryAfterWarningf)
+}
+
+func parseRetryAfterWithWarning(v string, warnf func(string, ...any)) time.Duration {
+	if warnf == nil {
+		warnf = func(string, ...any) {}
+	}
 	v = strings.TrimSpace(v)
 	if v == "" {
 		return 0
@@ -457,7 +489,7 @@ func parseRetryAfter(v string) time.Duration {
 		if secs > 0 {
 			return secs
 		}
-		retryAfterWarningf("[WARN] Anthropic Retry-After %q is non-positive - ignoring header and using exponential backoff.", v)
+		warnf("[WARN] Anthropic Retry-After %q is non-positive - ignoring header and using exponential backoff.", v)
 		return 0
 	}
 	if t, err := http.ParseTime(v); err == nil {
@@ -465,13 +497,19 @@ func parseRetryAfter(v string) time.Duration {
 		if d > 0 {
 			return d
 		}
-		retryAfterWarningf("[WARN] Anthropic Retry-After %q is non-positive - ignoring header and using exponential backoff.", v)
+		warnf("[WARN] Anthropic Retry-After %q is non-positive - ignoring header and using exponential backoff.", v)
 	}
 	return 0
 }
 
 func isRetryableNetErr(err error) bool {
 	if err == nil {
+		return false
+	}
+	// A client-side http.Client.Timeout is a local budget, not a transient
+	// upstream fault: every retry burns another full timeout (and is billed in
+	// full) without changing the outcome, so fail fast instead.
+	if isClientTimeoutErr(err) {
 		return false
 	}
 	var timeoutErr interface{ Timeout() bool }
@@ -484,6 +522,13 @@ func isRetryableNetErr(err error) bool {
 	// best-effort string matching
 	msg := strings.ToLower(err.Error())
 	return strings.Contains(msg, "timeout") || strings.Contains(msg, "connection") || strings.Contains(msg, "tls")
+}
+
+// isClientTimeoutErr reports whether err is net/http's own Client.Timeout
+// error. net/http only reports it through the message, so string matching is
+// the available signal.
+func isClientTimeoutErr(err error) bool {
+	return err != nil && strings.Contains(err.Error(), "Client.Timeout")
 }
 
 // ---- request/response mapping ----
@@ -568,8 +613,18 @@ func normalizeToolCallIDWithWarning(id string, warnf func(string, ...any)) strin
 }
 
 type thinkingParam struct {
-	Type         string `json:"type"` // "enabled"
-	BudgetTokens int    `json:"budget_tokens"`
+	Type         string `json:"type"` // "enabled"|"adaptive"
+	BudgetTokens int    `json:"budget_tokens,omitempty"`
+}
+
+type outputConfigParam struct {
+	Effort string `json:"effort,omitempty"`
+}
+
+type thinkingConfig struct {
+	Type         string
+	BudgetTokens int
+	Effort       string
 }
 
 type requestPayload struct {
@@ -586,7 +641,8 @@ type requestPayload struct {
 	TopP        *float64 `json:"top_p,omitempty"`
 	Seed        *int     `json:"seed,omitempty"`
 
-	Thinking *thinkingParam `json:"thinking,omitempty"`
+	Thinking     *thinkingParam     `json:"thinking,omitempty"`
+	OutputConfig *outputConfigParam `json:"output_config,omitempty"`
 
 	Stream bool `json:"stream,omitempty"`
 }
@@ -597,6 +653,19 @@ func (c *Client) InvokeStream(ctx context.Context, req llm.InvokeRequest) (<-cha
 	out := make(chan llm.StreamEvent, 128)
 	go func() {
 		defer close(out)
+
+		// sendEvent never blocks past cancellation: a consumer that stops
+		// reading (user interrupt, early return upstream) would otherwise pin
+		// this goroutine - and the HTTP body it holds - forever once the
+		// buffered channel fills up.
+		sendEvent := func(ev llm.StreamEvent) bool {
+			select {
+			case out <- ev:
+				return true
+			case <-ctx.Done():
+				return false
+			}
+		}
 
 		client := streamHTTPClient(c.httpClient())
 		baseURL := strings.TrimRight(c.baseURL(), "/")
@@ -615,29 +684,29 @@ func (c *Client) InvokeStream(ctx context.Context, req llm.InvokeRequest) (<-cha
 			maxDelay = 60 * time.Second
 		}
 		localBeta := append([]string(nil), c.Beta...)
-		localThinking := c.ThinkingBudgetTokens
+		localThinking := c.configuredThinking()
 		usedFinalDowngradeRetry := false
 
 		for attempt := 0; attempt < maxRetries+1; attempt++ {
 			if err := ctx.Err(); err != nil {
-				out <- llm.StreamErrorEvent{Err: err}
+				sendEvent(llm.StreamErrorEvent{Err: err})
 				return
 			}
-			payload, err := c.buildRequest(req, localThinking)
+			payload, err := c.buildRequestWithThinking(req, localThinking)
 			if err != nil {
-				out <- llm.StreamErrorEvent{Err: err}
+				sendEvent(llm.StreamErrorEvent{Err: err})
 				return
 			}
 			payload.Stream = true
 			body, err := json.Marshal(payload)
 			if err != nil {
-				out <- llm.StreamErrorEvent{Err: err}
+				sendEvent(llm.StreamErrorEvent{Err: err})
 				return
 			}
 
 			httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(body))
 			if err != nil {
-				out <- llm.StreamErrorEvent{Err: err}
+				sendEvent(llm.StreamErrorEvent{Err: err})
 				return
 			}
 			httpReq.Header.Set("Content-Type", "application/json")
@@ -657,25 +726,25 @@ func (c *Client) InvokeStream(ctx context.Context, req llm.InvokeRequest) (<-cha
 			resp, err := client.Do(httpReq)
 			if err != nil {
 				if ctxErr := ctx.Err(); ctxErr != nil {
-					out <- llm.StreamErrorEvent{Err: ctxErr}
+					sendEvent(llm.StreamErrorEvent{Err: ctxErr})
 					return
 				}
 				if attempt < maxRetries-1 && isRetryableNetErr(err) {
 					c.sleepBackoff(ctx, attempt, baseDelay, maxDelay, 0)
 					continue
 				}
-				out <- llm.StreamErrorEvent{Err: err}
+				sendEvent(llm.StreamErrorEvent{Err: err})
 				return
 			}
 
 			if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 				data, readErr := readResponseBodyLimited(resp.Body, endpoint)
 				if readErr != nil {
-					retryAfter := parseRetryAfter(resp.Header.Get("Retry-After"))
-					out <- llm.StreamErrorEvent{Err: anthropicReadBodyError(resp.StatusCode, retryAfter, readErr)}
+					retryAfter := parseRetryAfterWithWarning(resp.Header.Get("Retry-After"), c.warnf)
+					sendEvent(llm.StreamErrorEvent{Err: anthropicReadBodyError(resp.StatusCode, retryAfter, readErr)})
 					return
 				}
-				retryAfter := parseRetryAfter(resp.Header.Get("Retry-After"))
+				retryAfter := parseRetryAfterWithWarning(resp.Header.Get("Retry-After"), c.warnf)
 				msg := strings.TrimSpace(string(data))
 
 				didDowngrade := false
@@ -685,7 +754,7 @@ func (c *Client) InvokeStream(ctx context.Context, req llm.InvokeRequest) (<-cha
 					}
 				}
 				// Automatic downgrade: disable thinking when unsupported.
-				if (resp.StatusCode == 400 || resp.StatusCode == 422) && localThinking != nil && *localThinking > 0 && looksLikeThinkingUnsupported(msg) {
+				if (resp.StatusCode == 400 || resp.StatusCode == 422) && localThinking != nil && looksLikeThinkingUnsupported(msg) {
 					localThinking = nil
 					didDowngrade = true
 				}
@@ -702,7 +771,7 @@ func (c *Client) InvokeStream(ctx context.Context, req llm.InvokeRequest) (<-cha
 					c.sleepBackoff(ctx, attempt, baseDelay, maxDelay, retryAfter)
 					continue
 				}
-				out <- llm.StreamErrorEvent{Err: lastErr}
+				sendEvent(llm.StreamErrorEvent{Err: lastErr})
 				return
 			}
 
@@ -714,13 +783,14 @@ func (c *Client) InvokeStream(ctx context.Context, req llm.InvokeRequest) (<-cha
 			stopReason := ""
 			responseID := ""
 			nextTool := 0
-			emitResponseID := func(id string) {
+			sawMessageStop := false
+			emitResponseID := func(id string) bool {
 				id = strings.TrimSpace(id)
 				if id == "" || id == responseID {
-					return
+					return true
 				}
 				responseID = id
-				out <- llm.StreamResponseEvent{ResponseID: id}
+				return sendEvent(llm.StreamResponseEvent{ResponseID: id})
 			}
 			getToolIndex := func(blockIdx int) int {
 				if v, ok := blockToToolIndex[blockIdx]; ok {
@@ -745,7 +815,9 @@ func (c *Client) InvokeStream(ctx context.Context, req llm.InvokeRequest) (<-cha
 					return errors.New("anthropic stream: failed to decode SSE JSON event: expected object payload")
 				}
 				typ, _ := root["type"].(string)
-				emitResponseID(streamResponseIDFromEvent(typ, root))
+				if !emitResponseID(streamResponseIDFromEvent(typ, root)) {
+					return ctx.Err()
+				}
 				switch typ {
 				case "message_start":
 					if msg, ok := root["message"].(map[string]any); ok {
@@ -770,59 +842,146 @@ func (c *Client) InvokeStream(ctx context.Context, req llm.InvokeRequest) (<-cha
 						if ot > outputTokens {
 							outputTokens = ot
 						}
+						// Anthropic may repeat prompt-side usage on message_delta.
+						// If message_start omitted or under-reported it (interrupted
+						// stream, gateway stripping the initial usage), use the delta
+						// values as a fallback so prompt tokens are not reported as
+						// zero (which would force a local estimate + warning).
+						if it := intFromAny(u["input_tokens"]); it > inputTokens {
+							inputTokens = it
+						}
+						if raw, ok := u["cache_read_input_tokens"]; ok {
+							if v := intPtrFromAny(raw); v != nil && (promptCachedTokens == nil || *v > *promptCachedTokens) {
+								promptCachedTokens = v
+							}
+						}
+						if raw, ok := u["cache_creation_input_tokens"]; ok {
+							if v := intPtrFromAny(raw); v != nil && (promptCacheCreationTokens == nil || *v > *promptCacheCreationTokens) {
+								promptCacheCreationTokens = v
+							}
+						}
 					}
 				case "content_block_start":
 					idx := intFromAny(root["index"])
 					blk, _ := root["content_block"].(map[string]any)
 					btype, _ := blk["type"].(string)
-					if btype == "tool_use" {
+					switch btype {
+					case "tool_use":
 						id, _ := blk["id"].(string)
 						name, _ := blk["name"].(string)
 						ti := getToolIndex(idx)
-						out <- llm.StreamToolCallDeltaEvent{Index: ti, ID: id, NameDelta: name}
+						if !sendEvent(llm.StreamToolCallDeltaEvent{Index: ti, ID: id, NameDelta: name}) {
+							return ctx.Err()
+						}
+					case "thinking":
+						thinking, _ := blk["thinking"].(string)
+						signature, _ := blk["signature"].(string)
+						if !sendEvent(llm.StreamThinkingDeltaEvent{Index: idx, BlockType: "thinking", Delta: thinking, SignatureDelta: signature}) {
+							return ctx.Err()
+						}
+					case "redacted_thinking":
+						data, _ := blk["data"].(string)
+						if !sendEvent(llm.StreamThinkingDeltaEvent{Index: idx, BlockType: "redacted_thinking", Data: data}) {
+							return ctx.Err()
+						}
 					}
 				case "content_block_delta":
 					idx := intFromAny(root["index"])
 					del, _ := root["delta"].(map[string]any)
 					// text delta (preserve whitespace deltas)
 					if t, ok := del["text"].(string); ok && t != "" {
-						out <- llm.StreamTextDeltaEvent{Delta: t}
+						if !sendEvent(llm.StreamTextDeltaEvent{Delta: t}) {
+							return ctx.Err()
+						}
 						return nil
 					}
 					// thinking delta
 					if t, ok := del["thinking"].(string); ok && t != "" {
-						out <- llm.StreamThinkingDeltaEvent{Delta: t}
+						if !sendEvent(llm.StreamThinkingDeltaEvent{Index: idx, BlockType: "thinking", Delta: t}) {
+							return ctx.Err()
+						}
+						return nil
+					}
+					// thinking signature delta (opaque; preserve exactly for replay)
+					if signature, ok := del["signature"].(string); ok && signature != "" {
+						if !sendEvent(llm.StreamThinkingDeltaEvent{Index: idx, BlockType: "thinking", SignatureDelta: signature}) {
+							return ctx.Err()
+						}
 						return nil
 					}
 					// tool input json delta
 					if pj, ok := del["partial_json"].(string); ok && pj != "" {
 						ti := getToolIndex(idx)
-						out <- llm.StreamToolCallDeltaEvent{Index: ti, ArgumentsDelta: pj}
+						if !sendEvent(llm.StreamToolCallDeltaEvent{Index: ti, ArgumentsDelta: pj}) {
+							return ctx.Err()
+						}
 						return nil
 					}
 				case "message_stop":
+					sawMessageStop = true
 					if inputTokens > 0 || outputTokens > 0 || promptCachedTokens != nil || promptCacheCreationTokens != nil {
-						out <- llm.StreamUsageEvent{Usage: llm.Usage{
-							PromptTokens:              inputTokens,
-							CompletionTokens:          outputTokens,
-							TotalTokens:               inputTokens + outputTokens,
-							PromptCachedTokens:        promptCachedTokens,
-							PromptCacheCreationTokens: promptCacheCreationTokens,
-						}}
+						if !sendEvent(llm.StreamUsageEvent{Usage: *normalizedAnthropicUsage(inputTokens, outputTokens, promptCachedTokens, promptCacheCreationTokens)}) {
+							return ctx.Err()
+						}
 					}
+				case "error":
+					// Anthropic can emit mid-stream errors (e.g. overloaded_error);
+					// dropping them would surface a truncated response as success.
+					return parseAnthropicStreamEventError(root)
 				}
 				return nil
 			})
 			if err != nil {
-				out <- llm.StreamErrorEvent{Err: err}
+				sendEvent(llm.StreamErrorEvent{Err: err})
 				return
 			}
-			out <- llm.StreamDoneEvent{StopReason: stopReason}
+			if !sawMessageStop {
+				// A body that ends before message_stop is a truncated stream, not
+				// a completed turn: reporting done here would hand partial text to
+				// the caller with an empty stop reason.
+				sendEvent(llm.StreamErrorEvent{Err: &llm.ProviderError{Provider: "anthropic", Message: "stream ended before message_stop; response is incomplete"}})
+				return
+			}
+			sendEvent(llm.StreamDoneEvent{StopReason: stopReason})
 			return
 		}
-		out <- llm.StreamErrorEvent{Err: errors.New("anthropic stream: retry loop ended without result")}
+		sendEvent(llm.StreamErrorEvent{Err: errors.New("anthropic stream: retry loop ended without result")})
 	}()
 	return out, nil
+}
+
+// parseAnthropicStreamEventError converts an in-stream `error` event into a
+// typed provider error so callers can retry / surface it instead of receiving a
+// silently truncated success.
+func parseAnthropicStreamEventError(root map[string]any) error {
+	errObj, _ := root["error"].(map[string]any)
+	msg := strings.TrimSpace(anthropicStreamErrorString(errObj["message"]))
+	errType := strings.TrimSpace(anthropicStreamErrorString(errObj["type"]))
+	if msg == "" {
+		msg = strings.TrimSpace(anthropicStreamErrorString(root["message"]))
+	}
+	if msg == "" {
+		if errType != "" {
+			msg = errType
+		} else {
+			msg = "anthropic stream error"
+		}
+	} else if errType != "" {
+		msg = errType + ": " + msg
+	}
+	if strings.EqualFold(errType, "rate_limit_error") {
+		return &llm.RateLimitError{Provider: "anthropic", Message: msg}
+	}
+	statusCode := 0
+	if strings.EqualFold(errType, "overloaded_error") {
+		statusCode = http.StatusServiceUnavailable
+	}
+	return &llm.ProviderError{Provider: "anthropic", StatusCode: statusCode, Message: msg}
+}
+
+func anthropicStreamErrorString(v any) string {
+	s, _ := v.(string)
+	return s
 }
 
 func streamResponseIDFromEvent(eventType string, root map[string]any) string {
@@ -957,6 +1116,28 @@ func intPtrFromAny(v any) *int {
 }
 
 func (c *Client) buildRequest(req llm.InvokeRequest, thinkingBudgetTokens *int) (*requestPayload, error) {
+	return c.buildRequestWithThinking(req, c.configuredThinkingWithBudget(thinkingBudgetTokens))
+}
+
+func (c *Client) configuredThinking() *thinkingConfig {
+	return c.configuredThinkingWithBudget(c.ThinkingBudgetTokens)
+}
+
+func (c *Client) configuredThinkingWithBudget(thinkingBudgetTokens *int) *thinkingConfig {
+	mode := strings.ToLower(strings.TrimSpace(c.ThinkingMode))
+	if mode == "adaptive" {
+		return &thinkingConfig{Type: "adaptive", Effort: strings.TrimSpace(c.ThinkingEffort)}
+	}
+	if mode != "" && mode != "enabled" && mode != "manual" {
+		return &thinkingConfig{Type: mode, Effort: strings.TrimSpace(c.ThinkingEffort)}
+	}
+	if thinkingBudgetTokens == nil || *thinkingBudgetTokens <= 0 {
+		return nil
+	}
+	return &thinkingConfig{Type: "enabled", BudgetTokens: *thinkingBudgetTokens}
+}
+
+func (c *Client) buildRequestWithThinking(req llm.InvokeRequest, thinkingConfig *thinkingConfig) (*requestPayload, error) {
 	if c.ModelName == "" {
 		return nil, fmt.Errorf("anthropic: model is required")
 	}
@@ -965,7 +1146,7 @@ func (c *Client) buildRequest(req llm.InvokeRequest, thinkingBudgetTokens *int) 
 		maxTokens = 8192
 	}
 
-	sys, msgs, err := serializeMessages(req.Messages)
+	sys, msgs, err := serializeMessagesWithWarning(req.Messages, c.warnf)
 	if err != nil {
 		return nil, err
 	}
@@ -975,11 +1156,50 @@ func (c *Client) buildRequest(req llm.InvokeRequest, thinkingBudgetTokens *int) 
 		tools = serializeTools(req.Tools, c.MaxCachedToolDefinitions)
 	}
 
+	// Effective extended thinking for this call. A per-call DisableThinking wins
+	// over the configured budget: the agent uses it for the require-done recovery
+	// invocation, where a forced tool_choice must be sent and thinking would make
+	// that illegal on Anthropic.
+	var thinking *thinkingParam
+	var outputConfig *outputConfigParam
+	if thinkingConfig != nil && !req.DisableThinking {
+		switch strings.ToLower(strings.TrimSpace(thinkingConfig.Type)) {
+		case "adaptive":
+			thinking = &thinkingParam{Type: "adaptive"}
+			if effort := strings.TrimSpace(thinkingConfig.Effort); effort != "" {
+				switch strings.ToLower(effort) {
+				case "low", "medium", "high", "max":
+					outputConfig = &outputConfigParam{Effort: strings.ToLower(effort)}
+				default:
+					return nil, fmt.Errorf("anthropic: unsupported adaptive thinking effort %q (expected low, medium, high, or max)", effort)
+				}
+			}
+		case "enabled":
+			if thinkingConfig.BudgetTokens > 0 {
+				thinking = &thinkingParam{Type: "enabled", BudgetTokens: thinkingConfig.BudgetTokens}
+			}
+		default:
+			return nil, fmt.Errorf("anthropic: unsupported thinking mode %q", thinkingConfig.Type)
+		}
+	}
+
 	var toolChoice *toolChoiceParam
 	if len(tools) > 0 {
 		tc := req.ToolChoice
 		if tc == "" {
 			tc = "auto"
+		}
+		// Anthropic forbids a forced tool_choice (any / specific tool) while
+		// extended thinking is enabled; only auto and none are allowed. Agent-owned
+		// recovery disables thinking explicitly. Reject other conflicts instead of
+		// silently weakening the caller's forced-tool semantics.
+		if thinking != nil {
+			switch strings.ToLower(strings.TrimSpace(string(tc))) {
+			case "auto", "none":
+				// allowed under extended thinking
+			default:
+				return nil, fmt.Errorf("anthropic: tool_choice %q is incompatible with extended thinking; use auto/none or set DisableThinking for this call", tc)
+			}
 		}
 		toolChoice = mapToolChoice(tc)
 	}
@@ -990,22 +1210,18 @@ func (c *Client) buildRequest(req llm.InvokeRequest, thinkingBudgetTokens *int) 
 		temp = req.Temperature
 	}
 
-	var thinking *thinkingParam
-	if thinkingBudgetTokens != nil && *thinkingBudgetTokens > 0 {
-		thinking = &thinkingParam{Type: "enabled", BudgetTokens: *thinkingBudgetTokens}
-	}
-
 	return &requestPayload{
-		Model:       c.ModelName,
-		MaxTokens:   maxTokens,
-		System:      sys,
-		Messages:    msgs,
-		Tools:       tools,
-		ToolChoice:  toolChoice,
-		Temperature: temp,
-		TopP:        c.TopP,
-		Seed:        c.Seed,
-		Thinking:    thinking,
+		Model:        c.ModelName,
+		MaxTokens:    maxTokens,
+		System:       sys,
+		Messages:     msgs,
+		Tools:        tools,
+		ToolChoice:   toolChoice,
+		Temperature:  temp,
+		TopP:         c.TopP,
+		Seed:         c.Seed,
+		Thinking:     thinking,
+		OutputConfig: outputConfig,
 	}, nil
 }
 
@@ -1052,9 +1268,18 @@ func serializeTools(tools []llm.ToolDefinition, maxCached int) []toolParam {
 }
 
 func serializeMessages(in []llm.Message) (system any, out []messageParam, err error) {
+	return serializeMessagesWithWarning(in, toolIDNormalizationWarningf)
+}
+
+func serializeMessagesWithWarning(in []llm.Message, warnf func(string, ...any)) (system any, out []messageParam, err error) {
+	if err := validateAnthropicToolHistory(in); err != nil {
+		return nil, nil, err
+	}
+
 	var sysBlocks []contentBlockParam
 
-	for _, m := range in {
+	for i := 0; i < len(in); i++ {
+		m := in[i]
 		switch m.Role {
 		case llm.RoleSystem:
 			if strings.TrimSpace(m.Content.Text) != "" {
@@ -1067,8 +1292,20 @@ func serializeMessages(in []llm.Message) (system any, out []messageParam, err er
 			for _, b := range m.Content.Blocks {
 				sysBlocks = append(sysBlocks, toAnthropicBlock(b, m.Cache))
 			}
+		case llm.RoleTool:
+			// Anthropic requires every tool_result for one assistant turn to be
+			// carried by a single user message; splitting them into separate
+			// messages makes the request illegal.
+			results := make([]contentBlockParam, 0, 4)
+			j := i
+			for j < len(in) && in[j].Role == llm.RoleTool {
+				results = append(results, toAnthropicToolResultBlock(in[j], warnf))
+				j++
+			}
+			i = j - 1
+			out = append(out, messageParam{Role: "user", Content: results})
 		default:
-			mp, e := toAnthropicMessage(m)
+			mp, e := toAnthropicMessageWithWarning(m, warnf)
 			if e != nil {
 				return nil, nil, e
 			}
@@ -1089,6 +1326,52 @@ func serializeMessages(in []llm.Message) (system any, out []messageParam, err er
 	return system, out, nil
 }
 
+// validateAnthropicToolHistory fails closed on histories Anthropic rejects with
+// HTTP 400: every assistant tool_use block must be answered by exactly one
+// tool_result in the contiguous run of tool messages that follows it, and no
+// tool message may appear without such a preceding assistant turn. This mirrors
+// the OpenAI-side validation so both providers surface the same defect locally
+// instead of one silently sending an illegal request.
+func validateAnthropicToolHistory(messages []llm.Message) error {
+	for i := 0; i < len(messages); i++ {
+		m := messages[i]
+		if m.Role == llm.RoleTool {
+			return fmt.Errorf("anthropic: invalid tool history: tool message at index %d has no preceding assistant tool call", i)
+		}
+		if m.Role != llm.RoleAssistant || len(m.ToolCalls) == 0 {
+			continue
+		}
+		expected := make(map[string]bool, len(m.ToolCalls))
+		for _, call := range m.ToolCalls {
+			id := normalizeToolCallIDWithWarning(call.ID, nil)
+			if id == "" {
+				return fmt.Errorf("anthropic: invalid tool history: assistant tool call at index %d has empty id", i)
+			}
+			expected[id] = false
+		}
+		j := i + 1
+		for j < len(messages) && messages[j].Role == llm.RoleTool {
+			id := normalizeToolCallIDWithWarning(messages[j].ToolCallID, nil)
+			if id == "" {
+				return fmt.Errorf("anthropic: invalid tool history: tool message at index %d has empty tool_call_id", j)
+			}
+			if _, ok := expected[id]; !ok {
+				return fmt.Errorf("anthropic: invalid tool history: tool message at index %d references unknown tool_use id %q", j, id)
+			}
+			expected[id] = true
+			j++
+		}
+		for _, call := range m.ToolCalls {
+			id := normalizeToolCallIDWithWarning(call.ID, nil)
+			if !expected[id] {
+				return fmt.Errorf("anthropic: invalid tool history: assistant tool call %q at index %d is missing a contiguous tool result", id, i)
+			}
+		}
+		i = j - 1
+	}
+	return nil
+}
+
 func joinPlainSystemText(blocks []contentBlockParam) (string, bool) {
 	parts := make([]string, 0, len(blocks))
 	for _, blk := range blocks {
@@ -1101,23 +1384,13 @@ func joinPlainSystemText(blocks []contentBlockParam) (string, bool) {
 }
 
 func toAnthropicMessage(m llm.Message) (*messageParam, error) {
+	return toAnthropicMessageWithWarning(m, toolIDNormalizationWarningf)
+}
+
+func toAnthropicMessageWithWarning(m llm.Message, warnf func(string, ...any)) (*messageParam, error) {
 	if m.Role == llm.RoleTool {
 		// Anthropic expects tool results as role=user with tool_result blocks.
-		contentText := m.Content.PlainText()
-		if strings.TrimSpace(contentText) == "" {
-			contentText = "(no output)"
-		}
-		toolUseID := normalizeToolCallID(m.ToolCallID)
-		if toolUseID == "" {
-			toolUseID = m.ToolCallID
-		}
-		content := contentBlockParam{
-			Type:      "tool_result",
-			ToolUseID: toolUseID,
-			Content:   contentText,
-			IsError:   m.IsError,
-		}
-		return &messageParam{Role: "user", Content: []contentBlockParam{content}}, nil
+		return &messageParam{Role: "user", Content: []contentBlockParam{toAnthropicToolResultBlock(m, warnf)}}, nil
 	}
 
 	role := string(m.Role)
@@ -1127,19 +1400,15 @@ func toAnthropicMessage(m llm.Message) (*messageParam, error) {
 
 	blocks := []contentBlockParam{}
 	if strings.TrimSpace(m.Content.Text) != "" {
-		blk := contentBlockParam{Type: "text", Text: m.Content.Text}
-		if m.Cache {
-			blk.CacheCtrl = &cacheControl{Type: "ephemeral"}
-		}
-		blocks = append(blocks, blk)
+		blocks = append(blocks, contentBlockParam{Type: "text", Text: m.Content.Text})
 	}
 	for _, b := range m.Content.Blocks {
-		blocks = append(blocks, toAnthropicBlock(b, m.Cache))
+		blocks = append(blocks, toAnthropicBlock(b, false))
 	}
 
 	if m.Role == llm.RoleAssistant && len(m.ToolCalls) > 0 {
 		for _, tc := range m.ToolCalls {
-			id := normalizeToolCallID(tc.ID)
+			id := normalizeToolCallIDWithWarning(tc.ID, warnf)
 			if id == "" {
 				id = tc.ID
 			}
@@ -1165,7 +1434,63 @@ func toAnthropicMessage(m llm.Message) (*messageParam, error) {
 		// Anthropic rejects empty messages; omit them.
 		return nil, nil
 	}
+	if m.Cache {
+		// cache_control is a block-level breakpoint: mark only the final block
+		// so one cached message consumes one breakpoint, and so assistant
+		// turns whose last block is a tool_use still advance the prefix.
+		blocks[len(blocks)-1].CacheCtrl = &cacheControl{Type: "ephemeral"}
+	}
 	return &messageParam{Role: role, Content: blocks}, nil
+}
+
+// toAnthropicToolResultBlock maps a tool message onto a single tool_result
+// content block. Non-text content (e.g. images) is kept as structured block
+// content instead of being flattened away.
+func toAnthropicToolResultBlock(m llm.Message, warnf func(string, ...any)) contentBlockParam {
+	toolUseID := normalizeToolCallIDWithWarning(m.ToolCallID, warnf)
+	if toolUseID == "" {
+		toolUseID = m.ToolCallID
+	}
+	blk := contentBlockParam{
+		Type:      "tool_result",
+		ToolUseID: toolUseID,
+		Content:   toolResultContent(m),
+		IsError:   m.IsError,
+	}
+	if m.Cache {
+		blk.CacheCtrl = &cacheControl{Type: "ephemeral"}
+	}
+	return blk
+}
+
+// toolResultContent returns the tool_result payload: a plain string for
+// text-only results (the common case), structured blocks when the result
+// carries non-text content that must survive serialization.
+func toolResultContent(m llm.Message) any {
+	blocks := make([]contentBlockParam, 0, len(m.Content.Blocks)+1)
+	if strings.TrimSpace(m.Content.Text) != "" {
+		blocks = append(blocks, contentBlockParam{Type: "text", Text: m.Content.Text})
+	}
+	hasNonText := false
+	for _, b := range m.Content.Blocks {
+		mapped := toAnthropicBlock(b, false)
+		if mapped.Type == "text" {
+			if strings.TrimSpace(mapped.Text) == "" {
+				continue
+			}
+		} else {
+			hasNonText = true
+		}
+		blocks = append(blocks, mapped)
+	}
+	if !hasNonText {
+		text := m.Content.PlainText()
+		if strings.TrimSpace(text) == "" {
+			text = "(no output)"
+		}
+		return text
+	}
+	return blocks
 }
 
 func toAnthropicBlock(b llm.ContentBlock, inheritCache bool) contentBlockParam {
@@ -1303,6 +1628,7 @@ func parseResponse(data []byte) (*llm.Completion, error) {
 				},
 			})
 		case "thinking":
+			blocks = append(blocks, llm.ContentBlock{Type: "thinking", Thinking: blk.Thinking, Signature: blk.Signature})
 			thinkingParts = append(thinkingParts, blk.Thinking)
 		case "redacted_thinking":
 			blocks = append(blocks, llm.ContentBlock{Type: "redacted_thinking", Data: blk.Data})
@@ -1311,13 +1637,12 @@ func parseResponse(data []byte) (*llm.Completion, error) {
 		}
 	}
 
-	usage := &llm.Usage{
-		PromptTokens:              rp.Usage.InputTokens,
-		CompletionTokens:          rp.Usage.OutputTokens,
-		TotalTokens:               rp.Usage.InputTokens + rp.Usage.OutputTokens,
-		PromptCachedTokens:        rp.Usage.CacheReadInputTokens,
-		PromptCacheCreationTokens: rp.Usage.CacheCreationInputTokens,
-	}
+	usage := normalizedAnthropicUsage(
+		rp.Usage.InputTokens,
+		rp.Usage.OutputTokens,
+		rp.Usage.CacheReadInputTokens,
+		rp.Usage.CacheCreationInputTokens,
+	)
 
 	return &llm.Completion{
 		Content:    llm.Content{Blocks: blocks},
@@ -1328,4 +1653,20 @@ func parseResponse(data []byte) (*llm.Completion, error) {
 		ResponseID: strings.TrimSpace(rp.ID),
 		Raw:        append([]byte(nil), data...),
 	}, nil
+}
+
+func normalizedAnthropicUsage(inputTokens, outputTokens int, cachedTokens, cacheCreationTokens *int) *llm.Usage {
+	promptTotal := inputTokens
+	if cachedTokens != nil && *cachedTokens > 0 {
+		promptTotal += *cachedTokens
+	}
+	if cacheCreationTokens != nil && *cacheCreationTokens > 0 {
+		promptTotal += *cacheCreationTokens
+	}
+	usage := llm.NewProviderUsage(promptTotal, outputTokens, promptTotal+outputTokens)
+	uncached := inputTokens
+	usage.PromptUncachedTokens = &uncached
+	usage.PromptCachedTokens = cachedTokens
+	usage.PromptCacheCreationTokens = cacheCreationTokens
+	return usage
 }

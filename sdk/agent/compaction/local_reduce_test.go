@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"reflect"
 	"strings"
 	"testing"
 
@@ -11,9 +12,10 @@ import (
 )
 
 type memoryLedgerStore struct {
-	ledger *Ledger
-	saves  int
-	err    error
+	ledger  *Ledger
+	saves   int
+	err     error
+	saveErr error
 }
 
 func (s *memoryLedgerStore) Load(context.Context, string) (*Ledger, error) {
@@ -27,12 +29,48 @@ func (s *memoryLedgerStore) Load(context.Context, string) (*Ledger, error) {
 }
 
 func (s *memoryLedgerStore) Save(_ context.Context, _ string, ledger *Ledger) error {
+	if s.saveErr != nil {
+		return s.saveErr
+	}
 	if s.err != nil {
 		return s.err
 	}
 	s.saves++
 	s.ledger = ledger.Clone()
 	return nil
+}
+
+func TestCompactLocalLedgerSaveFailurePreservesHistory(t *testing.T) {
+	ctx := context.Background()
+	store := &memoryLedgerStore{
+		ledger:  NewLedger("sess-ledger-save-failure"),
+		saveErr: errors.New("ledger write denied"),
+	}
+	svc := NewService(&Config{
+		Enabled:       true,
+		ContextWindow: 2000,
+		LedgerStore:   store,
+		SessionID:     "sess-ledger-save-failure",
+		ToolArtifactWriter: ArtifactWriterFunc(func(context.Context, ArtifactRequest) (ArtifactResult, error) {
+			return ArtifactResult{Path: ".goode/truncated/tool_grep_1.txt"}, nil
+		}),
+		ProtectedRecentMessages: 1,
+	})
+	messages := snipTestMessages(strings.Repeat("hit\n", 400))
+
+	got, res, err := svc.CompactLocal(ctx, messages, &llm.Usage{TotalTokens: 1500})
+	if err == nil || !strings.Contains(err.Error(), "ledger write denied") {
+		t.Fatalf("CompactLocal error = %v, want ledger save failure", err)
+	}
+	if res.Compacted {
+		t.Fatalf("failed ledger save reported compaction success: %#v", res)
+	}
+	if !reflect.DeepEqual(got, messages) {
+		t.Fatalf("failed ledger save returned replacement history:\n got=%#v\nwant=%#v", got, messages)
+	}
+	if store.saves != 0 {
+		t.Fatalf("successful ledger saves = %d, want 0", store.saves)
+	}
 }
 
 func TestCompactLocalSnipsOldToolResultAndReusesLedger(t *testing.T) {
@@ -105,6 +143,90 @@ func TestCompactLocalSnipsOldToolResultAndReusesLedger(t *testing.T) {
 	}
 	if secondRes.Compacted != true {
 		t.Fatalf("second result = %#v, want compacted", secondRes)
+	}
+	if store.saves != 1 {
+		t.Fatalf("ledger saves after replacement reuse = %d, want still 1", store.saves)
+	}
+
+	third, thirdRes, err := svc.CompactLocal(ctx, first, &llm.Usage{TotalTokens: 1500})
+	if err != nil {
+		t.Fatalf("CompactLocal already-snipped history: %v", err)
+	}
+	if thirdRes.Compacted {
+		t.Fatalf("already-snipped history reported another compaction: %#v", thirdRes)
+	}
+	if !reflect.DeepEqual(third, first) {
+		t.Fatalf("already-snipped history changed:\n got=%#v\nwant=%#v", third, first)
+	}
+	if artifactWrites != 1 || store.saves != 1 || len(store.ledger.Replacements) != 1 {
+		t.Fatalf("already-snipped history churned: writes=%d saves=%d replacements=%d", artifactWrites, store.saves, len(store.ledger.Replacements))
+	}
+}
+
+func TestCompactLocalSameTextLedgerReuseIsNoOp(t *testing.T) {
+	ctx := context.Background()
+	messages := snipTestMessages(strings.Repeat("same output\n", 200))
+	original := messages[2].Content.PlainText()
+	key := StableMessageKey(MessageKeyInput{
+		Role:           string(messages[2].Role),
+		ToolCallID:     messages[2].ToolCallID,
+		ToolName:       messages[2].ToolName,
+		OriginalText:   original,
+		FirstSeenIndex: 2,
+	})
+	ledger := NewLedger("sess-local-noop")
+	ledger.Replacements = []LedgerReplacement{{
+		MessageKey:      key,
+		PartKey:         "content-0",
+		Role:            string(messages[2].Role),
+		ToolName:        messages[2].ToolName,
+		Tier:            tierSnip,
+		OriginalHash:    ContentHash(original),
+		ReplacementHash: ContentHash(original),
+		ReplacementText: original,
+		FullArtifact:    ".goode/truncated/tool_grep.txt",
+	}}
+	store := &memoryLedgerStore{ledger: ledger}
+	artifactWrites := 0
+	svc := NewService(&Config{
+		Enabled:       true,
+		ContextWindow: 2000,
+		LedgerStore:   store,
+		SessionID:     "sess-local-noop",
+		ToolArtifactWriter: ArtifactWriterFunc(func(context.Context, ArtifactRequest) (ArtifactResult, error) {
+			artifactWrites++
+			return ArtifactResult{Path: ".goode/truncated/unexpected.txt"}, nil
+		}),
+		ProtectedRecentMessages: 1,
+	})
+
+	got, res, err := svc.CompactLocal(ctx, messages, &llm.Usage{TotalTokens: 1500})
+	if err != nil {
+		t.Fatalf("CompactLocal: %v", err)
+	}
+	if res.Compacted {
+		t.Fatalf("same-text ledger replacement reported compaction: %#v", res)
+	}
+	if !reflect.DeepEqual(got, messages) {
+		t.Fatalf("same-text ledger replacement changed history:\n got=%#v\nwant=%#v", got, messages)
+	}
+	if artifactWrites != 0 || store.saves != 0 || len(store.ledger.Replacements) != 1 {
+		t.Fatalf("same-text ledger replacement caused churn: writes=%d saves=%d replacements=%d", artifactWrites, store.saves, len(store.ledger.Replacements))
+	}
+}
+
+func TestExtractTruncationArtifactPathRecognizesGeneratedAndLegacyMarkers(t *testing.T) {
+	want := ".goode/truncated/tool_grep_1.txt"
+	tests := []string{
+		"[Tool result snipped: grep tool_call_id=call-grep lines=10 bytes=100 full_output=" + want + "]",
+		"[Tool result snipped: grep tool_call_id=call-grep lines=10 bytes=100 full_output= " + want + "]",
+		"output shortened; full output: " + want,
+		"output shortened; saved to " + want,
+	}
+	for _, input := range tests {
+		if got := extractTruncationArtifactPath(input); got != want {
+			t.Fatalf("extractTruncationArtifactPath(%q) = %q, want %q", input, got, want)
+		}
 	}
 }
 
@@ -365,7 +487,48 @@ func TestCompactAutoUsesSnipBeforeSummaryWhenLocalReductionIsEnough(t *testing.T
 	}
 }
 
-func TestCompactLocalEstimatedUsesPruneAtSummaryThreshold(t *testing.T) {
+func TestCompactDestroyedPlaceholdersRemovesOnlyFullyDestroyedBlocks(t *testing.T) {
+	svc := NewService(&Config{Enabled: true, ContextWindow: 1_000_000})
+	messages := []llm.Message{
+		llm.NewUserMessage("start"),
+		llm.NewAssistantMessage("kept assistant evidence", []llm.ToolCall{{
+			ID: "destroyed-only", Type: "function", Function: llm.FunctionCall{Name: "read", Arguments: `{}`},
+		}}),
+		{Role: llm.RoleTool, ToolCallID: "destroyed-only", ToolName: "read", Destroyed: true, Content: llm.TextContent("[destroyed]")},
+		llm.NewAssistantMessage("mixed block", []llm.ToolCall{
+			{ID: "mixed-live", Type: "function", Function: llm.FunctionCall{Name: "read", Arguments: `{}`}},
+			{ID: "mixed-destroyed", Type: "function", Function: llm.FunctionCall{Name: "read", Arguments: `{}`}},
+		}),
+		llm.NewToolMessage("mixed-live", "read", llm.TextContent("valuable result"), false),
+		{Role: llm.RoleTool, ToolCallID: "mixed-destroyed", ToolName: "read", Destroyed: true, Content: llm.TextContent("[destroyed]")},
+		llm.NewUserMessage("latest"),
+	}
+
+	got, res, err := svc.CompactDestroyedPlaceholders(context.Background(), messages, &llm.Usage{PromptTokens: 100, TotalTokens: 100})
+	if err != nil {
+		t.Fatalf("CompactDestroyedPlaceholders: %v", err)
+	}
+	if !res.Compacted || res.Watermark != "placeholder_cleanup" {
+		t.Fatalf("result = %#v", res)
+	}
+	if len(got) != len(messages)-1 {
+		t.Fatalf("messages len = %d, want %d: %#v", len(got), len(messages)-1, got)
+	}
+	if got[1].Content.PlainText() != "kept assistant evidence" || len(got[1].ToolCalls) != 0 {
+		t.Fatalf("destroyed-only assistant was not repaired: %#v", got[1])
+	}
+	foundMixedDestroyed := false
+	for _, msg := range got {
+		if msg.ToolCallID == "mixed-destroyed" && msg.Destroyed {
+			foundMixedDestroyed = true
+		}
+	}
+	if !foundMixedDestroyed {
+		t.Fatal("mixed block with a live result must remain unchanged")
+	}
+}
+
+func TestCompactLocalEstimatedStopsAfterSnipDropsBelowPruneThreshold(t *testing.T) {
 	store := &memoryLedgerStore{ledger: NewLedger("sess-local-estimated")}
 	svc := NewService(&Config{
 		Enabled:        true,
@@ -382,14 +545,165 @@ func TestCompactLocalEstimatedUsesPruneAtSummaryThreshold(t *testing.T) {
 	if err != nil {
 		t.Fatalf("CompactLocalEstimated: %v", err)
 	}
-	if !res.Compacted || res.Watermark != "prune" {
-		t.Fatalf("result = %#v, want prune compaction", res)
+	if !res.Compacted || res.Watermark != "snip" {
+		t.Fatalf("result = %#v, want snip compaction", res)
 	}
-	if !containsTier(res.TiersApplied, "prune") {
-		t.Fatalf("tiers = %#v, want prune", res.TiersApplied)
+	if !containsTier(res.TiersApplied, "snip") || containsTier(res.TiersApplied, "prune") {
+		t.Fatalf("tiers = %#v, want snip only after re-estimation", res.TiersApplied)
 	}
-	if !strings.Contains(got[2].Content.PlainText(), "[Tool result pruned:") {
+	if !strings.Contains(got[2].Content.PlainText(), "[Tool result snipped:") {
 		t.Fatalf("tool result was not locally reduced: %q", got[2].Content.PlainText())
+	}
+}
+
+func TestProtectedZoneKeepsWholeCurrentToolHeavyTurn(t *testing.T) {
+	store := &memoryLedgerStore{ledger: NewLedger("sess-current-turn")}
+	svc := NewService(&Config{
+		Enabled:                 true,
+		ContextWindow:           4000,
+		LedgerStore:             store,
+		SessionID:               "sess-current-turn",
+		ProtectedRecentMessages: 1,
+		ToolArtifactWriter: ArtifactWriterFunc(func(_ context.Context, req ArtifactRequest) (ArtifactResult, error) {
+			return ArtifactResult{Path: ".goode/truncated/" + req.ToolCallID + ".txt"}, nil
+		}),
+	})
+	oldOutput := strings.Repeat("old-result\n", 300)
+	messages := []llm.Message{
+		llm.NewUserMessage("old completed turn"),
+		llm.NewAssistantMessage("old call", []llm.ToolCall{{ID: "old", Type: "function", Function: llm.FunctionCall{Name: "grep", Arguments: `{}`}}}),
+		llm.NewToolMessage("old", "grep", llm.TextContent(oldOutput), false),
+		llm.NewUserMessage("current tool-heavy request must remain intact"),
+	}
+	currentOutputs := make([]string, 0, 5)
+	for i := 0; i < 5; i++ {
+		id := fmt.Sprintf("current-%d", i)
+		output := strings.Repeat(fmt.Sprintf("current-result-%d\n", i), 180)
+		currentOutputs = append(currentOutputs, output)
+		messages = append(messages,
+			llm.NewAssistantMessage("current call", []llm.ToolCall{{ID: id, Type: "function", Function: llm.FunctionCall{Name: "read", Arguments: `{}`}}}),
+			llm.NewToolMessage(id, "read", llm.TextContent(output), false),
+		)
+	}
+
+	got, res, err := svc.CompactLocal(context.Background(), messages, &llm.Usage{TotalTokens: 3200})
+	if err != nil {
+		t.Fatalf("CompactLocal: %v", err)
+	}
+	if !res.Compacted || got[2].Content.PlainText() == oldOutput {
+		t.Fatalf("old completed turn was not compacted: result=%#v", res)
+	}
+	for i, want := range currentOutputs {
+		index := 5 + i*2
+		if got[index].Content.PlainText() != want {
+			t.Fatalf("current turn tool result %d changed at message %d", i, index)
+		}
+	}
+}
+
+func TestProtectedZoneKeepsOpenToolCallResultBlock(t *testing.T) {
+	svc := NewService(&Config{
+		Enabled:                 true,
+		ContextWindow:           2000,
+		LedgerStore:             &memoryLedgerStore{ledger: NewLedger("sess-open-block")},
+		SessionID:               "sess-open-block",
+		ProtectedRecentMessages: 1,
+		ToolArtifactWriter: ArtifactWriterFunc(func(context.Context, ArtifactRequest) (ArtifactResult, error) {
+			return ArtifactResult{Path: ".goode/truncated/open-block.txt"}, nil
+		}),
+	})
+	partialResult := strings.Repeat("partial-result\n", 300)
+	messages := []llm.Message{
+		llm.NewSystemMessage("system"),
+		llm.NewAssistantMessage("two calls are still in flight", []llm.ToolCall{
+			{ID: "call-complete", Type: "function", Function: llm.FunctionCall{Name: "read", Arguments: `{}`}},
+			{ID: "call-missing", Type: "function", Function: llm.FunctionCall{Name: "grep", Arguments: `{}`}},
+		}),
+		llm.NewToolMessage("call-complete", "read", llm.TextContent(partialResult), false),
+		llm.NewAssistantMessage("streamed continuation while the second result is pending", nil),
+	}
+
+	got, res, err := svc.CompactLocal(context.Background(), messages, &llm.Usage{TotalTokens: 1500})
+	if err != nil {
+		t.Fatalf("CompactLocal: %v", err)
+	}
+	if res.Compacted {
+		t.Fatalf("open tool topology was compacted: %#v", res)
+	}
+	if got[2].Content.PlainText() != partialResult {
+		t.Fatal("tool result inside open call/result block changed")
+	}
+}
+
+func TestMicrocompactNeverTouchesLatestRealUser(t *testing.T) {
+	artifactWrites := 0
+	svc := NewService(&Config{
+		Enabled:                    true,
+		ContextWindow:              2000,
+		LedgerStore:                &memoryLedgerStore{ledger: NewLedger("sess-latest-real-user")},
+		SessionID:                  "sess-latest-real-user",
+		EnableUserCodeMicrocompact: true,
+		ProtectedRecentMessages:    1,
+		ToolArtifactWriter: ArtifactWriterFunc(func(context.Context, ArtifactRequest) (ArtifactResult, error) {
+			artifactWrites++
+			return ArtifactResult{Path: ".goode/truncated/latest-user.md"}, nil
+		}),
+	})
+	latestRealUser := "latest real user code must remain verbatim\n```go\n" + numberedLines("latest-", 140) + "```\n"
+	messages := []llm.Message{
+		llm.NewUserMessage(latestRealUser),
+		llm.NewAssistantMessage("working", nil),
+		{Role: llm.RoleUser, Name: "sdk_internal_require_done", Content: llm.TextContent("Task completion must use the done tool.")},
+		llm.NewAssistantMessage("continuing", nil),
+	}
+
+	got, res, err := svc.CompactLocal(context.Background(), messages, &llm.Usage{TotalTokens: 1600})
+	if err != nil {
+		t.Fatalf("CompactLocal: %v", err)
+	}
+	if res.Compacted || artifactWrites != 0 {
+		t.Fatalf("latest real user was microcompacted: result=%#v writes=%d", res, artifactWrites)
+	}
+	if got[0].Content.PlainText() != latestRealUser {
+		t.Fatal("latest real user content changed")
+	}
+}
+
+func TestProtectedZoneHonorsConfiguredRecentTokenBudget(t *testing.T) {
+	svc := NewService(&Config{
+		Enabled:                 true,
+		ContextWindow:           4000,
+		LedgerStore:             &memoryLedgerStore{ledger: NewLedger("sess-token-zone")},
+		SessionID:               "sess-token-zone",
+		ProtectedRecentMessages: 1,
+		ProtectedRecentTokens:   500,
+		TokenEstimator: func(text string) int {
+			return len(text)
+		},
+		ToolArtifactWriter: ArtifactWriterFunc(func(_ context.Context, req ArtifactRequest) (ArtifactResult, error) {
+			return ArtifactResult{Path: ".goode/truncated/" + req.ToolCallID + ".txt"}, nil
+		}),
+	})
+	oldOutput := strings.Repeat("o", 1000)
+	recentOutput := strings.Repeat("r", 1000)
+	messages := []llm.Message{
+		llm.NewSystemMessage("system"),
+		llm.NewAssistantMessage("old", []llm.ToolCall{{ID: "old", Type: "function", Function: llm.FunctionCall{Name: "read", Arguments: `{}`}}}),
+		llm.NewToolMessage("old", "read", llm.TextContent(oldOutput), false),
+		llm.NewAssistantMessage("recent", []llm.ToolCall{{ID: "recent", Type: "function", Function: llm.FunctionCall{Name: "read", Arguments: `{}`}}}),
+		llm.NewToolMessage("recent", "read", llm.TextContent(recentOutput), false),
+		llm.NewAssistantMessage("tail", nil),
+	}
+
+	got, res, err := svc.CompactLocal(context.Background(), messages, &llm.Usage{TotalTokens: 3200})
+	if err != nil {
+		t.Fatalf("CompactLocal: %v", err)
+	}
+	if !res.Compacted || got[2].Content.PlainText() == oldOutput {
+		t.Fatalf("old material outside token zone was not compacted: %#v", res)
+	}
+	if got[4].Content.PlainText() != recentOutput {
+		t.Fatal("configured recent-token zone did not protect recent tool output")
 	}
 }
 

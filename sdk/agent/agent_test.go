@@ -31,6 +31,35 @@ func TestToolCallAccumulatorPreservesWhitespace(t *testing.T) {
 	}
 }
 
+func TestWithCompactionTelemetryPreservesComparableEstimateCounts(t *testing.T) {
+	ag := &Agent{compactor: compaction.NewService(&compaction.Config{Enabled: true})}
+	usage := &llm.Usage{
+		PromptTokens:       90,
+		CompletionTokens:   10,
+		TotalTokens:        100,
+		PromptTokensValid:  true,
+		PromptTokensSource: llm.PromptTokensSourceProvider,
+	}
+	res := compaction.Result{
+		Compacted:        true,
+		OriginalTokens:   180,
+		NewTokens:        120,
+		TokenCountSource: compaction.TokenCountSourceEstimate,
+		TiersApplied:     []string{"snip"},
+	}
+
+	got := ag.withCompactionTelemetry(res, "usage", "snip", usage)
+	if got.OriginalTokens != 180 || got.NewTokens != 120 {
+		t.Fatalf("withCompactionTelemetry rewrote comparable estimates: %d -> %d", got.OriginalTokens, got.NewTokens)
+	}
+	if got.TokenCountSource != compaction.TokenCountSourceEstimate {
+		t.Fatalf("token_count_source = %q, want %q", got.TokenCountSource, compaction.TokenCountSourceEstimate)
+	}
+	if got.Usage == nil || got.Usage.TotalTokens != 100 || got.Usage.PromptTokensSource != llm.PromptTokensSourceProvider {
+		t.Fatalf("provider trigger usage was not preserved: %#v", got.Usage)
+	}
+}
+
 func TestToolCallAccumulatorPreservesMissingArgumentsAndUsesPlaceholderPrefix(t *testing.T) {
 	acc := &toolCallAccumulator{}
 	acc.apply(llm.StreamToolCallDeltaEvent{Index: 0, NameDelta: "ping"})
@@ -252,10 +281,12 @@ func (m *textAutoContinueCompactionModel) Invoke(_ context.Context, req llm.Invo
 	doneCh := m.compactionDone
 	m.mu.Unlock()
 
-	if len(req.Messages) > 0 {
+	if len(req.Messages) > 1 {
+		first := req.Messages[0]
 		last := req.Messages[len(req.Messages)-1]
+		firstText := first.Content.PlainText()
 		lastText := last.Content.PlainText()
-		if last.Role == llm.RoleUser && strings.Contains(lastText, summaryPrompt) && strings.Contains(lastText, "internal context compaction pipeline") {
+		if first.Role == llm.RoleSystem && last.Role == llm.RoleUser && strings.Contains(firstText, summaryPrompt) && strings.Contains(firstText, "internal context compaction pipeline") && strings.Contains(lastText, "BEGIN_UNTRUSTED_MATERIAL") {
 			m.mu.Lock()
 			m.compactionCalls++
 			if doneCh != nil {
@@ -268,7 +299,7 @@ func (m *textAutoContinueCompactionModel) Invoke(_ context.Context, req llm.Invo
 			if doneCh != nil {
 				close(doneCh)
 			}
-			return &llm.Completion{Content: llm.TextContent("<summary>compressed</summary>"), StopReason: "stop", ResponseID: "resp_compaction"}, nil
+			return &llm.Completion{Content: llm.TextContent(validCompactionSummary("compressed")), StopReason: "stop", ResponseID: "resp_compaction"}, nil
 		}
 	}
 
@@ -290,9 +321,19 @@ func (m *textAutoContinueCompactionModel) Invoke(_ context.Context, req llm.Invo
 	}
 
 	if regularCalls == 2 {
-		return &llm.Completion{Content: llm.TextContent("part 2"), StopReason: "stop", ResponseID: "resp_regular_2"}, nil
+		return &llm.Completion{
+			Content:    llm.TextContent("part 2"),
+			StopReason: "stop",
+			ResponseID: "resp_regular_2",
+			Usage:      llm.NewProviderUsage(10, 2, 12),
+		}, nil
 	}
-	return &llm.Completion{Content: llm.TextContent("follow up"), StopReason: "stop", ResponseID: "resp_regular_3"}, nil
+	return &llm.Completion{
+		Content:    llm.TextContent("follow up"),
+		StopReason: "stop",
+		ResponseID: "resp_regular_3",
+		Usage:      llm.NewProviderUsage(12, 2, 14),
+	}, nil
 }
 
 func (m *textAutoContinueCompactionModel) Counts() (regular, compaction int) {
@@ -330,6 +371,7 @@ func TestAgentAutoContinuesToolCallsOnMaxTokens(t *testing.T) {
 	if tr, ok := findToolResult(events, "echo"); !ok || tr.IsError {
 		t.Fatalf("expected successful tool result for echo")
 	}
+	assertHistoryContainsNamedUserMessage(t, ag.Messages(), "Your response was truncated. Please continue exactly where you left off.", "sdk_internal_tool_call_continuation")
 }
 
 func TestAgentValidatesMergedToolCallsBeforeExecution(t *testing.T) {
@@ -381,6 +423,7 @@ func TestAgentValidatesMergedToolCallsBeforeExecution(t *testing.T) {
 	if tr, ok := findToolResult(events, "echo"); !ok || tr.IsError {
 		t.Fatalf("expected successful tool result for echo after validation")
 	}
+	assertHistoryContainsNamedUserMessage(t, ag.Messages(), "Your response was truncated. Please continue exactly where you left off.", "sdk_internal_tool_call_continuation")
 }
 
 func TestAgentContinuationTurnLimitEmitsWarningAndResets(t *testing.T) {
@@ -440,9 +483,10 @@ func TestAgentContinuationTurnLimitEmitsWarningAndResets(t *testing.T) {
 	if final != "finished via continuation limit" {
 		t.Fatalf("expected final response from done tool, got %q", final)
 	}
+	assertHistoryContainsNamedUserMessage(t, ag.Messages(), "Tool-call arguments are still invalid after continuation. Split the work into smaller tool calls and continue.", "sdk_internal_tool_call_continuation")
 }
 
-func TestAgentAutoContinueRunsCompactionAsyncAndAppliesOnNextTurn(t *testing.T) {
+func TestAgentAutoContinueWaitsForAsyncCompactionAtNextProviderBoundary(t *testing.T) {
 	const summaryPrompt = "summarize for compaction"
 	const compactionDelay = 200 * time.Millisecond
 	compactionDone := make(chan struct{})
@@ -456,7 +500,7 @@ func TestAgentAutoContinueRunsCompactionAsyncAndAppliesOnNextTurn(t *testing.T) 
 		LLM: model,
 		Compaction: &compaction.Config{
 			Enabled:                true,
-			ContextWindow:          100,
+			ContextWindow:          200,
 			ThresholdRatio:         0.5,
 			SummaryPrompt:          summaryPrompt,
 			KeepRecentUserMessages: 1,
@@ -464,6 +508,9 @@ func TestAgentAutoContinueRunsCompactionAsyncAndAppliesOnNextTurn(t *testing.T) 
 	})
 	if err != nil {
 		t.Fatalf("new agent: %v", err)
+	}
+	if trigger, watermark := ag.compactionTriggerAndWatermark(&llm.Completion{Usage: &llm.Usage{PromptTokens: 90, CompletionTokens: 10, TotalTokens: 100}}); trigger != "usage" || watermark != "summarize" {
+		t.Fatalf("precondition compaction trigger=%q watermark=%q, want usage/summarize", trigger, watermark)
 	}
 
 	start := time.Now()
@@ -474,11 +521,13 @@ func TestAgentAutoContinueRunsCompactionAsyncAndAppliesOnNextTurn(t *testing.T) 
 	if regularCalls != 2 {
 		t.Fatalf("expected 2 regular model calls, got %d", regularCalls)
 	}
-	if elapsed >= compactionDelay {
-		t.Fatalf("expected query to complete before compaction delay (%s), got %s", compactionDelay, elapsed)
+	if elapsed < compactionDelay {
+		t.Fatalf("expected next provider boundary to wait for compaction delay (%s), got %s", compactionDelay, elapsed)
 	}
 
 	sawCompaction := false
+	var compactionResult compaction.Result
+	var compactionTriggerUsage *llm.Usage
 	autoContinues := 0
 	final := ""
 	autoContinueRespID := ""
@@ -487,6 +536,8 @@ func TestAgentAutoContinueRunsCompactionAsyncAndAppliesOnNextTurn(t *testing.T) 
 		switch e := ev.(type) {
 		case CompactionEvent:
 			sawCompaction = true
+			compactionResult = e.Result
+			compactionTriggerUsage = e.TriggerUsage
 		case AutoContinueEvent:
 			autoContinueRespID = e.ResponseID
 			autoContinues++
@@ -495,8 +546,8 @@ func TestAgentAutoContinueRunsCompactionAsyncAndAppliesOnNextTurn(t *testing.T) 
 			finalRespID = e.ResponseID
 		}
 	}
-	if sawCompaction {
-		t.Fatalf("expected first turn to finish before async compaction applies")
+	if !sawCompaction {
+		t.Fatalf("expected async compaction to apply before the continuation provider call")
 	}
 	if autoContinues != 1 {
 		t.Fatalf("expected one auto-continue metadata event, got %d", autoContinues)
@@ -510,44 +561,13 @@ func TestAgentAutoContinueRunsCompactionAsyncAndAppliesOnNextTurn(t *testing.T) 
 	if finalRespID != "resp_regular_2" {
 		t.Fatalf("expected final response id resp_regular_2, got %q", finalRespID)
 	}
-
-	select {
-	case <-compactionDone:
-	case <-time.After(2 * time.Second):
-		t.Fatal("timed out waiting for async compaction to finish")
-	}
-	deadline := time.Now().Add(time.Second)
-	for time.Now().Before(deadline) {
-		if ag.hasPendingCompaction() {
-			break
-		}
-		time.Sleep(5 * time.Millisecond)
-	}
-	if !ag.hasPendingCompaction() {
-		t.Fatal("expected pending async compaction result before next turn")
-	}
+	assertHistoryContainsNamedUserMessage(t, ag.Messages(), "Your response was truncated. Please continue exactly where you left off.", "sdk_internal_max_tokens_continuation")
 	_, compactionCalls := model.Counts()
 	if compactionCalls != 1 {
 		t.Fatalf("expected 1 compaction model call, got %d", compactionCalls)
 	}
-
-	events2 := collectEvents(ag.QueryStream(context.Background(), llm.TextContent("continue")))
-	sawCompaction = false
-	var compactionResult compaction.Result
-	var compactionTriggerUsage *llm.Usage
-	final = ""
-	for _, ev := range events2 {
-		switch e := ev.(type) {
-		case CompactionEvent:
-			sawCompaction = true
-			compactionResult = e.Result
-			compactionTriggerUsage = e.TriggerUsage
-		case FinalResponseEvent:
-			final = e.Content
-		}
-	}
-	if !sawCompaction {
-		t.Fatalf("expected pending compaction to apply on next turn")
+	if ag.hasPendingCompaction() {
+		t.Fatal("compaction should be applied at the continuation boundary, not left pending")
 	}
 	if compactionResult.Trigger != "usage" {
 		t.Fatalf("compaction trigger = %q, want usage", compactionResult.Trigger)
@@ -564,11 +584,26 @@ func TestAgentAutoContinueRunsCompactionAsyncAndAppliesOnNextTurn(t *testing.T) 
 	if compactionTriggerUsage == nil || compactionTriggerUsage.PromptTokens != 90 {
 		t.Fatalf("legacy trigger usage = %#v, want prompt tokens 90", compactionTriggerUsage)
 	}
-	if compactionResult.OriginalTokens != 100 {
-		t.Fatalf("original tokens = %d, want trigger total tokens 100", compactionResult.OriginalTokens)
+	if compactionResult.OriginalTokens <= 0 || compactionResult.TokenCountSource != compaction.TokenCountSourceEstimate {
+		t.Fatalf("comparable estimate telemetry = %#v", compactionResult)
 	}
 	if compactionResult.NewTokens <= 0 {
 		t.Fatalf("new tokens should be populated, got %d", compactionResult.NewTokens)
+	}
+
+	events2 := collectEvents(ag.QueryStream(context.Background(), llm.TextContent("continue")))
+	sawCompaction = false
+	final = ""
+	for _, ev := range events2 {
+		switch e := ev.(type) {
+		case CompactionEvent:
+			sawCompaction = true
+		case FinalResponseEvent:
+			final = e.Content
+		}
+	}
+	if sawCompaction {
+		t.Fatalf("compaction was already applied in the first turn and must not be replayed")
 	}
 	if final != "follow up" {
 		t.Fatalf("expected follow-up final response, got %q", final)
@@ -606,9 +641,9 @@ func TestAgentShouldAttemptCompactionOnOverflowBeforeThreshold(t *testing.T) {
 }
 
 func TestAgentTruncatesToolResultContentAndMetadata(t *testing.T) {
-	const maxBytes = 80
+	const maxBytes = 256
 	const dumpTTL = 2 * time.Minute
-	large := strings.Repeat("界", 60) // 180 bytes, intentionally exceeds limit.
+	large := strings.Repeat("界", 200) // 600 bytes, intentionally exceeds limit.
 	tempDir := t.TempDir()
 	dumpPath := filepath.Join(tempDir, "tool-result.txt")
 	oldDumpWriter := writeToolResultDump
@@ -642,8 +677,8 @@ func TestAgentTruncatesToolResultContentAndMetadata(t *testing.T) {
 	if len(tr.Result) > maxBytes {
 		t.Fatalf("expected truncated result <= %d bytes, got %d", maxBytes, len(tr.Result))
 	}
-	if !strings.HasSuffix(tr.Result, toolResultTruncatedSuffix) {
-		t.Fatalf("expected truncation suffix, got %q", tr.Result)
+	if !strings.Contains(tr.Result, "[WARN] stage=artifact_sink") || !strings.Contains(tr.Result, "complete=false recoverable=false") {
+		t.Fatalf("expected explicit non-recoverable artifact diagnostic, got %q", tr.Result)
 	}
 	if !utf8.ValidString(tr.Result) {
 		t.Fatalf("expected valid UTF-8 truncated result")
@@ -705,8 +740,8 @@ func TestAgentTruncatesToolResultContentAndMetadata(t *testing.T) {
 		if len(plain) > maxBytes {
 			t.Fatalf("expected stored tool message <= %d bytes, got %d", maxBytes, len(plain))
 		}
-		if !strings.HasSuffix(plain, toolResultTruncatedSuffix) {
-			t.Fatalf("expected stored tool message truncation suffix, got %q", plain)
+		if !strings.Contains(plain, "[WARN] stage=artifact_sink") || !strings.Contains(plain, "complete=false recoverable=false") {
+			t.Fatalf("expected stored tool message artifact diagnostic, got %q", plain)
 		}
 	}
 	if !toolMessageFound {
@@ -1139,10 +1174,10 @@ func TestDestroyEphemeralMessagesScansBeyondLastPromptCount(t *testing.T) {
 
 	ag.destroyEphemeralMessages()
 
-	if !ag.messages[1].Destroyed || ag.messages[1].Content.PlainText() != "<removed to save context>" {
+	if !ag.messages[1].Destroyed || ag.messages[1].Content.PlainText() != ephemeralReleasedPlaceholder {
 		t.Fatalf("expected first ephemeral message to be destroyed, got %#v", ag.messages[1])
 	}
-	if !ag.messages[3].Destroyed || ag.messages[3].Content.PlainText() != "<removed to save context>" {
+	if !ag.messages[3].Destroyed || ag.messages[3].Content.PlainText() != ephemeralReleasedPlaceholder {
 		t.Fatalf("expected post-cutoff ephemeral message to be destroyed, got %#v", ag.messages[3])
 	}
 	if ag.messages[4].Destroyed || ag.messages[4].Content.PlainText() != "tool-3" {
@@ -1159,7 +1194,7 @@ func TestDestroyEphemeralMessagesResetsTrackingAfterReplaceHistory(t *testing.T)
 			llm.NewUserMessage("u1"),
 			{Role: llm.RoleTool, ToolName: "search", Content: llm.TextContent("old"), Ephemeral: true},
 		},
-		ephemeralByTool: make(map[string][]int),
+		ephemeralByKey: make(map[string][]int),
 	}
 
 	// Prime tracking state so ReplaceHistory must clear stale indices/cursor.
@@ -1171,11 +1206,53 @@ func TestDestroyEphemeralMessagesResetsTrackingAfterReplaceHistory(t *testing.T)
 	})
 	ag.destroyEphemeralMessages()
 
-	if !ag.messages[0].Destroyed || ag.messages[0].Content.PlainText() != "<removed to save context>" {
+	if !ag.messages[0].Destroyed || ag.messages[0].Content.PlainText() != ephemeralReleasedPlaceholder {
 		t.Fatalf("expected oldest replaced-history ephemeral message to be destroyed, got %#v", ag.messages[0])
 	}
 	if ag.messages[1].Destroyed || ag.messages[1].Content.PlainText() != "new-2" {
 		t.Fatalf("expected latest replaced-history ephemeral message to be preserved, got %#v", ag.messages[1])
+	}
+}
+
+// TestDestroyEphemeralMessagesKeepsDistinctTargets verifies the structural fix
+// for the self-bootstrap read loop: reading several *different* targets (each a
+// distinct path/offset/limit signature) must not evict one another, so a later
+// re-read never comes back as a placeholder just because other files were read
+// in between. Only redundant re-reads of the *same* signature collapse.
+func TestDestroyEphemeralMessagesKeepsDistinctTargets(t *testing.T) {
+	callA1 := llm.ToolCall{ID: "a1", Function: llm.FunctionCall{Name: "read", Arguments: `{"filePath":"a.go"}`}}
+	callB := llm.ToolCall{ID: "b", Function: llm.FunctionCall{Name: "read", Arguments: `{"filePath":"b.go"}`}}
+	callA2 := llm.ToolCall{ID: "a2", Function: llm.FunctionCall{Name: "read", Arguments: `{"filePath":"a.go"}`}}
+
+	ag := &Agent{
+		toolMap: map[string]tools.Tool{
+			"read": {Name: "read", EphemeralKeep: 1},
+		},
+		messages: []llm.Message{
+			llm.NewUserMessage("u1"),
+			llm.NewAssistantMessage("read a", []llm.ToolCall{callA1}),
+			{Role: llm.RoleTool, ToolCallID: "a1", ToolName: "read", Content: llm.TextContent("A-first"), Ephemeral: true},
+			llm.NewAssistantMessage("read b", []llm.ToolCall{callB}),
+			{Role: llm.RoleTool, ToolCallID: "b", ToolName: "read", Content: llm.TextContent("B-content"), Ephemeral: true},
+			llm.NewAssistantMessage("re-read a", []llm.ToolCall{callA2}),
+			{Role: llm.RoleTool, ToolCallID: "a2", ToolName: "read", Content: llm.TextContent("A-second"), Ephemeral: true},
+		},
+	}
+
+	ag.destroyEphemeralMessages()
+
+	// b.go was read once and never re-read: it must survive intact even though
+	// a.go was read after it (the old tool-name grouping would have evicted it).
+	if ag.messages[4].Destroyed || ag.messages[4].Content.PlainText() != "B-content" {
+		t.Fatalf("expected distinct-target read to be preserved, got %#v", ag.messages[4])
+	}
+	// The newest a.go re-read must be readable (real content, not placeholder).
+	if ag.messages[6].Destroyed || ag.messages[6].Content.PlainText() != "A-second" {
+		t.Fatalf("expected newest same-signature read to be preserved, got %#v", ag.messages[6])
+	}
+	// The stale earlier a.go read (same signature) is the only one recycled.
+	if !ag.messages[2].Destroyed || ag.messages[2].Content.PlainText() != ephemeralReleasedPlaceholder {
+		t.Fatalf("expected stale same-signature read to be recycled, got %#v", ag.messages[2])
 	}
 }
 

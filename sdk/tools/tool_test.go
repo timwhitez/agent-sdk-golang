@@ -80,6 +80,20 @@ func TestFunc_ErrorDiagnosticSeverityActionFormat(t *testing.T) {
 			t.Fatalf("expected downstream diagnostic passthrough, got %q", got)
 		}
 	})
+
+	t.Run("preserves structured stage action diagnostic", func(t *testing.T) {
+		const diag = "[ERROR] stage=artifact_retention action=use_unexpired_or_durable_artifact: ephemeral artifact has expired"
+		tool := Func[args]("handler_stage_action", "handler stage/action test", func(_ context.Context, _ args, _ *Container) (any, error) {
+			return nil, errors.New(diag)
+		})
+		out, err := tool.Execute(context.Background(), `{"count":1}`, NewContainer())
+		if err == nil {
+			t.Fatal("expected handler error")
+		}
+		if got := out.PlainText(); got != diag {
+			t.Fatalf("expected stage/action diagnostic passthrough, got %q", got)
+		}
+	})
 }
 
 func assertSeverityActionDiagnostic(t *testing.T, text string) {

@@ -1,6 +1,10 @@
 package openai
 
-import "testing"
+import (
+	"testing"
+
+	"github.com/timwhitez/agent-sdk-golang/sdk/llm"
+)
 
 func TestParseResponsesInfersTotalTokensWhenGatewayOmitsIt(t *testing.T) {
 	comp, err := parseResponses([]byte(`{"id":"resp_123","status":"completed","output":[{"type":"message","content":[{"type":"output_text","text":"ok"}]}],"usage":{"input_tokens":11,"output_tokens":7}}`))
@@ -41,5 +45,31 @@ func TestUsageFromResponsesAcceptsPromptCompletionAliases(t *testing.T) {
 	}
 	if usage.PromptTokens != 9 || usage.CompletionTokens != 4 || usage.TotalTokens != 13 {
 		t.Fatalf("unexpected usage: %+v", usage)
+	}
+}
+
+func TestUsageFromResponsesKeepsCachedAndImageTokensAsBreakdown(t *testing.T) {
+	usage := usageFromResponses(map[string]any{
+		"usage": map[string]any{
+			"input_tokens":  120,
+			"output_tokens": 30,
+			"total_tokens":  150,
+			"input_tokens_details": map[string]any{
+				"cached_tokens": 40,
+				"image_tokens":  6,
+			},
+		},
+	})
+	if usage == nil {
+		t.Fatal("expected usage")
+	}
+	if usage.PromptTokens != 120 || usage.TotalTokens != 150 {
+		t.Fatalf("breakdown was double-counted: %#v", usage)
+	}
+	if usage.PromptCachedTokens == nil || *usage.PromptCachedTokens != 40 || usage.PromptImageTokens == nil || *usage.PromptImageTokens != 6 {
+		t.Fatalf("missing prompt breakdown: %#v", usage)
+	}
+	if !usage.PromptTokensValid || usage.PromptTokensSource != llm.PromptTokensSourceProvider || usage.PromptTokensSemantics != llm.PromptTokensSemanticsTotalInputV1 {
+		t.Fatalf("unexpected normalized usage quality: %#v", usage)
 	}
 }

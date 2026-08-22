@@ -1030,6 +1030,37 @@ func usageTokenBreakdown(u map[string]any) (int, int) {
 	return pt, ct
 }
 
+func responsesPromptBreakdown(u map[string]any) (cached *int, image *int) {
+	if u == nil {
+		return nil, nil
+	}
+	details, _ := u["input_tokens_details"].(map[string]any)
+	if details == nil {
+		details, _ = u["prompt_tokens_details"].(map[string]any)
+	}
+	if details == nil {
+		return nil, nil
+	}
+	if v := intFromAny(details["cached_tokens"]); v > 0 {
+		cached = &v
+	}
+	if v := intFromAny(details["image_tokens"]); v > 0 {
+		image = &v
+	}
+	return cached, image
+}
+
+func normalizedResponsesUsage(u map[string]any) *llm.Usage {
+	if u == nil {
+		return nil
+	}
+	pt, ct := usageTokenBreakdown(u)
+	tt := intFromAny(u["total_tokens"])
+	usage := llm.NewProviderUsage(pt, ct, tt)
+	usage.PromptCachedTokens, usage.PromptImageTokens = responsesPromptBreakdown(u)
+	return usage
+}
+
 func responsesToolArguments(value any) string {
 	switch v := value.(type) {
 	case string:
@@ -1071,12 +1102,7 @@ func usageFromResponses(resp map[string]any) *llm.Usage {
 	if u == nil {
 		return nil
 	}
-	pt, ct := usageTokenBreakdown(u)
-	tt := intFromAny(u["total_tokens"])
-	if tt == 0 {
-		tt = pt + ct
-	}
-	return &llm.Usage{PromptTokens: pt, CompletionTokens: ct, TotalTokens: tt}
+	return normalizedResponsesUsage(u)
 }
 
 func extractThinkingFromResponses(resp map[string]any) string {
@@ -1671,12 +1697,7 @@ func parseResponses(data []byte) (*llm.Completion, error) {
 
 	usage := (*llm.Usage)(nil)
 	if u, ok := root["usage"].(map[string]any); ok {
-		pt, ct := usageTokenBreakdown(u)
-		tt := intFromAny(u["total_tokens"])
-		if tt == 0 && (pt > 0 || ct > 0) {
-			tt = pt + ct
-		}
-		usage = &llm.Usage{PromptTokens: pt, CompletionTokens: ct, TotalTokens: tt}
+		usage = normalizedResponsesUsage(u)
 	}
 
 	// Fallback: some responses variants include text at top-level "output_text".

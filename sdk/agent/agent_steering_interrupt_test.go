@@ -3,11 +3,13 @@ package agent
 import (
 	"context"
 	"errors"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/timwhitez/agent-sdk-golang/sdk/llm"
+	"github.com/timwhitez/agent-sdk-golang/sdk/tools"
 )
 
 // slowStreamingModel simulates a model that streams text slowly,
@@ -301,11 +303,23 @@ func TestSteeringInterruptPersistsUserMessageInHistory(t *testing.T) {
 
 	messages := ag.Messages()
 	found := false
+	foundInitial := false
 	for _, msg := range messages {
-		if msg.Role == llm.RoleUser && msg.PlainText() == "switch topics now" {
-			found = true
-			break
+		if msg.Role == llm.RoleUser && msg.PlainText() == "hello" {
+			if msg.Name != "" {
+				t.Fatalf("initial real user name = %q", msg.Name)
+			}
+			foundInitial = true
 		}
+		if msg.Role == llm.RoleUser && msg.PlainText() == "switch topics now" {
+			if msg.Name != "" {
+				t.Fatalf("steering real user name = %q", msg.Name)
+			}
+			found = true
+		}
+	}
+	if !foundInitial {
+		t.Fatalf("expected initial user message in history, messages=%#v", messages)
 	}
 	if !found {
 		t.Fatalf("expected steering message to be persisted in history, messages=%#v", messages)
@@ -457,5 +471,224 @@ func TestSteeringInterruptErrorIsNotRetryable(t *testing.T) {
 	var steerErr *llm.SteeringInterruptError
 	if !errors.As(err, &steerErr) {
 		t.Errorf("expected SteeringInterruptError, got %T: %v", err, err)
+	}
+}
+
+type steeringAfterToolCancelModel struct {
+	calls int
+}
+
+func (m *steeringAfterToolCancelModel) Provider() string { return "stub" }
+func (m *steeringAfterToolCancelModel) Model() string    { return "stub" }
+func (m *steeringAfterToolCancelModel) Invoke(_ context.Context, req llm.InvokeRequest) (*llm.Completion, error) {
+	m.calls++
+	if m.calls == 1 {
+		return &llm.Completion{
+			StopReason: "tool_calls",
+			ToolCalls: []llm.ToolCall{
+				{
+					ID:   "wait_1",
+					Type: "function",
+					Function: llm.FunctionCall{
+						Name:      "wait",
+						Arguments: `{}`,
+					},
+				},
+				{
+					ID:   "skipped_1",
+					Type: "function",
+					Function: llm.FunctionCall{
+						Name:      "should_not_run",
+						Arguments: `{}`,
+					},
+				},
+			},
+		}, nil
+	}
+	foundSteering := false
+	for _, message := range req.Messages {
+		if message.Role == llm.RoleUser && message.Content.PlainText() == "switch direction now" {
+			foundSteering = true
+			break
+		}
+	}
+	if !foundSteering {
+		return nil, errors.New("steering message missing after tool cancellation")
+	}
+	return &llm.Completion{
+		StopReason: "tool_calls",
+		ToolCalls: []llm.ToolCall{{
+			ID:   "done_1",
+			Type: "function",
+			Function: llm.FunctionCall{
+				Name:      "done",
+				Arguments: `{"message":"continued after steering"}`,
+			},
+		}},
+	}, nil
+}
+
+func TestSteeringCanCancelActiveToolWithoutCancelingQuery(t *testing.T) {
+	toolStarted := make(chan struct{})
+	skippedCalls := atomic.Int32{}
+	waitTool := tools.Func[struct{}]("wait", "wait until canceled", func(ctx context.Context, _ struct{}, _ *tools.Container) (any, error) {
+		close(toolStarted)
+		<-ctx.Done()
+		return nil, ctx.Err()
+	})
+	skippedTool := tools.Func[struct{}]("should_not_run", "must be skipped after steering", func(context.Context, struct{}, *tools.Container) (any, error) {
+		skippedCalls.Add(1)
+		return "unexpected", nil
+	})
+	doneTool := tools.Func[struct {
+		Message string `json:"message"`
+	}]("done", "complete task", func(_ context.Context, args struct {
+		Message string `json:"message"`
+	}, _ *tools.Container) (any, error) {
+		return nil, tools.TaskComplete(args.Message)
+	})
+
+	model := &steeringAfterToolCancelModel{}
+	ag, err := New(Config{
+		LLM:             model,
+		Tools:           []tools.Tool{waitTool, skippedTool, doneTool},
+		RequireDoneTool: true,
+	})
+	if err != nil {
+		t.Fatalf("new agent: %v", err)
+	}
+	steering := make(chan SteeringMsg, 1)
+	events := ag.QueryStreamWithSteering(context.Background(), llm.TextContent("start long tool"), steering)
+
+	select {
+	case <-toolStarted:
+	case <-time.After(2 * time.Second):
+		t.Fatal("timeout waiting for active tool")
+	}
+	steering <- SteeringMsg{Content: "switch direction now"}
+	if !ag.InterruptActiveStageForSteering() {
+		t.Fatal("expected active tool stage to be interruptible")
+	}
+
+	var steeringSeen bool
+	var final string
+	for ev := range events {
+		switch e := ev.(type) {
+		case SteeringReceivedEvent:
+			steeringSeen = e.Content == "switch direction now"
+		case FinalResponseEvent:
+			final = e.Content
+		case ErrorEvent:
+			t.Fatalf("stage-only steering interrupt ended the query: %#v", e)
+		}
+	}
+	if !steeringSeen {
+		t.Fatal("steering message was not applied after tool cancellation")
+	}
+	if final != "continued after steering" {
+		t.Fatalf("final response = %q", final)
+	}
+	if skippedCalls.Load() != 0 {
+		t.Fatalf("steering executed %d superseded tool call(s)", skippedCalls.Load())
+	}
+	foundSkippedResult := false
+	for _, message := range ag.Messages() {
+		if message.Role == llm.RoleTool && message.ToolCallID == "skipped_1" && strings.Contains(message.Content.PlainText(), "skipped because user steering") {
+			foundSkippedResult = true
+			break
+		}
+	}
+	if !foundSkippedResult {
+		t.Fatalf("superseded tool call did not receive a synthetic result: %#v", ag.Messages())
+	}
+}
+
+type steeringAlreadyAppliedStreamModel struct {
+	calls             atomic.Int32
+	firstStageStarted chan struct{}
+}
+
+func (m *steeringAlreadyAppliedStreamModel) Provider() string { return "stub" }
+func (m *steeringAlreadyAppliedStreamModel) Model() string    { return "stub" }
+func (m *steeringAlreadyAppliedStreamModel) Invoke(context.Context, llm.InvokeRequest) (*llm.Completion, error) {
+	return nil, errors.New("invoke should not be called")
+}
+func (m *steeringAlreadyAppliedStreamModel) InvokeStream(ctx context.Context, req llm.InvokeRequest) (<-chan llm.StreamEvent, error) {
+	steeringCount := 0
+	for _, message := range req.Messages {
+		if message.Role == llm.RoleUser && message.Content.PlainText() == "already applied steering" {
+			steeringCount++
+		}
+	}
+	if steeringCount != 1 {
+		return nil, errors.New("steering message must appear exactly once in provider history")
+	}
+
+	if m.calls.Add(1) == 1 {
+		close(m.firstStageStarted)
+		<-ctx.Done()
+		return nil, ctx.Err()
+	}
+
+	ch := make(chan llm.StreamEvent, 2)
+	ch <- llm.StreamTextDeltaEvent{Delta: "continued after already-applied steering"}
+	ch <- llm.StreamDoneEvent{StopReason: "stop"}
+	close(ch)
+	return ch, nil
+}
+
+func TestSteeringStageInterruptContinuesWhenSteeringWasAlreadyApplied(t *testing.T) {
+	model := &steeringAlreadyAppliedStreamModel{firstStageStarted: make(chan struct{})}
+	ag, err := New(Config{LLM: model})
+	if err != nil {
+		t.Fatalf("new agent: %v", err)
+	}
+
+	steering := make(chan SteeringMsg, 1)
+	steering <- SteeringMsg{Content: "already applied steering"}
+	events := ag.QueryStreamWithSteering(context.Background(), llm.TextContent("start"), steering)
+
+	select {
+	case <-model.firstStageStarted:
+	case <-time.After(2 * time.Second):
+		t.Fatal("timeout waiting for provider stage after steering was applied")
+	}
+	if !ag.InterruptActiveStageForSteering() {
+		t.Fatal("expected already-steered provider stage to be interruptible")
+	}
+
+	steeringEvents := 0
+	final := ""
+	for ev := range events {
+		switch e := ev.(type) {
+		case SteeringReceivedEvent:
+			if e.Content == "already applied steering" {
+				steeringEvents++
+			}
+		case FinalResponseEvent:
+			final = e.Content
+		case ErrorEvent:
+			t.Fatalf("already-applied steering interrupt ended the query: %#v", e)
+		}
+	}
+
+	if model.calls.Load() != 2 {
+		t.Fatalf("provider calls = %d, want 2", model.calls.Load())
+	}
+	if steeringEvents != 1 {
+		t.Fatalf("steering received events = %d, want 1", steeringEvents)
+	}
+	if final != "continued after already-applied steering" {
+		t.Fatalf("final response = %q", final)
+	}
+
+	steeringMessages := 0
+	for _, message := range ag.Messages() {
+		if message.Role == llm.RoleUser && message.Content.PlainText() == "already applied steering" {
+			steeringMessages++
+		}
+	}
+	if steeringMessages != 1 {
+		t.Fatalf("steering history messages = %d, want 1", steeringMessages)
 	}
 }

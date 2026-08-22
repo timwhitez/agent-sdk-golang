@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"log"
 	"runtime"
 	"strings"
@@ -356,5 +357,195 @@ func TestQueryStreamEmitsCompletionDiagnosticsAsWarnings(t *testing.T) {
 func TestTerminalEventPriorityKeepsErrorsAboveFinalResponses(t *testing.T) {
 	if terminalEventPriority(ErrorEvent{}) <= terminalEventPriority(FinalResponseEvent{}) {
 		t.Fatalf("ErrorEvent priority should be higher than FinalResponseEvent")
+	}
+}
+
+// REG: emitEvent takes no ctx, so a query whose caller has already gone away used
+// to pay the full criticalEventSendTimeoutFloor for every critical event even
+// though nobody was left to read the channel. The floor itself is intentional and
+// must stay in place for a live turn.
+func TestCriticalEventFloorIsSkippedForCanceledTurn(t *testing.T) {
+	ag, err := New(Config{
+		LLM:              &completionOnlyModel{},
+		EventBufferSize:  1,
+		EventSendTimeout: 5 * time.Millisecond,
+	})
+	if err != nil {
+		t.Fatalf("new agent: %v", err)
+	}
+
+	canceledOut := make(chan Event, 1)
+	canceledOut <- WarnEvent{Message: "filler"} // channel is now full
+	canceledCtx, cancel := context.WithCancel(context.Background())
+	defer ag.registerTurnCancellation(canceledOut, canceledCtx)()
+	cancel()
+
+	start := time.Now()
+	if ag.emitEvent(canceledOut, ToolResultEvent{Tool: "read"}) {
+		t.Fatal("expected the send into a full channel to fail")
+	}
+	if elapsed := time.Since(start); elapsed >= criticalEventSendTimeoutFloor {
+		t.Fatalf("canceled turn paid the critical-event floor: %v >= %v", elapsed, criticalEventSendTimeoutFloor)
+	}
+
+	start = time.Now()
+	for i := 0; i < 6; i++ {
+		ag.emitEvent(canceledOut, ToolResultEvent{Tool: "read"})
+	}
+	if elapsed := time.Since(start); elapsed >= criticalEventSendTimeoutFloor {
+		t.Fatalf("6 critical events on a canceled turn cost %v; expected far below one %v floor",
+			elapsed, criticalEventSendTimeoutFloor)
+	}
+
+	liveOut := make(chan Event, 1)
+	liveOut <- WarnEvent{Message: "filler"}
+	liveCtx, liveCancel := context.WithCancel(context.Background())
+	defer liveCancel()
+	defer ag.registerTurnCancellation(liveOut, liveCtx)()
+	start = time.Now()
+	ag.emitEvent(liveOut, ToolResultEvent{Tool: "read"})
+	if elapsed := time.Since(start); elapsed < criticalEventSendTimeoutFloor {
+		t.Fatalf("live turn lost the deliberate critical-event floor: %v < %v", elapsed, criticalEventSendTimeoutFloor)
+	}
+}
+
+// REG: critical drops returned before the dropped%logEvery gate, so sustained
+// backpressure emitted one warn line per drop. The exact count still reaches the
+// consumer through FinalResponseEvent.DroppedCriticalEvents, so the log line is
+// sampled like every other drop (with the first one always reported).
+func TestCriticalEventDropLoggingIsSampled(t *testing.T) {
+	var warnings lockedBuffer
+	ag, err := New(Config{
+		LLM:               &completionOnlyModel{},
+		EventDropLogEvery: 5,
+		Warningf: func(format string, args ...any) {
+			_, _ = warnings.Write([]byte(fmt.Sprintf(format, args...) + "\n"))
+		},
+	})
+	if err != nil {
+		t.Fatalf("new agent: %v", err)
+	}
+
+	const drops = 20
+	for i := 0; i < drops; i++ {
+		ag.logDroppedEvent(ToolResultEvent{Tool: "read"}, "channel_full")
+	}
+
+	lines := 0
+	for _, line := range strings.Split(warnings.String(), "\n") {
+		if strings.TrimSpace(line) != "" {
+			lines++
+		}
+	}
+	if lines >= drops {
+		t.Fatalf("critical drop logging is not sampled: %d drops produced %d warn lines", drops, lines)
+	}
+	if lines == 0 {
+		t.Fatal("expected at least the first critical drop to be logged")
+	}
+	if got := ag.criticalEventDropCount.Load(); got != drops {
+		t.Fatalf("critical drop counter = %d, want %d; sampling must not lose the exact count", got, drops)
+	}
+	if got := ag.eventDropCount.Load(); got != drops {
+		t.Fatalf("total drop counter = %d, want %d", got, drops)
+	}
+}
+
+// REG (R4-CC-005): isCriticalAgentEvent covers per-step kinds (StepStart,
+// ToolCall, ToolResult, StepComplete plus Accounting/Usage), i.e. roughly seven
+// critical events per tool call. Paying criticalEventSendTimeoutFloor for each
+// of them without a per-turn cap made a tool-heavy turn against a stalled
+// consumer cost the floor times the event count: 700 events (~100 tool calls)
+// measured ~175s of pure waiting. The floor must stay bounded per turn while the
+// drop accounting stays exact.
+func TestCriticalEventFloorIsBoundedPerTurn(t *testing.T) {
+	ag, err := New(Config{
+		LLM:             &completionOnlyModel{},
+		EventBufferSize: 1,
+	})
+	if err != nil {
+		t.Fatalf("new agent: %v", err)
+	}
+	out := make(chan Event, 1)
+	out <- WarnEvent{Message: "filler"} // full channel, and nothing drains it
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	defer ag.registerTurnCancellation(out, ctx)()
+
+	const events = 700 // ~100 tool calls x ~7 critical events
+	start := time.Now()
+	for i := 0; i < events; i++ {
+		ag.emitEvent(out, ToolResultEvent{Tool: "read"})
+	}
+	elapsed := time.Since(start)
+
+	// Without the cap this is events * criticalEventSendTimeoutFloor (~175s).
+	uncapped := time.Duration(events) * criticalEventSendTimeoutFloor
+	if elapsed >= uncapped/2 {
+		t.Fatalf("%d critical events cost %v; the per-turn floor budget (%v) is not bounding the wait (uncapped would be ~%v)",
+			events, elapsed, criticalEventFloorTurnBudget, uncapped)
+	}
+	// The budget must actually be spendable, not skipped outright.
+	if elapsed < criticalEventFloorTurnBudget {
+		t.Fatalf("%d critical events cost %v, below the %v floor budget: the deliberate floor was dropped entirely",
+			events, elapsed, criticalEventFloorTurnBudget)
+	}
+	// ISS-129b: drops must still be counted exactly, never silently discarded.
+	if got := ag.criticalEventDropCount.Load(); got != events {
+		t.Fatalf("critical drop counter = %d, want %d; capping the floor must not lose the exact count", got, events)
+	}
+}
+
+// REG (R4-CC-005): the per-turn cap must not eat the floor for the events that
+// arrive before the budget is spent, and a terminal event keeps the floor even
+// afterwards - there is at most one per turn, so it cannot multiply the cost, and
+// losing the turn's outcome is the worst possible drop.
+func TestCriticalEventFloorBudgetStillPaysTheFirstEvents(t *testing.T) {
+	ag, err := New(Config{
+		LLM:              &completionOnlyModel{},
+		EventBufferSize:  1,
+		EventSendTimeout: 5 * time.Millisecond,
+	})
+	if err != nil {
+		t.Fatalf("new agent: %v", err)
+	}
+	out := make(chan Event, 1)
+	out <- WarnEvent{Message: "filler"}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	defer ag.registerTurnCancellation(out, ctx)()
+
+	start := time.Now()
+	ag.emitEvent(out, ToolResultEvent{Tool: "read"})
+	if elapsed := time.Since(start); elapsed < criticalEventSendTimeoutFloor {
+		t.Fatalf("the first critical event of a turn lost the deliberate floor: %v < %v",
+			elapsed, criticalEventSendTimeoutFloor)
+	}
+
+	// Spend the rest of the turn's budget.
+	deadline := time.Now().Add(2 * criticalEventFloorTurnBudget)
+	for time.Now().Before(deadline) {
+		before := time.Now()
+		ag.emitEvent(out, ToolResultEvent{Tool: "read"})
+		if time.Since(before) < criticalEventSendTimeoutFloor {
+			break // budget spent, critical events fell back to the ordinary budget
+		}
+	}
+	start = time.Now()
+	ag.emitEvent(out, ToolResultEvent{Tool: "read"})
+	if elapsed := time.Since(start); elapsed >= criticalEventSendTimeoutFloor {
+		t.Fatalf("a critical event still paid the full floor after the turn budget was spent: %v", elapsed)
+	}
+
+	// A fresh turn gets a fresh budget.
+	freshOut := make(chan Event, 1)
+	freshOut <- WarnEvent{Message: "filler"}
+	freshCtx, freshCancel := context.WithCancel(context.Background())
+	defer freshCancel()
+	defer ag.registerTurnCancellation(freshOut, freshCtx)()
+	start = time.Now()
+	ag.emitEvent(freshOut, ToolResultEvent{Tool: "read"})
+	if elapsed := time.Since(start); elapsed < criticalEventSendTimeoutFloor {
+		t.Fatalf("a new turn did not get a fresh floor budget: %v < %v", elapsed, criticalEventSendTimeoutFloor)
 	}
 }

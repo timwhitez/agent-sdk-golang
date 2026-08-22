@@ -443,6 +443,9 @@ func TestRepeatToolSignatureGuardInjectsReminderAndContinuesUntilDone(t *testing
 	foundReminder := false
 	for _, msg := range history {
 		if msg.Role == llm.RoleUser && strings.Contains(msg.Content.PlainText(), reminderText) {
+			if msg.Name != "sdk_internal_loop_guard" {
+				t.Fatalf("loop-guard reminder name = %q", msg.Name)
+			}
 			foundReminder = true
 			break
 		}
@@ -495,13 +498,14 @@ func TestRepeatToolSignatureGuardRetreatsAfterStrikeThreshold(t *testing.T) {
 		t.Fatalf("new agent: %v", err)
 	}
 
-	// When the strike threshold is exhausted the guard retreats (disables
-	// itself) instead of aborting the run, so the model continues and the
-	// done tool is eventually reached. This matches Codex's loop, which has
-	// no repeated-call abort.
+	// When the strike budget is spent the guard downgrades (allows normal
+	// repeats, still intercepts recycled-placeholder re-reads) instead of
+	// aborting the run, so the model continues and the done tool is eventually
+	// reached. echo is non-ephemeral, so its repeats are never recycled and
+	// pass through freely after the downgrade.
 	events := collectEvents(ag.QueryStream(context.Background(), llm.TextContent("loop")))
 	if model.calls != 4 {
-		t.Fatalf("expected run to continue to done tool after retreat, got %d model calls", model.calls)
+		t.Fatalf("expected run to continue to done tool after downgrade, got %d model calls", model.calls)
 	}
 	if toolCalls != 2 {
 		t.Fatalf("expected only pre-strike tool calls to execute (strike call is skipped), got %d", toolCalls)
@@ -517,7 +521,7 @@ func TestRepeatToolSignatureGuardRetreatsAfterStrikeThreshold(t *testing.T) {
 				doomLoopErrors++
 			}
 		case WarnEvent:
-			if e.Kind == "loop_guard" && strings.Contains(e.Message, "protection exhausted") {
+			if e.Kind == "loop_guard" && strings.Contains(e.Message, "budget spent") {
 				retreatWarnings++
 			}
 		case FinalResponseEvent:
@@ -525,10 +529,10 @@ func TestRepeatToolSignatureGuardRetreatsAfterStrikeThreshold(t *testing.T) {
 		}
 	}
 	if doomLoopErrors != 0 {
-		t.Fatalf("expected no doom_loop error after retreat, got %d", doomLoopErrors)
+		t.Fatalf("expected no doom_loop error after downgrade, got %d", doomLoopErrors)
 	}
 	if retreatWarnings != 1 {
-		t.Fatalf("expected one loop_guard retreat warning, got %d", retreatWarnings)
+		t.Fatalf("expected one loop_guard downgrade warning, got %d", retreatWarnings)
 	}
 	if strings.TrimSpace(final) != "finished" {
 		t.Fatalf("expected done tool final response %q, got %q", "finished", final)
@@ -567,15 +571,15 @@ func TestRepeatToolSignatureGuardStrikePersistsAcrossInterveningTurns(t *testing
 		t.Fatalf("new agent: %v", err)
 	}
 
-	// Strikes persist across intervening turns until the threshold is
-	// exhausted, at which point the guard retreats and the run continues to
-	// the done tool instead of aborting.
+	// Strikes persist across intervening turns until the budget is spent, at
+	// which point the guard downgrades and the run continues to the done tool
+	// instead of aborting.
 	events := collectEvents(ag.QueryStream(context.Background(), llm.TextContent("loop")))
 	if model.calls != 8 {
-		t.Fatalf("expected run to continue to done call after retreat, got model calls=%d", model.calls)
+		t.Fatalf("expected run to continue to done call after downgrade, got model calls=%d", model.calls)
 	}
 	if toolCalls != 5 {
-		t.Fatalf("expected 5 executed echo calls before retreat, got %d", toolCalls)
+		t.Fatalf("expected 5 executed echo calls before downgrade, got %d", toolCalls)
 	}
 
 	doomLoopErrors := 0
@@ -588,7 +592,7 @@ func TestRepeatToolSignatureGuardStrikePersistsAcrossInterveningTurns(t *testing
 				doomLoopErrors++
 			}
 		case WarnEvent:
-			if e.Kind == "loop_guard" && strings.Contains(e.Message, "protection exhausted") {
+			if e.Kind == "loop_guard" && strings.Contains(e.Message, "budget spent") {
 				retreatWarnings++
 			}
 		case FinalResponseEvent:
@@ -596,10 +600,10 @@ func TestRepeatToolSignatureGuardStrikePersistsAcrossInterveningTurns(t *testing
 		}
 	}
 	if doomLoopErrors != 0 {
-		t.Fatalf("expected no doom_loop error after retreat, got %d", doomLoopErrors)
+		t.Fatalf("expected no doom_loop error after downgrade, got %d", doomLoopErrors)
 	}
 	if retreatWarnings != 1 {
-		t.Fatalf("expected one loop_guard retreat warning, got %d", retreatWarnings)
+		t.Fatalf("expected one loop_guard downgrade warning, got %d", retreatWarnings)
 	}
 	if strings.TrimSpace(final) != "finished" {
 		t.Fatalf("expected done tool final response %q, got %q", "finished", final)

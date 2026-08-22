@@ -11,6 +11,86 @@ import (
 	"github.com/timwhitez/agent-sdk-golang/sdk/tools"
 )
 
+// errStaleWriteTarget marks a refused write whose target changed after the tool
+// read it. Failing closed keeps a stale read from silently discarding a
+// concurrent writer's work; the caller is expected to reread and retry.
+var errStaleWriteTarget = errors.New("workspace_file_changed")
+
+// writeTargetSnapshot records what a write/edit tool observed while reading its
+// target so the write that lands after confirmation can detect a concurrent
+// modification. Mode/size/mtime alone cannot see a same-size overwrite within a
+// single timestamp tick, so the observed content is compared too whenever the
+// tool read the file in full.
+type writeTargetSnapshot struct {
+	Exists      bool
+	Info        os.FileInfo
+	Content     string
+	ContentFull bool
+}
+
+func (snapshot writeTargetSnapshot) matches(info os.FileInfo) bool {
+	if snapshot.Info == nil || info == nil {
+		return false
+	}
+	if !os.SameFile(snapshot.Info, info) {
+		return false
+	}
+	return snapshot.Info.Mode() == info.Mode() &&
+		snapshot.Info.Size() == info.Size() &&
+		snapshot.Info.ModTime().Equal(info.ModTime())
+}
+
+// verifyWriteTargetUnchanged re-checks the write target immediately before the
+// write lands. Confirmation can block on a human for a long time, which leaves a
+// wide window for a concurrent writer.
+func verifyWriteTargetUnchanged(resolvedPath string, snapshot writeTargetSnapshot, displayPath string) error {
+	info, err := os.Lstat(resolvedPath)
+	if err != nil {
+		if os.IsNotExist(err) {
+			if !snapshot.Exists {
+				return nil
+			}
+			return fmt.Errorf("%w: %s was deleted after it was read", errStaleWriteTarget, displayPath)
+		}
+		return err
+	}
+	if !snapshot.Exists {
+		return fmt.Errorf("%w: %s was created after it was read as missing", errStaleWriteTarget, displayPath)
+	}
+	if !snapshot.matches(info) {
+		return fmt.Errorf("%w: %s changed after it was read", errStaleWriteTarget, displayPath)
+	}
+	if !snapshot.ContentFull {
+		return nil
+	}
+	f, st, err := openFileNoFollow(resolvedPath)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	if st.IsDir() {
+		return fmt.Errorf("%w: %s is now a directory", errStaleWriteTarget, displayPath)
+	}
+	current, truncated, err := readPreviewBounded(f, int64(len(snapshot.Content))+1)
+	if err != nil {
+		return err
+	}
+	if truncated || string(current) != snapshot.Content {
+		return fmt.Errorf("%w: %s content changed after it was read", errStaleWriteTarget, displayPath)
+	}
+	return nil
+}
+
+// staleWriteTargetResult tells the model to reread rather than retry blindly.
+func staleWriteTargetResult(tool, path string, err error) (llm.Content, error) {
+	msg := formatErrorDiagnosticFromErr(
+		"workspace_file_changed",
+		err,
+		fmt.Sprintf("Read %s again and rebuild the %s from the current contents; the previous read is stale.", path, tool),
+	)
+	return llm.TextContent(msg), err
+}
+
 type writeArgs struct {
 	FilePath string `json:"file_path"`
 	Content  string `json:"content"`
@@ -32,10 +112,12 @@ func writeTool() tools.Tool {
 		raw := fmt.Sprintf("%s (%d bytes)", a.FilePath, len(a.Content))
 		oldContent := ""
 		diffTruncated := false
+		var target writeTargetSnapshot
 		if b, st, _, truncated, err := s.readPathPreviewBounded(p, maxWriteDiffBytes); err == nil {
 			if !st.IsDir() {
 				oldContent = string(b)
 				diffTruncated = truncated
+				target = writeTargetSnapshot{Exists: true, Info: st, Content: oldContent, ContentFull: !truncated}
 			}
 		} else if !os.IsNotExist(err) {
 			var secErr *SecurityError
@@ -71,6 +153,13 @@ func writeTool() tools.Tool {
 		resolvedPath, err := s.revalidatePathForAccess(p)
 		if err != nil {
 			msg := formatErrorDiagnosticFromErr("Security error", err, "Use a file path inside the sandbox root and retry.")
+			return llm.TextContent(msg), err
+		}
+		if err := verifyWriteTargetUnchanged(resolvedPath, target, a.FilePath); err != nil {
+			if errors.Is(err, errStaleWriteTarget) {
+				return staleWriteTargetResult("write", a.FilePath, err)
+			}
+			msg := formatErrorDiagnosticFromErr("Unable to verify file before write", err, "Check file permissions/path and retry.")
 			return llm.TextContent(msg), err
 		}
 		if err := writeFilePreserveMode(resolvedPath, []byte(a.Content), 0o644); err != nil {
@@ -128,6 +217,7 @@ func editTool() tools.Tool {
 			return llm.TextContent(msg), err
 		}
 		content := string(b)
+		target := writeTargetSnapshot{Exists: true, Info: st, Content: content, ContentFull: true}
 		if !strings.Contains(content, a.OldString) {
 			err := fmt.Errorf("string not found")
 			msg := formatErrorDiagnostic(fmt.Sprintf("String not found in %s", a.FilePath), "Check old_string matches file content and retry.")
@@ -158,6 +248,13 @@ func editTool() tools.Tool {
 		resolvedPath, err := s.revalidatePathForAccess(p)
 		if err != nil {
 			msg := formatErrorDiagnosticFromErr("Security error", err, "Use a file path inside the sandbox root and retry.")
+			return llm.TextContent(msg), err
+		}
+		if err := verifyWriteTargetUnchanged(resolvedPath, target, a.FilePath); err != nil {
+			if errors.Is(err, errStaleWriteTarget) {
+				return staleWriteTargetResult("edit", a.FilePath, err)
+			}
+			msg := formatErrorDiagnosticFromErr("Unable to verify file before edit", err, "Check file permissions/path and retry.")
 			return llm.TextContent(msg), err
 		}
 		if err := writeFilePreserveMode(resolvedPath, []byte(newContent), 0o644); err != nil {
@@ -229,6 +326,7 @@ func multieditTool() tools.Tool {
 			return llm.TextContent(msg), err
 		}
 		orig := string(b)
+		target := writeTargetSnapshot{Exists: true, Info: st, Content: orig, ContentFull: true}
 		content := orig
 		counts := make([]int, 0, len(a.Edits))
 		for i, e := range a.Edits {
@@ -278,6 +376,13 @@ func multieditTool() tools.Tool {
 		resolvedPath, err := s.revalidatePathForAccess(p)
 		if err != nil {
 			msg := formatErrorDiagnosticFromErr("Security error", err, "Use a file path inside the sandbox root and retry.")
+			return llm.TextContent(msg), err
+		}
+		if err := verifyWriteTargetUnchanged(resolvedPath, target, a.FilePath); err != nil {
+			if errors.Is(err, errStaleWriteTarget) {
+				return staleWriteTargetResult("multiedit", a.FilePath, err)
+			}
+			msg := formatErrorDiagnosticFromErr("Unable to verify file before multiedit", err, "Check file permissions/path and retry.")
 			return llm.TextContent(msg), err
 		}
 		if err := writeFilePreserveMode(resolvedPath, []byte(content), 0o644); err != nil {

@@ -5,6 +5,8 @@ import (
 	"regexp"
 	"time"
 
+	"github.com/timwhitez/agent-sdk-golang/sdk/agent/messageorigin"
+	"github.com/timwhitez/agent-sdk-golang/sdk/artifact"
 	"github.com/timwhitez/agent-sdk-golang/sdk/llm"
 )
 
@@ -16,8 +18,14 @@ const (
 	DefaultKeepRecentUserMessages = 3
 	DefaultToolSnapshotMaxEntries = 6
 	DefaultToolSnapshotMaxChars   = 2000
+	DefaultCheckpointMaxTokens    = 2000
+	DefaultSummaryTargetTokens    = 1600
 	DefaultCompactionRetries      = 1
-	compactionSummaryMessageName  = "compaction_summary"
+	compactionSummaryMessageName  = messageorigin.CompactionSummaryName
+	// TokenCountSourceEstimate identifies before/after counts produced by the
+	// same host-injected local estimator. Provider usage remains available in
+	// Result.Usage and must not be mixed into this comparable pair.
+	TokenCountSourceEstimate = "estimate"
 )
 
 const (
@@ -29,93 +37,57 @@ const (
 // DefaultSummaryPrefix mirrors Codex's summary prefix.
 const DefaultSummaryPrefix = `Another language model started to solve this problem and produced a summary of its thinking process. You also have access to the state of the tools that were used by that language model. Use this to build on the work that has already been done and avoid duplicating work. Here is the summary produced by the other language model, use the information in this summary to assist with your own analysis:`
 
-// DefaultSummaryPrompt is a coding-agent-optimized prompt for context compaction.
-// Designed based on Anthropic context engineering docs, Factory.ai evaluation findings,
-// Codex/Manus patterns, and common failure modes (Claude Code issue #14160).
-//
-// Key design decisions:
-//   - "Modified Files" is a dedicated section because Factory.ai found file paths are
-//     the #1 most commonly lost information type in summaries.
-//   - "Errors & Failed Approaches" is separated from general findings because Jason Liu
-//     and Anthropic both show this prevents the model from re-attempting failed strategies.
-//   - "User Constraints" are elevated to section 1 because issue #14160 shows users
-//     complain that preferences are lost after compaction.
-//   - "DO NOT re-derive" instruction prevents decision regression post-compaction.
-//   - "Verification" section preserves test commands which are commonly lost.
-const DefaultSummaryPrompt = `You are performing a context checkpoint. Write a structured handoff summary that will REPLACE the full conversation history. Your future self will have NO access to prior messages — only this summary plus the most recent user messages and tool state.
+// DefaultSummaryPrompt defines the evidence-first handoff
+// contract. Mandatory authority and the untrusted-material boundary are added
+// separately by the request builder as a system message.
+const DefaultSummaryPrompt = `Write an operational checkpoint for the next coding-agent turn.
 
-## Required Sections
+Trust order:
+1. Successful tool results and current filesystem/repository state.
+2. Explicit user messages and user-approved decisions.
+3. Assistant statements only when corroborated; otherwise label them UNVERIFIED.
 
-### 1. Task & User Constraints
-- The user's original request and explicit success criteria
-- User preferences, style requirements, or constraints they specified
-- Commitments or promises made to the user that must be honored
-- Response language or formatting requirements
+Required sections, in this exact order. Inside <summary>, emit every title as
+the exact level-2 Markdown heading shown below. Do not number, bold, rename,
+translate, or add a trailing colon to these heading lines. Put a non-empty body
+immediately below every heading.
 
-### 2. Modified Files
-List EVERY file created, modified, deleted, or analyzed — use EXACT absolute paths:
-- ` + "`/path/to/file.go`" + ` — what was changed and why
-- Include function names or line ranges when relevant for targeted re-reading
-- Mark files as [created], [modified], [deleted], or [analyzed]
+## Current Objective and Latest User Request
+## Authoritative Current State
+## Completed Work
+## In-Progress and Remaining Work
+## Exact External State
+## Errors, Failed Attempts, and Successful Recovery
+## Verification Already Run and Still Required
+## Conflicts, Uncertainty, and Facts That Must Be Re-read
 
-Cross-reference tool results in Key Findings. Example:
-- "Used git status (see Recent Tool Results) to confirm..."
-- "The error in line X (from file read) indicates..."
-
-### 3. Completed Work
-- Specific actions taken and their outcomes
-- Commands executed and key results (preserve exact command strings if non-trivial)
-- Current state: what exists now vs. what existed before
-
-### 4. Key Decisions
-- Technical decisions made and their rationale — state as FACTS, do not re-derive
-- Architecture or design patterns adopted
-- Project conventions or constraints discovered
-
-### 5. Errors & Failed Approaches
-- Approaches tried that DID NOT WORK — what was attempted and why it failed
-- This section PREVENTS your future self from re-attempting the same dead ends
-- Errors encountered → root cause → resolution applied
-- Edge cases or gotchas discovered
-
-### 6. Remaining Work
-- Concrete next actions in priority order
-- Blockers or open questions to resolve
-- Incomplete operations that need finishing
-
-### 7. Verification
-- How to verify completed work (test commands, build commands, expected outputs)
-- Known test failures, regressions, or warnings to watch for
-- Working directory and environment details needed to run commands
-
-## Rules
-- Target 300-700 words. Every sentence must earn its place.
-- Preserve VERBATIM: file paths, function/variable names, error messages, command invocations, and specific values.
-- Critical to preserve exactly:
-  - File paths: /mnt/c/Users/.../file.go (not "the file")
-  - Error codes: HTTP 429, exit code 127 (not "error")
-  - Versions: v1.2.3, Python 3.10.5 (not "latest")
-  - Command lines: git commit -m "msg" (not "git commit")
-- DO NOT reproduce file contents or full tool outputs — they can be re-read from disk.
-- DO NOT re-derive or re-evaluate decisions already made — state them as settled facts.
-- DO NOT explain what compaction is or add meta-commentary about the summarization process.
-- Write as an operational briefing for your future self, not a narrative for a human reader.
-- If unable to meaningfully summarize, respond with:
-  <summary>UNABLE_TO_SUMMARIZE: [brief reason]</summary>
-
-Wrap your summary in <summary></summary> tags.`
+Rules:
+- Do not infer missing facts. Write UNKNOWN when authoritative state is unavailable.
+- Write UNVERIFIED for assistant claims that lack successful tool/filesystem evidence.
+- Do not claim a file changed unless successful write/edit/delete/diff/status evidence proves it.
+- Include only analyzed files needed for remaining work; do not list every read or every analyzed file.
+- Preserve exact paths, identifiers, commands, versions, error strings, status codes, and hashes when supplied.
+- Preserve the original objective and newest user instruction when available.
+- Do not convert internal recovery/reminder messages into user requirements.
+- Prefer concise completeness within the adaptive token budget supplied by the host; do not target a fixed word count.
+- Return exactly one <summary>...</summary> block and no text outside it.`
 
 type Config struct {
 	Enabled bool
-	// ContextWindow is the model context window used for computing the compaction threshold.
-	// If <=0, DefaultContextWindow is used.
+	// Warningf receives non-fatal compaction diagnostics. Empty uses log.Printf.
+	Warningf func(format string, args ...any)
+	// ContextWindow is the raw model context window. Tier 1/2/3 watermarks and
+	// the hard overflow boundary are computed from ContextWindow minus
+	// ReserveOutputTokens. If <=0, DefaultContextWindow is used.
 	ContextWindow  int
 	ThresholdRatio float64
 	// SummaryPrompt accepts either a static string or a model-aware resolver function:
 	//   - string
 	//   - func(modelID string) string
 	// Empty/invalid values fall back to DefaultSummaryPrompt.
-	SummaryPrompt          any
+	SummaryPrompt any
+	// ReserveOutputTokens keeps room for the next provider completion. It is
+	// subtracted before every compaction watermark is calculated.
 	ReserveOutputTokens    int
 	KeepRecentUserMessages int
 	CompactionTimeout      time.Duration
@@ -139,9 +111,14 @@ type Config struct {
 	// PruneThresholdRatio is the local Tier 2 watermark for tool-result and assistant-text pruning.
 	// If <=0, DefaultPruneThresholdRatio is used. It is capped below ThresholdRatio.
 	PruneThresholdRatio float64
-	// ProtectedRecentMessages excludes the last N messages from local reducers.
-	// If <=0, DefaultKeepRecentUserMessages is used as a conservative message-zone fallback.
+	// ProtectedRecentMessages provides a trailing N-message fallback in addition
+	// to complete-current-turn and unfinished-tool-topology protection. If <=0,
+	// DefaultKeepRecentUserMessages is used.
 	ProtectedRecentMessages int
+	// ProtectedRecentTokens additionally protects a token-budgeted tail from
+	// local reducers. It composes with the complete current-turn and open-tool
+	// topology boundaries. Values <= 0 disable this optional extra budget.
+	ProtectedRecentTokens int
 	// EnableUserCodeMicrocompact allows local reducers to compact old markdown
 	// fenced code blocks inside user messages outside the protected zone.
 	EnableUserCodeMicrocompact bool
@@ -150,7 +127,38 @@ type Config struct {
 	LedgerStore LedgerStore
 	LedgerPath  string
 	// ToolArtifactWriter persists full tool outputs before local replacement.
+	// It is the legacy path-only compatibility writer. When any canonical
+	// artifact field below is configured, local replacement requires the whole
+	// canonical binding and does not promote this writer's path.
 	ToolArtifactWriter ArtifactWriter
+	// ArtifactOwnerProvider, ArtifactSink, ArtifactResolver,
+	// ArtifactResolverCapability, and ArtifactEnvelopeCodec form one canonical
+	// execution binding. Agent hosts should install the same binding used at the
+	// tool-result boundary. A partial binding fails closed with a visible warning.
+	ArtifactOwnerProvider      ArtifactOwnerProvider
+	ArtifactSink               artifact.Sink
+	ArtifactResolver           artifact.Resolver
+	ArtifactResolverCapability artifact.ResolverCapability
+	ArtifactEnvelopeCodec      artifact.EnvelopeCodec
+	// SummarySourceWriter optionally persists the source history used
+	// to produce a summary. SourceSnapshot is recorded only after this writer
+	// returns a non-empty durable path.
+	SummarySourceWriter ArtifactWriter
+	// CheckpointWriter durably records the final provider history and telemetry
+	// before an Agent replaces its in-memory history. Hosts own the storage
+	// implementation; the SDK owns commit ordering and failure semantics.
+	CheckpointWriter CompactionCheckpointWriter
+	// CheckpointProvider supplies bounded host-owned task, workspace, evidence,
+	// error, and validation state for summary material. The SDK defines the
+	// portable schema; hosts remain responsible for collecting repository and
+	// runtime state.
+	CheckpointProvider CheckpointProvider
+	// CheckpointMaxTokens bounds the rendered host checkpoint section. Values
+	// <= 0 use DefaultCheckpointMaxTokens.
+	CheckpointMaxTokens int
+	// SummaryTargetTokens is the host-selected adaptive output budget described
+	// to the summary model. Values <= 0 use DefaultSummaryTargetTokens.
+	SummaryTargetTokens int
 	// TokenEstimator estimates prompt tokens for a text fragment. When nil, a
 	// naive (len+3)/4 heuristic is used. Hosts (e.g. Goode) inject a detailed
 	// estimator so tier eligibility and reported token counts match the same
@@ -174,6 +182,8 @@ func DefaultConfig() Config {
 		MinSummaryCharsForToolContext: DefaultMinSummaryCharsForToolContext,
 		ToolSnapshotMaxEntries:        DefaultToolSnapshotMaxEntries,
 		ToolSnapshotMaxChars:          DefaultToolSnapshotMaxChars,
+		CheckpointMaxTokens:           DefaultCheckpointMaxTokens,
+		SummaryTargetTokens:           DefaultSummaryTargetTokens,
 		SnipThresholdRatio:            DefaultSnipThresholdRatio,
 		PruneThresholdRatio:           DefaultPruneThresholdRatio,
 		ProtectedRecentMessages:       DefaultKeepRecentUserMessages,
@@ -181,17 +191,39 @@ func DefaultConfig() Config {
 }
 
 type Result struct {
-	Compacted      bool       `json:"compacted"`
-	Trigger        string     `json:"trigger,omitempty"`
-	Watermark      string     `json:"watermark,omitempty"`
-	Usage          *llm.Usage `json:"usage,omitempty"`
-	OriginalTokens int        `json:"original_tokens,omitempty"`
-	NewTokens      int        `json:"new_tokens,omitempty"`
-	TiersApplied   []string   `json:"tiers_applied,omitempty"`
-	SnapshotPath   string     `json:"snapshot_path,omitempty"`
-	LedgerPath     string     `json:"ledger_path,omitempty"`
-	Warnings       []string   `json:"warnings,omitempty"`
-	Summary        string     `json:"summary,omitempty"`
+	Compacted          bool       `json:"compacted"`
+	Trigger            string     `json:"trigger,omitempty"`
+	Watermark          string     `json:"watermark,omitempty"`
+	Usage              *llm.Usage `json:"usage,omitempty"`
+	OriginalTokens     int        `json:"original_tokens,omitempty"`
+	NewTokens          int        `json:"new_tokens,omitempty"`
+	TokenCountSource   string     `json:"token_count_source,omitempty"`
+	TiersApplied       []string   `json:"tiers_applied,omitempty"`
+	SnapshotPath       string     `json:"snapshot_path,omitempty"`
+	LedgerPath         string     `json:"ledger_path,omitempty"`
+	Warnings           []string   `json:"warnings,omitempty"`
+	Summary            string     `json:"summary,omitempty"`
+	CheckpointID       string     `json:"checkpoint_id,omitempty"`
+	CheckpointMessages int        `json:"checkpoint_messages,omitempty"`
+
+	// Ledger updates are deferred when a runtime checkpoint writer is configured.
+	// The Agent commits this transaction immediately before the replayable
+	// checkpoint, then rolls it back if checkpoint persistence fails.
+	pendingLedger  *Ledger
+	previousLedger *Ledger
+}
+
+// PipelineRequest describes one canonical compaction decision. Runtime entry
+// points provide a trigger and usage/estimate; the service owns tier ordering,
+// re-estimation, summary escalation, and telemetry merging.
+type PipelineRequest struct {
+	Trigger          string
+	Usage            *llm.Usage
+	EstimatedTokens  int
+	AdditionalTokens int
+	TargetWatermark  string
+	AllowSummary     bool
+	ForceSummary     bool
 }
 
 var (
@@ -201,13 +233,21 @@ var (
 
 type summaryCapture struct {
 	start   int
+	end     int
 	content string
 }
 
 func ExtractSummary(text string) string {
+	return extractSummaryWithWarning(text, log.Printf)
+}
+
+func extractSummaryWithWarning(text string, warnf func(string, ...any)) string {
+	if warnf == nil {
+		warnf = func(string, ...any) {}
+	}
 	captures := collectSummaryCaptures(text)
 	if len(captures) == 0 {
-		log.Printf("compaction: summary extraction failed: missing <summary> or <compaction_summary> tags")
+		warnf("compaction: summary extraction failed: missing <summary> or <compaction_summary> tags")
 		return ""
 	}
 	last := captures[0]
@@ -218,7 +258,7 @@ func ExtractSummary(text string) string {
 	}
 	summary := stringsTrim(last.content)
 	if summary == "" {
-		log.Printf("compaction: summary extraction failed: empty summary block")
+		warnf("compaction: summary extraction failed: empty summary block")
 		return ""
 	}
 	return summary
@@ -239,6 +279,7 @@ func appendSummaryCaptures(dst []summaryCapture, text string, re *regexp.Regexp)
 		}
 		dst = append(dst, summaryCapture{
 			start:   idx[0],
+			end:     idx[1],
 			content: text[idx[2]:idx[3]],
 		})
 	}
@@ -267,6 +308,13 @@ func stringsTrim(s string) string {
 }
 
 func resolveSummaryPrompt(v any) SummaryPromptFunc {
+	return resolveSummaryPromptWithWarning(v, log.Printf)
+}
+
+func resolveSummaryPromptWithWarning(v any, warnf func(string, ...any)) SummaryPromptFunc {
+	if warnf == nil {
+		warnf = func(string, ...any) {}
+	}
 	fallback := func(string) string { return DefaultSummaryPrompt }
 	switch p := v.(type) {
 	case nil:
@@ -300,7 +348,7 @@ func resolveSummaryPrompt(v any) SummaryPromptFunc {
 			return prompt
 		}
 	default:
-		log.Printf("compaction: unsupported SummaryPrompt type %T; using default prompt", v)
+		warnf("compaction: unsupported SummaryPrompt type %T; using default prompt", v)
 		return fallback
 	}
 }

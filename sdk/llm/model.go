@@ -31,8 +31,17 @@ type StreamTextDeltaEvent struct{ Delta string }
 func (StreamTextDeltaEvent) isStreamEvent() {}
 
 // StreamThinkingDeltaEvent represents a thinking delta (provider-specific).
-// Callers may choose to ignore it for UI purposes.
-type StreamThinkingDeltaEvent struct{ Delta string }
+// Callers may choose to ignore it for UI purposes. Providers that require
+// signed thinking-block replay (Anthropic) also set Index/BlockType and emit
+// SignatureDelta or Data so the agent can preserve the exact structured block
+// in assistant history.
+type StreamThinkingDeltaEvent struct {
+	Delta          string
+	Index          int
+	BlockType      string
+	SignatureDelta string
+	Data           string
+}
 
 func (StreamThinkingDeltaEvent) isStreamEvent() {}
 
@@ -100,6 +109,14 @@ type InvokeRequest struct {
 
 	// Provider-specific knobs. Keep these minimal; wire more via concrete provider configs.
 	Temperature *float64
+
+	// DisableThinking asks the provider to suppress extended thinking / reasoning
+	// for this single call, even when the model is otherwise configured with a
+	// thinking budget. Providers that do not support extended thinking ignore it.
+	// The agent loop uses this for the require-done recovery invocation: some
+	// providers (Anthropic) forbid a forced tool_choice while extended thinking is
+	// enabled, so the one call that must force a tool has to run without thinking.
+	DisableThinking bool
 
 	// Responses options (OpenAI Responses API). Ignored by providers that don't use it.
 	Responses *ResponsesOptions

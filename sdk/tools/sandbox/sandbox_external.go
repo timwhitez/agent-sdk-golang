@@ -38,11 +38,12 @@ func externalDirectoryTool() tools.Tool {
 
 		conf := getConfirmer(deps, ctx)
 		meta := attachToolCallMeta(ctx, map[string]any{
-			"category":  "external_directory",
-			"summary":   fmt.Sprintf("Allow external path: %s", normalized),
-			"file_path": normalized,
-			"path":      normalized,
-			"raw":       normalized,
+			"category":      "external_directory",
+			"summary":       fmt.Sprintf("Allow external path: %s", normalized),
+			"file_path":     normalized,
+			"path":          normalized,
+			"raw":           normalized,
+			"force_confirm": true,
 		})
 		ok, err := conf.Confirm(ctx, "external_directory", buildConfirmDetail(meta))
 		if err != nil {

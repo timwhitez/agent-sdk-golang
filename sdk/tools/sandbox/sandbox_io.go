@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"syscall"
 )
 
 // ============================================================================
@@ -24,14 +25,19 @@ var writeFileBytes = func(f *os.File, data []byte) (int, error) {
 
 // writeFilePreserveMode writes data to path while preserving the existing file
 // mode (or using defaultMode if the file doesn't exist). Uses atomic write
-// with temp file and rename.
+// with temp file and rename. Ownership of an existing file is preserved on a
+// best-effort basis: rename does not inherit the previous owner, so the temp
+// file is chowned back before the swap when the process is privileged enough.
 func writeFilePreserveMode(path string, data []byte, defaultMode os.FileMode) error {
 	mode := defaultMode
+	preserveOwner := false
+	var ownerUID, ownerGID int
 	if info, err := os.Lstat(path); err == nil {
 		if info.Mode()&os.ModeSymlink != 0 {
 			return &SecurityError{Message: fmt.Sprintf("symlink target denied: %q", path)}
 		}
 		mode = info.Mode().Perm()
+		ownerUID, ownerGID, preserveOwner = fileOwnerIDs(info)
 	} else if !os.IsNotExist(err) {
 		return err
 	}
@@ -42,13 +48,11 @@ func writeFilePreserveMode(path string, data []byte, defaultMode os.FileMode) er
 	} else if err != nil && !os.IsNotExist(err) {
 		return err
 	}
-	if err := os.MkdirAll(dir, 0o755); err != nil {
+	if err := mkdirAllInheritMode(dir); err != nil {
 		return err
 	}
-	if dirFile, _, err := openFileNoFollow(dir); err != nil {
+	if err := ensureWriteDirNoFollow(dir); err != nil {
 		return err
-	} else {
-		_ = dirFile.Close()
 	}
 
 	tmp, err := writeFileTempFactory(dir, ".tmp-*")
@@ -59,6 +63,10 @@ func writeFilePreserveMode(path string, data []byte, defaultMode os.FileMode) er
 	cleanup := func() {
 		_ = tmp.Close()
 		_ = os.Remove(tmpName)
+	}
+	if err := ensureWriteDirNoFollow(dir); err != nil {
+		cleanup()
+		return err
 	}
 
 	n, err := writeFileBytes(tmp, data)
@@ -78,13 +86,88 @@ func writeFilePreserveMode(path string, data []byte, defaultMode os.FileMode) er
 		cleanup()
 		return err
 	}
+	if preserveOwner {
+		// Best-effort only: unprivileged processes cannot chown, and failing
+		// here would break writes that used to succeed. Keep the previous
+		// behaviour (owner becomes the current process) in that case.
+		_ = tmp.Chown(ownerUID, ownerGID)
+	}
 	if err := tmp.Close(); err != nil {
+		_ = os.Remove(tmpName)
+		return err
+	}
+	if err := ensureWriteDirNoFollow(dir); err != nil {
 		_ = os.Remove(tmpName)
 		return err
 	}
 	if err := os.Rename(tmpName, path); err != nil {
 		_ = os.Remove(tmpName)
 		return err
+	}
+	return nil
+}
+
+// ensureWriteDirNoFollow verifies dir is not a symlink and still refers to the
+// same directory that was stat'ed, closing the probe handle immediately.
+func ensureWriteDirNoFollow(dir string) error {
+	dirFile, _, err := openFileNoFollow(dir)
+	if err != nil {
+		return err
+	}
+	_ = dirFile.Close()
+	return nil
+}
+
+// mkdirAllInheritMode creates dir and any missing parents, giving each created
+// directory the permission bits of the nearest pre-existing ancestor instead of
+// a fixed 0755. This keeps new subtrees private when they live under a
+// restrictive directory (e.g. 0700).
+func mkdirAllInheritMode(dir string) error {
+	if info, err := os.Lstat(dir); err == nil {
+		if !info.IsDir() {
+			return &os.PathError{Op: "mkdir", Path: dir, Err: syscall.ENOTDIR}
+		}
+		return nil
+	} else if !os.IsNotExist(err) {
+		return err
+	}
+
+	// Walk up to the nearest existing ancestor, recording what must be created.
+	var missing []string
+	current := dir
+	var mode os.FileMode = 0o755
+	for {
+		info, err := os.Lstat(current)
+		if err == nil {
+			if !info.IsDir() {
+				return &os.PathError{Op: "mkdir", Path: current, Err: syscall.ENOTDIR}
+			}
+			mode = info.Mode().Perm()
+			break
+		}
+		if !os.IsNotExist(err) {
+			return err
+		}
+		missing = append(missing, current)
+		parent := filepath.Dir(current)
+		if parent == current {
+			break
+		}
+		current = parent
+	}
+
+	// Create from the outermost missing directory inward, chmod'ing explicitly
+	// so the inherited bits survive the process umask.
+	for i := len(missing) - 1; i >= 0; i-- {
+		if err := os.Mkdir(missing[i], mode); err != nil {
+			if os.IsExist(err) {
+				continue
+			}
+			return err
+		}
+		if err := os.Chmod(missing[i], mode); err != nil {
+			return err
+		}
 	}
 	return nil
 }

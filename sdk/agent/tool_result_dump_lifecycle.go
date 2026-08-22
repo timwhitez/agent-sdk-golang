@@ -85,11 +85,11 @@ func resolveToolResultDumpDir() (string, error) {
 func (a *Agent) initToolResultDumpLifecycle(now time.Time) {
 	dir, err := resolveToolResultDumpDir()
 	if err != nil {
-		log.Printf("warning: failed to initialize tool result dump lifecycle directory: %v", err)
+		a.warnf("warning: failed to initialize tool result dump lifecycle directory: %v", err)
 		return
 	}
-	if err := reclaimToolResultDumpOrphans(dir, now, a.toolResultDumpTTL); err != nil {
-		log.Printf("warning: failed to cleanup orphan tool result dumps: %v", err)
+	if err := reclaimToolResultDumpOrphansWithWarning(dir, now, a.toolResultDumpTTL, a.warnf); err != nil {
+		a.warnf("warning: failed to cleanup orphan tool result dumps: %v", err)
 	}
 
 	a.toolResultDumpsMu.Lock()
@@ -112,7 +112,7 @@ func (a *Agent) ensureToolResultDumpIndexLocked(now time.Time) {
 	if dir == "" {
 		resolved, err := resolveToolResultDumpDir()
 		if err != nil {
-			log.Printf("warning: failed to resolve tool result dump directory for index: %v", err)
+			a.warnf("warning: failed to resolve tool result dump directory for index: %v", err)
 			return
 		}
 		dir = resolved
@@ -144,7 +144,7 @@ func (a *Agent) registerToolResultDump(path string, now time.Time) toolResultDum
 	a.toolResultDumpsMu.Unlock()
 
 	if err := writeToolResultDumpIndex(indexPath, sessionID, snapshot, now); err != nil {
-		log.Printf("warning: failed to persist tool result dump index %q: %v", indexPath, err)
+		a.warnf("warning: failed to persist tool result dump index %q: %v", indexPath, err)
 	}
 	return entry
 }
@@ -157,7 +157,7 @@ func (a *Agent) cleanupToolResultDumps(now time.Time, removeAll bool) {
 		a.toolResultDumpsMu.Unlock()
 		if removeAll && strings.TrimSpace(indexPath) != "" {
 			if err := writeToolResultDumpIndex(indexPath, sessionID, nil, now); err != nil {
-				log.Printf("warning: failed to cleanup tool result dump index %q: %v", indexPath, err)
+				a.warnf("warning: failed to cleanup tool result dump index %q: %v", indexPath, err)
 			}
 		}
 		return
@@ -174,7 +174,7 @@ func (a *Agent) cleanupToolResultDumps(now time.Time, removeAll bool) {
 	for _, path := range candidates {
 		err := os.Remove(path)
 		if err != nil && !errors.Is(err, os.ErrNotExist) {
-			log.Printf("warning: failed to cleanup tool result dump %q: %v", path, err)
+			a.warnf("warning: failed to cleanup tool result dump %q: %v", path, err)
 			continue
 		}
 		a.toolResultDumpsMu.Lock()
@@ -193,7 +193,7 @@ func (a *Agent) cleanupToolResultDumps(now time.Time, removeAll bool) {
 	sessionID = a.toolResultDumpID
 	a.toolResultDumpsMu.Unlock()
 	if err := writeToolResultDumpIndex(indexPath, sessionID, snapshot, now); err != nil {
-		log.Printf("warning: failed to update tool result dump index %q: %v", indexPath, err)
+		a.warnf("warning: failed to update tool result dump index %q: %v", indexPath, err)
 	}
 }
 
@@ -209,38 +209,45 @@ func cloneToolResultDumpEntries(src map[string]toolResultDumpLifecycleEntry) map
 }
 
 func reclaimToolResultDumpOrphans(dir string, now time.Time, ttl time.Duration) error {
+	return reclaimToolResultDumpOrphansWithWarning(dir, now, ttl, log.Printf)
+}
+
+func reclaimToolResultDumpOrphansWithWarning(dir string, now time.Time, ttl time.Duration, warnf func(string, ...any)) error {
+	if warnf == nil {
+		warnf = func(string, ...any) {}
+	}
 	scanResult, err := scanToolResultDumpPaths(dir, toolResultDumpOrphanScanCap, toolResultDumpOrphanScanBatch)
 	if err != nil {
 		return fmt.Errorf("scan dump directory: %w", err)
 	}
 	if scanResult.scanTruncated {
-		log.Printf("warning: %s", toolResultDumpScanCapWarning(scanResult.scannedEntries, scanResult.scanCap))
+		warnf("warning: %s", toolResultDumpScanCapWarning(scanResult.scannedEntries, scanResult.scanCap))
 	}
 	indexPaths := scanResult.indexPaths
 	tracked := make(map[string]struct{})
 	for _, indexPath := range indexPaths {
-		sessionID, kept, changed, err := pruneToolResultDumpIndex(indexPath, now, ttl)
+		sessionID, kept, changed, err := pruneToolResultDumpIndexWithWarning(indexPath, now, ttl, warnf)
 		if err != nil {
 			var oversizedErr *toolResultDumpIndexTooLargeError
 			if errors.As(err, &oversizedErr) {
-				log.Printf("warning: %v", err)
+				warnf("warning: %v", err)
 				if rmErr := os.Remove(indexPath); rmErr != nil && !errors.Is(rmErr, os.ErrNotExist) {
-					log.Printf("warning: failed to remove oversized tool result dump index %q: %v", indexPath, rmErr)
+					warnf("warning: failed to remove oversized tool result dump index %q: %v", indexPath, rmErr)
 				}
 				continue
 			}
-			log.Printf("warning: failed to read tool result dump index %q: %v", indexPath, err)
+			warnf("warning: failed to read tool result dump index %q: %v", indexPath, err)
 			continue
 		}
 		if len(kept) == 0 {
 			if err := os.Remove(indexPath); err != nil && !errors.Is(err, os.ErrNotExist) {
-				log.Printf("warning: failed to cleanup empty tool result dump index %q: %v", indexPath, err)
+				warnf("warning: failed to cleanup empty tool result dump index %q: %v", indexPath, err)
 			}
 			continue
 		}
 		if changed {
 			if err := writeToolResultDumpIndex(indexPath, sessionID, kept, now); err != nil {
-				log.Printf("warning: failed to compact tool result dump index %q: %v", indexPath, err)
+				warnf("warning: failed to compact tool result dump index %q: %v", indexPath, err)
 			}
 		}
 		for path := range kept {
@@ -258,14 +265,14 @@ func reclaimToolResultDumpOrphans(dir string, now time.Time, ttl time.Duration) 
 			if errors.Is(err, os.ErrNotExist) {
 				continue
 			}
-			log.Printf("warning: failed to inspect orphan tool result dump %q: %v", path, err)
+			warnf("warning: failed to inspect orphan tool result dump %q: %v", path, err)
 			continue
 		}
 		if !expired {
 			continue
 		}
 		if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
-			log.Printf("warning: failed to cleanup orphan tool result dump %q: %v", path, err)
+			warnf("warning: failed to cleanup orphan tool result dump %q: %v", path, err)
 		}
 	}
 	return nil
@@ -336,6 +343,13 @@ func toolResultDumpScanCapWarning(scannedEntries, scanCap int) string {
 }
 
 func pruneToolResultDumpIndex(indexPath string, now time.Time, ttl time.Duration) (string, map[string]toolResultDumpLifecycleEntry, bool, error) {
+	return pruneToolResultDumpIndexWithWarning(indexPath, now, ttl, log.Printf)
+}
+
+func pruneToolResultDumpIndexWithWarning(indexPath string, now time.Time, ttl time.Duration, warnf func(string, ...any)) (string, map[string]toolResultDumpLifecycleEntry, bool, error) {
+	if warnf == nil {
+		warnf = func(string, ...any) {}
+	}
 	idx, err := readToolResultDumpIndex(indexPath)
 	if err != nil {
 		return "", nil, false, err
@@ -356,7 +370,7 @@ func pruneToolResultDumpIndex(indexPath string, now time.Time, ttl time.Duration
 					changed = true
 					continue
 				}
-				log.Printf("warning: failed to derive lifecycle for tool result dump %q: %v", path, derr)
+				warnf("warning: failed to derive lifecycle for tool result dump %q: %v", path, derr)
 				changed = true
 				continue
 			}
@@ -365,7 +379,7 @@ func pruneToolResultDumpIndex(indexPath string, now time.Time, ttl time.Duration
 		}
 		if !entry.ExpiresAt.After(now) {
 			if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
-				log.Printf("warning: failed to cleanup expired tool result dump %q: %v", path, err)
+				warnf("warning: failed to cleanup expired tool result dump %q: %v", path, err)
 				// Keep the entry in the index for retry in the next cleanup cycle
 				kept[path] = entry
 			} else {
@@ -379,7 +393,7 @@ func pruneToolResultDumpIndex(indexPath string, now time.Time, ttl time.Duration
 				changed = true
 				continue
 			}
-			log.Printf("warning: failed to stat indexed tool result dump %q: %v", path, err)
+			warnf("warning: failed to stat indexed tool result dump %q: %v", path, err)
 		}
 		kept[path] = entry
 	}

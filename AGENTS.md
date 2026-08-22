@@ -21,13 +21,45 @@ and progressive disclosure through `agent_docs/`.
 ### Runtime Capabilities
 - Boundary-aware steering before LLM calls and after each tool call (`sdk/agent/agent.go:226`, `sdk/agent/agent.go:448`, `sdk/agent/agent.go:959`)
 - Stream delta aggregation into a unified `Completion`, with response metadata propagated into `Completion.ResponseID` and surfaced on `UsageEvent` / `AutoContinueEvent` / `FinalResponseEvent` for downstream UI/aggregators (`sdk/agent/agent.go:255`, `sdk/agent/agent.go:285`, `sdk/agent/agent.go:348`, `sdk/agent/agent.go:646`)
+- Versioned prompt-usage normalization (`total_input_v1`) keeps cache/image counters as breakdowns, preserves raw provider zeroes, and falls back to one SDK history estimate plus a deduplicated warning when compatible gateways omit prompt tokens (`sdk/llm/usage.go`, `sdk/agent/agent.go`).
+- Versioned accounting projection emits one bounded, allowlisted
+  `AccountingEvent` after each delivered tool-result, usage, and compaction
+  event. The SDK payload contains surface-neutral measurements/dispositions but
+  no session, path, raw result, command, or arbitrary metadata; hosts add
+  identity, persistence, rollup, and reporting (`sdk/accounting`,
+  `sdk/agent/events.go`).
 - Auto-continue on `max_tokens` (including partial tool-call merge) now emits metadata-only `AutoContinueEvent` instead of text markers (`sdk/agent/agent.go:259`, `sdk/agent/agent.go:275`, `sdk/agent/agent.go:298`, `sdk/agent/events.go:113`)
 - Tool resolution via exact + normalized + alias matching (`sdk/agent/tool_resolve.go:107`, `sdk/agent/tool_resolve.go:30`)
 - Argument normalization with conservative loose-object repair + schema-key retry, including schema-derived single-string wrapping for custom tools and tool-specific alias handling for ambiguous keys like `line`/`offset` (`sdk/tools/args_normalize.go:21`, `sdk/tools/args_normalize.go:247`, `sdk/tools/tool.go:363`)
 - Empty tool results are surfaced as a warning content block (instead of silent no-op) (`sdk/tools/tool.go:77`)
-- Configurable tool-result truncation caps oversized tool output before storing history / emitting events, and writes the full pre-truncation payload to a temp file surfaced via metadata (`outputPath` / `result_output_path`) (`sdk/agent/agent.go:31`, `sdk/agent/agent.go:461`)
+- Configurable byte/token tool-result budgets recognize canonical
+  `sdk/artifact` envelopes, preserve fixed recovery fields while shrinking only
+  preview text, and can persist oversized plain results through a host-injected
+  dynamic owner provider (or static owner), sink, and registered resolver
+  capability. A plain result carrying the reserved ordered
+  `artifact_manifests` source metadata is persisted even below the ordinary
+  size threshold, with `tool_serialize_v1` lineage to those validated source
+  refs; the sink must preserve that lineage. The provider is resolved once per
+  canonical validation/write so session-switching Agents do not reuse stale
+  owners. Missing or failed host capability
+  returns a bounded `complete=false` / `recoverable=false` diagnostic without a
+  fabricated ref; the older temp dump remains metadata-only legacy
+  compatibility (`sdk/agent/tool_result_artifact.go`, `sdk/agent/agent.go`).
+- `execrunner` can stream stdout/stderr into separate host-owned canonical raw
+  objects through `artifact.StreamSink`; each committed manifest is checked
+  against collector bytes/hash/owner/recovery. Canonical mode keeps one bounded
+  combined UTF-8 preview and disables the anonymous combined temp duplicate;
+  begin/write/commit/manifest failures stay non-fatal to the process result and
+  surface structured stage/action diagnostics
+  (`sdk/tools/execrunner/canonical_stream.go`).
 - Ephemeral tool-output pruning before each model invocation (`sdk/tools/tool.go:18`, `sdk/agent/agent.go:229`, `sdk/agent/agent.go:790`)
-- Context compaction now uses cached enable/disable fast-path checks, async background compaction with next-turn atomic apply, hard overflow detection (`context_window - reserve_output_tokens`) alongside ratio thresholds, deduplicated system-message preservation (including compacted payloads), timeout/retry safeguards, model-aware summary prompts, strict summary extraction from the last `<summary>`/`<compaction_summary>` block, and rune-length-gated tool-context snapshots (`sdk/agent/agent.go:50`, `sdk/agent/agent.go:818`, `sdk/agent/agent.go:689`, `sdk/agent/agent.go:737`, `sdk/agent/compaction/service.go:99`, `sdk/agent/compaction/service.go:131`, `sdk/agent/compaction/models.go:108`, `sdk/agent/compaction/models.go:192`, `sdk/agent/compaction/service.go:259`)
+- Per-query evidence-progress recovery for deterministic `read`/`grep`/`list`
+  families suppresses already-covered evidence without caching side-effecting
+  tools. `read` and `read_file` share coverage while line and absolute-byte
+  ranges use separate units; mixed tool-call batches remain intact, and
+  compaction or target-state changes allow revalidation
+  (`sdk/agent/evidence_progress.go`, `sdk/agent/agent.go`).
+- Context compaction now uses cached enable/disable fast-path checks, async background compaction with next-turn atomic apply, hard overflow detection (`context_window - reserve_output_tokens`) alongside ratio thresholds, idempotent artifact-backed local reducers, comparable same-estimator before/after telemetry with provider usage kept separately, deduplicated system-message preservation (including compacted payloads), timeout/retry safeguards, model-aware summary prompts, strict summary extraction from the last `<summary>`/`<compaction_summary>` block, and rune-length-gated tool-context snapshots. When the Agent has a canonical host binding, local reducers resolve and revalidate complete owner-bound objects, persist plain source bytes once, store cloned manifests in the ledger, and reuse the same ref across prune/checkpoint cycles; embedders with only `ToolArtifactWriter` retain legacy path behavior (`sdk/agent/agent.go`, `sdk/agent/compaction/local_reduce.go`, `sdk/agent/compaction/canonical_artifact.go`, `sdk/agent/compaction/pipeline.go`, `sdk/agent/compaction/service.go`)
 - Provider compatibility downgrades for OpenAI/Anthropic variants; OpenAI Chat emits `parallel_tool_calls` only when enabled, uses stricter numeric `/api/vN` endpoint detection, and Anthropic logs original+normalized tool IDs when ID sanitization occurs (`sdk/llm/openai/chat.go:119`, `sdk/llm/openai/chat.go:445`, `sdk/llm/openai/chat.go:783`, `sdk/llm/openai/responses.go:126`, `sdk/llm/anthropic/client.go:120`, `sdk/llm/anthropic/client.go:521`)
 - Streaming guardrails preserve Anthropic whitespace thinking deltas, buffer malformed SSE splits, include provider/model/url context on OpenAI decode errors, and use crypto-randomized Anthropic backoff jitter (`sdk/llm/anthropic/client.go:724`, `sdk/llm/anthropic/client.go:757`, `sdk/llm/anthropic/client.go:220`, `sdk/llm/openai/chat.go:296`)
 - Sandbox safety with explicit confirmation gates (`sdk/tools/sandbox/sandbox.go:116`, `sdk/tools/sandbox/sandbox.go:306`); webfetch surfaces mid-stream response-body read failures (`sdk/tools/sandbox/sandbox.go:482`), `ls`/`grep` now reject malformed glob filters with explicit tool-scoped errors, glob surfaces matched-path `stat` failures via warnings/metadata, and grep reports non-permission open/read/seek/walk scan failures as warnings instead of silently skipping files (`sdk/tools/sandbox/sandbox.go:508`, `sdk/tools/sandbox/sandbox.go:1762`, `sdk/tools/sandbox/sandbox.go:1905`, `sdk/tools/sandbox/sandbox.go:1914`, `sdk/tools/sandbox/sandbox.go:1940`, `sdk/tools/sandbox/sandbox.go:2100`)
@@ -36,6 +68,7 @@ and progressive disclosure through `agent_docs/`.
 ### Project Structure (Core)
 ```
 sdk/agent/           Agent loop, events, steering, tool execution, compaction integration
+sdk/accounting/      Runtime-neutral bounded accounting schema and projectors
 sdk/llm/             Provider interfaces, types, and provider clients
 sdk/tools/           Tool definitions, arg normalization, schema helpers, sandbox tools
 sdk/tokens/          Optional token pricing and cost utilities

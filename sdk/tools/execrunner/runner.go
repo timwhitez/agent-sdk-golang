@@ -11,12 +11,26 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode/utf8"
+
+	"github.com/timwhitez/agent-sdk-golang/sdk/artifact"
 )
 
 const (
 	DefaultMaxOutputBytes = 100 * 1024
 	DefaultKillGrace      = 250 * time.Millisecond
+	// DefaultKillWaitGrace bounds how long Run waits for cmd.Wait to return
+	// after SIGKILL. Processes that escaped the group (setsid/daemons) can keep
+	// inherited output descriptors open indefinitely, so waiting is best-effort.
+	DefaultKillWaitGrace = 5 * time.Second
+	// invalidUTF8PreviewReplacement marks bytes that cannot be decoded in the
+	// bounded preview. The byte-exact artifact is unaffected.
+	invalidUTF8PreviewReplacement = "�"
 )
+
+// ErrProcessKillTimeout reports that the process group was killed but at least
+// one process did not reap within the kill wait grace, so Run stopped waiting.
+var ErrProcessKillTimeout = errors.New("execrunner: process did not exit after kill; abandoning wait")
 
 // Options controls command execution behavior.
 type Options struct {
@@ -28,27 +42,44 @@ type Options struct {
 	MaxOutputBytes int
 	ArtifactPrefix string
 	ArtifactDir    string
-	KillGrace      time.Duration
-	OnOutputChunk  func(OutputChunk)
+	// ArtifactOwner, ArtifactStreamSink, and ArtifactResolverCapability enable
+	// canonical, separately-owned stdout/stderr objects. ArtifactDir/Prefix are
+	// retained only for the legacy combined-path fallback.
+	ArtifactOwner              artifact.Owner
+	ArtifactStreamSink         artifact.StreamSink
+	ArtifactResolverCapability artifact.ResolverCapability
+	KillGrace                  time.Duration
+	// KillWaitGrace bounds the post-SIGKILL wait for the process to be reaped.
+	// Defaults to DefaultKillWaitGrace.
+	KillWaitGrace time.Duration
+	OnOutputChunk func(OutputChunk)
 }
 
 // Result captures execution outcome and output accounting.
 type Result struct {
-	Output            string
-	OutputBytes       int64
-	CapturedBytes     int
-	ExitCode          int
-	TimedOut          bool
-	OutputTruncated   bool
-	OutputPath        string
-	ArtifactBytes     int64
-	OutputArtifactErr string
+	Output        string
+	OutputBytes   int64
+	CapturedBytes int
+	ExitCode      int
+	TimedOut      bool
+	// KillProcessTimedOut reports that the process group was killed but the
+	// process was not reaped within KillWaitGrace, so Run abandoned the wait.
+	KillProcessTimedOut bool
+	OutputTruncated     bool
+	OutputPath          string
+	ArtifactBytes       int64
+	OutputArtifactErr   string
+	// OutputArtifacts contains only complete, validated canonical raw-stream
+	// manifests. Failed streams are represented in OutputArtifactDiagnostics.
+	OutputArtifacts           []artifact.Manifest
+	OutputArtifactDiagnostics []artifact.Diagnostic
 }
 
 // OutputChunk is emitted for each captured stdout/stderr write.
 type OutputChunk struct {
 	Data       []byte
 	TotalBytes int64
+	Stream     string
 }
 
 func Run(ctx context.Context, opts Options) (Result, error) {
@@ -64,6 +95,9 @@ func Run(ctx context.Context, opts Options) (Result, error) {
 	}
 	if opts.KillGrace == 0 {
 		opts.KillGrace = DefaultKillGrace
+	}
+	if opts.KillWaitGrace <= 0 {
+		opts.KillWaitGrace = DefaultKillWaitGrace
 	}
 
 	runCtx := ctx
@@ -81,8 +115,12 @@ func Run(ctx context.Context, opts Options) (Result, error) {
 	configureProcessGroup(cmd)
 
 	collector := newOutputCollector(opts.MaxOutputBytes, opts.ArtifactDir, opts.ArtifactPrefix, opts.OnOutputChunk)
-	cmd.Stdout = collector
-	cmd.Stderr = collector
+	canonical := newCanonicalProcessStreams(context.WithoutCancel(ctx), opts)
+	if canonical.requested {
+		collector.disableLegacyArtifact()
+	}
+	cmd.Stdout = processStreamWriter{stream: "stdout", combined: collector, canonical: canonical.stdout}
+	cmd.Stderr = processStreamWriter{stream: "stderr", combined: collector, canonical: canonical.stderr}
 
 	if err := cmd.Start(); err != nil {
 		collector.Close()
@@ -96,6 +134,7 @@ func Run(ctx context.Context, opts Options) (Result, error) {
 
 	var waitErr error
 	var rawWaitErr error
+	killWaitTimedOut := false
 	select {
 	case rawWaitErr = <-waitCh:
 		waitErr = rawWaitErr
@@ -103,20 +142,33 @@ func Run(ctx context.Context, opts Options) (Result, error) {
 		res.TimedOut = errors.Is(runCtx.Err(), context.DeadlineExceeded)
 		_ = signalProcessGroupTerminate(cmd.Process)
 
+		reaped := false
 		if opts.KillGrace > 0 {
 			timer := time.NewTimer(opts.KillGrace)
 			select {
 			case rawWaitErr = <-waitCh:
+				reaped = true
 				if !timer.Stop() {
 					<-timer.C
 				}
 			case <-timer.C:
-				_ = signalProcessGroupKill(cmd.Process)
-				rawWaitErr = <-waitCh
 			}
-		} else {
+		}
+		if !reaped {
 			_ = signalProcessGroupKill(cmd.Process)
-			rawWaitErr = <-waitCh
+			// SIGKILL cannot reach processes that escaped the group (setsid,
+			// daemons), and such a process can hold the inherited output
+			// descriptors open, which keeps cmd.Wait blocked forever. Bound the
+			// post-kill wait so the caller always gets a result.
+			killTimer := time.NewTimer(opts.KillWaitGrace)
+			select {
+			case rawWaitErr = <-waitCh:
+				if !killTimer.Stop() {
+					<-killTimer.C
+				}
+			case <-killTimer.C:
+				killWaitTimedOut = true
+			}
 		}
 
 		if res.TimedOut {
@@ -126,7 +178,20 @@ func Run(ctx context.Context, opts Options) (Result, error) {
 		}
 	}
 
-	collector.Close()
+	if killWaitTimedOut {
+		// cmd.Wait never returned, so the wait goroutine still owns the stream
+		// writers and the legacy artifact file must stay open for any straggler
+		// writes. Hand the close off so the descriptor is released whenever the
+		// straggler finally exits, instead of blocking this call.
+		res.KillProcessTimedOut = true
+		go func() {
+			<-waitCh
+			collector.Close()
+		}()
+	} else {
+		collector.Close()
+	}
+	canonical.finish(context.WithoutCancel(ctx))
 	snap := collector.snapshot()
 	res.Output = snap.preview
 	res.OutputBytes = snap.totalBytes
@@ -135,7 +200,25 @@ func Run(ctx context.Context, opts Options) (Result, error) {
 	res.OutputPath = snap.outputPath
 	res.ArtifactBytes = snap.artifactBytes
 	res.OutputArtifactErr = snap.artifactErr
+	res.OutputArtifacts = canonical.manifests()
+	res.OutputArtifactDiagnostics = canonical.diagnostics()
+	if canonicalBytes := canonical.artifactBytes(); canonicalBytes > 0 {
+		res.ArtifactBytes = canonicalBytes
+	}
+	if diagnostics := formatArtifactDiagnostics(res.OutputArtifactDiagnostics); diagnostics != "" {
+		if strings.TrimSpace(res.OutputArtifactErr) == "" {
+			res.OutputArtifactErr = diagnostics
+		} else {
+			res.OutputArtifactErr = strings.TrimSpace(res.OutputArtifactErr) + "; " + diagnostics
+		}
+	}
 	res.ExitCode = exitCodeFromError(rawWaitErr)
+	if killWaitTimedOut {
+		// cmd.Wait never returned, so rawWaitErr is nil and must not be read as
+		// a clean exit.
+		res.ExitCode = -1
+		waitErr = fmt.Errorf("%w after %s: %w", ErrProcessKillTimeout, opts.KillWaitGrace, waitErr)
+	}
 
 	if waitErr != nil {
 		return res, waitErr
@@ -170,7 +253,8 @@ type outputSnapshot struct {
 }
 
 type outputCollector struct {
-	mu sync.Mutex
+	mu         sync.Mutex
+	callbackMu sync.Mutex
 
 	limit int
 	onOut func(OutputChunk)
@@ -178,14 +262,15 @@ type outputCollector struct {
 	preview bytes.Buffer
 	total   int64
 
-	artifactDir    string
-	artifactPrefix string
-	artifact       *os.File
-	artifactPath   string
-	artifactBytes  int64
-	artifactErr    string
-	primed         bool
-	truncated      bool
+	artifactDir     string
+	artifactPrefix  string
+	artifact        *os.File
+	artifactPath    string
+	artifactBytes   int64
+	artifactErr     string
+	primed          bool
+	truncated       bool
+	disableArtifact bool
 }
 
 func newOutputCollector(limit int, artifactDir, artifactPrefix string, onOut func(OutputChunk)) *outputCollector {
@@ -201,6 +286,10 @@ func newOutputCollector(limit int, artifactDir, artifactPrefix string, onOut fun
 }
 
 func (c *outputCollector) Write(p []byte) (int, error) {
+	return c.writeStream("combined", p)
+}
+
+func (c *outputCollector) writeStream(stream string, p []byte) (int, error) {
 	chunk := append([]byte(nil), p...)
 	c.mu.Lock()
 
@@ -224,30 +313,39 @@ func (c *outputCollector) Write(p []byte) (int, error) {
 
 	if len(p) > 0 {
 		c.truncated = true
-		if err := c.ensureArtifactLocked(); err != nil {
+		if c.disableArtifact {
+			// Canonical stdout/stderr sinks own complete bytes in this mode. The
+			// legacy anonymous combined temp file would be a duplicate object.
+		} else if err := c.ensureArtifactLocked(); err != nil {
 			if c.artifactErr == "" {
 				c.artifactErr = err.Error()
 			}
 		} else if c.artifact != nil {
-			written, err := c.artifact.Write(p)
+			written, err := writeArtifactChunk(c.artifact, p)
 			c.artifactBytes += int64(written)
 			if err != nil && c.artifactErr == "" {
 				c.artifactErr = err.Error()
-			}
-			if err == nil && written < len(p) && c.artifactErr == "" {
-				c.artifactErr = io.ErrShortWrite.Error()
 			}
 		}
 	}
 	callback := c.onOut
 	c.mu.Unlock()
 	if callback != nil {
+		c.callbackMu.Lock()
 		callback(OutputChunk{
 			Data:       chunk,
 			TotalBytes: totalBytes,
+			Stream:     stream,
 		})
+		c.callbackMu.Unlock()
 	}
 	return n, nil
+}
+
+func (c *outputCollector) disableLegacyArtifact() {
+	c.mu.Lock()
+	c.disableArtifact = true
+	c.mu.Unlock()
 }
 
 func (c *outputCollector) Close() {
@@ -268,7 +366,7 @@ func (c *outputCollector) snapshot() outputSnapshot {
 
 	truncated := c.truncated || c.total > int64(c.preview.Len())
 	return outputSnapshot{
-		preview:       c.preview.String(),
+		preview:       boundedUTF8Preview(c.preview.Bytes(), c.limit),
 		totalBytes:    c.total,
 		truncated:     truncated,
 		outputPath:    c.artifactPath,
@@ -300,13 +398,49 @@ func (c *outputCollector) ensureArtifactLocked() error {
 	if c.preview.Len() == 0 {
 		return nil
 	}
-	written, werr := c.artifact.Write(c.preview.Bytes())
+	written, werr := writeArtifactChunk(c.artifact, c.preview.Bytes())
 	c.artifactBytes += int64(written)
 	if werr != nil {
 		return werr
 	}
-	if written < c.preview.Len() {
-		return io.ErrShortWrite
-	}
 	return nil
+}
+
+func writeArtifactChunk(w io.Writer, p []byte) (int, error) {
+	written, err := w.Write(p)
+	if err == nil && written < len(p) {
+		err = io.ErrShortWrite
+	}
+	return written, err
+}
+
+func boundedUTF8Preview(raw []byte, limit int) string {
+	if limit <= 0 || len(raw) == 0 {
+		return ""
+	}
+	// Command streams are byte-oriented and a cap may split a multi-byte rune.
+	// The artifact remains byte-exact; the preview marks undecodable bytes with
+	// U+FFFD instead of deleting them, then backs off to a rune boundary so it is
+	// always bounded, valid UTF-8 without silently swallowing characters.
+	return truncateAtRuneBoundary(
+		strings.ToValidUTF8(string(raw), invalidUTF8PreviewReplacement),
+		limit,
+	)
+}
+
+// truncateAtRuneBoundary caps text at maxBytes without splitting a multi-byte
+// rune. text is expected to be valid UTF-8, so the backoff is bounded by
+// utf8.UTFMax-1 bytes.
+func truncateAtRuneBoundary(text string, maxBytes int) string {
+	if maxBytes <= 0 {
+		return ""
+	}
+	if len(text) <= maxBytes {
+		return text
+	}
+	cut := maxBytes
+	for cut > 0 && !utf8.RuneStart(text[cut]) {
+		cut--
+	}
+	return text[:cut]
 }
