@@ -18,11 +18,12 @@ jobs:
         with:
           go-version-file: go.mod
       - run: python3 .github/fixes/issue-11.py
-      - run: rm -f .github/fixes/issue-11.py .github/workflows/apply-issue-11.yml
-      - run: gofmt -w sdk/agent/compaction/service.go sdk/agent/compaction/untrusted_framing_test.go
+      - run: python3 .github/fixes/issue-11-compat.py
+      - run: rm -f .github/fixes/issue-11.py .github/fixes/issue-11-compat.py .github/workflows/apply-issue-11.yml
+      - run: gofmt -w sdk/agent/compaction/service.go sdk/agent/compaction/service_test.go sdk/agent/compaction/untrusted_framing_test.go
       - run: git diff --check
       - name: Targeted tests
-        run: go test ./sdk/agent/compaction -run 'TestWrapUntrustedMaterialPreventsDelimiterInjection|TestCompactionInstructionsDefineJSONWholeLineFraming' -count=1
+        run: go test ./sdk/agent/compaction -run 'TestWrapUntrustedMaterialPreventsDelimiterInjection|TestCompactionInstructionsDefineJSONWholeLineFraming|TestCompactionPromptTreatsMaterialAsUntrustedData|TestCompactionMaterialUsesTokenBudget' -count=1
       - name: Full compaction tests
         run: go test ./sdk/agent/compaction -count=1
       - name: Full test suite
