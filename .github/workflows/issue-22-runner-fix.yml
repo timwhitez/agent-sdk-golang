@@ -79,19 +79,59 @@ jobs:
           bash /tmp/issue-22-step-1.sh
           python3 - <<'PY'
           from pathlib import Path
-          path = Path('sdk/agent/agent_turn_concurrency_test.go')
-          source = path.read_text(encoding='utf-8')
+
+          agent_path = Path('sdk/agent/agent.go')
+          agent_source = agent_path.read_text(encoding='utf-8')
+          old = '''\tif !a.turnActive.CompareAndSwap(false, true) {
+\t\tgo func() {
+\t\t\tdefer close(out)
+\t\t\ta.emitEvent(out, ErrorEvent{Kind: "agent_busy", Message: ErrAgentBusy.Error()})
+\t\t}()
+\t\treturn out
+\t}
+\tunregisterTurn := a.registerTurnCancellation(out, ctx)
+\tgo func() {
+\t\t// Release admission only after cancellation bookkeeping is removed and
+\t\t// the previous event stream is closed.
+\t\tdefer a.turnActive.Store(false)
+\t\tdefer close(out)
+\t\tdefer unregisterTurn()
+'''
+          new = '''\tif !a.turnActive.CompareAndSwap(false, true) {
+\t\t// Admission is decided synchronously and the channel is always buffered,
+\t\t// so publish the deterministic busy result before returning. This avoids
+\t\t// a scheduling race where callers receive a channel before its rejection.
+\t\tout <- ErrorEvent{Kind: "agent_busy", Message: ErrAgentBusy.Error()}
+\t\tclose(out)
+\t\treturn out
+\t}
+\tunregisterTurn := a.registerTurnCancellation(out, ctx)
+\tgo func() {
+\t\t// LIFO defer order removes cancellation bookkeeping, releases admission,
+\t\t// then closes the stream. Observing stream closure therefore guarantees
+\t\t// that a subsequent turn can be admitted.
+\t\tdefer close(out)
+\t\tdefer a.turnActive.Store(false)
+\t\tdefer unregisterTurn()
+'''
+          if agent_source.count(old) != 1:
+              raise SystemExit('unexpected generated turn-admission block')
+          agent_path.write_text(agent_source.replace(old, new, 1), encoding='utf-8')
+
+          test_path = Path('sdk/agent/agent_turn_concurrency_test.go')
+          test_source = test_path.read_text(encoding='utf-8')
           candidates = [
               'streams := make(chan <-chan Event, callers)',
               'streams := make(chan<- chan Event, callers)',
+              'streams := make(chan (<-chan Event), callers)',
           ]
-          matches = [candidate for candidate in candidates if source.count(candidate) == 1]
+          matches = [candidate for candidate in candidates if test_source.count(candidate) == 1]
           if len(matches) != 1:
               raise SystemExit(f'unexpected concurrent stream channel declaration: matches={matches!r}')
-          source = source.replace(matches[0], 'streams := make(chan (<-chan Event), callers)', 1)
-          path.write_text(source, encoding='utf-8')
+          test_source = test_source.replace(matches[0], 'streams := make(chan (<-chan Event), callers)', 1)
+          test_path.write_text(test_source, encoding='utf-8')
           PY
-          gofmt -w sdk/agent/agent_turn_concurrency_test.go
+          gofmt -w sdk/agent/agent.go sdk/agent/agent_turn_concurrency_test.go
           bash /tmp/issue-22-step-2.sh
           bash /tmp/issue-22-step-3.sh
           bash /tmp/issue-22-step-4.sh
