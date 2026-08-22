@@ -476,6 +476,15 @@ func (p *patchPlanner) planMove(fromRel, toRel string) error {
 	} else if err != nil && !os.IsNotExist(err) {
 		return err
 	}
+	if staged, ok := p.staged[toVP.resolved]; ok {
+		if !staged.deleted {
+			return fmt.Errorf("cannot move %s to %s: destination already exists in this patch", fromRel, toRel)
+		}
+	} else if _, err := os.Lstat(toPath); err == nil {
+		return fmt.Errorf("cannot move %s to %s: destination already exists", fromRel, toRel)
+	} else if !os.IsNotExist(err) {
+		return err
+	}
 	if staged, ok := p.staged[fromVP.resolved]; ok && !staged.deleted {
 		p.stage(toVP.resolved, &stagedFile{content: staged.content})
 		p.stage(fromVP.resolved, &stagedFile{deleted: true})
@@ -582,6 +591,14 @@ func (p *patchPlanner) commitAction(a patchAction) error {
 		if info, err := os.Lstat(toDir); err == nil && info.Mode()&os.ModeSymlink != 0 {
 			return &SecurityError{Message: fmt.Sprintf("symlink target denied: %q", toDir)}
 		} else if err != nil && !os.IsNotExist(err) {
+			return err
+		}
+		// os.Rename replaces an existing regular file on Unix. Re-check the
+		// destination immediately before commit so both pre-existing files and
+		// files created after planning fail closed on every platform.
+		if _, err := os.Lstat(toPath); err == nil {
+			return fmt.Errorf("cannot move %s to %s: destination already exists", a.relPath, a.moveTo)
+		} else if !os.IsNotExist(err) {
 			return err
 		}
 		if err := os.MkdirAll(toDir, 0o755); err != nil {
