@@ -77,6 +77,17 @@ jobs:
           PY
 
           bash /tmp/issue-22-step-1.sh
+          python3 - <<'PY'
+          from pathlib import Path
+          path = Path('sdk/agent/agent_turn_concurrency_test.go')
+          source = path.read_text(encoding='utf-8')
+          old = 'streams := make(chan <-chan Event, callers)'
+          new = 'streams := make(chan (<-chan Event), callers)'
+          if source.count(old) != 1:
+              raise SystemExit('unexpected concurrent stream channel declaration')
+          path.write_text(source.replace(old, new, 1), encoding='utf-8')
+          PY
+          gofmt -w sdk/agent/agent_turn_concurrency_test.go
           bash /tmp/issue-22-step-2.sh
           bash /tmp/issue-22-step-3.sh
           bash /tmp/issue-22-step-4.sh
