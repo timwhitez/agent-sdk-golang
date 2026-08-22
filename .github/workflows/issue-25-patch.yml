@@ -117,13 +117,12 @@ jobs:
         working-directory: repo
         run: go test ./... -count=1
 
-      - name: Commit validated fix and remove temporary workflow
+      - name: Commit validated source fix
         working-directory: repo
         run: |
           set -euo pipefail
-          rm .github/workflows/issue-25-patch.yml
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add -A
+          git add sdk/llm/openai/chat.go sdk/llm/openai/strict_schema_determinism_test.go
           git commit -m "fix(openai): canonicalize strict schema required order"
-          git push origin HEAD:"$TARGET_BRANCH"
+          git push origin HEAD:fix/issue-25-strict-schema-order
