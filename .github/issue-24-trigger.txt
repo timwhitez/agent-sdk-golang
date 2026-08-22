@@ -1,1 +1,0 @@
-Retrigger the final issue #24 validation after correcting the redirect test goroutine assertion.
