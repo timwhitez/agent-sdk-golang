@@ -82,8 +82,8 @@ def replace_transport(match: re.Match[str]) -> str:
     return '\torigDo := webfetchDoRequest\n\twebfetchDoRequest = ' + fn + '\n\tt.Cleanup(func() { webfetchDoRequest = origDo })'
 
 updated, count = pattern.subn(replace_transport, test_text)
-if count != 4:
-    raise SystemExit(f"expected 4 WebFetch transport fixtures, replaced {count}")
+if count != 3:
+    raise SystemExit(f"expected 3 WebFetch transport fixtures, replaced {count}")
 tests.write_text(updated)
 
 review_test = Path("sdk/tools/sandbox/sandbox_webfetch_transport_policy_test.go")
