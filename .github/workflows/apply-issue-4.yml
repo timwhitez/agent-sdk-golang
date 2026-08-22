@@ -18,8 +18,9 @@ jobs:
         with:
           go-version-file: go.mod
       - run: python3 .github/fixes/issue-4.py
-      - run: rm -f .github/fixes/issue-4.py .github/workflows/apply-issue-4.yml
-      - run: gofmt -w sdk/tools/sandbox/sandbox_webfetch.go sdk/tools/sandbox/sandbox_webfetch_confirmation_test.go
+      - run: python3 .github/fixes/issue-4-test.py
+      - run: rm -f .github/fixes/issue-4.py .github/fixes/issue-4-test.py .github/workflows/apply-issue-4.yml
+      - run: gofmt -w sdk/tools/sandbox/sandbox_webfetch.go sdk/tools/sandbox/sandbox_webfetch_confirmation_test.go sdk/tools/sandbox/sandbox_webfetch_rebinding_test.go
       - run: git diff --check
       - name: Targeted confirmation boundary tests
         run: go test ./sdk/tools/sandbox -run 'TestWebfetchDenialPerformsNoDNSOrDial|TestWebfetchBlockedLiteralIsRejectedWithoutPrompt|TestWebfetchRejectsReboundAddressUsedForSocket' -count=1
