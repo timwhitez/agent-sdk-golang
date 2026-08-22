@@ -18,7 +18,8 @@ jobs:
         with:
           go-version-file: go.mod
       - run: python3 .github/fixes/issue-6.py
-      - run: rm -f .github/fixes/issue-6.py .github/workflows/apply-issue-6.yml
+      - run: python3 .github/fixes/issue-6-test.py
+      - run: rm -f .github/fixes/issue-6.py .github/fixes/issue-6-test.py .github/workflows/apply-issue-6.yml
       - run: gofmt -w sdk/llm/openai/chat.go sdk/llm/openai/responses.go sdk/llm/openai/stream_forward.go sdk/llm/openai/stream_cancel_test.go
       - run: git diff --check
       - name: Targeted abandonment regression
