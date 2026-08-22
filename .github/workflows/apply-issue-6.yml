@@ -1,0 +1,39 @@
+name: Apply and verify issue 6 fix
+
+on:
+  push:
+    branches: [fix/issue-6-openai-stream-cancel]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: write
+
+jobs:
+  apply-test-commit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+      - run: python3 .github/fixes/issue-6.py
+      - run: rm -f .github/fixes/issue-6.py .github/workflows/apply-issue-6.yml
+      - run: gofmt -w sdk/llm/openai/chat.go sdk/llm/openai/responses.go sdk/llm/openai/stream_forward.go sdk/llm/openai/stream_cancel_test.go
+      - run: git diff --check
+      - name: Targeted abandonment regression
+        run: go test ./sdk/llm/openai -run TestOpenAIStreamsCloseWhenUnreadConsumerCancels -count=1
+      - name: OpenAI provider tests
+        run: go test ./sdk/llm/openai -count=1
+      - name: Race-focused regression
+        run: go test -race ./sdk/llm/openai -run TestOpenAIStreamsCloseWhenUnreadConsumerCancels -count=1
+      - name: Full test suite
+        run: go test ./... -count=1
+      - name: Commit verified fix
+        if: github.event_name == 'push'
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          git commit -m "fix(openai): release abandoned streaming producers"
+          git push origin "HEAD:${GITHUB_REF_NAME}"
