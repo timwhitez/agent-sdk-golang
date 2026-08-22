@@ -1,0 +1,24 @@
+name: Validate issue 24 final patch
+
+on:
+  push:
+    branches: [fix/issue-24-anthropic-redirect]
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: Focused Anthropic tests
+        run: go test ./sdk/llm/anthropic -count=1
+      - name: Race-focused Anthropic tests
+        run: go test -race ./sdk/llm/anthropic -count=1
+      - name: Full repository tests
+        run: go test ./... -count=1
