@@ -19,15 +19,14 @@ jobs:
         with:
           go-version-file: go.mod
       - run: python3 .github/fixes/issue-9.py
-      - run: rm -f .github/fixes/issue-9.py .github/workflows/apply-issue-9.yml
-      - run: gofmt -w sdk/llm/openai/chat.go sdk/agent/agent.go sdk/llm/openai/auth_retry_test.go sdk/agent/agent_auth_retry_test.go
+      - run: python3 .github/fixes/issue-9-contract-tests.py
+      - run: rm -f .github/fixes/issue-9.py .github/fixes/issue-9-contract-tests.py .github/workflows/apply-issue-9.yml
+      - run: gofmt -w sdk/llm/openai/chat.go sdk/llm/openai/chat_test.go sdk/agent/agent.go sdk/agent/agent_retry_loop_guard_test.go sdk/llm/openai/auth_retry_test.go sdk/agent/agent_auth_retry_test.go
       - run: git diff --check
       - name: Direct-provider request-count tests
-        run: go test ./sdk/llm/openai -run 'TestOpenAIAuthFailuresAreNotRetriedByDefault|TestOpenAIAuthRetryCanBeExplicitlyEnabled' -count=20
-      - name: Agent integration request-count test
-        run: go test ./sdk/agent -run TestAgentDoesNotRetryOpenAIAuthFailures -count=20
-      - name: Recheck previously flaky unrelated compaction test
-        run: go test ./sdk/agent/compaction -run TestLocalPrunePreservesLastNonSavedToolResult -count=20
+        run: go test ./sdk/llm/openai -run 'TestOpenAIAuthFailuresAreNotRetriedByDefault|TestOpenAIAuthRetryCanBeExplicitlyEnabled|TestOpenAIDefaultRetryableStatus' -count=20
+      - name: Agent integration and textual classifier tests
+        run: go test ./sdk/agent -run 'TestAgentDoesNotRetryOpenAIAuthFailures|TestInvokeRetryRetriesTextualRateLimitAndServerErrors|TestInvokeRetrySkipsTextualNonRetryableProviderErrors' -count=20
       - name: Full test suite, first pass
         run: go test ./... -count=1
       - name: Full test suite, second pass
