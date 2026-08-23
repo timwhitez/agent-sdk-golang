@@ -71,7 +71,10 @@ func webfetchTool() tools.Tool {
 		if scheme != "http" && scheme != "https" {
 			return "", fmt.Errorf("only http/https is supported")
 		}
-		if err := validateWebfetchDestinationURL(ctx, u, "request target"); err != nil {
+		// Before the user authorizes network access, validate only syntax and
+		// literal-IP policy. Hostname resolution is itself an observable network
+		// action and is deferred to the socket-bound validator after confirmation.
+		if err := validateWebfetchPreConfirmationURL(u, "request target"); err != nil {
 			return "", err
 		}
 		method := strings.ToUpper(strings.TrimSpace(a.Method))
@@ -202,6 +205,24 @@ func dialValidatedWebfetchDestination(ctx context.Context, network, address stri
 		dialErrors = append(dialErrors, dialErr.Error())
 	}
 	return nil, fmt.Errorf("cannot connect to validated socket target %q: %s", host, strings.Join(dialErrors, "; "))
+}
+
+// validateWebfetchPreConfirmationURL performs only local checks. A hostname is
+// intentionally not resolved until after the user has approved the request.
+func validateWebfetchPreConfirmationURL(target *url.URL, stage string) error {
+	if target == nil {
+		return fmt.Errorf("invalid url: missing host")
+	}
+	host := strings.TrimSpace(target.Hostname())
+	if host == "" {
+		return fmt.Errorf("invalid url: missing host")
+	}
+	if ip := parseWebfetchLiteralIP(host); ip != nil {
+		if class := classifyWebfetchAddress(ip); class != "" {
+			return webfetchDestinationDeniedError(stage, host, ip.String(), class)
+		}
+	}
+	return nil
 }
 
 // validateWebfetchDestinationURL validates that a URL destination is safe.
