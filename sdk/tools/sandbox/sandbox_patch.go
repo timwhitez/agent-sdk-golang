@@ -385,14 +385,48 @@ type stagedFile struct {
 // patchPlanner validates and stages every patch operation in memory so the
 // whole patch is known to be applicable before any of it reaches the disk.
 type patchPlanner struct {
-	s       *Sandbox
-	actions []patchAction
-	staged  map[string]*stagedFile
+	s        *Sandbox
+	actions  []patchAction
+	staged   map[string]*stagedFile
+	baseline map[string]writeTargetSnapshot
 }
 
 // newPatchPlanner creates an empty planner bound to a sandbox.
 func newPatchPlanner(s *Sandbox) *patchPlanner {
-	return &patchPlanner{s: s, staged: map[string]*stagedFile{}}
+	return &patchPlanner{
+		s:        s,
+		staged:   map[string]*stagedFile{},
+		baseline: map[string]writeTargetSnapshot{},
+	}
+}
+
+// rememberBaseline stores the first on-disk state observed for a path. Later
+// operations in the same patch compose through staged state and must not replace
+// this baseline with their own planned bytes.
+func (p *patchPlanner) rememberBaseline(key string, snapshot writeTargetSnapshot) {
+	if p.baseline == nil {
+		p.baseline = map[string]writeTargetSnapshot{}
+	}
+	if _, exists := p.baseline[key]; !exists {
+		p.baseline[key] = snapshot
+	}
+}
+
+func patchSnapshot(info os.FileInfo, content []byte) writeTargetSnapshot {
+	return writeTargetSnapshot{
+		Exists:      true,
+		Info:        info,
+		Content:     string(content),
+		ContentFull: true,
+	}
+}
+
+func snapshotPatchedFile(path string, content []byte) (writeTargetSnapshot, error) {
+	info, err := os.Lstat(path)
+	if err != nil {
+		return writeTargetSnapshot{}, err
+	}
+	return patchSnapshot(info, content), nil
 }
 
 // planAdd stages creation of a new file, rejecting paths that already exist.
@@ -414,6 +448,7 @@ func (p *patchPlanner) planAdd(relPath string, lines []string) error {
 	} else if !os.IsNotExist(err) {
 		return err
 	}
+	p.rememberBaseline(vp.resolved, writeTargetSnapshot{Exists: false})
 	content := strings.Join(lines, "\n")
 	if len(lines) > 0 {
 		content += "\n"
@@ -438,14 +473,14 @@ func (p *patchPlanner) planDelete(relPath string) error {
 			return fmt.Errorf("cannot delete %s: already deleted in this patch", relPath)
 		}
 	} else {
-		f, info, err := openFileNoFollow(resolvedPath)
+		raw, info, _, err := p.s.readAllPathBounded(vp, maxEditFileBytes)
 		if err != nil {
 			return err
 		}
-		_ = f.Close()
 		if !info.Mode().IsRegular() {
 			return fmt.Errorf("cannot delete %s: not a regular file", relPath)
 		}
+		p.rememberBaseline(vp.resolved, patchSnapshot(info, raw))
 	}
 	p.stage(vp.resolved, &stagedFile{deleted: true})
 	p.actions = append(p.actions, patchAction{kind: "delete", relPath: relPath, path: vp, resolved: resolvedPath})
@@ -484,10 +519,24 @@ func (p *patchPlanner) planMove(fromRel, toRel string) error {
 		return fmt.Errorf("cannot move %s to %s: destination already exists", fromRel, toRel)
 	} else if !os.IsNotExist(err) {
 		return err
+	} else {
+		p.rememberBaseline(toVP.resolved, writeTargetSnapshot{Exists: false})
 	}
-	if staged, ok := p.staged[fromVP.resolved]; ok && !staged.deleted {
+	if staged, ok := p.staged[fromVP.resolved]; ok {
+		if staged.deleted {
+			return fmt.Errorf("cannot move %s: source was deleted earlier in this patch", fromRel)
+		}
 		p.stage(toVP.resolved, &stagedFile{content: staged.content})
 		p.stage(fromVP.resolved, &stagedFile{deleted: true})
+	} else {
+		raw, info, _, err := p.s.readAllPathBounded(fromVP, maxEditFileBytes)
+		if err != nil {
+			return err
+		}
+		if !info.Mode().IsRegular() {
+			return fmt.Errorf("cannot move %s: not a regular file", fromRel)
+		}
+		p.rememberBaseline(fromVP.resolved, patchSnapshot(info, raw))
 	}
 	p.actions = append(p.actions, patchAction{kind: "move", relPath: fromRel, path: fromVP, resolved: fromPath, moveTo: toRel, movePath: toVP})
 	return nil
@@ -529,6 +578,7 @@ func (p *patchPlanner) planUpdate(relPath string, hunks []patchHunk) error {
 		}
 		raw = b
 		resolved = resolvedPath
+		p.rememberBaseline(vp.resolved, patchSnapshot(st, b))
 	}
 	out, err := applyHunksToContent(relPath, string(raw), hunks)
 	if err != nil {
@@ -552,9 +602,13 @@ func (p *patchPlanner) stage(key string, state *stagedFile) {
 // already landed, the error reports which files were applied and which were
 // not so the caller can recover instead of blindly retrying the whole patch.
 func (p *patchPlanner) commit() error {
+	expected := make(map[string]writeTargetSnapshot, len(p.baseline))
+	for key, snapshot := range p.baseline {
+		expected[key] = snapshot
+	}
 	applied := []string{}
 	for i, a := range p.actions {
-		if err := p.commitAction(a); err != nil {
+		if err := p.commitAction(a, expected); err != nil {
 			if len(applied) == 0 {
 				return err
 			}
@@ -569,15 +623,42 @@ func (p *patchPlanner) commit() error {
 	return nil
 }
 
-// commitAction performs a single staged action, revalidating the path first.
-func (p *patchPlanner) commitAction(a patchAction) error {
+func verifyPatchTargetUnchanged(expected map[string]writeTargetSnapshot, key, path, displayPath string) error {
+	snapshot, ok := expected[key]
+	if !ok {
+		return fmt.Errorf("%w: no planning snapshot for %s", errStaleWriteTarget, displayPath)
+	}
+	return verifyWriteTargetUnchanged(path, snapshot, displayPath)
+}
+
+func updatePatchExpected(expected map[string]writeTargetSnapshot, key, path string, content []byte) error {
+	snapshot, err := snapshotPatchedFile(path, content)
+	if err != nil {
+		return err
+	}
+	expected[key] = snapshot
+	return nil
+}
+
+// commitAction performs a single staged action, revalidating identity and
+// content immediately before the mutation. expected is updated after each
+// successful action so multiple operations in one patch do not reject their own
+// earlier writes as external changes.
+func (p *patchPlanner) commitAction(a patchAction, expected map[string]writeTargetSnapshot) error {
 	switch a.kind {
 	case "delete":
 		resolvedPath, err := p.s.revalidatePathForAccess(a.path)
 		if err != nil {
 			return err
 		}
-		return os.Remove(resolvedPath)
+		if err := verifyPatchTargetUnchanged(expected, a.path.resolved, resolvedPath, a.relPath); err != nil {
+			return err
+		}
+		if err := os.Remove(resolvedPath); err != nil {
+			return err
+		}
+		expected[a.path.resolved] = writeTargetSnapshot{Exists: false}
+		return nil
 	case "move":
 		fromPath, err := p.s.revalidatePathForAccess(a.path)
 		if err != nil {
@@ -587,18 +668,21 @@ func (p *patchPlanner) commitAction(a patchAction) error {
 		if err != nil {
 			return err
 		}
+		if err := verifyPatchTargetUnchanged(expected, a.path.resolved, fromPath, a.relPath); err != nil {
+			return err
+		}
 		toDir := filepath.Dir(toPath)
 		if info, err := os.Lstat(toDir); err == nil && info.Mode()&os.ModeSymlink != 0 {
 			return &SecurityError{Message: fmt.Sprintf("symlink target denied: %q", toDir)}
 		} else if err != nil && !os.IsNotExist(err) {
 			return err
 		}
-		// os.Rename replaces an existing regular file on Unix. Re-check the
-		// destination immediately before commit so both pre-existing files and
-		// files created after planning fail closed on every platform.
 		if _, err := os.Lstat(toPath); err == nil {
 			return fmt.Errorf("cannot move %s to %s: destination already exists", a.relPath, a.moveTo)
 		} else if !os.IsNotExist(err) {
+			return err
+		}
+		if err := verifyPatchTargetUnchanged(expected, a.movePath.resolved, toPath, a.moveTo); err != nil {
 			return err
 		}
 		if err := os.MkdirAll(toDir, 0o755); err != nil {
@@ -609,7 +693,12 @@ func (p *patchPlanner) commitAction(a patchAction) error {
 		} else {
 			_ = dirFile.Close()
 		}
-		return moveRegularFileNoReplace(fromPath, toPath)
+		sourceContent := []byte(expected[a.path.resolved].Content)
+		if err := moveRegularFileNoReplace(fromPath, toPath); err != nil {
+			return err
+		}
+		expected[a.path.resolved] = writeTargetSnapshot{Exists: false}
+		return updatePatchExpected(expected, a.movePath.resolved, toPath, sourceContent)
 	default:
 		currentPath, err := p.s.revalidatePathForAccess(a.path)
 		if err != nil {
@@ -618,7 +707,13 @@ func (p *patchPlanner) commitAction(a patchAction) error {
 		if !pathsEqual(currentPath, a.resolved) {
 			return &SecurityError{Message: fmt.Sprintf("path changed during patch apply: %q (was %q, now %q)", a.relPath, a.resolved, currentPath)}
 		}
-		return writeFilePreserveMode(currentPath, a.content, 0o644)
+		if err := verifyPatchTargetUnchanged(expected, a.path.resolved, currentPath, a.relPath); err != nil {
+			return err
+		}
+		if err := writeFilePreserveMode(currentPath, a.content, 0o644); err != nil {
+			return err
+		}
+		return updatePatchExpected(expected, a.path.resolved, currentPath, a.content)
 	}
 }
 
