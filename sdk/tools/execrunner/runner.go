@@ -126,6 +126,17 @@ func Run(ctx context.Context, opts Options) (Result, error) {
 		collector.Close()
 		return res, err
 	}
+	processGroup, err := attachProcessGroup(cmd.Process)
+	if err != nil {
+		// Fail closed: a command that could not be placed inside the platform
+		// process-tree boundary must not continue running unsupervised.
+		_ = cmd.Process.Kill()
+		_ = cmd.Wait()
+		collector.Close()
+		canonical.finish(context.WithoutCancel(ctx))
+		return res, fmt.Errorf("establish process-tree boundary: %w", err)
+	}
+	defer processGroup.close()
 
 	waitCh := make(chan error, 1)
 	go func() {
@@ -140,7 +151,7 @@ func Run(ctx context.Context, opts Options) (Result, error) {
 		waitErr = rawWaitErr
 	case <-runCtx.Done():
 		res.TimedOut = errors.Is(runCtx.Err(), context.DeadlineExceeded)
-		_ = signalProcessGroupTerminate(cmd.Process)
+		_ = processGroup.terminate()
 
 		reaped := false
 		if opts.KillGrace > 0 {
@@ -155,7 +166,7 @@ func Run(ctx context.Context, opts Options) (Result, error) {
 			}
 		}
 		if !reaped {
-			_ = signalProcessGroupKill(cmd.Process)
+			_ = processGroup.kill()
 			// SIGKILL cannot reach processes that escaped the group (setsid,
 			// daemons), and such a process can hold the inherited output
 			// descriptors open, which keeps cmd.Wait blocked forever. Bound the

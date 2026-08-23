@@ -40,3 +40,27 @@ func signalProcessGroupKill(proc *os.Process) error {
 	}
 	return err
 }
+
+type processGroupController struct {
+	process *os.Process
+}
+
+func attachProcessGroup(proc *os.Process) (*processGroupController, error) {
+	return &processGroupController{process: proc}, nil
+}
+
+func (c *processGroupController) terminate() error {
+	if c == nil {
+		return nil
+	}
+	return signalProcessGroupTerminate(c.process)
+}
+
+func (c *processGroupController) kill() error {
+	if c == nil {
+		return nil
+	}
+	return signalProcessGroupKill(c.process)
+}
+
+func (c *processGroupController) close() error { return nil }
