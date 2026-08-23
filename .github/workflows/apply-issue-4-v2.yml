@@ -19,13 +19,14 @@ jobs:
         with:
           go-version-file: go.mod
       - run: python3 .github/fixes/issue-4-v2.py
-      - run: rm -f .github/fixes/issue-4-v2.py .github/workflows/apply-issue-4-v2.yml
-      - run: gofmt -w sdk/tools/sandbox/sandbox_webfetch.go sdk/tools/sandbox/sandbox_webfetch_confirmation_test.go sdk/tools/sandbox/sandbox_webfetch_rebinding_test.go
+      - run: python3 .github/fixes/issue-4-contract-tests.py
+      - run: rm -f .github/fixes/issue-4-v2.py .github/fixes/issue-4-contract-tests.py .github/workflows/apply-issue-4-v2.yml
+      - run: gofmt -w sdk/tools/sandbox/sandbox_webfetch.go sdk/tools/sandbox/sandbox_test.go sdk/tools/sandbox/sandbox_webfetch_confirmation_test.go sdk/tools/sandbox/sandbox_webfetch_rebinding_test.go
       - run: git diff --check
       - name: Focused confirmation and socket-bound tests
-        run: go test ./sdk/tools/sandbox -run 'TestWebfetchDenialPerformsNoDNSOrDial|TestWebfetchBlockedLiteralIsRejectedWithoutPrompt|TestWebfetchRejectsReboundAddressUsedForSocket|TestWebfetchDoesNotInheritCustomDefaultRoundTripper|TestValidatedWebfetchDialUsesLiteralApprovedAddress' -count=20
+        run: go test ./sdk/tools/sandbox -run 'TestWebfetchDenialPerformsNoDNSOrDial|TestWebfetchBlockedLiteralIsRejectedWithoutPrompt|TestWebfetchRejectsReboundAddressUsedForSocket|TestWebfetchToolBlocksPrivateDestination|TestWebfetchDoesNotInheritCustomDefaultRoundTripper|TestValidatedWebfetchDialUsesLiteralApprovedAddress' -count=20
       - name: Race-focused tests
-        run: go test -race ./sdk/tools/sandbox -run 'TestWebfetchDenialPerformsNoDNSOrDial|TestWebfetchBlockedLiteralIsRejectedWithoutPrompt|TestWebfetchRejectsReboundAddressUsedForSocket' -count=10
+        run: go test -race ./sdk/tools/sandbox -run 'TestWebfetchDenialPerformsNoDNSOrDial|TestWebfetchBlockedLiteralIsRejectedWithoutPrompt|TestWebfetchRejectsReboundAddressUsedForSocket|TestWebfetchToolBlocksPrivateDestination' -count=10
       - name: Complete Sandbox tests
         run: go test ./sdk/tools/sandbox -count=1
       - name: Full repository tests
