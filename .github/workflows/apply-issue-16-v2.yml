@@ -1,0 +1,40 @@
+name: Apply and verify rebased issue 16 fix
+
+on:
+  push:
+    branches: [fix/issue-16-apply-patch-stale-targets-v2]
+  pull_request:
+    branches: [fix/issue-18-apply-patch-move-no-clobber]
+
+permissions:
+  contents: write
+
+jobs:
+  apply-test-commit:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+      - run: python3 .github/fixes/issue-16-v2.py
+      - run: rm -f .github/fixes/issue-16-v2.py .github/workflows/apply-issue-16-v2.yml
+      - run: gofmt -w sdk/tools/sandbox/sandbox_patch.go sdk/tools/sandbox/sandbox_patch_stale_target_test.go
+      - run: git diff --check
+      - name: Focused stale-target and atomic-move tests
+        run: go test ./sdk/tools/sandbox -run 'TestPatchPlannerRejectsUpdatedFileChangedAfterPlanning|TestPatchPlannerRejectsDeleteTargetReplacedAfterPlanning|TestPatchPlannerRejectsMoveSourceChangedAfterPlanning|TestPatchPlannerMultipleUpdatesDoNotConflictWithOwnWrites|TestPatchPlannerMoveRejectsDestinationCreatedAfterPlanning|TestPatchPlannerMoveRejectsDestinationCreatedAfterFinalCheck' -count=20
+      - name: Race-focused tests
+        run: go test -race ./sdk/tools/sandbox -run 'TestPatchPlannerRejectsUpdatedFileChangedAfterPlanning|TestPatchPlannerRejectsDeleteTargetReplacedAfterPlanning|TestPatchPlannerRejectsMoveSourceChangedAfterPlanning|TestPatchPlannerMultipleUpdatesDoNotConflictWithOwnWrites|TestPatchPlannerMoveRejectsDestinationCreatedAfterPlanning|TestPatchPlannerMoveRejectsDestinationCreatedAfterFinalCheck' -count=10
+      - name: Sandbox tests
+        run: go test ./sdk/tools/sandbox -count=1
+      - name: Full repository tests
+        run: go test ./... -count=1
+      - name: Commit verified source-only fix
+        if: github.event_name == 'push'
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          git commit -m "fix(sandbox): reject stale apply_patch targets"
+          git push origin "HEAD:${GITHUB_REF_NAME}"
