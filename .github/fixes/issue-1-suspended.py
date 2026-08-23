@@ -1,7 +1,7 @@
 from pathlib import Path
 
 path = Path("sdk/tools/execrunner/process_group_windows.go")
-text = path.read_text()
+text = path.read_text(encoding="utf-8")
 text = text.replace(
 '''\tprocessSetQuota                    = 0x0100
 \tprocessTerminate                   = 0x0001
@@ -26,7 +26,7 @@ text = text.replace(
 '''\tcmd.SysProcAttr.CreationFlags |= syscall.CREATE_NEW_PROCESS_GROUP
 ''',
 '''\t// The process must not execute user code before it is assigned to the Job
-\t// Object, otherwise it can spawn a descendant during the Start→Assign gap.
+\t// Object, otherwise it can spawn a descendant during the Start-to-Assign gap.
 \tcmd.SysProcAttr.CreationFlags |= syscall.CREATE_NEW_PROCESS_GROUP | createSuspended
 ''',
 1,
@@ -58,4 +58,4 @@ new = '''\tok, _, callErr = procAssignProcessToJobObject.Call(uintptr(job), uint
 '''
 if text.count(old) != 1:
     raise SystemExit(f"assign/resume anchor count={text.count(old)}")
-path.write_text(text.replace(old, new))
+path.write_text(text.replace(old, new), encoding="utf-8")
