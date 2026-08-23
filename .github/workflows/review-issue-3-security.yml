@@ -19,15 +19,16 @@ jobs:
         with:
           go-version-file: go.mod
       - run: python3 .github/fixes/issue-3-security-review.py
-      - run: rm -f .github/fixes/issue-3-security-review.py .github/workflows/review-issue-3-security.yml
+      - run: python3 .github/fixes/issue-3-redirect-fixture.py
+      - run: rm -f .github/fixes/issue-3-security-review.py .github/fixes/issue-3-redirect-fixture.py .github/workflows/review-issue-3-security.yml
       - run: gofmt -w sdk/tools/sandbox/sandbox_webfetch.go sdk/tools/sandbox/sandbox_test.go sdk/tools/sandbox/sandbox_webfetch_transport_policy_test.go
       - run: git diff --check
       - name: Focused transport-policy tests
-        run: go test ./sdk/tools/sandbox -run 'TestWebfetchRejectsReboundAddressUsedForSocket|TestWebfetchDoesNotInheritCustomDefaultRoundTripper|TestValidatedWebfetchDialUsesLiteralApprovedAddress|TestWebfetchToolTruncationNotice|TestWebfetchToolReadErrorIsSurfaced|TestWebfetchToolBlocksRedirectToPrivateDestination' -count=1
+        run: go test ./sdk/tools/sandbox -run 'TestWebfetchRejectsReboundAddressUsedForSocket|TestWebfetchDoesNotInheritCustomDefaultRoundTripper|TestValidatedWebfetchDialUsesLiteralApprovedAddress|TestWebfetchToolTruncationNotice|TestWebfetchToolReadErrorIsSurfaced|TestWebfetchToolBlocksRedirectToPrivateDestination' -count=20
       - name: Sandbox tests
         run: go test ./sdk/tools/sandbox -count=1
       - name: Race-focused tests
-        run: go test -race ./sdk/tools/sandbox -run 'TestWebfetchRejectsReboundAddressUsedForSocket|TestWebfetchDoesNotInheritCustomDefaultRoundTripper|TestValidatedWebfetchDialUsesLiteralApprovedAddress' -count=1
+        run: go test -race ./sdk/tools/sandbox -run 'TestWebfetchRejectsReboundAddressUsedForSocket|TestWebfetchDoesNotInheritCustomDefaultRoundTripper|TestValidatedWebfetchDialUsesLiteralApprovedAddress' -count=10
       - name: Full test suite
         run: go test ./... -count=1
       - name: Commit second-pass verified fix
