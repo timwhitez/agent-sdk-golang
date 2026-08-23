@@ -41,6 +41,14 @@ var webfetchDialContext = func(ctx context.Context, network, address string) (ne
 	return (&net.Dialer{}).DialContext(ctx, network, address)
 }
 
+// webfetchDoRequest is the HTTP execution seam used by package tests. The
+// production value always executes the request with the validated client built
+// below; unlike replacing http.DefaultTransport, overriding this seam cannot
+// silently alter the transport policy in a deployed process.
+var webfetchDoRequest = func(client *http.Client, request *http.Request) (*http.Response, error) {
+	return client.Do(request)
+}
+
 // SetWebfetchLookupIPAddrs sets the IP address lookup function for webfetch.
 // This is primarily used for testing.
 func SetWebfetchLookupIPAddrs(fn func(context.Context, string) ([]net.IPAddr, error)) {
@@ -121,7 +129,7 @@ func webfetchTool() tools.Tool {
 				req.Header.Set(kk, vv)
 			}
 		}
-		resp, err := hc.Do(req)
+		resp, err := webfetchDoRequest(hc, req)
 		if err != nil {
 			return "", fmt.Errorf("request failed: %w", err)
 		}
@@ -152,18 +160,25 @@ func webfetchTool() tools.Tool {
 }
 
 func newWebfetchHTTPClient(timeout time.Duration) *http.Client {
+	var transport *http.Transport
 	if base, ok := http.DefaultTransport.(*http.Transport); ok && base != nil {
-		transport := base.Clone()
-		// A proxy would resolve the target independently and defeat destination
-		// pinning. Webfetch therefore connects directly to the validated address.
-		transport.Proxy = nil
-		transport.DialContext = dialValidatedWebfetchDestination
-		return &http.Client{Timeout: timeout, Transport: transport}
+		transport = base.Clone()
+	} else {
+		// Do not inherit a process-global custom RoundTripper: it could resolve or
+		// proxy the hostname independently and bypass socket-bound validation.
+		transport = &http.Transport{
+			ForceAttemptHTTP2:     true,
+			MaxIdleConns:          100,
+			IdleConnTimeout:       90 * time.Second,
+			TLSHandshakeTimeout:   10 * time.Second,
+			ExpectContinueTimeout: time.Second,
+		}
 	}
-	// A non-*http.Transport value is an explicit host/test replacement that may
-	// implement its own connection policy. Preserve that injection seam instead
-	// of silently bypassing it with a new default transport.
-	return &http.Client{Timeout: timeout, Transport: http.DefaultTransport}
+	// A proxy would resolve the target independently and defeat destination
+	// pinning. Webfetch therefore connects directly to the validated address.
+	transport.Proxy = nil
+	transport.DialContext = dialValidatedWebfetchDestination
+	return &http.Client{Timeout: timeout, Transport: transport}
 }
 
 // dialValidatedWebfetchDestination resolves and classifies the exact address

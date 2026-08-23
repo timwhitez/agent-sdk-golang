@@ -1678,8 +1678,8 @@ func TestGrepToolInvalidGlobPatternReturnsError(t *testing.T) {
 func TestWebfetchToolTruncationNotice(t *testing.T) {
 	useSandboxPublicWebfetchResolver(t)
 
-	origTransport := http.DefaultTransport
-	http.DefaultTransport = roundTripFunc(func(r *http.Request) (*http.Response, error) {
+	origDo := webfetchDoRequest
+	webfetchDoRequest = func(_ *http.Client, r *http.Request) (*http.Response, error) {
 		body := io.NopCloser(strings.NewReader("abcdefghijklmnopqrstuvwxyz"))
 		return &http.Response{
 			Status:     "200 OK",
@@ -1688,8 +1688,8 @@ func TestWebfetchToolTruncationNotice(t *testing.T) {
 			Header:     make(http.Header),
 			Request:    r,
 		}, nil
-	})
-	t.Cleanup(func() { http.DefaultTransport = origTransport })
+	}
+	t.Cleanup(func() { webfetchDoRequest = origDo })
 
 	deps := tools.NewContainer()
 	tools.Provide(deps, ConfirmKey, func(context.Context) (Confirmer, error) { return allowConfirmer{}, nil })
@@ -1719,8 +1719,8 @@ func TestWebfetchToolTruncationNotice(t *testing.T) {
 func TestWebfetchToolReadErrorIsSurfaced(t *testing.T) {
 	useSandboxPublicWebfetchResolver(t)
 
-	origTransport := http.DefaultTransport
-	http.DefaultTransport = roundTripFunc(func(r *http.Request) (*http.Response, error) {
+	origDo := webfetchDoRequest
+	webfetchDoRequest = func(_ *http.Client, r *http.Request) (*http.Response, error) {
 		body := &failAfterReader{data: []byte("partial")}
 		return &http.Response{
 			Status:     "200 OK",
@@ -1729,8 +1729,8 @@ func TestWebfetchToolReadErrorIsSurfaced(t *testing.T) {
 			Header:     make(http.Header),
 			Request:    r,
 		}, nil
-	})
-	t.Cleanup(func() { http.DefaultTransport = origTransport })
+	}
+	t.Cleanup(func() { webfetchDoRequest = origDo })
 
 	deps := tools.NewContainer()
 	tools.Provide(deps, ConfirmKey, func(context.Context) (Confirmer, error) { return allowConfirmer{}, nil })
@@ -1754,12 +1754,12 @@ func TestWebfetchToolReadErrorIsSurfaced(t *testing.T) {
 func TestWebfetchToolBlocksPrivateDestination(t *testing.T) {
 	useSandboxPublicWebfetchResolver(t)
 
-	origTransport := http.DefaultTransport
-	http.DefaultTransport = roundTripFunc(func(*http.Request) (*http.Response, error) {
+	origDo := webfetchDoRequest
+	webfetchDoRequest = func(_ *http.Client, _ *http.Request) (*http.Response, error) {
 		t.Fatalf("webfetch request should not run for blocked private destination")
 		return nil, nil
-	})
-	t.Cleanup(func() { http.DefaultTransport = origTransport })
+	}
+	t.Cleanup(func() { webfetchDoRequest = origDo })
 
 	deps := tools.NewContainer()
 	tools.Provide(deps, ConfirmKey, func(context.Context) (Confirmer, error) { return allowConfirmer{}, nil })
@@ -1799,24 +1799,26 @@ func TestWebfetchToolBlocksPrivateDestination(t *testing.T) {
 func TestWebfetchToolBlocksRedirectToPrivateDestination(t *testing.T) {
 	useSandboxPublicWebfetchResolver(t)
 
-	origTransport := http.DefaultTransport
+	origDo := webfetchDoRequest
 	var calls int
-	http.DefaultTransport = roundTripFunc(func(r *http.Request) (*http.Response, error) {
+	webfetchDoRequest = func(client *http.Client, r *http.Request) (*http.Response, error) {
 		calls++
 		if calls > 1 {
 			t.Fatalf("redirect request should not run for blocked private destination")
 		}
-		resp := &http.Response{
-			Status:     "302 Found",
-			StatusCode: http.StatusFound,
-			Header:     make(http.Header),
-			Body:       io.NopCloser(strings.NewReader("redirect")),
-			Request:    r,
+		redirectRequest, requestErr := http.NewRequestWithContext(r.Context(), http.MethodGet, "http://internal.test/private", nil)
+		if requestErr != nil {
+			return nil, requestErr
 		}
-		resp.Header.Set("Location", "http://internal.test/private")
-		return resp, nil
-	})
-	t.Cleanup(func() { http.DefaultTransport = origTransport })
+		if client.CheckRedirect == nil {
+			return nil, errors.New("WebFetch client has no redirect policy")
+		}
+		if redirectErr := client.CheckRedirect(redirectRequest, []*http.Request{r}); redirectErr != nil {
+			return nil, redirectErr
+		}
+		return nil, errors.New("private redirect was unexpectedly accepted")
+	}
+	t.Cleanup(func() { webfetchDoRequest = origDo })
 
 	deps := tools.NewContainer()
 	tools.Provide(deps, ConfirmKey, func(context.Context) (Confirmer, error) { return allowConfirmer{}, nil })
