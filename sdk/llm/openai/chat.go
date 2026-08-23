@@ -677,7 +677,10 @@ func (c *ChatClient) isRetryableStatus(code int) bool {
 
 func defaultRetryableStatus(code int) bool {
 	switch code {
-	case 401, 403, 408, 409, 425, 429:
+	// Authentication and authorization failures are permanent for a client
+	// whose credentials do not change between attempts. Integrations with an
+	// explicit refresh mechanism can opt in through RetryableStatusCodes.
+	case 408, 409, 425, 429:
 		return true
 	default:
 		return code >= 500 && code <= 599
