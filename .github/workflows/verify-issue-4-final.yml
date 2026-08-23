@@ -1,0 +1,28 @@
+name: Verify final issue 4 confirmation boundary
+
+on:
+  push:
+    branches: [fix/issue-4-webfetch-confirm-before-dns-v2]
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: Focused confirmation tests
+        run: go test ./sdk/tools/sandbox -run 'TestWebfetchDenialPerformsNoDNSOrDial|TestWebfetchBlockedLiteralIsRejectedWithoutPrompt|TestWebfetchRejectsReboundAddressUsedForSocket|TestWebfetchToolBlocksPrivateDestination' -count=20
+      - name: Race-focused confirmation tests
+        run: go test -race ./sdk/tools/sandbox -run 'TestWebfetchDenialPerformsNoDNSOrDial|TestWebfetchBlockedLiteralIsRejectedWithoutPrompt|TestWebfetchRejectsReboundAddressUsedForSocket' -count=10
+      - name: Complete Sandbox tests
+        run: go test ./sdk/tools/sandbox -count=1
+      - name: Full repository tests
+        run: go test ./... -count=1
