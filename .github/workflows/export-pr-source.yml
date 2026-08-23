@@ -1,0 +1,27 @@
+name: export-pr-source
+
+on:
+  pull_request:
+    branches:
+      - ops/snapshot-base
+
+permissions:
+  contents: read
+
+jobs:
+  export:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out exact PR head
+        uses: actions/checkout@v5
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          fetch-depth: 0
+      - name: Package source
+        run: git archive --format=tar.gz --output=source.tar.gz HEAD
+      - name: Upload source archive
+        uses: actions/upload-artifact@v4
+        with:
+          name: sdk-source-${{ github.event.pull_request.head.sha }}
+          path: source.tar.gz
+          if-no-files-found: error
