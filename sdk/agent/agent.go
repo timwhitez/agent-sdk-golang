@@ -425,7 +425,7 @@ func New(cfg Config) (*Agent, error) {
 		ephemeralSigByCall:    make(map[string]string),
 	}
 	if len(cfg.InitialMessages) > 0 {
-		ag.messages = append([]llm.Message(nil), cfg.InitialMessages...)
+		ag.messages = llm.CloneMessages(cfg.InitialMessages)
 	}
 	ag.initToolResultDumpLifecycle(toolResultDumpNow())
 	return ag, nil
@@ -463,9 +463,7 @@ func (a *Agent) UpdateCompactionConfig(cfg *compaction.Config) {
 func (a *Agent) Messages() []llm.Message {
 	a.mu.Lock()
 	defer a.mu.Unlock()
-	cpy := make([]llm.Message, len(a.messages))
-	copy(cpy, a.messages)
-	return cpy
+	return llm.CloneMessages(a.messages)
 }
 
 func (a *Agent) ClearHistory() {
@@ -480,7 +478,7 @@ func (a *Agent) ClearHistory() {
 // Callers should include the system prompt message if they want it preserved.
 func (a *Agent) ReplaceHistory(messages []llm.Message) {
 	a.mu.Lock()
-	a.messages = append([]llm.Message(nil), messages...)
+	a.messages = llm.CloneMessages(messages)
 	a.resetEphemeralTrackingLocked()
 	a.mu.Unlock()
 	a.cleanupToolResultDumps(toolResultDumpNow(), true)
