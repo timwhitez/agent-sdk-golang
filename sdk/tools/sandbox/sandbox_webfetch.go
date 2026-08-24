@@ -160,24 +160,19 @@ func webfetchTool() tools.Tool {
 }
 
 func newWebfetchHTTPClient(timeout time.Duration) *http.Client {
-	var transport *http.Transport
-	if base, ok := http.DefaultTransport.(*http.Transport); ok && base != nil {
-		transport = base.Clone()
-	} else {
-		// Do not inherit a process-global custom RoundTripper: it could resolve or
-		// proxy the hostname independently and bypass socket-bound validation.
-		transport = &http.Transport{
-			ForceAttemptHTTP2:     true,
-			MaxIdleConns:          100,
-			IdleConnTimeout:       90 * time.Second,
-			TLSHandshakeTimeout:   10 * time.Second,
-			ExpectContinueTimeout: time.Second,
-		}
+	// Build from fixed, package-owned defaults instead of cloning the process
+	// global transport. A mutated *http.Transport can carry DialTLSContext or
+	// DialTLS hooks that bypass DialContext for HTTPS, as well as proxy or TLS
+	// policy that is outside WebFetch's destination-validation boundary.
+	transport := &http.Transport{
+		Proxy:                 nil,
+		DialContext:           dialValidatedWebfetchDestination,
+		ForceAttemptHTTP2:     true,
+		MaxIdleConns:          100,
+		IdleConnTimeout:       90 * time.Second,
+		TLSHandshakeTimeout:   10 * time.Second,
+		ExpectContinueTimeout: time.Second,
 	}
-	// A proxy would resolve the target independently and defeat destination
-	// pinning. Webfetch therefore connects directly to the validated address.
-	transport.Proxy = nil
-	transport.DialContext = dialValidatedWebfetchDestination
 	return &http.Client{Timeout: timeout, Transport: transport}
 }
 
