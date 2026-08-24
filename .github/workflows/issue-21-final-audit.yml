@@ -1,0 +1,252 @@
+name: One-shot final audit for issue 21
+
+on:
+  issue_comment:
+    types: [created]
+
+permissions:
+  contents: write
+  issues: write
+
+concurrency:
+  group: issue-21-final-audit
+  cancel-in-progress: false
+
+jobs:
+  audit:
+    if: github.event.issue.number == 21 && github.event.comment.body == 'issue-21-final-audit-20260824-e3b9'
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - name: Set up Go
+        uses: actions/setup-go@v6
+        with:
+          go-version: '1.24.5'
+          cache: true
+
+      - name: Rebuild, audit, and publish the pull-request branch
+        id: audit
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TARGET_BRANCH: fix/issue-21-compaction-state
+          WORKFLOW_PATH: .github/workflows/issue-21-final-audit.yml
+        run: |
+          set -euo pipefail
+          git clone "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" repo
+          cd repo
+          git fetch origin main "$TARGET_BRANCH"
+          trigger_head="$(git rev-parse origin/main)"
+          old_pr_head="$(git rev-parse "origin/$TARGET_BRANCH")"
+          echo "old_pr_head=$old_pr_head" >> "$GITHUB_OUTPUT"
+
+          # Remove this one-shot workflow from the default branch first. The
+          # current run continues from its immutable event snapshot, while the
+          # candidate can then be built directly on the clean latest main.
+          git checkout -B cleanup origin/main
+          git rm "$WORKFLOW_PATH"
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git commit -m "chore: remove one-shot issue 21 audit workflow"
+          git push --force-with-lease="refs/heads/main:${trigger_head}" origin HEAD:refs/heads/main
+          clean_main="$(git rev-parse HEAD)"
+          echo "clean_main=$clean_main" >> "$GITHUB_OUTPUT"
+
+          # Rebuild the PR on the clean current main. Copy only the two focused
+          # new files from the previous PR head and transplant the small edits
+          # to current source and documentation below.
+          git checkout -B issue-21-audited "$clean_main"
+          git show "$old_pr_head:sdk/agent/compaction_runtime.go" > sdk/agent/compaction_runtime.go
+          git show "$old_pr_head:sdk/agent/agent_compaction_update_race_test.go" > sdk/agent/agent_compaction_update_race_test.go
+
+          python3 - <<'PY'
+          from pathlib import Path
+
+          path = Path("sdk/agent/agent.go")
+          source = path.read_text(encoding="utf-8")
+
+          def replace_once(old: str, new: str, label: str) -> None:
+              global source
+              count = source.count(old)
+              if count != 1:
+                  raise SystemExit(f"{label}: expected exactly one match, found {count}")
+              source = source.replace(old, new, 1)
+
+          replace_once(
+              "\tcompactor *compaction.Service\n\n\ttodoCompactionPending  atomic.Bool\n",
+              "\tcompactor *compaction.Service\n\n"
+              "\t// compactionRuntimeMu protects installation of compactor/hasCompactor.\n"
+              "\t// Readers do not take this lock at each call site; instead every complete\n"
+              "\t// turn, explicit compaction, checkpoint commit, and asynchronous compaction\n"
+              "\t// holds a lifecycle use registered through beginCompactionRuntimeUse.\n"
+              "\tcompactionRuntimeMu      sync.Mutex\n"
+              "\tcompactionRuntimeUses    int\n"
+              "\tpendingCompactionRuntime *compactionRuntimeUpdate\n\n"
+              "\ttodoCompactionPending  atomic.Bool\n",
+              "Agent compaction runtime fields",
+          )
+
+          replace_once(
+              "// UpdateCompactionConfig replaces the compaction service used for subsequent turns.\n"
+              "// Callers should prefer updating compaction between turns when the agent is idle.\n"
+              "func (a *Agent) UpdateCompactionConfig(cfg *compaction.Config) {\n"
+              "\tif a == nil {\n"
+              "\t\treturn\n"
+              "\t}\n"
+              "\tcfg = bindCompactionArtifactConfig(cfg, a.warningf, a.artifactOwner, a.artifactOwnerProvider, a.artifactSink, a.artifactResolver, a.artifactResolverCapability, a.artifactEnvelopeCodec)\n"
+              "\tcompSvc := compaction.NewService(cfg)\n"
+              "\thasCompactor := compSvc != nil && compSvc.Config.Enabled\n"
+              "\tif !hasCompactor {\n"
+              "\t\tcompSvc = nil\n"
+              "\t\ta.todoCompactionPending.Store(false)\n"
+              "\t\ta.compactionRetryPending.Store(false)\n"
+              "\t\ta.pendingCompactionMu.Lock()\n"
+              "\t\ta.pendingCompaction = nil\n"
+              "\t\ta.pendingCompactionMu.Unlock()\n"
+              "\t}\n"
+              "\ta.compactor = compSvc\n"
+              "\ta.hasCompactor = hasCompactor\n"
+              "}\n",
+              "// UpdateCompactionConfig replaces the compaction service used by future\n"
+              "// operations. If a turn, explicit compaction, checkpoint commit, or asynchronous\n"
+              "// compaction is active, the latest update is queued and installed atomically\n"
+              "// when the last active operation exits. The call never blocks an in-turn warning\n"
+              "// callback and an active operation keeps one coherent service/configuration.\n"
+              "func (a *Agent) UpdateCompactionConfig(cfg *compaction.Config) {\n"
+              "\tif a == nil {\n"
+              "\t\treturn\n"
+              "\t}\n"
+              "\tcfg = bindCompactionArtifactConfig(cfg, a.warningf, a.artifactOwner, a.artifactOwnerProvider, a.artifactSink, a.artifactResolver, a.artifactResolverCapability, a.artifactEnvelopeCodec)\n"
+              "\tcompSvc := compaction.NewService(cfg)\n"
+              "\thasCompactor := compSvc != nil && compSvc.Config.Enabled\n"
+              "\tif !hasCompactor {\n"
+              "\t\tcompSvc = nil\n"
+              "\t}\n"
+              "\ta.installOrQueueCompactionRuntime(&compactionRuntimeUpdate{service: compSvc, enabled: hasCompactor})\n"
+              "}\n",
+              "UpdateCompactionConfig",
+          )
+
+          replace_once(
+              "\t\treturn out\n"
+              "\t}\n"
+              "\tunregisterTurn := a.registerTurnCancellation(out, ctx)\n"
+              "\tgo func() {\n",
+              "\t\treturn out\n"
+              "\t}\n"
+              "\treleaseCompactionRuntime := a.beginCompactionRuntimeUse()\n"
+              "\tunregisterTurn := a.registerTurnCancellation(out, ctx)\n"
+              "\tgo func() {\n",
+              "QueryStreamWithSteering admission",
+          )
+
+          replace_once(
+              "\t\tdefer close(out)\n"
+              "\t\tdefer a.turnActive.Store(false)\n"
+              "\t\tdefer unregisterTurn()\n"
+              "\t\ta.cleanupToolResultDumps(toolResultDumpNow(), false)\n",
+              "\t\tdefer close(out)\n"
+              "\t\tdefer a.turnActive.Store(false)\n"
+              "\t\tdefer unregisterTurn()\n"
+              "\t\t// Release while admission is still held, and before channel close, so\n"
+              "\t\t// a queued configuration is visible at the next accepted operation.\n"
+              "\t\tdefer releaseCompactionRuntime()\n"
+              "\t\ta.cleanupToolResultDumps(toolResultDumpNow(), false)\n",
+              "QueryStreamWithSteering cleanup",
+          )
+
+          replace_once(
+              "\ttriggerUsage := cloneUsage(last.Usage)\n"
+              "\tgo a.runCompactionAsync(ctx, messages, snapshotLen, decisionUsage, triggerUsage, trigger, watermark)\n"
+              "\treturn nil\n",
+              "\ttriggerUsage := cloneUsage(last.Usage)\n"
+              "\t// Retain the old service synchronously before the goroutine can be\n"
+              "\t// scheduled; otherwise a queued update could install between launch and\n"
+              "\t// the asynchronous compactor's first instruction.\n"
+              "\treleaseCompactionRuntime := a.beginCompactionRuntimeUse()\n"
+              "\tgo func() {\n"
+              "\t\tdefer releaseCompactionRuntime()\n"
+              "\t\ta.runCompactionAsync(ctx, messages, snapshotLen, decisionUsage, triggerUsage, trigger, watermark)\n"
+              "\t}()\n"
+              "\treturn nil\n",
+              "asynchronous compaction launch",
+          )
+
+          replace_once(
+              "func (a *Agent) CompactPipelineNow(ctx context.Context, req compaction.PipelineRequest) (compaction.Result, error) {\n"
+              "\tif !a.hasCompactor || a.compactor == nil {\n",
+              "func (a *Agent) CompactPipelineNow(ctx context.Context, req compaction.PipelineRequest) (compaction.Result, error) {\n"
+              "\treleaseCompactionRuntime := a.beginCompactionRuntimeUse()\n"
+              "\tdefer releaseCompactionRuntime()\n"
+              "\tif !a.hasCompactor || a.compactor == nil {\n",
+              "CompactPipelineNow lifecycle",
+          )
+
+          replace_once(
+              "func (a *Agent) CommitCompactionCheckpoint(ctx context.Context, messages []llm.Message, res compaction.Result) (compaction.Result, error) {\n"
+              "\tcommit, err := a.persistCompactionCheckpoint(ctx, messages, res)\n",
+              "func (a *Agent) CommitCompactionCheckpoint(ctx context.Context, messages []llm.Message, res compaction.Result) (compaction.Result, error) {\n"
+              "\treleaseCompactionRuntime := a.beginCompactionRuntimeUse()\n"
+              "\tdefer releaseCompactionRuntime()\n"
+              "\tcommit, err := a.persistCompactionCheckpoint(ctx, messages, res)\n",
+              "CommitCompactionCheckpoint lifecycle",
+          )
+
+          path.write_text(source, encoding="utf-8")
+
+          docs = Path("agent_docs/architecture.md")
+          doc_source = docs.read_text(encoding="utf-8")
+          heading = "## Runtime Compaction Configuration Updates"
+          if heading in doc_source:
+              raise SystemExit("runtime compaction update section unexpectedly exists on main")
+          docs.write_text(doc_source.rstrip() + """
+
+## Runtime Compaction Configuration Updates
+
+`UpdateCompactionConfig` installs a new compaction service immediately only when
+no compaction-related operation is active. A complete agent turn, a manual or
+preflight compaction, an exported checkpoint commit, and each asynchronous
+compaction hold a lifecycle use. Updates received while uses are active are
+coalesced (latest wins) and installed when the final use exits. This keeps the
+`hasCompactor` flag and service pointer coherent without blocking an update made
+from an in-turn warning callback. Pending results produced by the superseded
+service are discarded before the replacement is installed.
+""", encoding="utf-8")
+          PY
+
+          gofmt -w sdk/agent/agent.go sdk/agent/compaction_runtime.go sdk/agent/agent_compaction_update_race_test.go
+          git diff --check
+          test -z "$(gofmt -l .)"
+          go vet ./...
+          go test ./sdk/agent -run '^Test(UpdateCompactionConfig|AgentUpdateCompactionConfig)' -count=20
+          go test -race ./sdk/agent -run '^Test(UpdateCompactionConfig|AgentUpdateCompactionConfig)' -count=10
+          go test ./... -count=1
+          go test -race ./sdk/agent/... -count=1
+          go build ./...
+
+          git add agent_docs/architecture.md sdk/agent/agent.go sdk/agent/agent_compaction_update_race_test.go sdk/agent/compaction_runtime.go
+          git diff --cached --check
+          git commit -m "fix(agent): serialize compaction runtime replacement"
+          git merge-base --is-ancestor "$clean_main" HEAD
+          expected="$(printf '%s\n' agent_docs/architecture.md sdk/agent/agent.go sdk/agent/agent_compaction_update_race_test.go sdk/agent/compaction_runtime.go | sort)"
+          actual="$(git diff --name-only "$clean_main"...HEAD | sort)"
+          test "$actual" = "$expected"
+          new_head="$(git rev-parse HEAD)"
+          echo "new_head=$new_head" >> "$GITHUB_OUTPUT"
+          git push --force-with-lease="refs/heads/${TARGET_BRANCH}:${old_pr_head}" origin "HEAD:refs/heads/${TARGET_BRANCH}"
+
+      - name: Report audit result
+        if: always()
+        env:
+          GH_TOKEN: ${{ github.token }}
+          OUTCOME: ${{ steps.audit.outcome }}
+          CLEAN_MAIN: ${{ steps.audit.outputs.clean_main }}
+          NEW_HEAD: ${{ steps.audit.outputs.new_head }}
+          OLD_HEAD: ${{ steps.audit.outputs.old_pr_head }}
+        run: |
+          set -euo pipefail
+          body="Issue #21 one-shot audit outcome: ${OUTCOME}. Run: ${GITHUB_RUN_ID}. Previous PR head: ${OLD_HEAD:-unknown}. Clean main: ${CLEAN_MAIN:-unknown}. Audited PR head: ${NEW_HEAD:-not-published}."
+          gh issue comment 21 --repo "$GITHUB_REPOSITORY" --body "$body"
+          if [ "$OUTCOME" != "success" ]; then
+            exit 1
+          fi
