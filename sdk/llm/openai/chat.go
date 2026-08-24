@@ -463,7 +463,10 @@ func (c *ChatClient) InvokeStream(ctx context.Context, req llm.InvokeRequest) (<
 				out <- llm.StreamErrorEvent{Err: err}
 				return
 			}
-			out <- llm.StreamDoneEvent{StopReason: stopReason}
+			out <- llm.StreamErrorEvent{Err: &llm.ProviderError{
+				Provider: local.Provider(),
+				Message:  fmt.Sprintf("stream ended before [DONE]; response is incomplete (model=%q endpoint=%s)", local.ModelName, endpoint),
+			}}
 			return
 		}
 		out <- llm.StreamErrorEvent{Err: errors.New("openai stream: retry loop ended without result")}

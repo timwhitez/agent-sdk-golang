@@ -625,6 +625,7 @@ func (c *ResponsesClient) InvokeStream(ctx context.Context, req llm.InvokeReques
 			}
 
 			stopReason := ""
+			sawCompleted := false
 			thinkingEmitted := false
 			textEmitted := false
 			streamResponseID := ""
@@ -835,6 +836,7 @@ func (c *ResponsesClient) InvokeStream(ctx context.Context, req llm.InvokeReques
 						}
 					}
 				case "response.completed":
+					sawCompleted = true
 					respObj, _ := root["response"].(map[string]any)
 					if respObj != nil {
 						if id, ok := respObj["id"].(string); ok && strings.TrimSpace(id) != "" {
@@ -882,6 +884,13 @@ func (c *ResponsesClient) InvokeStream(ctx context.Context, req llm.InvokeReques
 			}
 			if err != nil {
 				out <- llm.StreamErrorEvent{Err: err}
+				return
+			}
+			if !sawCompleted {
+				out <- llm.StreamErrorEvent{Err: &llm.ProviderError{
+					Provider: local.Provider(),
+					Message:  fmt.Sprintf("stream ended before response.completed or [DONE]; response is incomplete (model=%q endpoint=%s)", local.ModelName, endpoint),
+				}}
 				return
 			}
 			out <- llm.StreamDoneEvent{StopReason: stopReason}
