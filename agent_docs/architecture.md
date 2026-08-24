@@ -544,3 +544,12 @@ Mapping details:
 - Only non-hidden tools are advertised to providers; hidden tools remain internal controls (`sdk/agent/agent.go:233`, `sdk/tools/tool.go:24`)
 - Steering is only injected at deterministic boundaries, not during provider/tool execution (`sdk/agent/agent.go:226`, `sdk/agent/agent.go:448`)
 - Compaction preserves system-message semantics by explicitly re-prepending deduplicated system messages after summary replacement, while also deduplicating any system messages returned by compacted payloads (`sdk/agent/agent.go:894`, `sdk/agent/compaction/service.go:122`)
+
+## Agent Turn Concurrency Contract
+
+A single `Agent` owns one mutable conversation and permits exactly one active
+`QueryStream` / `QueryStreamWithSteering` turn. Admission is acquired before the
+turn goroutine starts. An overlapping submission receives an
+`ErrorEvent{Kind: "agent_busy"}` and does not append input, invoke a provider,
+or replace steering/cancellation state. Callers needing parallel turns must use
+separate `Agent` instances.
