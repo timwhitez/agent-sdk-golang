@@ -553,3 +553,16 @@ turn goroutine starts. An overlapping submission receives an
 `ErrorEvent{Kind: "agent_busy"}` and does not append input, invoke a provider,
 or replace steering/cancellation state. Callers needing parallel turns must use
 separate `Agent` instances.
+
+## Runtime Compaction Configuration Updates
+
+`UpdateCompactionConfig` is non-blocking. If the current compaction runtime is in
+use, updates are coalesced and the latest replacement becomes a generation
+barrier: later top-level turns, manual/preflight compactions, and exported
+checkpoint commits wait rather than joining the superseded generation. Child
+work already launched by an active operation (notably asynchronous compaction)
+retains that operation's old generation and completes coherently. When the last
+old-generation use exits, the latest replacement is installed atomically,
+stale pending compaction output and old retry/cooldown state are discarded, and
+all waiters resume on the new runtime. A disabled replacement also clears the
+pending todo checkpoint signal.
