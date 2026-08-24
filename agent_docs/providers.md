@@ -111,3 +111,12 @@ stream normalization, and response metadata behavior.
 - Cost helper fetches LiteLLM pricing data, caches for 24h, warns on pricing-init/cache-read/cache-parse/cache-write/cost-calc failures while keeping non-fatal usage-only fallback, and tracks usage history (`sdk/tokens/cost.go:20`, `sdk/tokens/cost.go:22`, `sdk/tokens/cost.go:99`, `sdk/tokens/cost.go:108`, `sdk/tokens/cost.go:126`, `sdk/tokens/cost.go:173`, `sdk/tokens/cost.go:217`)
 - Pricing lookup now supports case-insensitive names, common aliases, provider-prefix probing, and base-family fallback (choosing latest/date-tagged variants when exact names are unavailable) (`sdk/tokens/cost.go:292`, `sdk/tokens/cost.go:310`, `sdk/tokens/cost.go:392`)
 - Cost math separates cached vs non-cached prompt tokens and output tokens (`sdk/tokens/cost.go:243`, `sdk/tokens/cost.go:255`, `sdk/tokens/cost.go:263`)
+
+### Anthropic redirect credential boundary
+
+Anthropic buffered and streaming clients follow only same-origin redirects.
+Cross-origin targets and HTTPS-to-non-HTTPS downgrades are rejected before a
+redirected request is sent, so `x-api-key` and request content never leave the
+configured API origin. A caller-provided `CheckRedirect` callback is composed
+for allowed same-origin redirects and cannot mutate the request onto another
+origin without a second policy check.

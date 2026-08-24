@@ -11,6 +11,7 @@ import (
 	"log"
 	"net/http"
 	"net/url"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -1228,6 +1229,7 @@ func makeStrictSchema(schema map[string]any) map[string]any {
 		newProps[name] = makeStrictProperty(prop, wasRequired)
 	}
 	s["properties"] = newProps
+	sort.Strings(all)
 	// all required
 	reqList := make([]any, 0, len(all))
 	for _, name := range all {

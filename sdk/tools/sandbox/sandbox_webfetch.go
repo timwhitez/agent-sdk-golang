@@ -9,6 +9,7 @@ import (
 	"net/netip"
 	"net/url"
 	"strings"
+	"time"
 
 	"github.com/timwhitez/agent-sdk-golang/sdk/tools"
 )
@@ -34,6 +35,20 @@ var webfetchLookupIPAddrs = func(ctx context.Context, host string) ([]net.IPAddr
 	return net.DefaultResolver.LookupIPAddr(ctx, host)
 }
 
+// webfetchDialContext is the final socket dial seam. The production path is
+// always called with a literal IP selected from the just-validated DNS result.
+var webfetchDialContext = func(ctx context.Context, network, address string) (net.Conn, error) {
+	return (&net.Dialer{}).DialContext(ctx, network, address)
+}
+
+// webfetchDoRequest is the HTTP execution seam used by package tests. The
+// production value always executes the request with the validated client built
+// below; unlike replacing http.DefaultTransport, overriding this seam cannot
+// silently alter the transport policy in a deployed process.
+var webfetchDoRequest = func(client *http.Client, request *http.Request) (*http.Response, error) {
+	return client.Do(request)
+}
+
 // SetWebfetchLookupIPAddrs sets the IP address lookup function for webfetch.
 // This is primarily used for testing.
 func SetWebfetchLookupIPAddrs(fn func(context.Context, string) ([]net.IPAddr, error)) {
@@ -56,7 +71,10 @@ func webfetchTool() tools.Tool {
 		if scheme != "http" && scheme != "https" {
 			return "", fmt.Errorf("only http/https is supported")
 		}
-		if err := validateWebfetchDestinationURL(ctx, u, "request target"); err != nil {
+		// Before the user authorizes network access, validate only syntax and
+		// literal-IP policy. Hostname resolution is itself an observable network
+		// action and is deferred to the socket-bound validator after confirmation.
+		if err := validateWebfetchPreConfirmationURL(u, "request target"); err != nil {
 			return "", err
 		}
 		method := strings.ToUpper(strings.TrimSpace(a.Method))
@@ -66,9 +84,9 @@ func webfetchTool() tools.Tool {
 		if method != http.MethodGet && method != http.MethodHead {
 			return "", fmt.Errorf("only GET/HEAD is supported")
 		}
-		timeout, timeoutDuration, err := checkedSandboxTimeout(a.Timeout, 30)
-		if err != nil {
-			return "", fmt.Errorf("invalid webfetch timeout: %w; use a timeout from 1 to %d seconds", err, maxSandboxTimeoutSeconds)
+		timeout := a.Timeout
+		if timeout <= 0 {
+			timeout = 30
 		}
 		maxBytes := a.MaxBytes
 		if maxBytes <= 0 {
@@ -93,17 +111,15 @@ func webfetchTool() tools.Tool {
 			return denied.PlainText(), denyErr
 		}
 
-		hc := &http.Client{
-			Timeout: timeoutDuration,
-			CheckRedirect: func(req *http.Request, via []*http.Request) error {
-				if len(via) >= webfetchMaxRedirects {
-					return fmt.Errorf("stopped after %d redirects", webfetchMaxRedirects)
-				}
-				if req == nil || req.URL == nil {
-					return fmt.Errorf("invalid redirect target")
-				}
-				return validateWebfetchDestinationURL(req.Context(), req.URL, "redirect target")
-			},
+		hc := newWebfetchHTTPClient(time.Duration(timeout) * time.Second)
+		hc.CheckRedirect = func(req *http.Request, via []*http.Request) error {
+			if len(via) >= webfetchMaxRedirects {
+				return fmt.Errorf("stopped after %d redirects", webfetchMaxRedirects)
+			}
+			if req == nil || req.URL == nil {
+				return fmt.Errorf("invalid redirect target")
+			}
+			return validateWebfetchDestinationURL(req.Context(), req.URL, "redirect target")
 		}
 		req, err := http.NewRequestWithContext(ctx, method, rawURL, nil)
 		if err != nil {
@@ -116,7 +132,7 @@ func webfetchTool() tools.Tool {
 				req.Header.Set(kk, vv)
 			}
 		}
-		resp, err := hc.Do(req)
+		resp, err := webfetchDoRequest(hc, req)
 		if err != nil {
 			return "", fmt.Errorf("request failed: %w", err)
 		}
@@ -146,6 +162,64 @@ func webfetchTool() tools.Tool {
 	})
 }
 
+func newWebfetchHTTPClient(timeout time.Duration) *http.Client {
+	// Build from fixed, package-owned defaults instead of cloning the process
+	// global transport. A mutated *http.Transport can carry DialTLSContext or
+	// DialTLS hooks that bypass DialContext for HTTPS, as well as proxy or TLS
+	// policy that is outside WebFetch's destination-validation boundary.
+	transport := &http.Transport{
+		Proxy:                 nil,
+		DialContext:           dialValidatedWebfetchDestination,
+		ForceAttemptHTTP2:     true,
+		MaxIdleConns:          100,
+		IdleConnTimeout:       90 * time.Second,
+		TLSHandshakeTimeout:   10 * time.Second,
+		ExpectContinueTimeout: time.Second,
+	}
+	return &http.Client{Timeout: timeout, Transport: transport}
+}
+
+// dialValidatedWebfetchDestination resolves and classifies the exact address
+// set used for this socket, then dials a selected literal IP. The original host
+// remains on the request URL, preserving the HTTP Host header and TLS SNI.
+func dialValidatedWebfetchDestination(ctx context.Context, network, address string) (net.Conn, error) {
+	host, port, err := net.SplitHostPort(address)
+	if err != nil {
+		return nil, fmt.Errorf("invalid webfetch dial address %q: %w", address, err)
+	}
+	addrs, err := resolveAndValidateWebfetchHost(ctx, host, "socket target")
+	if err != nil {
+		return nil, err
+	}
+	var dialErrors []string
+	for _, ip := range addrs {
+		conn, dialErr := webfetchDialContext(ctx, network, net.JoinHostPort(ip.String(), port))
+		if dialErr == nil {
+			return conn, nil
+		}
+		dialErrors = append(dialErrors, dialErr.Error())
+	}
+	return nil, fmt.Errorf("cannot connect to validated socket target %q: %s", host, strings.Join(dialErrors, "; "))
+}
+
+// validateWebfetchPreConfirmationURL performs only local checks. A hostname is
+// intentionally not resolved until after the user has approved the request.
+func validateWebfetchPreConfirmationURL(target *url.URL, stage string) error {
+	if target == nil {
+		return fmt.Errorf("invalid url: missing host")
+	}
+	host := strings.TrimSpace(target.Hostname())
+	if host == "" {
+		return fmt.Errorf("invalid url: missing host")
+	}
+	if ip := parseWebfetchLiteralIP(host); ip != nil {
+		if class := classifyWebfetchAddress(ip); class != "" {
+			return webfetchDestinationDeniedError(stage, host, ip.String(), class)
+		}
+	}
+	return nil
+}
+
 // validateWebfetchDestinationURL validates that a URL destination is safe.
 func validateWebfetchDestinationURL(ctx context.Context, target *url.URL, stage string) error {
 	if target == nil {
@@ -160,40 +234,45 @@ func validateWebfetchDestinationURL(ctx context.Context, target *url.URL, stage 
 
 // validateWebfetchHostDestination validates that a host destination is safe.
 func validateWebfetchHostDestination(ctx context.Context, host, stage string) error {
+	_, err := resolveAndValidateWebfetchHost(ctx, host, stage)
+	return err
+}
+
+func resolveAndValidateWebfetchHost(ctx context.Context, host, stage string) ([]net.IP, error) {
 	host = strings.TrimSpace(host)
 	if host == "" {
-		return fmt.Errorf("invalid url: missing host")
+		return nil, fmt.Errorf("invalid url: missing host")
 	}
 	if stage == "" {
 		stage = "request target"
 	}
 	if ip := parseWebfetchLiteralIP(host); ip != nil {
 		if class := classifyWebfetchAddress(ip); class != "" {
-			return webfetchDestinationDeniedError(stage, host, ip.String(), class)
+			return nil, webfetchDestinationDeniedError(stage, host, ip.String(), class)
 		}
-		return nil
+		return []net.IP{append(net.IP(nil), ip...)}, nil
 	}
 	addrs, err := webfetchLookupIPAddrs(ctx, host)
 	if err != nil {
-		return fmt.Errorf("cannot resolve %s %q: %v. Check hostname spelling and retry with a public URL", stage, host, err)
+		return nil, fmt.Errorf("cannot resolve %s %q: %v. Check hostname spelling and retry with a public URL", stage, host, err)
 	}
 	if len(addrs) == 0 {
-		return fmt.Errorf("cannot resolve %s %q: no addresses returned. Check hostname spelling and retry with a public URL", stage, host)
+		return nil, fmt.Errorf("cannot resolve %s %q: no addresses returned. Check hostname spelling and retry with a public URL", stage, host)
 	}
-	usable := 0
+	validated := make([]net.IP, 0, len(addrs))
 	for _, addr := range addrs {
 		if addr.IP == nil {
 			continue
 		}
-		usable++
 		if class := classifyWebfetchAddress(addr.IP); class != "" {
-			return webfetchDestinationDeniedError(stage, host, addr.IP.String(), class)
+			return nil, webfetchDestinationDeniedError(stage, host, addr.IP.String(), class)
 		}
+		validated = append(validated, append(net.IP(nil), addr.IP...))
 	}
-	if usable == 0 {
-		return fmt.Errorf("cannot resolve %s %q: no usable addresses returned. Check hostname spelling and retry with a public URL", stage, host)
+	if len(validated) == 0 {
+		return nil, fmt.Errorf("cannot resolve %s %q: no usable addresses returned. Check hostname spelling and retry with a public URL", stage, host)
 	}
-	return nil
+	return validated, nil
 }
 
 // parseWebfetchLiteralIP parses a host string as a literal IP address.

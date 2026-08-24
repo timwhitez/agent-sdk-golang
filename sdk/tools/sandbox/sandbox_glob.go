@@ -72,6 +72,27 @@ func globSkippedWarning(diag globSkippedDiagnostics) string {
 	)
 }
 
+// globWalkWarning creates a warning for paths skipped because directory traversal failed.
+func globWalkWarning(diag globSkippedDiagnostics) string {
+	if diag.count == 0 {
+		return ""
+	}
+	summary := ""
+	if len(diag.samples) == 0 {
+		summary = fmt.Sprintf("glob skipped %d path(s) because directory traversal failed", diag.count)
+	} else {
+		summary = fmt.Sprintf(
+			"glob skipped %d path(s) because directory traversal failed: %s",
+			diag.count,
+			strings.Join(diag.samples, ", "),
+		)
+	}
+	return formatWarningDiagnostic(
+		summary,
+		"Review traversal errors and directory permissions, then rerun glob for complete results.",
+	)
+}
+
 // globSymlinkWarning creates a warning for paths skipped due to being symbolic links.
 func globSymlinkWarning(diag globSkippedDiagnostics) string {
 	if diag.count == 0 {
@@ -177,8 +198,14 @@ func globTool() tools.Tool {
 		scanTruncated := false
 		skippedStat := globSkippedDiagnostics{}
 		skippedSymlink := globSkippedDiagnostics{}
+		skippedWalk := globSkippedDiagnostics{}
 		walkErr := globWalkDir(base, func(path string, d os.DirEntry, walkErr error) error {
 			if walkErr != nil {
+				displayPath := resultPathForDisplay(s, path)
+				if pathsEqual(filepath.Clean(path), filepath.Clean(base)) {
+					return fmt.Errorf("cannot inspect glob root %s: %w", displayPath, walkErr)
+				}
+				skippedWalk.add(displayPath)
 				if d != nil && d.IsDir() {
 					return filepath.SkipDir
 				}
@@ -253,19 +280,28 @@ func globTool() tools.Tool {
 		}
 		statWarning := globSkippedWarning(skippedStat)
 		symlinkWarning := globSymlinkWarning(skippedSymlink)
+		walkWarning := globWalkWarning(skippedWalk)
 		scanWarning := ""
 		if scanTruncated {
 			scanWarning = globScanCapWarning(scannedCandidates, maxGlobScanFiles)
 		}
-		skippedCount := skippedStat.count + skippedSymlink.count
+		skippedCount := skippedStat.count + skippedSymlink.count + skippedWalk.count
 		skippedReason := ""
-		switch {
-		case skippedStat.count > 0 && skippedSymlink.count > 0:
-			skippedReason = "multiple"
-		case skippedStat.count > 0:
+		reasonKinds := 0
+		if skippedStat.count > 0 {
+			reasonKinds++
 			skippedReason = "stat_error"
-		case skippedSymlink.count > 0:
+		}
+		if skippedSymlink.count > 0 {
+			reasonKinds++
 			skippedReason = "symlink_target"
+		}
+		if skippedWalk.count > 0 {
+			reasonKinds++
+			skippedReason = "walk_error"
+		}
+		if reasonKinds > 1 {
+			skippedReason = "multiple"
 		}
 		meta := map[string]any{
 			"count":     totalFiles,
@@ -285,6 +321,10 @@ func globTool() tools.Tool {
 			meta["skipped_symlink_paths"] = skippedSymlink.count
 			meta["skipped_symlink_samples"] = append([]string(nil), skippedSymlink.samples...)
 		}
+		if skippedWalk.count > 0 {
+			meta["skipped_walk_paths"] = skippedWalk.count
+			meta["skipped_walk_samples"] = append([]string(nil), skippedWalk.samples...)
+		}
 		if scanTruncated {
 			meta["scan_truncated"] = true
 			meta["scan_cap"] = maxGlobScanFiles
@@ -297,7 +337,7 @@ func globTool() tools.Tool {
 		}
 		tools.UpsertToolResultMetadata(ctx, meta)
 		if totalFiles == 0 {
-			return appendGlobWarning("No files match pattern: "+a.Pattern, statWarning, symlinkWarning, scanWarning), nil
+			return appendGlobWarning("No files match pattern: "+a.Pattern, statWarning, symlinkWarning, walkWarning, scanWarning), nil
 		}
 		header := ""
 		if scanTruncated {
@@ -307,6 +347,6 @@ func globTool() tools.Tool {
 		} else {
 			header = fmt.Sprintf("Found %d file(s):", totalFiles)
 		}
-		return appendGlobWarning(fmt.Sprintf("%s\n%s", header, strings.Join(files, "\n")), statWarning, symlinkWarning, scanWarning), nil
+		return appendGlobWarning(fmt.Sprintf("%s\n%s", header, strings.Join(files, "\n")), statWarning, symlinkWarning, walkWarning, scanWarning), nil
 	})
 }

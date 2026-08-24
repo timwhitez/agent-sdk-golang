@@ -76,7 +76,7 @@ func (c *Client) Provider() string { return "anthropic" }
 func (c *Client) Model() string { return c.ModelName }
 
 func (c *Client) Invoke(ctx context.Context, req llm.InvokeRequest) (*llm.Completion, error) {
-	client := c.httpClient()
+	client := redirectSafeHTTPClient(c.httpClient())
 	baseURL := strings.TrimRight(c.baseURL(), "/")
 	endpoint := anthropicEndpoint(baseURL, "messages")
 	lastErr := error(nil)
@@ -667,7 +667,7 @@ func (c *Client) InvokeStream(ctx context.Context, req llm.InvokeRequest) (<-cha
 			}
 		}
 
-		client := streamHTTPClient(c.httpClient())
+		client := streamHTTPClient(redirectSafeHTTPClient(c.httpClient()))
 		baseURL := strings.TrimRight(c.baseURL(), "/")
 		endpoint := anthropicEndpoint(baseURL, "messages")
 
@@ -1341,30 +1341,48 @@ func validateAnthropicToolHistory(messages []llm.Message) error {
 		if m.Role != llm.RoleAssistant || len(m.ToolCalls) == 0 {
 			continue
 		}
+
+		// Preserve the source identity separately from Anthropic's wire-safe ID.
+		// The normalization is lossy (for example call/a and call:a both become
+		// call_a), so keying only by the normalized value can silently merge two
+		// distinct calls and let one tool_result satisfy both.
 		expected := make(map[string]bool, len(m.ToolCalls))
+		wireOwner := make(map[string]string, len(m.ToolCalls))
 		for _, call := range m.ToolCalls {
-			id := normalizeToolCallIDWithWarning(call.ID, nil)
-			if id == "" {
+			originalID := strings.TrimSpace(call.ID)
+			if originalID == "" {
 				return fmt.Errorf("anthropic: invalid tool history: assistant tool call at index %d has empty id", i)
 			}
-			expected[id] = false
+			wireID := normalizeToolCallIDWithWarning(originalID, nil)
+			if previous, exists := wireOwner[wireID]; exists {
+				if previous == originalID {
+					return fmt.Errorf("anthropic: invalid tool history: assistant tool call at index %d repeats id %q", i, originalID)
+				}
+				return fmt.Errorf("anthropic: invalid tool history: assistant tool call ids %q and %q at index %d both normalize to %q", previous, originalID, i, wireID)
+			}
+			wireOwner[wireID] = originalID
+			expected[originalID] = false
 		}
+
 		j := i + 1
 		for j < len(messages) && messages[j].Role == llm.RoleTool {
-			id := normalizeToolCallIDWithWarning(messages[j].ToolCallID, nil)
-			if id == "" {
+			originalID := strings.TrimSpace(messages[j].ToolCallID)
+			if originalID == "" {
 				return fmt.Errorf("anthropic: invalid tool history: tool message at index %d has empty tool_call_id", j)
 			}
-			if _, ok := expected[id]; !ok {
-				return fmt.Errorf("anthropic: invalid tool history: tool message at index %d references unknown tool_use id %q", j, id)
+			seen, ok := expected[originalID]
+			if !ok {
+				return fmt.Errorf("anthropic: invalid tool history: tool message at index %d references unknown tool_use id %q", j, originalID)
 			}
-			expected[id] = true
+			if seen {
+				return fmt.Errorf("anthropic: invalid tool history: tool message at index %d repeats tool_use id %q", j, originalID)
+			}
+			expected[originalID] = true
 			j++
 		}
-		for _, call := range m.ToolCalls {
-			id := normalizeToolCallIDWithWarning(call.ID, nil)
-			if !expected[id] {
-				return fmt.Errorf("anthropic: invalid tool history: assistant tool call %q at index %d is missing a contiguous tool result", id, i)
+		for originalID, seen := range expected {
+			if !seen {
+				return fmt.Errorf("anthropic: invalid tool history: assistant tool call %q at index %d is missing a contiguous tool result", originalID, i)
 			}
 		}
 		i = j - 1
