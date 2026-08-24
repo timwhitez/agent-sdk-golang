@@ -76,7 +76,7 @@ func (c *Client) Provider() string { return "anthropic" }
 func (c *Client) Model() string { return c.ModelName }
 
 func (c *Client) Invoke(ctx context.Context, req llm.InvokeRequest) (*llm.Completion, error) {
-	client := c.httpClient()
+	client := redirectSafeHTTPClient(c.httpClient())
 	baseURL := strings.TrimRight(c.baseURL(), "/")
 	endpoint := anthropicEndpoint(baseURL, "messages")
 	lastErr := error(nil)
@@ -667,7 +667,7 @@ func (c *Client) InvokeStream(ctx context.Context, req llm.InvokeRequest) (<-cha
 			}
 		}
 
-		client := streamHTTPClient(c.httpClient())
+		client := streamHTTPClient(redirectSafeHTTPClient(c.httpClient()))
 		baseURL := strings.TrimRight(c.baseURL(), "/")
 		endpoint := anthropicEndpoint(baseURL, "messages")
 
