@@ -1754,12 +1754,12 @@ func TestWebfetchToolReadErrorIsSurfaced(t *testing.T) {
 func TestWebfetchToolBlocksPrivateDestination(t *testing.T) {
 	useSandboxPublicWebfetchResolver(t)
 
-	origDo := webfetchDoRequest
-	webfetchDoRequest = func(_ *http.Client, _ *http.Request) (*http.Response, error) {
-		t.Fatalf("webfetch request should not run for blocked private destination")
+	origDial := webfetchDialContext
+	webfetchDialContext = func(context.Context, string, string) (net.Conn, error) {
+		t.Fatalf("low-level socket dial should not run for blocked private destination")
 		return nil, nil
 	}
-	t.Cleanup(func() { webfetchDoRequest = origDo })
+	t.Cleanup(func() { webfetchDialContext = origDial })
 
 	deps := tools.NewContainer()
 	tools.Provide(deps, ConfirmKey, func(context.Context) (Confirmer, error) { return allowConfirmer{}, nil })
@@ -1768,11 +1768,12 @@ func TestWebfetchToolBlocksPrivateDestination(t *testing.T) {
 		name          string
 		url           string
 		wantSubstring string
+		wantStage     string
 	}{
-		{name: "loopback", url: "http://127.0.0.1:8080", wantSubstring: "loopback"},
-		{name: "rfc1918", url: "http://10.1.2.3", wantSubstring: "private"},
-		{name: "link-local", url: "http://169.254.10.20", wantSubstring: "link-local"},
-		{name: "private-dns", url: "http://internal.test/private", wantSubstring: "private"},
+		{name: "loopback", url: "http://127.0.0.1:8080", wantSubstring: "loopback", wantStage: "blocked request target"},
+		{name: "rfc1918", url: "http://10.1.2.3", wantSubstring: "private", wantStage: "blocked request target"},
+		{name: "link-local", url: "http://169.254.10.20", wantSubstring: "link-local", wantStage: "blocked request target"},
+		{name: "private-dns", url: "http://internal.test/private", wantSubstring: "private", wantStage: "blocked socket target"},
 	}
 
 	for _, tt := range tests {
@@ -1783,8 +1784,8 @@ func TestWebfetchToolBlocksPrivateDestination(t *testing.T) {
 				t.Fatalf("expected destination block for %s", tt.url)
 			}
 			gotErr := strings.ToLower(err.Error())
-			if !strings.Contains(gotErr, "blocked request target") {
-				t.Fatalf("expected blocked request-target diagnostic, got %q", err.Error())
+			if !strings.Contains(gotErr, tt.wantStage) {
+				t.Fatalf("expected %q diagnostic, got %q", tt.wantStage, err.Error())
 			}
 			if !strings.Contains(gotErr, tt.wantSubstring) {
 				t.Fatalf("expected %q diagnostic, got %q", tt.wantSubstring, err.Error())
