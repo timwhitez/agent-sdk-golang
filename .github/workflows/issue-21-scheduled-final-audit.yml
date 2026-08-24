@@ -1,6 +1,9 @@
-name: Scheduled final audit for issue 21
+name: Final audit for issue 21
 
 on:
+  pull_request_target:
+    types: [synchronize]
+    branches: [main]
   schedule:
     - cron: '*/5 * * * *'
 
@@ -9,11 +12,12 @@ permissions:
   issues: write
 
 concurrency:
-  group: issue-21-scheduled-final-audit
+  group: issue-21-final-audit
   cancel-in-progress: false
 
 jobs:
   audit:
+    if: github.event_name == 'schedule' || github.event.pull_request.number == 37
     runs-on: ubuntu-latest
     timeout-minutes: 45
     steps:
@@ -43,7 +47,7 @@ jobs:
           git rm "$WORKFLOW_PATH"
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git commit -m "chore: remove scheduled issue 21 audit workflow"
+          git commit -m "chore: remove issue 21 final audit workflow"
           git push --force-with-lease="refs/heads/main:${trigger_head}" origin HEAD:refs/heads/main
           clean_main="$(git rev-parse HEAD)"
           echo "clean_main=$clean_main" >> "$GITHUB_OUTPUT"
@@ -238,7 +242,7 @@ service are discarded before the replacement is installed.
           OLD_HEAD: ${{ steps.audit.outputs.old_pr_head }}
         run: |
           set -euo pipefail
-          body="Issue #21 scheduled audit outcome: ${OUTCOME}. Run: ${GITHUB_RUN_ID}. Previous PR head: ${OLD_HEAD:-unknown}. Clean main: ${CLEAN_MAIN:-unknown}. Audited PR head: ${NEW_HEAD:-not-published}."
+          body="Issue #21 final audit outcome: ${OUTCOME}. Run: ${GITHUB_RUN_ID}. Previous PR head: ${OLD_HEAD:-unknown}. Clean main: ${CLEAN_MAIN:-unknown}. Audited PR head: ${NEW_HEAD:-not-published}."
           gh issue comment 21 --repo "$GITHUB_REPOSITORY" --body "$body"
           if [ "$OUTCOME" != "success" ]; then
             exit 1
