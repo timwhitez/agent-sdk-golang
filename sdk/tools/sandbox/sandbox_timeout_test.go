@@ -64,9 +64,10 @@ func TestBashRejectsOversizedTimeoutBeforeConfirmation(t *testing.T) {
 }
 
 func TestWebfetchRejectsOversizedTimeoutBeforeConfirmation(t *testing.T) {
+	useSandboxPublicWebfetchResolver(t)
 	confirmer := &countingTimeoutConfirmer{}
 	deps := timeoutTestDeps(t, confirmer)
-	args, _ := json.Marshal(map[string]any{"url": "https://example.com", "timeout": maxSandboxTimeoutSeconds + 1})
+	args, _ := json.Marshal(map[string]any{"url": "https://example.test", "timeout": maxSandboxTimeoutSeconds + 1})
 	_, err := webfetchTool().Execute(context.Background(), string(args), deps)
 	if err == nil || !strings.Contains(err.Error(), "maximum allowed") {
 		t.Fatalf("webfetch oversized timeout error = %v", err)
