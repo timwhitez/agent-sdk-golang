@@ -8,6 +8,7 @@ import (
 	"log"
 	"net"
 	"os"
+	"reflect"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -3741,61 +3742,94 @@ func (a *Agent) applyPendingCompaction(out chan Event) {
 		a.pendingCompaction = nil
 	}
 	a.pendingCompactionMu.Unlock()
-	if pending == nil {
+	if pending == nil || !pending.result.Compacted {
 		return
 	}
-	if !pending.result.Compacted {
+
+	// Build an immutable candidate under the history lock, then release the
+	// lock before any host-controlled ledger/checkpoint I/O. The source snapshot
+	// is compared again before publication so a concurrent history mutation is
+	// never overwritten by a stale compaction result.
+	a.mu.Lock()
+	source := llm.CloneMessages(a.messages)
+	currentLen := len(source)
+	if currentLen < pending.snapshotLen {
+		a.mu.Unlock()
+		a.warnf("compaction apply skipped: history shrank (%d < %d); scheduling retry", currentLen, pending.snapshotLen)
+		a.requeuePendingCompaction(pending)
+		a.compactionRetryPending.Store(true)
+		return
+	}
+	tailCap := currentLen - pending.snapshotLen
+	pairingRepaired := false
+	merged := llm.CloneMessages(pending.messages)
+	if tailCap > 0 {
+		merged = append(merged, llm.CloneMessages(source[pending.snapshotLen:])...)
+		// pending.messages dropped every assistant tool_use block, so a tail
+		// that starts inside a tool block would splice orphaned tool results
+		// onto the summary. Repair rather than trust the caller to compact only
+		// on user-message boundaries.
+		if repaired, changed := repairToolCallPairs(merged); changed {
+			pairingRepaired = true
+			merged = repaired
+		}
+	}
+	a.mu.Unlock()
+
+	if pairingRepaired {
+		a.warnf("compaction apply repaired tool-call pairing at the summary/tail splice point")
+	}
+	// Estimation may invoke a host-supplied TokenEstimator; keep it outside the
+	// history lock for the same re-entrancy reason as checkpoint persistence.
+	pending.result = a.reconcileCompactionTelemetry(pending.result, source, merged, 0)
+	commit, commitErr := a.persistCompactionCheckpoint(context.Background(), merged, pending.result)
+	if commitErr != nil {
+		a.requeuePendingCompaction(pending)
+		a.compactionRetryPending.Store(true)
+		warning := commitErr.Error()
+		if len(commit.result.Warnings) > 0 {
+			warning = commit.result.Warnings[len(commit.result.Warnings)-1]
+		}
+		a.warnf("%s", warning)
 		return
 	}
 
 	a.mu.Lock()
-	currentLen := len(a.messages)
-	tailCap := 0
-	if currentLen > pending.snapshotLen {
-		tailCap = currentLen - pending.snapshotLen
-	}
-	merged := make([]llm.Message, 0, len(pending.messages)+tailCap)
-	merged = append(merged, pending.messages...)
-	if currentLen < pending.snapshotLen {
-		a.warnf("compaction apply skipped: history shrank (%d < %d); scheduling retry", currentLen, pending.snapshotLen)
+	if !reflect.DeepEqual(a.messages, source) {
 		a.mu.Unlock()
+		rollbackErr := error(nil)
+		if commit.persisted {
+			rollbackErr = a.compactor.RollbackPendingLedger(context.Background(), &commit.transaction)
+		}
+		a.requeuePendingCompaction(pending)
 		a.compactionRetryPending.Store(true)
+		if rollbackErr != nil {
+			a.warnf("compaction apply deferred because history changed while checkpoint persistence was running; ledger rollback failed: %v", rollbackErr)
+		} else {
+			a.warnf("compaction apply deferred because history changed while checkpoint persistence was running; ledger state was rolled back and the unreferenced checkpoint can be garbage-collected")
+		}
 		return
 	}
-	if currentLen > pending.snapshotLen {
-		merged = append(merged, a.messages[pending.snapshotLen:]...)
-		// pending.messages dropped every assistant tool_use block, so a tail
-		// that starts inside a tool block would splice orphaned tool results
-		// onto the summary. Repair rather than trust the caller to only ever
-		// compact on user-message boundaries.
-		if repaired, changed := repairToolCallPairs(merged); changed {
-			a.warnf("compaction apply repaired tool-call pairing at the summary/tail splice point")
-			merged = repaired
-		}
-	}
-	pending.result = a.reconcileCompactionTelemetry(pending.result, a.messages, merged, 0)
-	committedResult, commitErr := a.CommitCompactionCheckpoint(context.Background(), merged, pending.result)
-	if commitErr != nil {
-		a.mu.Unlock()
-		a.pendingCompactionMu.Lock()
-		if a.pendingCompaction == nil {
-			a.pendingCompaction = pending
-		}
-		a.pendingCompactionMu.Unlock()
-		a.compactionRetryPending.Store(true)
-		warning := commitErr.Error()
-		if len(committedResult.Warnings) > 0 {
-			warning = committedResult.Warnings[len(committedResult.Warnings)-1]
-		}
-		a.warnf("%s", warning)
-		return
+	if commit.persisted {
+		a.compactor.FinalizePendingLedger(&commit.transaction)
 	}
 	a.messages = merged
 	a.resetEphemeralTrackingLocked()
 	a.compactionGeneration.Add(1)
 	a.mu.Unlock()
 
-	a.emitCompactionWithAccounting(out, CompactionEvent{Result: committedResult, TriggerUsage: pending.triggerUsage})
+	a.emitCompactionWithAccounting(out, CompactionEvent{Result: commit.result, TriggerUsage: pending.triggerUsage})
+}
+
+func (a *Agent) requeuePendingCompaction(pending *pendingCompaction) {
+	if a == nil || pending == nil {
+		return
+	}
+	a.pendingCompactionMu.Lock()
+	if a.pendingCompaction == nil {
+		a.pendingCompaction = pending
+	}
+	a.pendingCompactionMu.Unlock()
 }
 
 // CompactNow forces a compaction run regardless of current token usage.
@@ -3851,39 +3885,71 @@ func (a *Agent) CompactPipelineNow(ctx context.Context, req compaction.PipelineR
 // CommitCompactionCheckpoint durably records compacted provider history before
 // callers replace in-memory history. A persistence failure is fail-closed: the
 // returned result is not reported as compacted and the caller keeps old state.
-func (a *Agent) CommitCompactionCheckpoint(ctx context.Context, messages []llm.Message, res compaction.Result) (compaction.Result, error) {
+type pendingCheckpointCommit struct {
+	result      compaction.Result
+	transaction compaction.Result
+	persisted   bool
+}
+
+// persistCompactionCheckpoint performs all potentially blocking persistence
+// without finalizing the deferred ledger transaction. The caller finalizes only
+// after it has atomically published the matching in-memory history.
+func (a *Agent) persistCompactionCheckpoint(ctx context.Context, messages []llm.Message, res compaction.Result) (pendingCheckpointCommit, error) {
+	commit := pendingCheckpointCommit{result: res, transaction: res}
 	if a == nil || !res.Compacted || a.compactor == nil || a.compactor.Config.CheckpointWriter == nil {
-		return res, nil
+		return commit, nil
 	}
 	if ctx == nil {
 		ctx = context.Background()
 	}
-	if err := a.compactor.CommitPendingLedger(ctx, &res); err != nil {
+	transaction := res
+	if err := a.compactor.CommitPendingLedger(ctx, &transaction); err != nil {
 		warning := fmt.Sprintf("[WARN] Compaction ledger persistence failed before runtime checkpoint - original in-memory history was preserved and compaction remains retryable. (stage=save_compaction_ledger action=check ledger storage and retry: %v)", err)
-		res.Compacted = false
-		res.CheckpointID = ""
-		res.Warnings = append(res.Warnings, warning)
-		return res, fmt.Errorf("compaction ledger persistence failed: %w", err)
+		failed := res
+		failed.Compacted = false
+		failed.CheckpointID = ""
+		failed.Warnings = append(failed.Warnings, warning)
+		commit.result = failed
+		return commit, fmt.Errorf("compaction ledger persistence failed: %w", err)
 	}
-	checkpoint, err := compaction.NewCompactionCheckpoint(messages, res)
+	checkpoint, err := compaction.NewCompactionCheckpoint(messages, transaction)
 	if err == nil {
 		err = a.compactor.Config.CheckpointWriter.SaveCompactionCheckpoint(ctx, checkpoint)
 	}
 	if err != nil {
-		rollbackErr := a.compactor.RollbackPendingLedger(context.Background(), &res)
+		rollbackErr := a.compactor.RollbackPendingLedger(context.Background(), &transaction)
 		warning := fmt.Sprintf("[WARN] Compaction checkpoint persistence failed - original in-memory history was preserved and compaction remains retryable. (stage=append_compaction_checkpoint action=check checkpoint storage and retry: %v)", err)
-		res.Compacted = false
-		res.CheckpointID = ""
-		res.Warnings = append(res.Warnings, warning)
+		failed := res
+		failed.Compacted = false
+		failed.CheckpointID = ""
+		failed.Warnings = append(failed.Warnings, warning)
 		if rollbackErr != nil {
 			rollbackWarning := fmt.Sprintf("[ERROR] Compaction ledger rollback failed - stale ledger metadata may require a safe full rebuild on retry. (stage=rollback_compaction_ledger action=check ledger storage and retry: %v)", rollbackErr)
-			res.Warnings = append(res.Warnings, rollbackWarning)
-			return res, fmt.Errorf("compaction checkpoint persistence failed: %w (ledger rollback failed: %v)", err, rollbackErr)
+			failed.Warnings = append(failed.Warnings, rollbackWarning)
+			commit.result = failed
+			return commit, fmt.Errorf("compaction checkpoint persistence failed: %w (ledger rollback failed: %v)", err, rollbackErr)
 		}
-		return res, fmt.Errorf("compaction checkpoint persistence failed: %w", err)
+		commit.result = failed
+		return commit, fmt.Errorf("compaction checkpoint persistence failed: %w", err)
 	}
-	a.compactor.FinalizePendingLedger(&res)
-	return checkpoint.Result, nil
+	commit.result = checkpoint.Result
+	commit.transaction = transaction
+	commit.persisted = true
+	return commit, nil
+}
+
+// CommitCompactionCheckpoint durably records compacted provider history before
+// callers replace in-memory history. A persistence failure is fail-closed: the
+// returned result is not reported as compacted and the caller keeps old state.
+func (a *Agent) CommitCompactionCheckpoint(ctx context.Context, messages []llm.Message, res compaction.Result) (compaction.Result, error) {
+	commit, err := a.persistCompactionCheckpoint(ctx, messages, res)
+	if err != nil {
+		return commit.result, err
+	}
+	if commit.persisted {
+		a.compactor.FinalizePendingLedger(&commit.transaction)
+	}
+	return commit.result, nil
 }
 
 // CompactLocalNow forces the local snip/prune reducers using an estimated token
