@@ -202,7 +202,11 @@ func Run(ctx context.Context, opts Options) (Result, error) {
 	} else {
 		collector.Close()
 	}
-	canonical.finish(context.WithoutCancel(ctx))
+	if killWaitTimedOut {
+		canonical.abortIncomplete(context.WithoutCancel(ctx), fmt.Errorf("process wait exceeded %s after tree kill; output streams have not reached EOF", opts.KillWaitGrace))
+	} else {
+		canonical.finish(context.WithoutCancel(ctx))
+	}
 	snap := collector.snapshot()
 	res.Output = snap.preview
 	res.OutputBytes = snap.totalBytes
