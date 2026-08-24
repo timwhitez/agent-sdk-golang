@@ -164,6 +164,15 @@ type Agent struct {
 
 	compactor *compaction.Service
 
+	// compactionRuntimeMu protects installation of compactor/hasCompactor.
+	// Complete operations hold a lifecycle use; a queued replacement is a
+	// barrier for later top-level operations while retained child work may
+	// finish against its parent's coherent generation.
+	compactionRuntimeMu      sync.Mutex
+	compactionRuntimeUses    int
+	pendingCompactionRuntime *compactionRuntimeUpdate
+	compactionRuntimeWaitCh  chan struct{}
+
 	todoCompactionPending  atomic.Bool
 	compactionRetryPending atomic.Bool
 	compactionInFlight     atomic.Bool
@@ -443,8 +452,11 @@ func (a *Agent) warnf(format string, args ...any) {
 	log.Printf(format, args...)
 }
 
-// UpdateCompactionConfig replaces the compaction service used for subsequent turns.
-// Callers should prefer updating compaction between turns when the agent is idle.
+// UpdateCompactionConfig replaces the compaction service used by future
+// operations. The call itself never blocks: while an old generation is in
+// use, updates are coalesced (latest wins). Later top-level operations wait
+// for that generation to drain, while child work already launched by an
+// active operation finishes against the same coherent service/configuration.
 func (a *Agent) UpdateCompactionConfig(cfg *compaction.Config) {
 	if a == nil {
 		return
@@ -454,14 +466,8 @@ func (a *Agent) UpdateCompactionConfig(cfg *compaction.Config) {
 	hasCompactor := compSvc != nil && compSvc.Config.Enabled
 	if !hasCompactor {
 		compSvc = nil
-		a.todoCompactionPending.Store(false)
-		a.compactionRetryPending.Store(false)
-		a.pendingCompactionMu.Lock()
-		a.pendingCompaction = nil
-		a.pendingCompactionMu.Unlock()
 	}
-	a.compactor = compSvc
-	a.hasCompactor = hasCompactor
+	a.installOrQueueCompactionRuntime(&compactionRuntimeUpdate{service: compSvc, enabled: hasCompactor})
 }
 
 func (a *Agent) Messages() []llm.Message {
@@ -534,13 +540,27 @@ func (a *Agent) QueryStreamWithSteering(ctx context.Context, input llm.Content, 
 		close(out)
 		return out
 	}
+	// Reserve synchronously when possible so an update made after this call
+	// cannot overtake an already admitted turn. A pending replacement is
+	// waited inside the goroutine so QueryStream remains non-blocking.
+	runtimeRelease, runtimeAcquired := a.tryBeginCompactionRuntimeUse()
 	unregisterTurn := a.registerTurnCancellation(out, ctx)
-	go func() {
-		// Later defers execute first. By the time admission is released, all turn
-		// cleanup and cancellation bookkeeping have completed.
+	go func(releaseCompactionRuntime func(), acquired bool) {
+		// Later defers execute first. Runtime release happens before admission
+		// is reopened and before channel close, so the next accepted operation
+		// observes any queued replacement.
 		defer close(out)
 		defer a.turnActive.Store(false)
 		defer unregisterTurn()
+		if !acquired {
+			var err error
+			releaseCompactionRuntime, err = a.beginCompactionRuntimeUse(ctx)
+			if err != nil {
+				a.emitEvent(out, a.errEvent(err))
+				return
+			}
+		}
+		defer releaseCompactionRuntime()
 		a.cleanupToolResultDumps(toolResultDumpNow(), false)
 
 		if a.compactionInFlight.Load() {
@@ -1370,7 +1390,7 @@ func (a *Agent) QueryStreamWithSteering(ctx context.Context, input llm.Content, 
 		msg := fmt.Sprintf("Max iterations reached (%d)", a.maxIterations)
 		emitErr(ErrorEvent{Provider: a.llm.Provider(), Message: msg, Kind: "max_iterations"})
 		emitFinal(fmt.Sprintf("[Max iterations reached] %d", a.maxIterations), lastResponseID)
-	}()
+	}(runtimeRelease, runtimeAcquired)
 	return out
 }
 
@@ -2963,7 +2983,13 @@ func (a *Agent) checkAndCompactWithGrowth(ctx context.Context, last *llm.Complet
 	a.mu.Unlock()
 	snapshotLen := len(messages)
 	triggerUsage := cloneUsage(last.Usage)
-	go a.runCompactionAsync(ctx, messages, snapshotLen, decisionUsage, triggerUsage, trigger, watermark)
+	// Retain synchronously before launch; otherwise the parent could release
+	// and install a queued replacement before the child reads the service.
+	releaseCompactionRuntime := a.retainCompactionRuntimeUse()
+	go func() {
+		defer releaseCompactionRuntime()
+		a.runCompactionAsync(ctx, messages, snapshotLen, decisionUsage, triggerUsage, trigger, watermark)
+	}()
 	return nil
 }
 
@@ -3868,6 +3894,11 @@ func (a *Agent) CompactNow(ctx context.Context) (compaction.Result, error) {
 // Hosts use this for preflight so they do not duplicate local-versus-summary
 // decisions outside the SDK.
 func (a *Agent) CompactPipelineNow(ctx context.Context, req compaction.PipelineRequest) (compaction.Result, error) {
+	releaseCompactionRuntime, err := a.beginCompactionRuntimeUse(ctx)
+	if err != nil {
+		return compaction.Result{Compacted: false}, err
+	}
+	defer releaseCompactionRuntime()
 	if !a.hasCompactor || a.compactor == nil {
 		return compaction.Result{Compacted: false}, nil
 	}
@@ -3891,7 +3922,7 @@ func (a *Agent) CompactPipelineNow(ctx context.Context, req compaction.PipelineR
 	newMsgs = a.withPreservedSystem(orig, newMsgs)
 	if res.Compacted {
 		res = a.reconcileCompactionTelemetry(res, orig, newMsgs, req.AdditionalTokens)
-		res, err = a.CommitCompactionCheckpoint(ctx, newMsgs, res)
+		res, err = a.commitCompactionCheckpoint(ctx, newMsgs, res)
 		if err != nil {
 			return res, err
 		}
@@ -3964,6 +3995,15 @@ func (a *Agent) persistCompactionCheckpoint(ctx context.Context, messages []llm.
 // callers replace in-memory history. A persistence failure is fail-closed: the
 // returned result is not reported as compacted and the caller keeps old state.
 func (a *Agent) CommitCompactionCheckpoint(ctx context.Context, messages []llm.Message, res compaction.Result) (compaction.Result, error) {
+	releaseCompactionRuntime, err := a.beginCompactionRuntimeUse(ctx)
+	if err != nil {
+		return res, err
+	}
+	defer releaseCompactionRuntime()
+	return a.commitCompactionCheckpoint(ctx, messages, res)
+}
+
+func (a *Agent) commitCompactionCheckpoint(ctx context.Context, messages []llm.Message, res compaction.Result) (compaction.Result, error) {
 	commit, err := a.persistCompactionCheckpoint(ctx, messages, res)
 	if err != nil {
 		return commit.result, err
