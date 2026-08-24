@@ -935,8 +935,8 @@ func TestOpenAIDefaultRetryableStatus(t *testing.T) {
 		want bool
 	}{
 		{code: 400, want: false},
-		{code: 401, want: true},
-		{code: 403, want: true},
+		{code: 401, want: false},
+		{code: 403, want: false},
 		{code: 404, want: false},
 		{code: 408, want: true},
 		{code: 409, want: true},

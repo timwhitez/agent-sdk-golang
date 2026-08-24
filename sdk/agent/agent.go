@@ -4322,7 +4322,7 @@ func providerErrorKind(status int) string {
 
 func retryableProviderStatus(status int) bool {
 	switch status {
-	case 401, 403, 408, 409, 425, 429:
+	case 408, 409, 425, 429:
 		return true
 	default:
 		return status >= 500 && status <= 599

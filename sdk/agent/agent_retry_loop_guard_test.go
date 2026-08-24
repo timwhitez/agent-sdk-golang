@@ -189,8 +189,6 @@ func TestInvokeRetryRetriesTextualRateLimitAndServerErrors(t *testing.T) {
 		name string
 		err  error
 	}{
-		{name: "auth_401", err: errors.New("provider failed with HTTP status 401 unauthorized")},
-		{name: "permission_403", err: errors.New("provider failed with HTTP status 403 permission denied")},
 		{name: "rate_limit_429", err: errors.New("openai-responses (429): Too Many Requests")},
 		{name: "server_status_529", err: errors.New("provider failed with HTTP status 529 overloaded")},
 		{name: "server_text", err: errors.New("upstream service unavailable, please retry")},
@@ -223,6 +221,8 @@ func TestInvokeRetrySkipsTextualNonRetryableProviderErrors(t *testing.T) {
 		name string
 		err  error
 	}{
+		{name: "auth_401", err: errors.New("provider failed with HTTP status 401 unauthorized")},
+		{name: "permission_403", err: errors.New("provider failed with HTTP status 403 permission denied")},
 		{name: "bad_request_400", err: errors.New("provider failed with HTTP status 400 invalid request")},
 		{name: "invalid_request_422", err: errors.New("provider failed with HTTP status 422 invalid request")},
 	}
