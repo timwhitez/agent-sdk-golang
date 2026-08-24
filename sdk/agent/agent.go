@@ -1840,6 +1840,7 @@ func (a *Agent) invokeCompletionWithSteering(ctx context.Context, req llm.Invoke
 		var usage *llm.Usage
 		stopReason := ""
 		responseID := ""
+		sawDone := false
 		streamedText := false
 		emittedVisible := false
 		metadata := &streamMetadataBuffer{}
@@ -1920,6 +1921,7 @@ func (a *Agent) invokeCompletionWithSteering(ctx context.Context, req llm.Invoke
 				return e.AsError()
 			case llm.StreamDoneEvent:
 				stopReason = e.StopReason
+				sawDone = true
 			}
 			return nil
 		}
@@ -1948,6 +1950,13 @@ func (a *Agent) invokeCompletionWithSteering(ctx context.Context, req llm.Invoke
 				if !ok {
 					if err := metadata.flush(processStreamEvent); err != nil {
 						return finishProviderStage(partialCompletion(), streamedText, err)
+					}
+					if !sawDone {
+						return finishProviderStage(partialCompletion(), streamedText, &llm.IncompleteStreamError{
+							Provider: a.llm.Provider(),
+							Model:    a.llm.Model(),
+							Message:  "provider event channel closed before StreamDoneEvent",
+						})
 					}
 					return finishProviderStage(partialCompletion(), streamedText, nil)
 				}
