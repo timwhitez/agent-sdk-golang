@@ -36,7 +36,7 @@ func (f CompactionCheckpointWriterFunc) SaveCompactionCheckpoint(ctx context.Con
 func NewCompactionCheckpoint(messages []llm.Message, res Result) (CompactionCheckpoint, error) {
 	checkpoint := CompactionCheckpoint{
 		SchemaVersion: CompactionCheckpointSchemaVersion,
-		Messages:      append([]llm.Message(nil), messages...),
+		Messages:      llm.CloneMessages(messages),
 		Result:        cloneCheckpointResult(res),
 	}
 	checkpoint.Result.CheckpointID = ""
