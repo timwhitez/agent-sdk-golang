@@ -25,10 +25,30 @@ type readArgs struct {
 	Limit    int    `json:"limit,omitempty"`  // number of lines
 }
 
+const (
+	maxReadLineOffset    = 10_000_000
+	maxReadLineLimit     = 10_000
+	readLineLimitDefault = 2_000
+)
+
+func validateReadNumericArgs(args readArgs) error {
+	if args.Offset > maxReadLineOffset {
+		return fmt.Errorf("read offset %d exceeds maximum %d", args.Offset, maxReadLineOffset)
+	}
+	if args.Limit > maxReadLineLimit {
+		return fmt.Errorf("read limit %d exceeds maximum %d", args.Limit, maxReadLineLimit)
+	}
+	return nil
+}
+
 // readTool returns a tool that reads file contents with line numbers,
 // offset/limit support, and binary file detection.
 func readTool() tools.Tool {
 	return toolWithArgs[readArgs]("read", "Read contents of a file", func(ctx context.Context, a readArgs, deps *tools.Container) (llm.Content, error) {
+		if err := validateReadNumericArgs(a); err != nil {
+			msg := formatErrorDiagnosticFromErr("Invalid read range", err, fmt.Sprintf("Use offset <= %d and limit <= %d, then retry.", maxReadLineOffset, maxReadLineLimit))
+			return llm.TextContent(msg), err
+		}
 		s, err := tools.Get(deps, ctx, Key)
 		if err != nil {
 			return llm.TextContent(""), err
@@ -98,13 +118,17 @@ func readTool() tools.Tool {
 		}
 		limit := a.Limit
 		if limit <= 0 {
-			limit = 2000
+			limit = readLineLimitDefault
 		}
 
 		scanner := bufio.NewScanner(bytes.NewReader(decoded))
 		scanner.Buffer(make([]byte, 0, 64*1024), maxReadDecodedBytes)
 
-		out := make([]string, 0, limit)
+		initialCapacity := limit
+		if initialCapacity > 256 {
+			initialCapacity = 256
+		}
+		out := make([]string, 0, initialCapacity)
 		truncatedOutput := false
 		truncatedLines := false
 		outputBytes := 0

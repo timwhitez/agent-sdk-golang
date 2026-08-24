@@ -30,6 +30,28 @@ type grepArgs struct {
 	LineNumbers *bool  `json:"line_numbers,omitempty"` // default true
 }
 
+const (
+	maxGrepContextLines = 1_000
+	maxGrepResults      = 10_000
+	grepResultsDefault  = 50
+)
+
+func validateGrepNumericArgs(args grepArgs) error {
+	for name, value := range map[string]int{
+		"before":  args.Before,
+		"after":   args.After,
+		"context": args.Context,
+	} {
+		if value > maxGrepContextLines {
+			return fmt.Errorf("grep %s %d exceeds maximum %d", name, value, maxGrepContextLines)
+		}
+	}
+	if args.MaxResults > maxGrepResults {
+		return fmt.Errorf("grep max_results %d exceeds maximum %d", args.MaxResults, maxGrepResults)
+	}
+	return nil
+}
+
 var (
 	grepWalkDirFn = filepath.WalkDir
 	grepOpenFile  = func(path string) (*os.File, error) {
@@ -49,6 +71,9 @@ var (
 
 func grepTool() tools.Tool {
 	return tools.Func[grepArgs]("grep", "Search file contents with regex", func(ctx context.Context, a grepArgs, deps *tools.Container) (any, error) {
+		if err := validateGrepNumericArgs(a); err != nil {
+			return "", fmt.Errorf("invalid grep limits: %w; use context/before/after <= %d and max_results <= %d", err, maxGrepContextLines, maxGrepResults)
+		}
 		s, err := tools.Get(deps, ctx, Key)
 		if err != nil {
 			return "", err
@@ -87,7 +112,7 @@ func grepTool() tools.Tool {
 		}
 		maxOut := a.MaxResults
 		if maxOut <= 0 {
-			maxOut = 50
+			maxOut = grepResultsDefault
 		}
 		mode := strings.TrimSpace(a.OutputMode)
 		if mode == "" {
@@ -192,7 +217,11 @@ func grepTool() tools.Tool {
 				no   int
 				text string
 			}
-			prev := make([]prevLine, 0, before)
+			initialContextCapacity := before
+			if initialContextCapacity > 64 {
+				initialContextCapacity = 64
+			}
+			prev := make([]prevLine, 0, initialContextCapacity)
 			pushPrev := func(no int, text string) {
 				if before <= 0 {
 					return
