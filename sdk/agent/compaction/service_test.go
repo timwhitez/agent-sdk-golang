@@ -257,6 +257,57 @@ func TestCompactionQualityGateRequiresUniqueOrderedExactLevelTwoHeadings(t *test
 	}
 }
 
+func TestCompactionQualityGateIgnoresFencedHeadingLookalikes(t *testing.T) {
+	valid, envelopeReasons := validateSummaryEnvelope(structuredTestSummary("", ""))
+	if len(envelopeReasons) != 0 {
+		t.Fatalf("valid summary envelope: %v", envelopeReasons)
+	}
+	fenced := "```markdown\n" + valid + "\n```"
+	reasons := validateRequiredSummarySections(fenced)
+	if len(reasons) == 0 || !strings.Contains(strings.Join(reasons, "; "), "missing required section") {
+		t.Fatalf("fenced heading lookalikes passed validation: %v", reasons)
+	}
+}
+
+func TestCompactionQualityGateAcceptsCRLFHeadings(t *testing.T) {
+	valid, envelopeReasons := validateSummaryEnvelope(structuredTestSummary("", ""))
+	if len(envelopeReasons) != 0 {
+		t.Fatalf("valid summary envelope: %v", envelopeReasons)
+	}
+	if reasons := validateRequiredSummarySections(strings.ReplaceAll(valid, "\n", "\r\n")); len(reasons) != 0 {
+		t.Fatalf("CRLF summary rejected: %v", reasons)
+	}
+}
+
+func TestCompactionQualityGateDoesNotCountAnotherHeadingAsSectionBody(t *testing.T) {
+	valid, envelopeReasons := validateSummaryEnvelope(structuredTestSummary("", ""))
+	if len(envelopeReasons) != 0 {
+		t.Fatalf("valid summary envelope: %v", envelopeReasons)
+	}
+	first := requiredSummarySections[0]
+	withEmptyBody := strings.Replace(valid, "## "+first+"\nuser request preserved", "## "+first+"\n### unrelated heading\ntext", 1)
+	reasons := validateRequiredSummarySections(withEmptyBody)
+	if !strings.Contains(strings.Join(reasons, "; "), "empty required section: "+first) {
+		t.Fatalf("extra heading masqueraded as required-section body: %v", reasons)
+	}
+}
+
+func TestMaterialSectionBodyIgnoresFencedHeadingLookalike(t *testing.T) {
+	material := strings.Join([]string{
+		"```markdown",
+		"## Latest Real User Request",
+		"wrong fenced value",
+		"```",
+		"## Latest Real User Request",
+		"real request",
+		"## Host Checkpoint Context",
+		"Status: VERIFIED",
+	}, "\n")
+	if got := materialSectionBody(material, "Latest Real User Request"); got != "real request" {
+		t.Fatalf("material section body = %q, want real request", got)
+	}
+}
+
 func TestCompactionQualityGateAllowsCredentialLikeSecurityMaterial(t *testing.T) {
 	material := `Cookie: user="adm\\073n" Authorization: Bearer lab-fixture-token`
 	model := mockCompactModel{response: structuredTestSummary("Verification Already Run and Still Required", material)}
