@@ -136,10 +136,7 @@ func renderCheckpointContext(snapshot CheckpointContext, maxTokens int, estimate
 	if maxTokens <= 0 {
 		maxTokens = DefaultCheckpointMaxTokens
 	}
-	status := strings.ToUpper(strings.TrimSpace(snapshot.Status))
-	if status == "" {
-		status = CheckpointStatusVerified
-	}
+	status := checkpointContextStatus(snapshot)
 	var b strings.Builder
 	b.WriteString("## Host Checkpoint Context\n")
 	b.WriteString("Status: ")
@@ -176,6 +173,14 @@ func renderCheckpointContext(snapshot CheckpointContext, maxTokens int, estimate
 		return rendered
 	}
 	return truncateTextToTokenBudget(rendered, maxTokens, estimate)
+}
+
+func checkpointContextStatus(snapshot CheckpointContext) string {
+	status := strings.ToUpper(strings.TrimSpace(snapshot.Status))
+	if status == "" {
+		return CheckpointStatusVerified
+	}
+	return status
 }
 
 func writeCheckpointValue(b *strings.Builder, label string, value CheckpointValue, estimate tokenEstimator) {

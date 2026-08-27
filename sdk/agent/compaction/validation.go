@@ -33,9 +33,14 @@ func validateSummaryOutput(raw, material string) (string, error) {
 	summary, reasons := validateSummaryEnvelope(raw)
 	if summary != "" {
 		reasons = append(reasons, validateRequiredSummarySections(summary)...)
-		reasons = append(reasons, validateSummaryFactCoverage(summary, material)...)
-		if strings.Contains(material, "Status: "+CheckpointStatusUnknown) && !strings.Contains(strings.ToUpper(summary), CheckpointStatusUnknown) {
-			reasons = append(reasons, "host state is UNKNOWN but summary does not preserve UNKNOWN")
+		facts, err := summaryValidationFactsFromMaterial(material)
+		if err != nil {
+			reasons = append(reasons, "compaction material framing is invalid: "+err.Error())
+		} else {
+			reasons = append(reasons, validateSummaryFactCoverage(summary, facts)...)
+			if facts.HostCheckpointStatus == CheckpointStatusUnknown && !strings.Contains(strings.ToUpper(summary), CheckpointStatusUnknown) {
+				reasons = append(reasons, "host state is UNKNOWN but summary does not preserve UNKNOWN")
+			}
 		}
 	}
 	if len(reasons) > 0 {
@@ -45,19 +50,53 @@ func validateSummaryOutput(raw, material string) (string, error) {
 	return summary, nil
 }
 
-func validateSummaryFactCoverage(summary, material string) []string {
-	reasons := []string{}
-	decodedMaterial, err := decodeSummaryValidationMaterial(material)
+type summaryValidationFacts struct {
+	LatestRealUserRequest *string
+	HostCheckpointStatus  string
+}
+
+func summaryValidationFactsFromMaterial(material string) (summaryValidationFacts, error) {
+	envelope, framed, err := decodeCompactionMaterialEnvelope(material)
 	if err != nil {
-		return append(reasons, "compaction material framing is invalid: "+err.Error())
+		return summaryValidationFacts{}, err
 	}
-	material = decodedMaterial
-	latest := materialSectionBody(material, "Latest Real User Request")
+	if framed {
+		return summaryValidationFacts{
+			LatestRealUserRequest: cloneStringPointer(envelope.LatestRealUserRequest),
+			HostCheckpointStatus:  strings.ToUpper(strings.TrimSpace(envelope.HostCheckpointStatus)),
+		}, nil
+	}
+	latest := materialSectionBody(envelope.Material, "Latest Real User Request")
+	return summaryValidationFacts{
+		LatestRealUserRequest: &latest,
+		HostCheckpointStatus:  legacyHostCheckpointStatus(envelope.Material),
+	}, nil
+}
+
+func legacyHostCheckpointStatus(material string) string {
+	if !strings.Contains(material, "## Host Checkpoint Context") {
+		return ""
+	}
+	if strings.Contains(material, "Status: "+CheckpointStatusUnknown) {
+		return CheckpointStatusUnknown
+	}
+	if strings.Contains(material, "Status: "+CheckpointStatusVerified) {
+		return CheckpointStatusVerified
+	}
+	return ""
+}
+
+func validateSummaryFactCoverage(summary string, facts summaryValidationFacts) []string {
+	reasons := []string{}
+	latest := ""
+	if facts.LatestRealUserRequest != nil {
+		latest = *facts.LatestRealUserRequest
+	}
 	objective := materialSectionBody(summary, "Current Objective and Latest User Request")
 	if strings.TrimSpace(latest) != "" && strings.ToUpper(strings.TrimSpace(latest)) != CheckpointStatusUnknown && summaryBodyIsOnlyUnknown(objective) {
 		reasons = append(reasons, "latest user request was supplied but Current Objective and Latest User Request is UNKNOWN")
 	}
-	if strings.Contains(material, "## Host Checkpoint Context") && strings.Contains(material, "Status: "+CheckpointStatusVerified) {
+	if facts.HostCheckpointStatus == CheckpointStatusVerified {
 		external := materialSectionBody(summary, "Exact External State")
 		if summaryBodyIsOnlyUnknown(external) {
 			reasons = append(reasons, "verified host state was supplied but Exact External State is UNKNOWN")

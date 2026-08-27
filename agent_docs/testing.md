@@ -103,11 +103,14 @@ This document summarizes recommended test commands and current coverage focus.
   UNKNOWN/warning behavior for host checkpoint provider failure. Watermark
   anchors cover the shared usable prompt window, exhausted-budget behavior, and
   the 70%/80%/85%/100% decision matrix. Quality-gate anchors cover system/data
-  role separation, untrusted boundaries, required-section rejection,
+  role separation, untrusted boundaries, protected JSON anchor-envelope
+  retention, required-section rejection,
   credential-like task material acceptance, and history/ledger atomicity on
   rejected summaries. The same suite drives real framed `Compact` requests to
-  verify latest-user and verified-checkpoint coverage plus malformed-frame
-  rejection.
+  verify latest-user and verified-checkpoint coverage plus malformed-frame and
+  malformed-envelope rejection. Full and incremental regressions include
+  headings, fences, quotes, JSON fragments, newlines, and frame markers inside
+  first/latest user text.
 - `sdk/agent/compaction/ledger_test.go` - compaction ledger schema validation,
   replacement hash checks, duplicate replacement rejection, stable message-key
   normalization, canonical-manifest durability and provider-stub checks,
