@@ -107,12 +107,11 @@ func (c *ResponsesClient) Invoke(ctx context.Context, req llm.InvokeRequest) (*l
 			}
 
 			if resp.StatusCode >= 200 && resp.StatusCode < 300 {
-				comp, err := parseResponses(data)
-				if err != nil {
-					return nil, err
+				comp, parseErr := parseResponsesForProvider(local.Provider(), data)
+				if comp != nil {
+					comp.Diagnostics = append(comp.Diagnostics, diagnostics...)
 				}
-				comp.Diagnostics = append(comp.Diagnostics, diagnostics...)
-				return comp, nil
+				return comp, parseErr
 			}
 
 			retryAfter := parseRetryAfter(resp.Header.Get("Retry-After"))
@@ -713,6 +712,8 @@ func (c *ResponsesClient) InvokeStream(ctx context.Context, req llm.InvokeReques
 			sawCompleted := false
 			thinkingEmitted := false
 			textEmitted := false
+			refusalText := ""
+			observedNonterminalStatus := ""
 			streamResponseID := ""
 			emitResponseID := func(id string) {
 				id = strings.TrimSpace(id)
@@ -722,12 +723,63 @@ func (c *ResponsesClient) InvokeStream(ctx context.Context, req llm.InvokeReques
 				streamResponseID = id
 				out <- llm.StreamResponseEvent{ResponseID: id}
 			}
+			emitRefusalDelta := func(delta string) {
+				if delta == "" {
+					return
+				}
+				refusalText += delta
+				out <- llm.StreamTextDeltaEvent{Delta: delta}
+			}
+			emitRefusalFinal := func(final string) error {
+				if strings.TrimSpace(final) == "" {
+					return nil
+				}
+				if !strings.HasPrefix(final, refusalText) {
+					return &llm.ProviderError{
+						Provider: local.Provider(),
+						Message:  "Responses refusal final text conflicts with the streamed refusal prefix",
+					}
+				}
+				if suffix := strings.TrimPrefix(final, refusalText); suffix != "" {
+					out <- llm.StreamTextDeltaEvent{Delta: suffix}
+				}
+				refusalText = final
+				return nil
+			}
+			emitTerminalResponse := func(respObj map[string]any) error {
+				emitResponseID(responsesStreamResponseID(map[string]any{"response": respObj}))
+				if u := usageFromResponses(respObj); u != nil {
+					out <- llm.StreamUsageEvent{Usage: *u}
+				}
+				if !thinkingEmitted {
+					if thinking := extractThinkingFromResponses(respObj); thinking != "" {
+						out <- llm.StreamThinkingDeltaEvent{Delta: thinking}
+						thinkingEmitted = true
+					}
+				}
+				if !textEmitted {
+					if text := extractTextFromResponses(respObj); strings.TrimSpace(text) != "" {
+						out <- llm.StreamTextDeltaEvent{Delta: text}
+						textEmitted = true
+					}
+				}
+				if refusal := extractRefusalFromResponses(respObj); refusal != "" {
+					return emitRefusalFinal(refusal)
+				}
+				return nil
+			}
 			err = consumeSSEWithBodyClose(resp.Body, func(data string) error {
 				data = strings.TrimSpace(data)
 				if data == "" {
 					return nil
 				}
 				if data == "[DONE]" {
+					if observedNonterminalStatus != "" && !sawCompleted {
+						return &llm.ProviderError{
+							Provider: local.Provider(),
+							Message:  fmt.Sprintf("Responses stream received [DONE] while response status remained %q", observedNonterminalStatus),
+						}
+					}
 					return errSSEDone
 				}
 				var root map[string]any
@@ -747,6 +799,31 @@ func (c *ResponsesClient) InvokeStream(ctx context.Context, req llm.InvokeReques
 						out <- llm.StreamTextDeltaEvent{Delta: d}
 						textEmitted = true
 					}
+				case "response.refusal.delta":
+					if d, ok := root["delta"].(string); ok && d != "" {
+						emitRefusalDelta(d)
+					}
+				case "response.refusal.done":
+					if refusal, ok := root["refusal"].(string); ok {
+						return emitRefusalFinal(refusal)
+					}
+				case "response.created":
+					respObj, _ := root["response"].(map[string]any)
+					status := strings.ToLower(stringFromAny(respObj["status"]))
+					if status == "" {
+						status = "in_progress"
+					}
+					if status != "in_progress" && status != "queued" {
+						return responsesStreamStatusConflictError(local.Provider(), "response.created", "in_progress or queued", status, respObj)
+					}
+					observedNonterminalStatus = status
+				case "response.in_progress", "response.queued":
+					respObj, _ := root["response"].(map[string]any)
+					expectedStatus := strings.TrimPrefix(typ, "response.")
+					if statusErr := responsesValidateStreamEventStatus(local.Provider(), typ, expectedStatus, respObj); statusErr != nil {
+						return statusErr
+					}
+					observedNonterminalStatus = expectedStatus
 				case "response.reasoning.delta", "response.reasoning_text.delta", "response.reasoning_content.delta", "response.thinking.delta":
 					if d, ok := root["delta"].(string); ok && d != "" {
 						out <- llm.StreamThinkingDeltaEvent{Delta: d}
@@ -784,9 +861,13 @@ func (c *ResponsesClient) InvokeStream(ctx context.Context, req llm.InvokeReques
 								}
 								ct, _ := cm["type"].(string)
 								if ct == "output_text" || ct == "text" {
-									if txt, ok := cm["text"].(string); ok && strings.TrimSpace(txt) != "" && !textEmitted {
+									if txt := responsesContentText(cm); strings.TrimSpace(txt) != "" && !textEmitted {
 										out <- llm.StreamTextDeltaEvent{Delta: txt}
 										textEmitted = true
+									}
+								} else if ct == "refusal" {
+									if txt := responsesContentText(cm); strings.TrimSpace(txt) != "" {
+										emitRefusalDelta(txt)
 									}
 								} else if ct == "reasoning" || ct == "reasoning_text" || ct == "thinking" {
 									if txt, ok := cm["text"].(string); ok && strings.TrimSpace(txt) != "" {
@@ -847,9 +928,15 @@ func (c *ResponsesClient) InvokeStream(ctx context.Context, req llm.InvokeReques
 								}
 								ct, _ := cm["type"].(string)
 								if ct == "output_text" || ct == "text" {
-									if txt, ok := cm["text"].(string); ok && strings.TrimSpace(txt) != "" && !textEmitted {
+									if txt := responsesContentText(cm); strings.TrimSpace(txt) != "" && !textEmitted {
 										out <- llm.StreamTextDeltaEvent{Delta: txt}
 										textEmitted = true
+									}
+								} else if ct == "refusal" {
+									if txt := responsesContentText(cm); strings.TrimSpace(txt) != "" {
+										if refusalErr := emitRefusalFinal(txt); refusalErr != nil {
+											return refusalErr
+										}
 									}
 								} else if ct == "reasoning" || ct == "reasoning_text" || ct == "thinking" {
 									if txt, ok := cm["text"].(string); ok && strings.TrimSpace(txt) != "" {
@@ -945,38 +1032,52 @@ func (c *ResponsesClient) InvokeStream(ctx context.Context, req llm.InvokeReques
 				case "response.completed":
 					sawCompleted = true
 					respObj, _ := root["response"].(map[string]any)
-					if respObj != nil {
-						if id, ok := respObj["id"].(string); ok && strings.TrimSpace(id) != "" {
-							out <- llm.StreamResponseEvent{ResponseID: id}
-						}
-					} else if id, ok := root["response_id"].(string); ok && strings.TrimSpace(id) != "" {
-						out <- llm.StreamResponseEvent{ResponseID: id}
+					if respObj == nil {
+						respObj = root
 					}
-					if u := usageFromResponses(respObj); u != nil {
-						out <- llm.StreamUsageEvent{Usage: *u}
+					if emitErr := emitTerminalResponse(respObj); emitErr != nil {
+						return emitErr
 					}
-					if !thinkingEmitted {
-						if thinking := extractThinkingFromResponses(respObj); thinking != "" {
-							out <- llm.StreamThinkingDeltaEvent{Delta: thinking}
-							thinkingEmitted = true
-						}
+					if statusErr := responsesValidateStreamEventStatus(local.Provider(), typ, "completed", respObj); statusErr != nil {
+						return statusErr
 					}
-					if !textEmitted {
-						if text := extractTextFromResponses(respObj); strings.TrimSpace(text) != "" {
-							out <- llm.StreamTextDeltaEvent{Delta: text}
-							textEmitted = true
-						}
+					if responsesHasError(respObj) {
+						return parseResponsesStreamEventError(local.Provider(), respObj)
 					}
-					// Extract stop reason from completed response
-					if respObj != nil {
-						if sr, ok := respObj["status"].(string); ok {
-							if sr == "incomplete" {
-								stopReason = "max_tokens"
-							} else if sr == "completed" {
-								stopReason = "end_turn"
-							}
-						}
+					stopReason = "end_turn"
+					return errSSEDone
+				case "response.incomplete":
+					sawCompleted = true
+					respObj, _ := root["response"].(map[string]any)
+					if respObj == nil {
+						respObj = root
 					}
+					if emitErr := emitTerminalResponse(respObj); emitErr != nil {
+						return emitErr
+					}
+					if statusErr := responsesValidateStreamEventStatus(local.Provider(), typ, "incomplete", respObj); statusErr != nil {
+						return statusErr
+					}
+					var terminalErr error
+					stopReason, terminalErr = responsesIncompleteStopReason(local.Provider(), respObj)
+					if terminalErr != nil {
+						return terminalErr
+					}
+					return errSSEDone
+				case "response.failed", "response.cancelled":
+					sawCompleted = true
+					respObj, _ := root["response"].(map[string]any)
+					if respObj == nil {
+						respObj = root
+					}
+					status := strings.TrimPrefix(typ, "response.")
+					if emitErr := emitTerminalResponse(respObj); emitErr != nil {
+						return emitErr
+					}
+					if statusErr := responsesValidateStreamEventStatus(local.Provider(), typ, status, respObj); statusErr != nil {
+						return statusErr
+					}
+					return responsesTerminalStatusError(local.Provider(), respObj, status)
 				case "response.error", "error":
 					if streamErr := parseResponsesStreamEventError(local.Provider(), root); streamErr != nil {
 						return streamErr
@@ -1013,8 +1114,16 @@ func parseResponsesStreamEventError(provider string, root map[string]any) error 
 	msg := firstNonEmptyString(
 		stringFromAny(errObj["message"]),
 		stringFromAny(errObj["detail"]),
+		stringFromAny(root["error"]),
 		stringFromAny(root["message"]),
 	)
+	if refusal := extractRefusalFromResponses(root); refusal != "" {
+		if msg == "" {
+			msg = "response refused: " + refusal
+		} else {
+			msg += "; refusal: " + refusal
+		}
+	}
 	if msg == "" {
 		msg = "openai responses stream error"
 	}
@@ -1043,6 +1152,70 @@ func parseResponsesStreamEventError(provider string, root map[string]any) error 
 		return &llm.RateLimitError{Provider: provider, Message: msg, RetryAfter: retryAfter}
 	}
 	return &llm.ProviderError{Provider: provider, StatusCode: statusCode, Message: msg, RetryAfter: retryAfter}
+}
+
+func responsesHasError(resp map[string]any) bool {
+	if resp == nil {
+		return false
+	}
+	value, ok := resp["error"]
+	return ok && value != nil
+}
+
+func responsesTerminalStatusError(provider string, resp map[string]any, status string) error {
+	status = strings.ToLower(strings.TrimSpace(status))
+	if responsesHasError(resp) {
+		return parseResponsesStreamEventError(provider, resp)
+	}
+	responseID := stringFromAny(resp["id"])
+	message := fmt.Sprintf("response ended with status %q", status)
+	if responseID != "" {
+		message = fmt.Sprintf("response %q ended with status %q", responseID, status)
+	}
+	if refusal := extractRefusalFromResponses(resp); refusal != "" {
+		message += "; refusal: " + refusal
+	}
+	return &llm.ProviderError{Provider: openAIProviderLabel(provider), Message: message}
+}
+
+func responsesValidateStreamEventStatus(provider, eventType, expectedStatus string, resp map[string]any) error {
+	expectedStatus = strings.ToLower(strings.TrimSpace(expectedStatus))
+	payloadStatus := strings.ToLower(stringFromAny(resp["status"]))
+	if payloadStatus == "" || payloadStatus == expectedStatus {
+		return nil
+	}
+	return responsesStreamStatusConflictError(provider, eventType, expectedStatus, payloadStatus, resp)
+}
+
+func responsesStreamStatusConflictError(provider, eventType, expectedStatus, payloadStatus string, resp map[string]any) error {
+	message := fmt.Sprintf("Responses stream event %q conflicts with response status %q; expected %q", eventType, payloadStatus, expectedStatus)
+	if responseID := stringFromAny(resp["id"]); responseID != "" {
+		message = fmt.Sprintf("response %q: %s", responseID, message)
+	}
+	return &llm.ProviderError{Provider: openAIProviderLabel(provider), Message: message}
+}
+
+func responsesIncompleteStopReason(provider string, resp map[string]any) (string, error) {
+	if responsesHasError(resp) {
+		return "", parseResponsesStreamEventError(provider, resp)
+	}
+	details, _ := resp["incomplete_details"].(map[string]any)
+	reason := strings.ToLower(stringFromAny(details["reason"]))
+	switch reason {
+	case "max_output_tokens":
+		return "max_tokens", nil
+	case "content_filter":
+		return "content_filter", nil
+	default:
+		message := "response is incomplete without a supported incomplete_details.reason"
+		if reason != "" {
+			message = fmt.Sprintf("response is incomplete for unsupported reason %q", reason)
+		}
+		if responseID := stringFromAny(resp["id"]); responseID != "" {
+			message = fmt.Sprintf("response %q: %s", responseID, message)
+		}
+		return "", &llm.ProviderError{Provider: openAIProviderLabel(provider), Message: message}
+	}
 }
 
 func stringFromAny(v any) string {
@@ -1305,7 +1478,7 @@ func extractTextFromResponses(resp map[string]any) string {
 					}
 					ct, _ := cm["type"].(string)
 					if ct == "output_text" || ct == "text" {
-						if txt, ok := cm["text"].(string); ok && strings.TrimSpace(txt) != "" {
+						if txt := responsesContentText(cm); strings.TrimSpace(txt) != "" {
 							textParts = append(textParts, txt)
 						}
 					}
@@ -1319,6 +1492,46 @@ func extractTextFromResponses(resp map[string]any) string {
 		}
 	}
 	return strings.TrimSpace(strings.Join(textParts, "\n"))
+}
+
+func extractRefusalFromResponses(resp map[string]any) string {
+	if resp == nil {
+		return ""
+	}
+	refusalParts := []string{}
+	if outArr, ok := resp["output"].([]any); ok {
+		for _, itemAny := range outArr {
+			item, ok := itemAny.(map[string]any)
+			if !ok || stringFromAny(item["type"]) != "message" {
+				continue
+			}
+			contentArr, _ := item["content"].([]any)
+			for _, contentAny := range contentArr {
+				content, ok := contentAny.(map[string]any)
+				if !ok || stringFromAny(content["type"]) != "refusal" {
+					continue
+				}
+				if refusal := responsesContentText(content); strings.TrimSpace(refusal) != "" {
+					refusalParts = append(refusalParts, refusal)
+				}
+			}
+		}
+	}
+	if len(refusalParts) == 0 {
+		if refusal, ok := resp["refusal"].(string); ok && strings.TrimSpace(refusal) != "" {
+			refusalParts = append(refusalParts, refusal)
+		}
+	}
+	return strings.TrimSpace(strings.Join(refusalParts, "\n"))
+}
+
+func responsesContentText(content map[string]any) string {
+	for _, key := range []string{"text", "refusal", "content"} {
+		if value, ok := content[key].(string); ok && strings.TrimSpace(value) != "" {
+			return value
+		}
+	}
+	return ""
 }
 
 func responsesTextControlsFromOptions(opts *llm.ResponsesOptions) any {
@@ -1740,6 +1953,10 @@ func (c *ResponsesClient) buildRequest(req llm.InvokeRequest) (*responsesRequest
 // ---- response parsing (best-effort) ----
 
 func parseResponses(data []byte) (*llm.Completion, error) {
+	return parseResponsesForProvider("openai", data)
+}
+
+func parseResponsesForProvider(provider string, data []byte) (*llm.Completion, error) {
 	var root map[string]any
 	if err := json.Unmarshal(data, &root); err != nil {
 		return nil, err
@@ -1765,8 +1982,8 @@ func parseResponses(data []byte) (*llm.Completion, error) {
 						continue
 					}
 					ct, _ := cm["type"].(string)
-					if ct == "output_text" || ct == "text" {
-						if txt, ok := cm["text"].(string); ok {
+					if ct == "output_text" || ct == "text" || ct == "refusal" {
+						if txt := responsesContentText(cm); txt != "" {
 							blocks = append(blocks, llm.ContentBlock{Type: "text", Text: txt})
 						}
 					} else if ct == "reasoning" || ct == "reasoning_text" || ct == "thinking" {
@@ -1830,16 +2047,6 @@ func parseResponses(data []byte) (*llm.Completion, error) {
 		thinkingParts = append(thinkingParts, t)
 	}
 
-	// Extract stop reason from responses API (status field).
-	stopReason := ""
-	if sr, ok := root["status"].(string); ok {
-		if sr == "incomplete" {
-			stopReason = "max_tokens"
-		} else if sr == "completed" {
-			stopReason = "end_turn"
-		}
-	}
-
 	thinking := strings.TrimSpace(strings.Join(thinkingParts, "\n"))
 	responseID, _ := root["id"].(string)
 	if strings.TrimSpace(responseID) == "" {
@@ -1847,7 +2054,26 @@ func parseResponses(data []byte) (*llm.Completion, error) {
 			responseID = id
 		}
 	}
-	return &llm.Completion{Content: llm.Content{Blocks: blocks}, Thinking: thinking, ToolCalls: toolCalls, Usage: usage, StopReason: stopReason, ResponseID: responseID, Raw: append([]byte(nil), data...)}, nil
+	completion := &llm.Completion{Content: llm.Content{Blocks: blocks}, Thinking: thinking, ToolCalls: toolCalls, Usage: usage, ResponseID: responseID, Raw: append([]byte(nil), data...)}
+	status := strings.ToLower(stringFromAny(root["status"]))
+	if responsesHasError(root) {
+		return completion, parseResponsesStreamEventError(provider, root)
+	}
+	switch status {
+	case "", "completed":
+		if status == "completed" {
+			completion.StopReason = "end_turn"
+		}
+		return completion, nil
+	case "incomplete":
+		stopReason, err := responsesIncompleteStopReason(provider, root)
+		completion.StopReason = stopReason
+		return completion, err
+	case "failed", "cancelled", "queued", "in_progress":
+		return completion, responsesTerminalStatusError(provider, root, status)
+	default:
+		return completion, responsesTerminalStatusError(provider, root, status)
+	}
 }
 
 func responsesToolCallIdentifiers(item map[string]any) (itemID, callID string) {
