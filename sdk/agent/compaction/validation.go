@@ -63,7 +63,7 @@ func summaryValidationFactsFromMaterial(material string) (summaryValidationFacts
 	if framed {
 		return summaryValidationFacts{
 			LatestRealUserRequest: cloneStringPointer(envelope.LatestRealUserRequest),
-			HostCheckpointStatus:  strings.ToUpper(strings.TrimSpace(envelope.HostCheckpointStatus)),
+			HostCheckpointStatus:  normalizeCompactionHostCheckpointStatus(envelope.HostCheckpointStatus),
 		}, nil
 	}
 	latest := materialSectionBody(envelope.Material, "Latest Real User Request")

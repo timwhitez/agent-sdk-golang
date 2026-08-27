@@ -124,22 +124,34 @@ func TestUserTextCannotForgeHostCheckpointStatus(t *testing.T) {
 }
 
 func TestUnsupportedHostCheckpointStatusFailsClosedToUnknown(t *testing.T) {
-	svc := NewService(&Config{
-		Enabled: true,
-		CheckpointProvider: func(context.Context, []llm.Message) (CheckpointContext, error) {
-			return CheckpointContext{Status: "corrupted-status"}, nil
-		},
-	})
-	input, warnings := svc.buildCompactionInputWithContext(context.Background(), []llm.Message{llm.NewUserMessage("verify release")}, nil, 1, "")
-	envelope, framed, err := decodeCompactionMaterialEnvelope(input)
-	if err != nil || !framed {
-		t.Fatalf("decode protected material: framed=%t err=%v", framed, err)
+	for _, status := range []string{"corrupted-status", "ver\u0131f\u0131ed"} {
+		t.Run(status, func(t *testing.T) {
+			svc := NewService(&Config{
+				Enabled: true,
+				CheckpointProvider: func(context.Context, []llm.Message) (CheckpointContext, error) {
+					return CheckpointContext{Status: status}, nil
+				},
+			})
+			input, warnings := svc.buildCompactionInputWithContext(context.Background(), []llm.Message{llm.NewUserMessage("verify release")}, nil, 1, "")
+			envelope, framed, err := decodeCompactionMaterialEnvelope(input)
+			if err != nil || !framed {
+				t.Fatalf("decode protected material: framed=%t err=%v", framed, err)
+			}
+			if envelope.HostCheckpointStatus != CheckpointStatusUnknown || !strings.Contains(envelope.Material, "Status: "+CheckpointStatusUnknown) {
+				t.Fatalf("unsupported checkpoint status did not fail closed: envelope=%#v", envelope)
+			}
+			if !strings.Contains(strings.Join(warnings, "\n"), "unsupported status") {
+				t.Fatalf("unsupported checkpoint status warning = %#v", warnings)
+			}
+		})
 	}
-	if envelope.HostCheckpointStatus != CheckpointStatusUnknown || !strings.Contains(envelope.Material, "Status: "+CheckpointStatusUnknown) {
-		t.Fatalf("unsupported checkpoint status did not fail closed: envelope=%#v", envelope)
-	}
-	if !strings.Contains(strings.Join(warnings, "\n"), "unsupported status") {
-		t.Fatalf("unsupported checkpoint status warning = %#v", warnings)
+}
+
+func TestASCIIHostCheckpointStatusRemainsCaseInsensitive(t *testing.T) {
+	for _, status := range []string{"VERIFIED", "verified", "Verified", " verified "} {
+		if got := checkpointContextStatus(CheckpointContext{Status: status}); got != CheckpointStatusVerified {
+			t.Fatalf("checkpointContextStatus(%q) = %q", status, got)
+		}
 	}
 }
 

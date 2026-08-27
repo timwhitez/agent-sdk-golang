@@ -176,14 +176,15 @@ func renderCheckpointContext(snapshot CheckpointContext, maxTokens int, estimate
 }
 
 func checkpointContextStatus(snapshot CheckpointContext) string {
-	status := strings.ToUpper(strings.TrimSpace(snapshot.Status))
+	status, valid := normalizeASCIICompactionStatus(snapshot.Status)
+	if !valid {
+		return CheckpointStatusUnknown
+	}
 	switch status {
 	case "":
 		return CheckpointStatusVerified
-	case CheckpointStatusVerified, CheckpointStatusUnverified, CheckpointStatusUnknown:
-		return status
 	default:
-		return CheckpointStatusUnknown
+		return status
 	}
 }
 
@@ -191,7 +192,10 @@ func writeCheckpointValue(b *strings.Builder, label string, value CheckpointValu
 	if strings.TrimSpace(value.Value) == "" && strings.TrimSpace(value.Status) == "" {
 		return
 	}
-	status := strings.ToUpper(strings.TrimSpace(value.Status))
+	status, valid := normalizeASCIICompactionStatus(value.Status)
+	if !valid {
+		status = CheckpointStatusUnknown
+	}
 	if status == "" {
 		status = CheckpointStatusVerified
 	}
@@ -202,7 +206,10 @@ func writeWorkspace(b *strings.Builder, workspace CheckpointWorkspace, estimate 
 	if strings.TrimSpace(workspace.Status) == "" && strings.TrimSpace(workspace.CWD) == "" && strings.TrimSpace(workspace.Repository) == "" && strings.TrimSpace(workspace.Error) == "" {
 		return
 	}
-	status := strings.ToUpper(strings.TrimSpace(workspace.Status))
+	status, valid := normalizeASCIICompactionStatus(workspace.Status)
+	if !valid {
+		status = CheckpointStatusUnknown
+	}
 	if status == "" {
 		status = CheckpointStatusVerified
 	}
@@ -322,7 +329,10 @@ func writeClaims(b *strings.Builder, claims []CheckpointClaim, estimate tokenEst
 		if i >= checkpointMaxClaims {
 			break
 		}
-		status := strings.ToUpper(strings.TrimSpace(item.Status))
+		status, valid := normalizeASCIICompactionStatus(item.Status)
+		if !valid {
+			status = CheckpointStatusUnknown
+		}
 		if status == "" {
 			status = CheckpointStatusUnverified
 		}

@@ -161,11 +161,36 @@ func validateCompactionEnvelopeObject(data string) error {
 }
 
 func normalizeCompactionHostCheckpointStatus(status string) string {
-	status = strings.ToUpper(strings.TrimSpace(status))
-	if validCompactionHostCheckpointStatus(status) {
-		return status
+	normalized, valid := normalizeASCIICompactionStatus(status)
+	if valid {
+		return normalized
 	}
 	return CheckpointStatusUnknown
+}
+
+// normalizeASCIICompactionStatus preserves the former ASCII case-insensitive
+// host API without allowing Unicode case folding to turn lookalikes into an
+// authoritative status.
+func normalizeASCIICompactionStatus(status string) (string, bool) {
+	trimmed := strings.TrimSpace(status)
+	if trimmed == "" {
+		return "", true
+	}
+	upper := make([]byte, len(trimmed))
+	for i := range len(trimmed) {
+		char := trimmed[i]
+		if char >= 'a' && char <= 'z' {
+			char -= 'a' - 'A'
+		} else if char >= 0x80 {
+			return "", false
+		}
+		upper[i] = char
+	}
+	normalized := string(upper)
+	if !validCompactionHostCheckpointStatus(normalized) {
+		return "", false
+	}
+	return normalized, true
 }
 
 func validCompactionHostCheckpointStatus(status string) bool {
