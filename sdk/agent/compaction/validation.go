@@ -81,9 +81,13 @@ func decodeSummaryValidationMaterial(material string) (string, error) {
 	if strings.ContainsAny(encoded, "\r\n") {
 		return "", fmt.Errorf("expected one JSON-string payload line")
 	}
-	var decoded string
-	if err := json.Unmarshal([]byte(encoded), &decoded); err != nil {
+	var value any
+	if err := json.Unmarshal([]byte(encoded), &value); err != nil {
 		return "", fmt.Errorf("payload is not a valid JSON string: %w", err)
+	}
+	decoded, ok := value.(string)
+	if !ok {
+		return "", fmt.Errorf("payload JSON type must be string")
 	}
 	return decoded, nil
 }

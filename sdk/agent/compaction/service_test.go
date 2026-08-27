@@ -385,6 +385,7 @@ func TestCompactionQualityGateRejectsMalformedMaterialFrame(t *testing.T) {
 	tests := []string{
 		beginUntrustedMaterial + "\nnot-json\n" + endUntrustedMaterial,
 		beginUntrustedMaterial + "\n{}\n" + endUntrustedMaterial,
+		beginUntrustedMaterial + "\nnull\n" + endUntrustedMaterial,
 		beginUntrustedMaterial + "\n\"line one\"\n\"line two\"\n" + endUntrustedMaterial,
 		beginUntrustedMaterial + "\n\"missing end marker\"",
 	}
