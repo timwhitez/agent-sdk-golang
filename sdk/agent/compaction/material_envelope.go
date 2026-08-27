@@ -172,6 +172,11 @@ func normalizeCompactionHostCheckpointStatus(status string) string {
 // host API without allowing Unicode case folding to turn lookalikes into an
 // authoritative status.
 func normalizeASCIICompactionStatus(status string) (string, bool) {
+	for i := range len(status) {
+		if status[i] >= 0x80 {
+			return "", false
+		}
+	}
 	trimmed := strings.TrimSpace(status)
 	if trimmed == "" {
 		return "", true
@@ -181,8 +186,6 @@ func normalizeASCIICompactionStatus(status string) (string, bool) {
 		char := trimmed[i]
 		if char >= 'a' && char <= 'z' {
 			char -= 'a' - 'A'
-		} else if char >= 0x80 {
-			return "", false
 		}
 		upper[i] = char
 	}

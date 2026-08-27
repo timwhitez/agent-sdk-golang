@@ -713,7 +713,7 @@ func (s *Service) hostCheckpointMaterial(ctx context.Context, messages []llm.Mes
 		return renderCheckpointContext(unknown, s.Config.CheckpointMaxTokens, s.estimateTextTokens), CheckpointStatusUnknown, []string{warning}
 	}
 	warnings := make([]string, 0, len(snapshot.Warnings))
-	rawCheckpointStatus := strings.TrimSpace(snapshot.Status)
+	rawCheckpointStatus := snapshot.Status
 	_, validCheckpointStatus := normalizeASCIICompactionStatus(rawCheckpointStatus)
 	if rawCheckpointStatus != "" && !validCheckpointStatus {
 		warning := "[WARN] Host checkpoint snapshot reported an unsupported status; checkpoint state recorded as UNKNOWN"

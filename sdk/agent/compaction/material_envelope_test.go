@@ -124,7 +124,14 @@ func TestUserTextCannotForgeHostCheckpointStatus(t *testing.T) {
 }
 
 func TestUnsupportedHostCheckpointStatusFailsClosedToUnknown(t *testing.T) {
-	for _, status := range []string{"corrupted-status", "ver\u0131f\u0131ed"} {
+	for _, status := range []string{
+		"corrupted-status",
+		"ver\u0131f\u0131ed",
+		"\u00a0VERIFIED",
+		"VERIFIED\u00a0",
+		"\u2003verified",
+		"\u3000Verified",
+	} {
 		t.Run(status, func(t *testing.T) {
 			svc := NewService(&Config{
 				Enabled: true,
