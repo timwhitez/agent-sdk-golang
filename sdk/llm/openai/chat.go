@@ -934,6 +934,10 @@ func isRetryableNetErr(err error) bool {
 	if err == nil {
 		return false
 	}
+	var retryDecision openAIRetryDecision
+	if errors.As(err, &retryDecision) {
+		return retryDecision.openAIRetryable()
+	}
 	var timeoutErr interface{ Timeout() bool }
 	if errors.As(err, &timeoutErr) && timeoutErr.Timeout() {
 		return true

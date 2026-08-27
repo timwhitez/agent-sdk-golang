@@ -1,6 +1,7 @@
 package openai
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"net"
@@ -16,6 +17,55 @@ type openAIOrigin struct {
 	host   string
 	port   string
 }
+
+type openAIRetryDecision interface {
+	openAIRetryable() bool
+}
+
+type openAIRedirectPolicyError struct {
+	err error
+}
+
+func newOpenAIRedirectPolicyError(err error) *openAIRedirectPolicyError {
+	return &openAIRedirectPolicyError{err: err}
+}
+
+func (e *openAIRedirectPolicyError) Error() string {
+	if e == nil || e.err == nil {
+		return "openai: redirect rejected"
+	}
+	return e.err.Error()
+}
+
+func (e *openAIRedirectPolicyError) Unwrap() error {
+	if e == nil {
+		return nil
+	}
+	return e.err
+}
+
+func (*openAIRedirectPolicyError) openAIRetryable() bool { return false }
+
+type openAISanitizedRequestError struct{}
+
+func (openAISanitizedRequestError) Error() string         { return "HTTP request failed" }
+func (openAISanitizedRequestError) openAIRetryable() bool { return false }
+
+type openAISanitizedNetworkError struct {
+	retryable bool
+}
+
+func (openAISanitizedNetworkError) Error() string { return "network request failed" }
+func (e openAISanitizedNetworkError) openAIRetryable() bool {
+	return e.retryable
+}
+
+type openAISanitizedTimeoutError struct{}
+
+func (openAISanitizedTimeoutError) Error() string         { return "network request timed out" }
+func (openAISanitizedTimeoutError) Timeout() bool         { return true }
+func (openAISanitizedTimeoutError) Temporary() bool       { return true }
+func (openAISanitizedTimeoutError) openAIRetryable() bool { return true }
 
 func originForOpenAIURL(value *url.URL) (openAIOrigin, error) {
 	if value == nil {
@@ -49,6 +99,9 @@ func validateOpenAIRedirectTarget(origin openAIOrigin, target *url.URL) error {
 	if origin != destination {
 		return fmt.Errorf("openai: refusing cross-origin redirect to %s://%s:%s", destination.scheme, destination.host, destination.port)
 	}
+	if target.User != nil {
+		return errors.New("openai: refusing redirect with embedded URL credentials")
+	}
 	return nil
 }
 
@@ -72,7 +125,38 @@ func sanitizeOpenAIHTTPError(err error) error {
 	if parsed, parseErr := url.Parse(urlErr.URL); parseErr == nil {
 		safeURL = openAIOriginLabel(parsed)
 	}
-	return &url.Error{Op: urlErr.Op, URL: safeURL, Err: urlErr.Err}
+	var cause error = openAISanitizedRequestError{}
+	var policyErr *openAIRedirectPolicyError
+	if errors.As(urlErr.Err, &policyErr) && policyErr != nil {
+		cause = policyErr
+	} else if errors.Is(urlErr.Err, context.Canceled) {
+		cause = context.Canceled
+	} else if errors.Is(urlErr.Err, context.DeadlineExceeded) {
+		cause = context.DeadlineExceeded
+	} else {
+		var netErr net.Error
+		if errors.As(urlErr.Err, &netErr) {
+			if netErr.Timeout() {
+				cause = openAISanitizedTimeoutError{}
+			} else {
+				cause = openAISanitizedNetworkError{retryable: retryableOpenAINetworkError(urlErr.Err)}
+			}
+		}
+	}
+	return &url.Error{Op: urlErr.Op, URL: safeURL, Err: cause}
+}
+
+func retryableOpenAINetworkError(err error) bool {
+	var dnsErr *net.DNSError
+	if errors.As(err, &dnsErr) && dnsErr != nil && dnsErr.IsNotFound {
+		return false
+	}
+	var opErr *net.OpError
+	if errors.As(err, &opErr) && opErr != nil {
+		return true
+	}
+	var temporary interface{ Temporary() bool }
+	return errors.As(err, &temporary) && temporary.Temporary()
 }
 
 // redirectSafeOpenAIHTTPClient clones base and installs a mandatory policy
@@ -87,27 +171,27 @@ func redirectSafeOpenAIHTTPClient(base *http.Client) *http.Client {
 	callerCheck := base.CheckRedirect
 	cloned.CheckRedirect = func(req *http.Request, via []*http.Request) error {
 		if len(via) == 0 || via[0] == nil || via[0].URL == nil {
-			return fmt.Errorf("openai: redirect is missing its origin request")
+			return newOpenAIRedirectPolicyError(errors.New("openai: redirect is missing its origin request"))
 		}
 		if len(via) >= openAIMaxRedirects {
-			return fmt.Errorf("openai: stopped after %d redirects", openAIMaxRedirects)
+			return newOpenAIRedirectPolicyError(fmt.Errorf("openai: stopped after %d redirects", openAIMaxRedirects))
 		}
 		origin, err := originForOpenAIURL(via[0].URL)
 		if err != nil {
-			return err
+			return newOpenAIRedirectPolicyError(err)
 		}
 		if req == nil {
-			return fmt.Errorf("openai: redirect request is missing")
+			return newOpenAIRedirectPolicyError(errors.New("openai: redirect request is missing"))
 		}
 		if err := validateOpenAIRedirectTarget(origin, req.URL); err != nil {
-			return err
+			return newOpenAIRedirectPolicyError(err)
 		}
 		if callerCheck != nil {
 			if err := callerCheck(req, via); err != nil {
 				return err
 			}
 			if err := validateOpenAIRedirectTarget(origin, req.URL); err != nil {
-				return err
+				return newOpenAIRedirectPolicyError(err)
 			}
 		}
 		return nil

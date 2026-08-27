@@ -107,7 +107,9 @@ only same-origin redirects. Origin includes scheme, host, and effective port;
 HTTPS-to-HTTP downgrades are rejected before a redirected request is sent.
 Caller-provided redirect callbacks run only for an initially allowed target,
 and the target URL is checked again after the callback returns so it cannot
-move bearer credentials onto another origin.
+move bearer credentials onto another origin. Redirect-policy and malformed
+Location failures are fail-fast and their diagnostics never echo URL
+userinfo, path, or query data.
 
 ## Usage and Optional Cost Calculation
 - Providers populate a versioned `Usage` contract; downstream cost calculation is optional (`sdk/llm/types.go`, `sdk/llm/usage.go`, `sdk/tokens/cost.go:80`).

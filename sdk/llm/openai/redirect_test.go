@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -20,14 +21,18 @@ func openAIRedirectTestRequest() llm.InvokeRequest {
 }
 
 func invokeOpenAIRedirectTest(t *testing.T, provider string, streaming bool, baseURL, apiKey string) error {
+	return invokeOpenAIRedirectTestWithRetries(t, provider, streaming, baseURL, apiKey, 1)
+}
+
+func invokeOpenAIRedirectTestWithRetries(t *testing.T, provider string, streaming bool, baseURL, apiKey string, maxRetries int) error {
 	t.Helper()
 	request := openAIRedirectTestRequest()
 	var model llm.ChatModel
 	switch provider {
 	case "chat":
-		model = &ChatClient{HTTPClient: &http.Client{Timeout: 2 * time.Second}, BaseURL: baseURL, APIKey: apiKey, ModelName: "test-model", MaxRetries: 1}
+		model = &ChatClient{HTTPClient: &http.Client{Timeout: 2 * time.Second}, BaseURL: baseURL, APIKey: apiKey, ModelName: "test-model", MaxRetries: maxRetries, RetryBaseDelay: time.Nanosecond, RetryMaxDelay: time.Nanosecond}
 	case "responses":
-		model = &ResponsesClient{HTTPClient: &http.Client{Timeout: 2 * time.Second}, BaseURL: baseURL, APIKey: apiKey, ModelName: "test-model", MaxRetries: 1}
+		model = &ResponsesClient{HTTPClient: &http.Client{Timeout: 2 * time.Second}, BaseURL: baseURL, APIKey: apiKey, ModelName: "test-model", MaxRetries: maxRetries, RetryBaseDelay: time.Nanosecond, RetryMaxDelay: time.Nanosecond}
 	default:
 		t.Fatalf("unknown provider %q", provider)
 	}
@@ -50,6 +55,159 @@ func invokeOpenAIRedirectTest(t *testing.T, provider string, streaming bool, bas
 	}
 	return nil
 }
+
+func TestOpenAIClientsRedactMalformedLocationAndDoNotRetry(t *testing.T) {
+	for _, provider := range []string{"chat", "responses"} {
+		for _, streaming := range []bool{false, true} {
+			provider := provider
+			streaming := streaming
+			t.Run(provider+map[bool]string{false: "_buffered", true: "_streaming"}[streaming], func(t *testing.T) {
+				const secret = "malformed-location-secret"
+				var sourceCalls atomic.Int32
+				redirector := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+					sourceCalls.Add(1)
+					w.Header().Set("Location", "https://audit-user:audit-password@connection.invalid/%zz?token="+secret)
+					w.WriteHeader(http.StatusTemporaryRedirect)
+				}))
+				defer redirector.Close()
+
+				err := invokeOpenAIRedirectTestWithRetries(t, provider, streaming, redirector.URL, secret, 3)
+				if err == nil {
+					t.Fatal("malformed redirect unexpectedly succeeded")
+				}
+				for _, value := range []string{secret, "audit-user", "audit-password", "connection.invalid", "/%zz", "token="} {
+					if strings.Contains(err.Error(), value) {
+						t.Fatalf("malformed redirect error exposed %q: %v", value, err)
+					}
+				}
+				if got := sourceCalls.Load(); got != 1 {
+					t.Fatalf("malformed redirect source received %d requests, want fail-fast 1", got)
+				}
+			})
+		}
+	}
+}
+
+func TestOpenAIClientsDoNotRetryPolicyErrorWithRetryKeyword(t *testing.T) {
+	for _, provider := range []string{"chat", "responses"} {
+		for _, streaming := range []bool{false, true} {
+			provider := provider
+			streaming := streaming
+			t.Run(provider+map[bool]string{false: "_buffered", true: "_streaming"}[streaming], func(t *testing.T) {
+				var sourceCalls atomic.Int32
+				redirector := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+					sourceCalls.Add(1)
+					w.Header().Set("Location", "http://connection.invalid/private")
+					w.WriteHeader(http.StatusTemporaryRedirect)
+				}))
+				defer redirector.Close()
+
+				err := invokeOpenAIRedirectTestWithRetries(t, provider, streaming, redirector.URL, "policy-secret", 3)
+				if err == nil || !strings.Contains(err.Error(), "cross-origin redirect") {
+					t.Fatalf("policy redirect error = %v", err)
+				}
+				if isRetryableNetErr(err) {
+					t.Fatalf("redirect policy error was classified retryable: %v", err)
+				}
+				if got := sourceCalls.Load(); got != 1 {
+					t.Fatalf("policy redirect source received %d requests, want fail-fast 1", got)
+				}
+			})
+		}
+	}
+}
+
+func TestOpenAIClientsRejectSameOriginRedirectURLCredentials(t *testing.T) {
+	for _, provider := range []string{"chat", "responses"} {
+		for _, streaming := range []bool{false, true} {
+			provider := provider
+			streaming := streaming
+			t.Run(provider+map[bool]string{false: "_buffered", true: "_streaming"}[streaming], func(t *testing.T) {
+				var sourceCalls atomic.Int32
+				var redirectedCalls atomic.Int32
+				var server *httptest.Server
+				server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+					sourceCalls.Add(1)
+					if r.URL.Path == "/redirected" {
+						redirectedCalls.Add(1)
+						w.WriteHeader(http.StatusInternalServerError)
+						return
+					}
+					target := strings.Replace(server.URL, "://", "://audit-user:audit-password@", 1) + "/redirected?token=audit-query-secret"
+					w.Header().Set("Location", target)
+					w.WriteHeader(http.StatusTemporaryRedirect)
+				}))
+				defer server.Close()
+
+				err := invokeOpenAIRedirectTestWithRetries(t, provider, streaming, server.URL, "bearer-secret", 3)
+				if err == nil || !strings.Contains(err.Error(), "embedded URL credentials") {
+					t.Fatalf("redirect credential error = %v", err)
+				}
+				for _, value := range []string{"audit-user", "audit-password", "audit-query-secret", "/redirected"} {
+					if strings.Contains(err.Error(), value) {
+						t.Fatalf("redirect credential error exposed %q: %v", value, err)
+					}
+				}
+				if sourceCalls.Load() != 1 || redirectedCalls.Load() != 0 {
+					t.Fatalf("source/redirected calls = %d/%d, want 1/0", sourceCalls.Load(), redirectedCalls.Load())
+				}
+			})
+		}
+	}
+}
+
+func TestSanitizeOpenAIHTTPErrorPreservesSafeRetrySemantics(t *testing.T) {
+	t.Parallel()
+	const secret = "network-error-secret"
+	tests := []struct {
+		name        string
+		cause       error
+		wantRetry   bool
+		wantTimeout bool
+	}{
+		{name: "timeout", cause: secretOpenAITimeoutError{message: secret}, wantRetry: true, wantTimeout: true},
+		{name: "network operation", cause: &net.OpError{Op: "dial", Net: "tcp", Err: errors.New(secret)}, wantRetry: true},
+		{name: "permanent network error", cause: secretOpenAIPermanentNetError{message: secret}},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			err := sanitizeOpenAIHTTPError(&url.Error{
+				Op:  "Post",
+				URL: "https://api.example.test/private?token=" + secret,
+				Err: tc.cause,
+			})
+			var sanitized *url.Error
+			if !errors.As(err, &sanitized) {
+				t.Fatalf("sanitized error = %T, want *url.Error", err)
+			}
+			if strings.Contains(sanitized.Error(), secret) || strings.Contains(sanitized.Error(), "/private") {
+				t.Fatalf("sanitized error leaked request details: %q", sanitized.Error())
+			}
+			if got := isRetryableNetErr(sanitized); got != tc.wantRetry {
+				t.Fatalf("retryable = %t, want %t: %v", got, tc.wantRetry, sanitized)
+			}
+			if got := sanitized.Timeout(); got != tc.wantTimeout {
+				t.Fatalf("timeout = %t, want %t: %v", got, tc.wantTimeout, sanitized)
+			}
+		})
+	}
+}
+
+type secretOpenAITimeoutError struct {
+	message string
+}
+
+func (e secretOpenAITimeoutError) Error() string { return e.message }
+func (secretOpenAITimeoutError) Timeout() bool   { return true }
+func (secretOpenAITimeoutError) Temporary() bool { return true }
+
+type secretOpenAIPermanentNetError struct {
+	message string
+}
+
+func (e secretOpenAIPermanentNetError) Error() string { return e.message }
+func (secretOpenAIPermanentNetError) Timeout() bool   { return false }
+func (secretOpenAIPermanentNetError) Temporary() bool { return false }
 
 func TestOpenAIClientsRejectCrossOriginRedirectWithoutLeakingBearerToken(t *testing.T) {
 	for _, provider := range []string{"chat", "responses"} {
