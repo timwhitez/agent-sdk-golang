@@ -710,7 +710,8 @@ func (c *ResponsesClient) InvokeStream(ctx context.Context, req llm.InvokeReques
 			sawCompleted := false
 			thinkingEmitted := false
 			textEmitted := false
-			refusalEmitted := false
+			refusalText := ""
+			observedNonterminalStatus := ""
 			streamResponseID := ""
 			emitResponseID := func(id string) {
 				id = strings.TrimSpace(id)
@@ -720,7 +721,30 @@ func (c *ResponsesClient) InvokeStream(ctx context.Context, req llm.InvokeReques
 				streamResponseID = id
 				out <- llm.StreamResponseEvent{ResponseID: id}
 			}
-			emitTerminalResponse := func(respObj map[string]any) {
+			emitRefusalDelta := func(delta string) {
+				if delta == "" {
+					return
+				}
+				refusalText += delta
+				out <- llm.StreamTextDeltaEvent{Delta: delta}
+			}
+			emitRefusalFinal := func(final string) error {
+				if strings.TrimSpace(final) == "" {
+					return nil
+				}
+				if !strings.HasPrefix(final, refusalText) {
+					return &llm.ProviderError{
+						Provider: local.Provider(),
+						Message:  "Responses refusal final text conflicts with the streamed refusal prefix",
+					}
+				}
+				if suffix := strings.TrimPrefix(final, refusalText); suffix != "" {
+					out <- llm.StreamTextDeltaEvent{Delta: suffix}
+				}
+				refusalText = final
+				return nil
+			}
+			emitTerminalResponse := func(respObj map[string]any) error {
 				emitResponseID(responsesStreamResponseID(map[string]any{"response": respObj}))
 				if u := usageFromResponses(respObj); u != nil {
 					out <- llm.StreamUsageEvent{Usage: *u}
@@ -737,12 +761,10 @@ func (c *ResponsesClient) InvokeStream(ctx context.Context, req llm.InvokeReques
 						textEmitted = true
 					}
 				}
-				if !refusalEmitted {
-					if refusal := extractRefusalFromResponses(respObj); refusal != "" {
-						out <- llm.StreamTextDeltaEvent{Delta: refusal}
-						refusalEmitted = true
-					}
+				if refusal := extractRefusalFromResponses(respObj); refusal != "" {
+					return emitRefusalFinal(refusal)
 				}
+				return nil
 			}
 			err = consumeSSEWithBodyClose(resp.Body, func(data string) error {
 				data = strings.TrimSpace(data)
@@ -750,6 +772,12 @@ func (c *ResponsesClient) InvokeStream(ctx context.Context, req llm.InvokeReques
 					return nil
 				}
 				if data == "[DONE]" {
+					if observedNonterminalStatus != "" && !sawCompleted {
+						return &llm.ProviderError{
+							Provider: local.Provider(),
+							Message:  fmt.Sprintf("Responses stream received [DONE] while response status remained %q", observedNonterminalStatus),
+						}
+					}
 					return errSSEDone
 				}
 				var root map[string]any
@@ -771,14 +799,29 @@ func (c *ResponsesClient) InvokeStream(ctx context.Context, req llm.InvokeReques
 					}
 				case "response.refusal.delta":
 					if d, ok := root["delta"].(string); ok && d != "" {
-						out <- llm.StreamTextDeltaEvent{Delta: d}
-						refusalEmitted = true
+						emitRefusalDelta(d)
 					}
 				case "response.refusal.done":
-					if refusal, ok := root["refusal"].(string); ok && strings.TrimSpace(refusal) != "" && !refusalEmitted {
-						out <- llm.StreamTextDeltaEvent{Delta: refusal}
-						refusalEmitted = true
+					if refusal, ok := root["refusal"].(string); ok {
+						return emitRefusalFinal(refusal)
 					}
+				case "response.created":
+					respObj, _ := root["response"].(map[string]any)
+					status := strings.ToLower(stringFromAny(respObj["status"]))
+					if status == "" {
+						status = "in_progress"
+					}
+					if status != "in_progress" && status != "queued" {
+						return responsesStreamStatusConflictError(local.Provider(), "response.created", "in_progress or queued", status, respObj)
+					}
+					observedNonterminalStatus = status
+				case "response.in_progress", "response.queued":
+					respObj, _ := root["response"].(map[string]any)
+					expectedStatus := strings.TrimPrefix(typ, "response.")
+					if statusErr := responsesValidateStreamEventStatus(local.Provider(), typ, expectedStatus, respObj); statusErr != nil {
+						return statusErr
+					}
+					observedNonterminalStatus = expectedStatus
 				case "response.reasoning.delta", "response.reasoning_text.delta", "response.reasoning_content.delta", "response.thinking.delta":
 					if d, ok := root["delta"].(string); ok && d != "" {
 						out <- llm.StreamThinkingDeltaEvent{Delta: d}
@@ -821,9 +864,8 @@ func (c *ResponsesClient) InvokeStream(ctx context.Context, req llm.InvokeReques
 										textEmitted = true
 									}
 								} else if ct == "refusal" {
-									if txt := responsesContentText(cm); strings.TrimSpace(txt) != "" && !refusalEmitted {
-										out <- llm.StreamTextDeltaEvent{Delta: txt}
-										refusalEmitted = true
+									if txt := responsesContentText(cm); strings.TrimSpace(txt) != "" {
+										emitRefusalDelta(txt)
 									}
 								} else if ct == "reasoning" || ct == "reasoning_text" || ct == "thinking" {
 									if txt, ok := cm["text"].(string); ok && strings.TrimSpace(txt) != "" {
@@ -889,9 +931,10 @@ func (c *ResponsesClient) InvokeStream(ctx context.Context, req llm.InvokeReques
 										textEmitted = true
 									}
 								} else if ct == "refusal" {
-									if txt := responsesContentText(cm); strings.TrimSpace(txt) != "" && !refusalEmitted {
-										out <- llm.StreamTextDeltaEvent{Delta: txt}
-										refusalEmitted = true
+									if txt := responsesContentText(cm); strings.TrimSpace(txt) != "" {
+										if refusalErr := emitRefusalFinal(txt); refusalErr != nil {
+											return refusalErr
+										}
 									}
 								} else if ct == "reasoning" || ct == "reasoning_text" || ct == "thinking" {
 									if txt, ok := cm["text"].(string); ok && strings.TrimSpace(txt) != "" {
@@ -990,13 +1033,14 @@ func (c *ResponsesClient) InvokeStream(ctx context.Context, req llm.InvokeReques
 					if respObj == nil {
 						respObj = root
 					}
-					emitTerminalResponse(respObj)
+					if emitErr := emitTerminalResponse(respObj); emitErr != nil {
+						return emitErr
+					}
+					if statusErr := responsesValidateStreamEventStatus(local.Provider(), typ, "completed", respObj); statusErr != nil {
+						return statusErr
+					}
 					if responsesHasError(respObj) {
 						return parseResponsesStreamEventError(local.Provider(), respObj)
-					}
-					status := strings.ToLower(stringFromAny(respObj["status"]))
-					if status != "" && status != "completed" {
-						return responsesTerminalStatusError(local.Provider(), respObj, status)
 					}
 					stopReason = "end_turn"
 					return errSSEDone
@@ -1006,7 +1050,12 @@ func (c *ResponsesClient) InvokeStream(ctx context.Context, req llm.InvokeReques
 					if respObj == nil {
 						respObj = root
 					}
-					emitTerminalResponse(respObj)
+					if emitErr := emitTerminalResponse(respObj); emitErr != nil {
+						return emitErr
+					}
+					if statusErr := responsesValidateStreamEventStatus(local.Provider(), typ, "incomplete", respObj); statusErr != nil {
+						return statusErr
+					}
 					var terminalErr error
 					stopReason, terminalErr = responsesIncompleteStopReason(local.Provider(), respObj)
 					if terminalErr != nil {
@@ -1019,8 +1068,13 @@ func (c *ResponsesClient) InvokeStream(ctx context.Context, req llm.InvokeReques
 					if respObj == nil {
 						respObj = root
 					}
-					emitTerminalResponse(respObj)
 					status := strings.TrimPrefix(typ, "response.")
+					if emitErr := emitTerminalResponse(respObj); emitErr != nil {
+						return emitErr
+					}
+					if statusErr := responsesValidateStreamEventStatus(local.Provider(), typ, status, respObj); statusErr != nil {
+						return statusErr
+					}
 					return responsesTerminalStatusError(local.Provider(), respObj, status)
 				case "response.error", "error":
 					if streamErr := parseResponsesStreamEventError(local.Provider(), root); streamErr != nil {
@@ -1118,6 +1172,23 @@ func responsesTerminalStatusError(provider string, resp map[string]any, status s
 	}
 	if refusal := extractRefusalFromResponses(resp); refusal != "" {
 		message += "; refusal: " + refusal
+	}
+	return &llm.ProviderError{Provider: openAIProviderLabel(provider), Message: message}
+}
+
+func responsesValidateStreamEventStatus(provider, eventType, expectedStatus string, resp map[string]any) error {
+	expectedStatus = strings.ToLower(strings.TrimSpace(expectedStatus))
+	payloadStatus := strings.ToLower(stringFromAny(resp["status"]))
+	if payloadStatus == "" || payloadStatus == expectedStatus {
+		return nil
+	}
+	return responsesStreamStatusConflictError(provider, eventType, expectedStatus, payloadStatus, resp)
+}
+
+func responsesStreamStatusConflictError(provider, eventType, expectedStatus, payloadStatus string, resp map[string]any) error {
+	message := fmt.Sprintf("Responses stream event %q conflicts with response status %q; expected %q", eventType, payloadStatus, expectedStatus)
+	if responseID := stringFromAny(resp["id"]); responseID != "" {
+		message = fmt.Sprintf("response %q: %s", responseID, message)
 	}
 	return &llm.ProviderError{Provider: openAIProviderLabel(provider), Message: message}
 }

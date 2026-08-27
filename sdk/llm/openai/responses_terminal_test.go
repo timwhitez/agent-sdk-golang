@@ -148,7 +148,8 @@ func TestResponsesStreamIncompleteTerminalEvents(t *testing.T) {
 func TestResponsesStreamFailedPreservesRefusalAndMetadata(t *testing.T) {
 	t.Parallel()
 	server := openAIStreamFixture(t,
-		`{"type":"response.refusal.delta","response_id":"resp_failed","delta":"Request refused."}`,
+		`{"type":"response.refusal.delta","response_id":"resp_failed","delta":"Request"}`,
+		`{"type":"response.refusal.done","response_id":"resp_failed","refusal":"Request refused."}`,
 		`{"type":"response.failed","response":{"id":"resp_failed","status":"failed","error":{"code":"server_error","message":"generation failed"},"output":[{"type":"message","content":[{"type":"refusal","refusal":"Request refused."}]}],"usage":{"input_tokens":7,"output_tokens":1,"total_tokens":8}}}`,
 	)
 	defer server.Close()
@@ -176,6 +177,72 @@ func TestResponsesStreamFailedPreservesRefusalAndMetadata(t *testing.T) {
 		t.Fatalf("refusal text = %q, want exactly one streamed refusal", text)
 	}
 	if providerErr == nil || providerErr.Provider != "gateway-responses" {
+		t.Fatalf("provider error = %#v", providerErr)
+	}
+}
+
+func TestResponsesStreamDoneCannotPromoteInProgressResponse(t *testing.T) {
+	t.Parallel()
+	server := openAIStreamFixture(t,
+		`{"type":"response.in_progress","response":{"id":"resp_progress","status":"in_progress","output":[]}}`,
+		`[DONE]`,
+	)
+	defer server.Close()
+	client := &ResponsesClient{BaseURL: server.URL, ModelName: "test-model", MaxRetries: 1, ProviderLabel: "gateway-responses"}
+	stream, err := client.InvokeStream(context.Background(), llm.InvokeRequest{Messages: []llm.Message{llm.NewUserMessage("hello")}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	events := collectOpenAIStream(stream)
+	var providerErr *llm.ProviderError
+	for _, event := range events {
+		switch typed := event.(type) {
+		case llm.StreamDoneEvent:
+			t.Fatalf("in-progress response emitted success: %#v", events)
+		case llm.StreamErrorEvent:
+			if !errors.As(typed.AsError(), &providerErr) {
+				t.Fatalf("error = %v, want ProviderError", typed.AsError())
+			}
+		}
+	}
+	if providerErr == nil || providerErr.Provider != "gateway-responses" || !strings.Contains(providerErr.Message, "in_progress") {
+		t.Fatalf("provider error = %#v", providerErr)
+	}
+}
+
+func TestResponsesStreamRejectsTerminalEventStatusConflict(t *testing.T) {
+	t.Parallel()
+	server := openAIStreamFixture(t,
+		`{"type":"response.incomplete","response":{"id":"resp_conflict","status":"failed","incomplete_details":{"reason":"max_output_tokens"},"output":[],"usage":{"input_tokens":4,"output_tokens":1,"total_tokens":5}}}`,
+	)
+	defer server.Close()
+	client := &ResponsesClient{BaseURL: server.URL, ModelName: "test-model", MaxRetries: 1, ProviderLabel: "gateway-responses"}
+	stream, err := client.InvokeStream(context.Background(), llm.InvokeRequest{Messages: []llm.Message{llm.NewUserMessage("hello")}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	events := collectOpenAIStream(stream)
+	responseIndex, usageIndex, errorIndex := -1, -1, -1
+	var providerErr *llm.ProviderError
+	for index, event := range events {
+		switch typed := event.(type) {
+		case llm.StreamResponseEvent:
+			responseIndex = index
+		case llm.StreamUsageEvent:
+			usageIndex = index
+		case llm.StreamDoneEvent:
+			t.Fatalf("conflicting terminal status emitted success: %#v", events)
+		case llm.StreamErrorEvent:
+			errorIndex = index
+			if !errors.As(typed.AsError(), &providerErr) {
+				t.Fatalf("error = %v, want ProviderError", typed.AsError())
+			}
+		}
+	}
+	if responseIndex < 0 || usageIndex < 0 || errorIndex < 0 || responseIndex >= errorIndex || usageIndex >= errorIndex {
+		t.Fatalf("metadata/error order = %d/%d/%d: %#v", responseIndex, usageIndex, errorIndex, events)
+	}
+	if providerErr == nil || !strings.Contains(providerErr.Message, "conflicts") {
 		t.Fatalf("provider error = %#v", providerErr)
 	}
 }
