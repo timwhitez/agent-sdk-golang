@@ -269,6 +269,28 @@ func TestCompactionQualityGateIgnoresFencedHeadingLookalikes(t *testing.T) {
 	}
 }
 
+func TestCompactionQualityGateIgnoresTildeFencedHeadingLookalikes(t *testing.T) {
+	valid, envelopeReasons := validateSummaryEnvelope(structuredTestSummary("", ""))
+	if len(envelopeReasons) != 0 {
+		t.Fatalf("valid summary envelope: %v", envelopeReasons)
+	}
+	fenced := "~~~markdown\n" + valid + "\n~~~"
+	if reasons := validateRequiredSummarySections(fenced); len(reasons) == 0 {
+		t.Fatal("tilde-fenced heading lookalikes passed validation")
+	}
+}
+
+func TestCompactionQualityGateDoesNotCloseFenceOnUnicodeWhitespace(t *testing.T) {
+	valid, envelopeReasons := validateSummaryEnvelope(structuredTestSummary("", ""))
+	if len(envelopeReasons) != 0 {
+		t.Fatalf("valid summary envelope: %v", envelopeReasons)
+	}
+	fenced := "```markdown\nignored\n```\u00a0\n" + valid
+	if reasons := validateRequiredSummarySections(fenced); len(reasons) == 0 {
+		t.Fatal("non-CommonMark Unicode whitespace closed a code fence")
+	}
+}
+
 func TestCompactionQualityGateAcceptsCRLFHeadings(t *testing.T) {
 	valid, envelopeReasons := validateSummaryEnvelope(structuredTestSummary("", ""))
 	if len(envelopeReasons) != 0 {
@@ -289,6 +311,19 @@ func TestCompactionQualityGateDoesNotCountAnotherHeadingAsSectionBody(t *testing
 	reasons := validateRequiredSummarySections(withEmptyBody)
 	if !strings.Contains(strings.Join(reasons, "; "), "empty required section: "+first) {
 		t.Fatalf("extra heading masqueraded as required-section body: %v", reasons)
+	}
+}
+
+func TestCompactionQualityGateRecognizesIndentedMarkdownHeadingBoundary(t *testing.T) {
+	valid, envelopeReasons := validateSummaryEnvelope(structuredTestSummary("", ""))
+	if len(envelopeReasons) != 0 {
+		t.Fatalf("valid summary envelope: %v", envelopeReasons)
+	}
+	first := requiredSummarySections[0]
+	withEmptyBody := strings.Replace(valid, "## "+first+"\nuser request preserved", "## "+first+"\n   ### indented heading\ntext", 1)
+	reasons := validateRequiredSummarySections(withEmptyBody)
+	if !strings.Contains(strings.Join(reasons, "; "), "empty required section: "+first) {
+		t.Fatalf("indented Markdown heading masqueraded as required-section body: %v", reasons)
 	}
 }
 

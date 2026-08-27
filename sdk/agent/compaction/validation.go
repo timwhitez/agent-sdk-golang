@@ -198,13 +198,24 @@ func scanMarkdownHeadings(text string) []markdownHeading {
 				fenceChar = 0
 				fenceWidth = 0
 			}
-		} else if fenceChar == 0 && strings.HasPrefix(line, "#") {
+		} else if fenceChar == 0 {
+			headingOffset := 0
+			for headingOffset < len(line) && headingOffset < 4 && line[headingOffset] == ' ' {
+				headingOffset++
+			}
+			if headingOffset > 3 || headingOffset >= len(line) || line[headingOffset] != '#' {
+				if next > len(text) {
+					break
+				}
+				start = next
+				continue
+			}
 			level := 0
-			for level < len(line) && level < 6 && line[level] == '#' {
+			for headingOffset+level < len(line) && level < 6 && line[headingOffset+level] == '#' {
 				level++
 			}
 			if level > 0 {
-				title := strings.TrimSpace(line[level:])
+				title := strings.TrimSpace(line[headingOffset+level:])
 				headings = append(headings, markdownHeading{line: line, title: title, start: start, end: min(next, len(text))})
 			}
 		}
@@ -238,8 +249,17 @@ func markdownFenceMarker(line string, active byte, activeWidth int) (marker byte
 	if active == 0 {
 		return marker, width, false
 	}
-	if marker != active || width < activeWidth || strings.TrimSpace(line[indent+width:]) != "" {
+	if marker != active || width < activeWidth || !onlyASCIISpaceOrTab(line[indent+width:]) {
 		return 0, 0, false
 	}
 	return marker, width, true
+}
+
+func onlyASCIISpaceOrTab(text string) bool {
+	for i := 0; i < len(text); i++ {
+		if text[i] != ' ' && text[i] != '\t' {
+			return false
+		}
+	}
+	return true
 }
