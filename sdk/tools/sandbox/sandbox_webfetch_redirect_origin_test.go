@@ -187,3 +187,30 @@ func TestWebfetchRedirectErrorSanitizesCredentialBearingLocation(t *testing.T) {
 		})
 	}
 }
+
+func TestSanitizeWebfetchRequestErrorPreservesTimeoutSemanticsWithoutDetails(t *testing.T) {
+	const secret = "audit-timeout-secret"
+	err := sanitizeWebfetchRequestError(&url.Error{
+		Op:  "Get",
+		URL: "https://example.test/private?token=" + secret,
+		Err: secretWebfetchTimeoutError{message: secret},
+	})
+	var sanitized *url.Error
+	if !errors.As(err, &sanitized) {
+		t.Fatalf("sanitized error = %T, want *url.Error", err)
+	}
+	if !sanitized.Timeout() {
+		t.Fatalf("sanitized timeout error lost Timeout semantics: %v", sanitized)
+	}
+	if strings.Contains(sanitized.Error(), secret) || strings.Contains(sanitized.Error(), "/private") {
+		t.Fatalf("sanitized timeout error leaked request details: %q", sanitized.Error())
+	}
+}
+
+type secretWebfetchTimeoutError struct {
+	message string
+}
+
+func (e secretWebfetchTimeoutError) Error() string { return e.message }
+func (secretWebfetchTimeoutError) Timeout() bool   { return true }
+func (secretWebfetchTimeoutError) Temporary() bool { return true }

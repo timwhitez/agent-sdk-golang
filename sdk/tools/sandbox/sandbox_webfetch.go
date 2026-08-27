@@ -300,7 +300,7 @@ func sanitizeWebfetchRequestError(err error) error {
 	} else {
 		var netErr net.Error
 		if errors.As(urlErr.Err, &netErr) && netErr.Timeout() {
-			cause = errors.New("network request timed out")
+			cause = webfetchRequestTimeoutError{}
 		}
 	}
 	return &url.Error{Op: urlErr.Op, URL: safeURL, Err: cause}
@@ -313,6 +313,12 @@ func sanitizeWebfetchRequestError(err error) error {
 type webfetchSafeRequestDiagnostic struct {
 	err error
 }
+
+type webfetchRequestTimeoutError struct{}
+
+func (webfetchRequestTimeoutError) Error() string   { return "network request timed out" }
+func (webfetchRequestTimeoutError) Timeout() bool   { return true }
+func (webfetchRequestTimeoutError) Temporary() bool { return true }
 
 func newWebfetchSafeRequestDiagnostic(err error) *webfetchSafeRequestDiagnostic {
 	return &webfetchSafeRequestDiagnostic{err: err}
