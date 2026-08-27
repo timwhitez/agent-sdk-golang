@@ -91,6 +91,9 @@ func responsesProviderStateFromRawItems(items []json.RawMessage) ([]llm.Provider
 		if err := json.Unmarshal(item["type"], &itemType); err != nil || strings.TrimSpace(itemType) == "" {
 			return nil, fmt.Errorf("openai responses: output item %d has no valid type", index)
 		}
+		if err := validateResponsesOutputItem(index, itemType, item); err != nil {
+			return nil, err
+		}
 		totalBytes += len(raw)
 		if totalBytes > maxResponsesStateBytes {
 			return nil, fmt.Errorf("openai responses: opaque output state exceeds %d bytes", maxResponsesStateBytes)
@@ -104,10 +107,48 @@ func responsesProviderStateFromRawItems(items []json.RawMessage) ([]llm.Provider
 	return states, nil
 }
 
+func validateResponsesOutputItem(index int, itemType string, item map[string]json.RawMessage) error {
+	itemType = strings.TrimSpace(itemType)
+	if strings.HasPrefix(itemType, "input_") || strings.HasSuffix(itemType, "_output") || itemType == "item_reference" {
+		return fmt.Errorf("openai responses: output item %d uses input-only type %q", index, itemType)
+	}
+	if itemType != "message" {
+		return nil
+	}
+	if rawRole, present := item["role"]; present {
+		var role string
+		if err := json.Unmarshal(rawRole, &role); err != nil || role != "assistant" {
+			return fmt.Errorf("openai responses: output message item %d must have role assistant when role is present", index)
+		}
+	}
+	var content []json.RawMessage
+	if err := json.Unmarshal(item["content"], &content); err != nil {
+		return fmt.Errorf("openai responses: output message item %d must have a content array", index)
+	}
+	for partIndex, rawPart := range content {
+		var part map[string]json.RawMessage
+		if err := json.Unmarshal(rawPart, &part); err != nil || part == nil {
+			return fmt.Errorf("openai responses: output message item %d content %d must be an object", index, partIndex)
+		}
+		var partType string
+		if err := json.Unmarshal(part["type"], &partType); err != nil || strings.TrimSpace(partType) == "" {
+			return fmt.Errorf("openai responses: output message item %d content %d has no valid type", index, partIndex)
+		}
+		if strings.HasPrefix(strings.TrimSpace(partType), "input_") {
+			return fmt.Errorf("openai responses: output message item %d content %d uses input-only type %q", index, partIndex, strings.TrimSpace(partType))
+		}
+	}
+	return nil
+}
+
 func responsesOutputItemsFromMessage(message llm.Message) ([]json.RawMessage, bool, error) {
-	items := make([]json.RawMessage, 0, len(message.ProviderState))
+	providerState, err := llm.ProviderStateFromContent(message.Content)
+	if err != nil {
+		return nil, true, err
+	}
+	items := make([]json.RawMessage, 0, len(providerState))
 	totalBytes := 0
-	for _, state := range message.ProviderState {
+	for _, state := range providerState {
 		if state.Provider != responsesStateProvider || state.Kind != responsesOutputItemStateKind {
 			continue
 		}
@@ -127,15 +168,19 @@ func responsesOutputItemsFromMessage(message llm.Message) ([]json.RawMessage, bo
 	return items, len(items) > 0, nil
 }
 
-func responsesMessagesContainOutputState(messages []llm.Message) bool {
+func responsesMessagesContainOutputState(messages []llm.Message) (bool, error) {
 	for _, message := range messages {
-		for _, state := range message.ProviderState {
+		stateItems, err := llm.ProviderStateFromContent(message.Content)
+		if err != nil {
+			return true, err
+		}
+		for _, state := range stateItems {
 			if state.Provider == responsesStateProvider && state.Kind == responsesOutputItemStateKind {
-				return true
+				return true, nil
 			}
 		}
 	}
-	return false
+	return false, nil
 }
 
 func orderedResponsesStreamState(items map[int]llm.ProviderState) ([]llm.ProviderState, error) {

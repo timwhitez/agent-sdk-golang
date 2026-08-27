@@ -46,8 +46,10 @@ stream normalization, and response metadata behavior.
 - Tool choice intentionally omits explicit `auto` for compatibility, while preserving `none`/`required`/forced tool modes (`sdk/llm/openai/responses.go:1085`)
 - Parsed response IDs are attached to `Completion.ResponseID` (`sdk/llm/openai/responses.go:1272`)
 - Manual/stateless continuation preserves each returned Responses output item
-  in opaque `Message.ProviderState`. The state is never included in `PlainText`
-  or UI output; response-item-mode requests replay it in provider order before
+  in an opaque reserved `ContentBlock`; use `llm.ProviderStateFromContent` and
+  `llm.WithProviderState` instead of changing the public `Message` or
+  `Completion` struct shape. The state is never included in `PlainText` or UI
+  output; response-item-mode requests replay it in provider order before
   matching `function_call_output` items. Legacy message mode fails closed rather
   than silently dropping opaque state. Buffered and streaming clients use the
   same path, including `id`, `call_id`, `phase`, and `encrypted_content` fields.
@@ -56,12 +58,14 @@ stream normalization, and response metadata behavior.
   fails closed when externally restored state is malformed or attached to a
   non-assistant message. Tool-pair repair and compaction mutations clear stale
   opaque items whenever their matching assistant message is changed.
-- For provider-managed state, set `ResponsesOptions.PreviousResponseID` or
-  `ConversationID` and send only new input. Those options are mutually exclusive
+- For provider-managed state, set `ResponsesOptions.ConversationID`, or put a
+  string `previous_response_id` in a dedicated `ResponsesClient.Extra` clone,
+  and send only new input. `ConversationID` uses the official Responses wire
+  field `conversation`. Those options are mutually exclusive
   with each other and with manually replayed `ProviderState`. For manual
   stateless reasoning (for example `store=false`), request
   `reasoning.encrypted_content` through `ResponsesOptions.Include`, then retain
-  the returned `ProviderState` with the assistant message. OpenAI's Responses
+  the returned provider-state content block with the assistant message. OpenAI's Responses
   guide requires prior output items to be supplied again when callers manage
   context themselves.
 

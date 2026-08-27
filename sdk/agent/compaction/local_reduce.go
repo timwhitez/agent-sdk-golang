@@ -132,7 +132,7 @@ func removeDestroyedToolBlocks(messages []llm.Message) ([]llm.Message, bool) {
 		}
 		if clearedCalls[i] {
 			msg.ToolCalls = nil
-			msg.ProviderState = nil
+			msg.Content = llm.WithoutProviderState(msg.Content)
 		}
 		out = append(out, msg)
 	}
@@ -317,7 +317,6 @@ func (r *localReducer) reduce(messages []llm.Message) ([]llm.Message, []string, 
 			continue
 		}
 		msg.Content = llm.TextContent(repl.ReplacementText)
-		msg.ProviderState = nil
 		out[i] = msg
 		changed++
 		applied[repl.Tier] = struct{}{}

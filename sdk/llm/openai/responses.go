@@ -261,7 +261,7 @@ type responsesRequest struct {
 	Include   []string       `json:"include,omitempty"`
 
 	PromptCacheKey     string `json:"prompt_cache_key,omitempty"`
-	ConversationID     string `json:"conversation_id,omitempty"`
+	Conversation       string `json:"conversation,omitempty"`
 	PreviousResponseID string `json:"previous_response_id,omitempty"`
 	Store              *bool  `json:"store,omitempty"`
 
@@ -360,7 +360,7 @@ func looksLikeResponsesInputUnsupported(msg string) bool {
 	if strings.Contains(s, "unknown field") || strings.Contains(s, "unrecognized") || strings.Contains(s, "unexpected") {
 		if strings.Contains(s, "instructions") || strings.Contains(s, "input") || strings.Contains(s, "text") ||
 			strings.Contains(s, "include") || strings.Contains(s, "parallel_tool_calls") ||
-			strings.Contains(s, "prompt_cache_key") || strings.Contains(s, "conversation_id") {
+			strings.Contains(s, "prompt_cache_key") || strings.Contains(s, "conversation") || strings.Contains(s, "conversation_id") {
 			return true
 		}
 	}
@@ -1640,6 +1640,9 @@ func responsesPartsFromContent(content llm.Content, textPartType string) ([]resp
 	}
 	if len(content.Blocks) > 0 {
 		for _, blk := range content.Blocks {
+			if llm.IsProviderStateBlock(blk) {
+				continue
+			}
 			switch blk.Type {
 			case "text":
 				if strings.TrimSpace(blk.Text) != "" {
@@ -1709,6 +1712,9 @@ func responsesContentPlainText(content llm.Content) string {
 	}
 	appendText(content.Text)
 	for _, blk := range content.Blocks {
+		if llm.IsProviderStateBlock(blk) {
+			continue
+		}
 		switch blk.Type {
 		case "text":
 			appendText(blk.Text)
@@ -1801,7 +1807,11 @@ func (c *ResponsesClient) buildRequest(req llm.InvokeRequest) (*responsesRequest
 			}
 		}
 	}
-	if !useItems && responsesMessagesContainOutputState(req.Messages) {
+	containsOutputState, err := responsesMessagesContainOutputState(req.Messages)
+	if err != nil {
+		return nil, fmt.Errorf("openai responses: invalid manually replayed provider state: %w", err)
+	}
+	if !useItems && containsOutputState {
 		return nil, fmt.Errorf("openai responses: manually replayed provider state requires response item input mode")
 	}
 
@@ -2029,20 +2039,27 @@ func (c *ResponsesClient) buildRequest(req llm.InvokeRequest) (*responsesRequest
 		}
 		promptCacheKey = strings.TrimSpace(opts.PromptCacheKey)
 		conversationID = strings.TrimSpace(opts.ConversationID)
-		previousResponseID = strings.TrimSpace(opts.PreviousResponseID)
 		store = opts.Store
 		if opts.ParallelToolCalls != nil {
 			parallelToolCalls = opts.ParallelToolCalls
 		}
 	}
-	if conversationID != "" && previousResponseID != "" {
-		return nil, fmt.Errorf("openai responses: conversation_id and previous_response_id cannot both be set")
+	if rawPreviousResponseID, present := c.Extra["previous_response_id"]; present {
+		value, ok := rawPreviousResponseID.(string)
+		if !ok {
+			return nil, fmt.Errorf("openai responses: previous_response_id extra must be a string")
+		}
+		previousResponseID = strings.TrimSpace(value)
 	}
-	if (conversationID != "" || previousResponseID != "") && responsesMessagesContainOutputState(req.Messages) {
-		return nil, fmt.Errorf("openai responses: conversation_id or previous_response_id cannot be combined with manually replayed provider state")
+	if conversationID != "" && previousResponseID != "" {
+		return nil, fmt.Errorf("openai responses: conversation and previous_response_id cannot both be set")
+	}
+	if (conversationID != "" || previousResponseID != "") && containsOutputState {
+		return nil, fmt.Errorf("openai responses: conversation or previous_response_id cannot be combined with manually replayed provider state")
 	}
 
 	extra := cloneMap(c.Extra)
+	delete(extra, "previous_response_id")
 	extraBody := cloneMap(c.ExtraBody)
 
 	return &responsesRequest{
@@ -2061,7 +2078,7 @@ func (c *ResponsesClient) buildRequest(req llm.InvokeRequest) (*responsesRequest
 		Text:               textParam,
 		Include:            include,
 		PromptCacheKey:     promptCacheKey,
-		ConversationID:     conversationID,
+		Conversation:       conversationID,
 		PreviousResponseID: previousResponseID,
 		Store:              store,
 		Extra:              extra,
@@ -2186,10 +2203,14 @@ func parseResponsesForProvider(provider string, data []byte) (*llm.Completion, e
 			responseID = id
 		}
 	}
-	completion := &llm.Completion{Content: llm.Content{Blocks: blocks}, Thinking: thinking, ToolCalls: toolCalls, Usage: usage, ResponseID: responseID, ProviderState: providerState, Raw: append([]byte(nil), data...)}
+	content, err := llm.WithProviderState(llm.Content{Blocks: blocks}, providerState)
+	if err != nil {
+		return nil, fmt.Errorf("openai responses: attach provider state: %w", err)
+	}
+	completion := &llm.Completion{Content: content, Thinking: thinking, ToolCalls: toolCalls, Usage: usage, ResponseID: responseID, Raw: append([]byte(nil), data...)}
 	status := strings.ToLower(stringFromAny(root["status"]))
 	if responsesHasError(root) {
-		completion.ProviderState = nil
+		completion.Content = llm.WithoutProviderState(completion.Content)
 		return completion, parseResponsesStreamEventError(provider, root)
 	}
 	switch status {
@@ -2202,14 +2223,14 @@ func parseResponsesForProvider(provider string, data []byte) (*llm.Completion, e
 		stopReason, err := responsesIncompleteStopReason(provider, root)
 		completion.StopReason = stopReason
 		if err != nil {
-			completion.ProviderState = nil
+			completion.Content = llm.WithoutProviderState(completion.Content)
 		}
 		return completion, err
 	case "failed", "cancelled", "queued", "in_progress":
-		completion.ProviderState = nil
+		completion.Content = llm.WithoutProviderState(completion.Content)
 		return completion, responsesTerminalStatusError(provider, root, status)
 	default:
-		completion.ProviderState = nil
+		completion.Content = llm.WithoutProviderState(completion.Content)
 		return completion, responsesTerminalStatusError(provider, root, status)
 	}
 }

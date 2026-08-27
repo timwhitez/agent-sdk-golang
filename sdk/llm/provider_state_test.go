@@ -8,25 +8,28 @@ import (
 
 func TestProviderStateIsOpaqueClonedAndTokenAccounted(t *testing.T) {
 	const sentinel = "encrypted-provider-state-sentinel"
-	message := Message{
-		Role:    RoleAssistant,
-		Content: TextContent("visible answer"),
-		ProviderState: []ProviderState{{
+	content, err := WithProviderState(
+		TextContent("visible answer"),
+		[]ProviderState{{
 			Provider: "test-provider",
 			Kind:     "opaque.v1",
 			Data:     json.RawMessage(`{"encrypted":"` + sentinel + `"}`),
 		}},
+	)
+	if err != nil {
+		t.Fatal(err)
 	}
+	message := Message{Role: RoleAssistant, Content: content}
 	if strings.Contains(message.PlainText(), sentinel) || message.PlainText() != "visible answer" {
 		t.Fatalf("opaque provider state leaked into plain text: %q", message.PlainText())
 	}
 	clone := CloneMessage(message)
-	clone.ProviderState[0].Data[2] = 'X'
-	if string(message.ProviderState[0].Data) == string(clone.ProviderState[0].Data) {
-		t.Fatal("CloneMessage aliased provider state bytes")
+	clone.Content.Blocks[len(clone.Content.Blocks)-1].Data = "changed"
+	if message.Content.Blocks[len(message.Content.Blocks)-1].Data == clone.Content.Blocks[len(clone.Content.Blocks)-1].Data {
+		t.Fatal("CloneMessage aliased provider-state content blocks")
 	}
 	withoutState := message
-	withoutState.ProviderState = nil
+	withoutState.Content = WithoutProviderState(withoutState.Content)
 	if EstimateMessagesTokens([]Message{message}) <= EstimateMessagesTokens([]Message{withoutState}) {
 		t.Fatal("opaque provider state was omitted from token estimation")
 	}
@@ -38,7 +41,11 @@ func TestProviderStateIsOpaqueClonedAndTokenAccounted(t *testing.T) {
 	if err := json.Unmarshal(encoded, &decoded); err != nil {
 		t.Fatal(err)
 	}
-	if len(decoded.ProviderState) != 1 || !strings.Contains(string(decoded.ProviderState[0].Data), sentinel) {
-		t.Fatalf("provider state did not survive history serialization: %#v", decoded.ProviderState)
+	state, err := ProviderStateFromContent(decoded.Content)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(state) != 1 || !strings.Contains(string(state[0].Data), sentinel) {
+		t.Fatalf("provider state did not survive history serialization: %#v", state)
 	}
 }

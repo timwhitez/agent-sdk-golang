@@ -24,7 +24,6 @@ func CloneMessage(message Message) Message {
 			out.ToolCalls[i] = CloneToolCall(message.ToolCalls[i])
 		}
 	}
-	out.ProviderState = CloneProviderState(message.ProviderState)
 	return out
 }
 

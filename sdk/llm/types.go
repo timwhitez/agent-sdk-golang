@@ -85,7 +85,15 @@ type ProviderState struct {
 func TextContent(s string) Content { return Content{Text: s} }
 
 func (c Content) IsEmpty() bool {
-	return strings.TrimSpace(c.Text) == "" && len(c.Blocks) == 0
+	if strings.TrimSpace(c.Text) != "" {
+		return false
+	}
+	for _, block := range c.Blocks {
+		if !IsProviderStateBlock(block) {
+			return false
+		}
+	}
+	return true
 }
 
 func (c Content) PlainText() string {
@@ -127,9 +135,6 @@ type Message struct {
 	// Ephemeral tool result handling.
 	Ephemeral bool `json:"ephemeral,omitempty"`
 	Destroyed bool `json:"destroyed,omitempty"`
-
-	// ProviderState is opaque provider-owned history. Other providers ignore it.
-	ProviderState []ProviderState `json:"provider_state,omitempty"`
 }
 
 func (m Message) PlainText() string { return m.Content.PlainText() }
@@ -159,15 +164,14 @@ type Usage struct {
 }
 
 type Completion struct {
-	Content       Content         `json:"content"`
-	Thinking      string          `json:"thinking,omitempty"`
-	ToolCalls     []ToolCall      `json:"tool_calls,omitempty"`
-	Usage         *Usage          `json:"usage,omitempty"`
-	StopReason    string          `json:"stop_reason,omitempty"`
-	ResponseID    string          `json:"response_id,omitempty"`
-	Diagnostics   []Diagnostic    `json:"diagnostics,omitempty"`
-	ProviderState []ProviderState `json:"provider_state,omitempty"`
-	Raw           json.RawMessage `json:"-"`
+	Content     Content         `json:"content"`
+	Thinking    string          `json:"thinking,omitempty"`
+	ToolCalls   []ToolCall      `json:"tool_calls,omitempty"`
+	Usage       *Usage          `json:"usage,omitempty"`
+	StopReason  string          `json:"stop_reason,omitempty"`
+	ResponseID  string          `json:"response_id,omitempty"`
+	Diagnostics []Diagnostic    `json:"diagnostics,omitempty"`
+	Raw         json.RawMessage `json:"-"`
 }
 
 // WarningSinkSetter lets runtime hosts route provider diagnostics without

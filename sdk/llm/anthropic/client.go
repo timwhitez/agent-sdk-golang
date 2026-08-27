@@ -1290,6 +1290,9 @@ func serializeMessagesWithWarning(in []llm.Message, warnf func(string, ...any)) 
 				sysBlocks = append(sysBlocks, blk)
 			}
 			for _, b := range m.Content.Blocks {
+				if llm.IsProviderStateBlock(b) {
+					continue
+				}
 				sysBlocks = append(sysBlocks, toAnthropicBlock(b, m.Cache))
 			}
 		case llm.RoleTool:
@@ -1421,6 +1424,9 @@ func toAnthropicMessageWithWarning(m llm.Message, warnf func(string, ...any)) (*
 		blocks = append(blocks, contentBlockParam{Type: "text", Text: m.Content.Text})
 	}
 	for _, b := range m.Content.Blocks {
+		if llm.IsProviderStateBlock(b) {
+			continue
+		}
 		blocks = append(blocks, toAnthropicBlock(b, false))
 	}
 
@@ -1491,6 +1497,9 @@ func toolResultContent(m llm.Message) any {
 	}
 	hasNonText := false
 	for _, b := range m.Content.Blocks {
+		if llm.IsProviderStateBlock(b) {
+			continue
+		}
 		mapped := toAnthropicBlock(b, false)
 		if mapped.Type == "text" {
 			if strings.TrimSpace(mapped.Text) == "" {
@@ -1512,6 +1521,9 @@ func toolResultContent(m llm.Message) any {
 }
 
 func toAnthropicBlock(b llm.ContentBlock, inheritCache bool) contentBlockParam {
+	if llm.IsProviderStateBlock(b) {
+		return contentBlockParam{}
+	}
 	blk := contentBlockParam{Type: b.Type}
 	if inheritCache {
 		blk.CacheCtrl = &cacheControl{Type: "ephemeral"}

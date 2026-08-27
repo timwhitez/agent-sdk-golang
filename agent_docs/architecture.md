@@ -5,11 +5,14 @@ Use `AGENTS.md` for fast orientation, then read only the sections needed for you
 
 ## Module Boundaries
 - `sdk/agent/` owns loop orchestration, history state, event emission, tool dispatch, steering boundaries, and compaction integration (`sdk/agent/agent.go:20`, `sdk/agent/events.go:10`, `sdk/agent/agent.go:838`)
-- Provider-owned continuation data lives in opaque `llm.ProviderState` records.
-  The agent clones and persists successful completion state with assistant
-  history without rendering it; provider adapters alone validate and replay
-  matching records. Any local mutation that invalidates an assistant tool or
-  text representation clears its opaque state.
+- Provider-owned continuation data lives in opaque `llm.ProviderState` records
+  encoded by `llm.WithProviderState` in a reserved, non-rendering
+  `ContentBlock`. This preserves the public positional shape of `Message` and
+  `Completion`. The agent clones and persists successful completion state with
+  assistant history; provider adapters alone validate and replay matching
+  records. Any local mutation that invalidates an assistant representation
+  clears it with `llm.WithoutProviderState`, except a pending max-token tool
+  continuation, which must replay the exact provider output on the next call.
 - `sdk/accounting/` owns the versioned, bounded semantic projection for tool
   results, provider usage, and compaction. It allowlists measurements and
   disposition fields, keeps unknown distinct from zero, requires a named/

@@ -31,12 +31,10 @@ type ResponsesOptions struct {
 	// Instructions sets/overrides the top-level instructions field.
 	Instructions string `json:"-"`
 
+	// ConversationID is serialized on the Responses wire as "conversation".
 	ConversationID string `json:"conversation_id,omitempty"`
-	// PreviousResponseID enables provider-managed continuation. When set, callers
-	// should send only new input instead of replaying manual ProviderState.
-	PreviousResponseID string `json:"previous_response_id,omitempty"`
-	PromptCacheKey     string `json:"prompt_cache_key,omitempty"`
-	Include            []string
+	PromptCacheKey string `json:"prompt_cache_key,omitempty"`
+	Include        []string
 
 	Text      *ResponsesTextControls `json:"text,omitempty"`
 	Reasoning *ResponsesReasoning    `json:"reasoning,omitempty"`
