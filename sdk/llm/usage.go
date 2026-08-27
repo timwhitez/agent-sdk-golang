@@ -158,6 +158,11 @@ func EstimateMessagesTokens(messages []Message) int {
 			total += estimateTextTokens(call.Function.Name)
 			total += estimateTextTokens(call.Function.Arguments)
 		}
+		for _, state := range msg.ProviderState {
+			total += estimateTextTokens(state.Provider)
+			total += estimateTextTokens(state.Kind)
+			total += estimateTextTokens(string(state.Data))
+		}
 		total += 4
 	}
 	return total

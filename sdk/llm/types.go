@@ -72,6 +72,16 @@ type Content struct {
 	Blocks []ContentBlock `json:"blocks,omitempty"`
 }
 
+// ProviderState carries provider-owned conversation state that must be replayed
+// without interpreting provider fields, but must never be rendered as
+// user-visible content. Provider adapters define their own Provider/Kind values
+// and validate Data before use.
+type ProviderState struct {
+	Provider string          `json:"provider"`
+	Kind     string          `json:"kind"`
+	Data     json.RawMessage `json:"data"`
+}
+
 func TextContent(s string) Content { return Content{Text: s} }
 
 func (c Content) IsEmpty() bool {
@@ -117,6 +127,9 @@ type Message struct {
 	// Ephemeral tool result handling.
 	Ephemeral bool `json:"ephemeral,omitempty"`
 	Destroyed bool `json:"destroyed,omitempty"`
+
+	// ProviderState is opaque provider-owned history. Other providers ignore it.
+	ProviderState []ProviderState `json:"provider_state,omitempty"`
 }
 
 func (m Message) PlainText() string { return m.Content.PlainText() }
@@ -146,14 +159,15 @@ type Usage struct {
 }
 
 type Completion struct {
-	Content     Content         `json:"content"`
-	Thinking    string          `json:"thinking,omitempty"`
-	ToolCalls   []ToolCall      `json:"tool_calls,omitempty"`
-	Usage       *Usage          `json:"usage,omitempty"`
-	StopReason  string          `json:"stop_reason,omitempty"`
-	ResponseID  string          `json:"response_id,omitempty"`
-	Diagnostics []Diagnostic    `json:"diagnostics,omitempty"`
-	Raw         json.RawMessage `json:"-"`
+	Content       Content         `json:"content"`
+	Thinking      string          `json:"thinking,omitempty"`
+	ToolCalls     []ToolCall      `json:"tool_calls,omitempty"`
+	Usage         *Usage          `json:"usage,omitempty"`
+	StopReason    string          `json:"stop_reason,omitempty"`
+	ResponseID    string          `json:"response_id,omitempty"`
+	Diagnostics   []Diagnostic    `json:"diagnostics,omitempty"`
+	ProviderState []ProviderState `json:"provider_state,omitempty"`
+	Raw           json.RawMessage `json:"-"`
 }
 
 // WarningSinkSetter lets runtime hosts route provider diagnostics without

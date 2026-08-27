@@ -32,8 +32,11 @@ type ResponsesOptions struct {
 	Instructions string `json:"-"`
 
 	ConversationID string `json:"conversation_id,omitempty"`
-	PromptCacheKey string `json:"prompt_cache_key,omitempty"`
-	Include        []string
+	// PreviousResponseID enables provider-managed continuation. When set, callers
+	// should send only new input instead of replaying manual ProviderState.
+	PreviousResponseID string `json:"previous_response_id,omitempty"`
+	PromptCacheKey     string `json:"prompt_cache_key,omitempty"`
+	Include            []string
 
 	Text      *ResponsesTextControls `json:"text,omitempty"`
 	Reasoning *ResponsesReasoning    `json:"reasoning,omitempty"`

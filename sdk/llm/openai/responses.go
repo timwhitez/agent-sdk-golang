@@ -260,9 +260,10 @@ type responsesRequest struct {
 	Text      any            `json:"text,omitempty"`
 	Include   []string       `json:"include,omitempty"`
 
-	PromptCacheKey string `json:"prompt_cache_key,omitempty"`
-	ConversationID string `json:"conversation_id,omitempty"`
-	Store          *bool  `json:"store,omitempty"`
+	PromptCacheKey     string `json:"prompt_cache_key,omitempty"`
+	ConversationID     string `json:"conversation_id,omitempty"`
+	PreviousResponseID string `json:"previous_response_id,omitempty"`
+	Store              *bool  `json:"store,omitempty"`
 
 	Stream bool `json:"stream,omitempty"`
 
@@ -714,6 +715,9 @@ func (c *ResponsesClient) InvokeStream(ctx context.Context, req llm.InvokeReques
 			textEmitted := false
 			refusalText := ""
 			observedNonterminalStatus := ""
+			streamOutputItems := map[int]llm.ProviderState{}
+			streamOutputBytes := 0
+			providerStateEmitted := false
 			streamResponseID := ""
 			emitResponseID := func(id string) {
 				id = strings.TrimSpace(id)
@@ -768,6 +772,38 @@ func (c *ResponsesClient) InvokeStream(ctx context.Context, req llm.InvokeReques
 				}
 				return nil
 			}
+			emitProviderState := func(eventData string) error {
+				if providerStateEmitted {
+					return nil
+				}
+				var state []llm.ProviderState
+				if strings.TrimSpace(eventData) != "" {
+					parsed, err := responsesProviderStateFromStreamEvent([]byte(eventData))
+					if err != nil {
+						return err
+					}
+					state = parsed
+				}
+				if len(state) > 0 && len(streamOutputItems) > 0 {
+					for outputIndex, streamed := range streamOutputItems {
+						if outputIndex < 0 || outputIndex >= len(state) || !responsesJSONEqual(streamed.Data, state[outputIndex].Data) {
+							return &llm.ProviderError{Provider: local.Provider(), Message: fmt.Sprintf("Responses terminal output conflicts with streamed output index %d", outputIndex)}
+						}
+					}
+				}
+				if len(state) == 0 {
+					var orderErr error
+					state, orderErr = orderedResponsesStreamState(streamOutputItems)
+					if orderErr != nil {
+						return orderErr
+					}
+				}
+				if len(state) > 0 {
+					out <- llm.StreamProviderStateEvent{State: state}
+				}
+				providerStateEmitted = true
+				return nil
+			}
 			err = consumeSSEWithBodyClose(resp.Body, func(data string) error {
 				data = strings.TrimSpace(data)
 				if data == "" {
@@ -779,6 +815,9 @@ func (c *ResponsesClient) InvokeStream(ctx context.Context, req llm.InvokeReques
 							Provider: local.Provider(),
 							Message:  fmt.Sprintf("Responses stream received [DONE] while response status remained %q", observedNonterminalStatus),
 						}
+					}
+					if stateErr := emitProviderState(""); stateErr != nil {
+						return stateErr
 					}
 					return errSSEDone
 				}
@@ -898,6 +937,26 @@ func (c *ResponsesClient) InvokeStream(ctx context.Context, req llm.InvokeReques
 						}
 					}
 				case "response.output_item.done":
+					outputIndex, opaqueState, hasOpaqueState, stateErr := responsesProviderStateFromRawStreamItem([]byte(data))
+					if stateErr != nil {
+						return stateErr
+					}
+					if hasOpaqueState {
+						if existing, ok := streamOutputItems[outputIndex]; ok {
+							if !responsesJSONEqual(existing.Data, opaqueState.Data) {
+								return &llm.ProviderError{Provider: local.Provider(), Message: fmt.Sprintf("Responses stream output index %d changed opaque item data", outputIndex)}
+							}
+						} else {
+							if len(streamOutputItems) >= maxResponsesOutputItems {
+								return fmt.Errorf("openai responses: output item count exceeds limit %d", maxResponsesOutputItems)
+							}
+							if streamOutputBytes+len(opaqueState.Data) > maxResponsesStateBytes {
+								return fmt.Errorf("openai responses: opaque output state exceeds %d bytes", maxResponsesStateBytes)
+							}
+							streamOutputItems[outputIndex] = opaqueState
+							streamOutputBytes += len(opaqueState.Data)
+						}
+					}
 					item, _ := root["item"].(map[string]any)
 					itType, _ := item["type"].(string)
 					if itType == "reasoning" || itType == "thinking" || itType == "reasoning_text" {
@@ -1044,6 +1103,9 @@ func (c *ResponsesClient) InvokeStream(ctx context.Context, req llm.InvokeReques
 					if responsesHasError(respObj) {
 						return parseResponsesStreamEventError(local.Provider(), respObj)
 					}
+					if stateErr := emitProviderState(data); stateErr != nil {
+						return stateErr
+					}
 					stopReason = "end_turn"
 					return errSSEDone
 				case "response.incomplete":
@@ -1062,6 +1124,9 @@ func (c *ResponsesClient) InvokeStream(ctx context.Context, req llm.InvokeReques
 					stopReason, terminalErr = responsesIncompleteStopReason(local.Provider(), respObj)
 					if terminalErr != nil {
 						return terminalErr
+					}
+					if stateErr := emitProviderState(data); stateErr != nil {
+						return stateErr
 					}
 					return errSSEDone
 				case "response.failed", "response.cancelled":
@@ -1736,6 +1801,9 @@ func (c *ResponsesClient) buildRequest(req llm.InvokeRequest) (*responsesRequest
 			}
 		}
 	}
+	if !useItems && responsesMessagesContainOutputState(req.Messages) {
+		return nil, fmt.Errorf("openai responses: manually replayed provider state requires response item input mode")
+	}
 
 	var systemTexts []string
 	for _, m := range req.Messages {
@@ -1761,12 +1829,50 @@ func (c *ResponsesClient) buildRequest(req llm.InvokeRequest) (*responsesRequest
 	var input any
 	if useItems {
 		items := make([]responsesInputItem, 0, len(req.Messages))
+		var mixedItems []any
+		opaqueItemCount := 0
+		opaqueStateBytes := 0
+		appendItem := func(item responsesInputItem) {
+			if mixedItems != nil {
+				mixedItems = append(mixedItems, item)
+				return
+			}
+			items = append(items, item)
+		}
+		appendOpaqueItem := func(item json.RawMessage) {
+			if mixedItems == nil {
+				mixedItems = make([]any, 0, len(items)+1)
+				for _, existing := range items {
+					mixedItems = append(mixedItems, existing)
+				}
+				items = nil
+			}
+			mixedItems = append(mixedItems, item)
+		}
 		for _, m := range req.Messages {
 			role := string(m.Role)
 			if role != "system" && role != "user" && role != "assistant" && role != "tool" {
 				continue
 			}
+			opaqueItems, foundOpaqueItems, err := responsesOutputItemsFromMessage(m)
+			if err != nil {
+				return nil, err
+			}
+			if foundOpaqueItems && role != "assistant" {
+				return nil, fmt.Errorf("openai responses: opaque output state is only valid on assistant messages")
+			}
 			if role == "system" && useInstructions {
+				continue
+			}
+			if foundOpaqueItems {
+				for _, item := range opaqueItems {
+					opaqueItemCount++
+					opaqueStateBytes += len(item)
+					if opaqueItemCount > maxResponsesOutputItems || opaqueStateBytes > maxResponsesStateBytes {
+						return nil, fmt.Errorf("openai responses: opaque output history exceeds %d items or %d bytes", maxResponsesOutputItems, maxResponsesStateBytes)
+					}
+					appendOpaqueItem(item)
+				}
 				continue
 			}
 			if role == "tool" {
@@ -1775,7 +1881,7 @@ func (c *ResponsesClient) buildRequest(req llm.InvokeRequest) (*responsesRequest
 					// Fallback: represent as user text to avoid dropping content.
 					role = "user"
 				} else {
-					items = append(items, responsesInputItem{
+					appendItem(responsesInputItem{
 						Type:   "function_call_output",
 						CallID: callID,
 						Output: responsesToolOutput(m.Content, m.IsError),
@@ -1784,7 +1890,7 @@ func (c *ResponsesClient) buildRequest(req llm.InvokeRequest) (*responsesRequest
 				}
 			}
 			if contentAny, ok := responsesMessageContent(role, m.Content, stringContent); ok {
-				items = append(items, responsesInputItem{Type: "message", Role: role, Content: contentAny})
+				appendItem(responsesInputItem{Type: "message", Role: role, Content: contentAny})
 			}
 			if role == "assistant" && len(m.ToolCalls) > 0 {
 				for i, tc := range m.ToolCalls {
@@ -1800,7 +1906,7 @@ func (c *ResponsesClient) buildRequest(req llm.InvokeRequest) (*responsesRequest
 					if args == "" {
 						args = "{}"
 					}
-					items = append(items, responsesInputItem{
+					appendItem(responsesInputItem{
 						Type:      "function_call",
 						CallID:    callID,
 						Name:      name,
@@ -1809,14 +1915,18 @@ func (c *ResponsesClient) buildRequest(req llm.InvokeRequest) (*responsesRequest
 				}
 			}
 		}
-		if len(items) == 0 {
+		if len(items) == 0 && len(mixedItems) == 0 {
 			var content any = "(empty)"
 			if !stringContent {
 				content = []responsesContentPart{{Type: "input_text", Text: "(empty)"}}
 			}
-			items = append(items, responsesInputItem{Type: "message", Role: "user", Content: content})
+			appendItem(responsesInputItem{Type: "message", Role: "user", Content: content})
 		}
-		input = items
+		if mixedItems != nil {
+			input = mixedItems
+		} else {
+			input = items
+		}
 	} else {
 		msgs := make([]responsesMessage, 0, len(req.Messages))
 		for _, m := range req.Messages {
@@ -1910,6 +2020,7 @@ func (c *ResponsesClient) buildRequest(req llm.InvokeRequest) (*responsesRequest
 	include := []string(nil)
 	promptCacheKey := ""
 	conversationID := ""
+	previousResponseID := ""
 	store := (*bool)(nil)
 	parallelToolCalls := (*bool)(nil)
 	if opts != nil {
@@ -1918,35 +2029,43 @@ func (c *ResponsesClient) buildRequest(req llm.InvokeRequest) (*responsesRequest
 		}
 		promptCacheKey = strings.TrimSpace(opts.PromptCacheKey)
 		conversationID = strings.TrimSpace(opts.ConversationID)
+		previousResponseID = strings.TrimSpace(opts.PreviousResponseID)
 		store = opts.Store
 		if opts.ParallelToolCalls != nil {
 			parallelToolCalls = opts.ParallelToolCalls
 		}
+	}
+	if conversationID != "" && previousResponseID != "" {
+		return nil, fmt.Errorf("openai responses: conversation_id and previous_response_id cannot both be set")
+	}
+	if (conversationID != "" || previousResponseID != "") && responsesMessagesContainOutputState(req.Messages) {
+		return nil, fmt.Errorf("openai responses: conversation_id or previous_response_id cannot be combined with manually replayed provider state")
 	}
 
 	extra := cloneMap(c.Extra)
 	extraBody := cloneMap(c.ExtraBody)
 
 	return &responsesRequest{
-		Model:             c.ModelName,
-		Instructions:      instructions,
-		Input:             input,
-		Tools:             toolsList,
-		ToolChoice:        toolChoice,
-		ParallelToolCalls: parallelToolCalls,
-		Temperature:       temp,
-		TopP:              c.TopP,
-		Seed:              c.Seed,
-		MaxOutputTokens:   c.MaxOutputTokens,
-		ServiceTier:       strings.TrimSpace(c.ServiceTier),
-		Reasoning:         reasoning,
-		Text:              textParam,
-		Include:           include,
-		PromptCacheKey:    promptCacheKey,
-		ConversationID:    conversationID,
-		Store:             store,
-		Extra:             extra,
-		ExtraBody:         extraBody,
+		Model:              c.ModelName,
+		Instructions:       instructions,
+		Input:              input,
+		Tools:              toolsList,
+		ToolChoice:         toolChoice,
+		ParallelToolCalls:  parallelToolCalls,
+		Temperature:        temp,
+		TopP:               c.TopP,
+		Seed:               c.Seed,
+		MaxOutputTokens:    c.MaxOutputTokens,
+		ServiceTier:        strings.TrimSpace(c.ServiceTier),
+		Reasoning:          reasoning,
+		Text:               textParam,
+		Include:            include,
+		PromptCacheKey:     promptCacheKey,
+		ConversationID:     conversationID,
+		PreviousResponseID: previousResponseID,
+		Store:              store,
+		Extra:              extra,
+		ExtraBody:          extraBody,
 	}, nil
 }
 
@@ -1969,6 +2088,10 @@ func parseResponsesForProvider(provider string, data []byte) (*llm.Completion, e
 			Provider: provider,
 			Message:  "Responses response root must be a non-null JSON object",
 		}
+	}
+	providerState, err := responsesProviderStateFromResponseJSON(data)
+	if err != nil {
+		return nil, err
 	}
 
 	blocks := []llm.ContentBlock{}
@@ -2063,9 +2186,10 @@ func parseResponsesForProvider(provider string, data []byte) (*llm.Completion, e
 			responseID = id
 		}
 	}
-	completion := &llm.Completion{Content: llm.Content{Blocks: blocks}, Thinking: thinking, ToolCalls: toolCalls, Usage: usage, ResponseID: responseID, Raw: append([]byte(nil), data...)}
+	completion := &llm.Completion{Content: llm.Content{Blocks: blocks}, Thinking: thinking, ToolCalls: toolCalls, Usage: usage, ResponseID: responseID, ProviderState: providerState, Raw: append([]byte(nil), data...)}
 	status := strings.ToLower(stringFromAny(root["status"]))
 	if responsesHasError(root) {
+		completion.ProviderState = nil
 		return completion, parseResponsesStreamEventError(provider, root)
 	}
 	switch status {
@@ -2077,10 +2201,15 @@ func parseResponsesForProvider(provider string, data []byte) (*llm.Completion, e
 	case "incomplete":
 		stopReason, err := responsesIncompleteStopReason(provider, root)
 		completion.StopReason = stopReason
+		if err != nil {
+			completion.ProviderState = nil
+		}
 		return completion, err
 	case "failed", "cancelled", "queued", "in_progress":
+		completion.ProviderState = nil
 		return completion, responsesTerminalStatusError(provider, root, status)
 	default:
+		completion.ProviderState = nil
 		return completion, responsesTerminalStatusError(provider, root, status)
 	}
 }

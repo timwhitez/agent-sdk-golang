@@ -831,7 +831,12 @@ func (a *Agent) QueryStreamWithSteering(ctx context.Context, input llm.Content, 
 
 			// Append assistant message.
 			a.mu.Lock()
-			a.messages = append(a.messages, llm.Message{Role: llm.RoleAssistant, Content: comp.Content, ToolCalls: comp.ToolCalls})
+			a.messages = append(a.messages, llm.Message{
+				Role:          llm.RoleAssistant,
+				Content:       comp.Content,
+				ToolCalls:     comp.ToolCalls,
+				ProviderState: llm.CloneProviderState(comp.ProviderState),
+			})
 			msgIndex := len(a.messages) - 1
 			a.mu.Unlock()
 			postCompletionEstimate := 0
@@ -1738,13 +1743,14 @@ func hasVisiblePartialCompletion(comp *llm.Completion) bool {
 	if strings.TrimSpace(comp.Thinking) != "" {
 		return true
 	}
-	return len(comp.ToolCalls) > 0
+	return len(comp.ToolCalls) > 0 || len(comp.ProviderState) > 0
 }
 
 type streamMetadataBuffer struct {
-	events     []llm.StreamEvent
-	usage      *llm.Usage
-	responseID string
+	events        []llm.StreamEvent
+	usage         *llm.Usage
+	responseID    string
+	providerState []llm.ProviderState
 }
 
 func (b *streamMetadataBuffer) add(ev llm.StreamEvent) bool {
@@ -1758,6 +1764,10 @@ func (b *streamMetadataBuffer) add(ev llm.StreamEvent) bool {
 		if id := strings.TrimSpace(e.ResponseID); id != "" {
 			b.responseID = id
 		}
+		b.events = append(b.events, ev)
+		return true
+	case llm.StreamProviderStateEvent:
+		b.providerState = append(b.providerState, llm.CloneProviderState(e.State)...)
 		b.events = append(b.events, ev)
 		return true
 	case llm.StreamDoneEvent:
@@ -1858,6 +1868,7 @@ func (a *Agent) invokeCompletionWithSteering(ctx context.Context, req llm.Invoke
 		thinkingBlocks := &structuredThinkingBlockAccumulator{}
 		acc := &toolCallAccumulator{}
 		var usage *llm.Usage
+		var providerState []llm.ProviderState
 		stopReason := ""
 		responseID := ""
 		sawDone := false
@@ -1877,7 +1888,7 @@ func (a *Agent) invokeCompletionWithSteering(ctx context.Context, req llm.Invoke
 			}
 			thinkingText := strings.TrimSpace(thinking.String())
 			toolCalls := acc.finalize()
-			visible := !content.IsEmpty() || thinkingText != "" || len(toolCalls) > 0
+			visible := !content.IsEmpty() || thinkingText != "" || len(toolCalls) > 0 || len(providerState) > 0
 			completionUsage := usage
 			if completionUsage == nil && !visible {
 				completionUsage = metadata.usage
@@ -1886,13 +1897,18 @@ func (a *Agent) invokeCompletionWithSteering(ctx context.Context, req llm.Invoke
 			if strings.TrimSpace(completionResponseID) == "" && !visible {
 				completionResponseID = metadata.responseID
 			}
+			completionProviderState := providerState
+			if len(completionProviderState) == 0 && !visible {
+				completionProviderState = metadata.providerState
+			}
 			return &llm.Completion{
-				Content:    content,
-				Thinking:   thinkingText,
-				ToolCalls:  toolCalls,
-				Usage:      completionUsage,
-				StopReason: stopReason,
-				ResponseID: completionResponseID,
+				Content:       content,
+				Thinking:      thinkingText,
+				ToolCalls:     toolCalls,
+				Usage:         completionUsage,
+				StopReason:    stopReason,
+				ResponseID:    completionResponseID,
+				ProviderState: llm.CloneProviderState(completionProviderState),
 			}
 		}
 		processStreamEvent := func(ev llm.StreamEvent) error {
@@ -1925,6 +1941,8 @@ func (a *Agent) invokeCompletionWithSteering(ctx context.Context, req llm.Invoke
 				if id := strings.TrimSpace(e.ResponseID); id != "" {
 					responseID = id
 				}
+			case llm.StreamProviderStateEvent:
+				providerState = append(providerState, llm.CloneProviderState(e.State)...)
 			case llm.StreamRetryEvent:
 				msg := strings.TrimSpace(e.Message)
 				if msg == "" {
@@ -2297,6 +2315,7 @@ func repairToolCallPairsDetailed(messages []llm.Message) (out []llm.Message, cha
 			out = append(out, messages[i+1:j]...)
 		} else {
 			m.ToolCalls = nil
+			m.ProviderState = nil
 			out = append(out, m)
 			changed = true
 			if !isPendingContinuationBoundary(messages, i, j) {
@@ -4786,6 +4805,7 @@ func (a *Agent) discardContinuationToolCalls(cont *toolCallContinuation, current
 	cont.discardPartialToolCalls(a.messages)
 	if currentIndex >= 0 && currentIndex < len(a.messages) && a.messages[currentIndex].Role == llm.RoleAssistant {
 		a.messages[currentIndex].ToolCalls = nil
+		a.messages[currentIndex].ProviderState = nil
 	}
 	a.mu.Unlock()
 	cont.reset()
@@ -4868,6 +4888,7 @@ func (c *toolCallContinuation) clearPartialToolCalls(messages []llm.Message, cur
 		}
 		if hasPartial {
 			messages[i].ToolCalls = nil
+			messages[i].ProviderState = nil
 		}
 	}
 	c.reset()

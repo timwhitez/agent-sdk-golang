@@ -24,6 +24,20 @@ func CloneMessage(message Message) Message {
 			out.ToolCalls[i] = CloneToolCall(message.ToolCalls[i])
 		}
 	}
+	out.ProviderState = CloneProviderState(message.ProviderState)
+	return out
+}
+
+// CloneProviderState returns a deep copy of opaque provider history.
+func CloneProviderState(state []ProviderState) []ProviderState {
+	if state == nil {
+		return nil
+	}
+	out := make([]ProviderState, len(state))
+	for i := range state {
+		out[i] = state[i]
+		out[i].Data = append([]byte(nil), state[i].Data...)
+	}
 	return out
 }
 

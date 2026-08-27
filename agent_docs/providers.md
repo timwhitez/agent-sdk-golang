@@ -45,6 +45,25 @@ stream normalization, and response metadata behavior.
 - Buffered and streaming terminal parsing preserves refusal text and distinguishes `max_output_tokens` from `content_filter`. Failed, cancelled, queued, in-progress, root-error, and unsupported incomplete states fail closed with typed provider errors; streaming terminals emit response ID and usage before the terminal event.
 - Tool choice intentionally omits explicit `auto` for compatibility, while preserving `none`/`required`/forced tool modes (`sdk/llm/openai/responses.go:1085`)
 - Parsed response IDs are attached to `Completion.ResponseID` (`sdk/llm/openai/responses.go:1272`)
+- Manual/stateless continuation preserves each returned Responses output item
+  in opaque `Message.ProviderState`. The state is never included in `PlainText`
+  or UI output; response-item-mode requests replay it in provider order before
+  matching `function_call_output` items. Legacy message mode fails closed rather
+  than silently dropping opaque state. Buffered and streaming clients use the
+  same path, including `id`, `call_id`, `phase`, and `encrypted_content` fields.
+- Opaque Responses state is bounded to 1,024 items and 8 MiB per response and
+  per outgoing manual history. It is included in token/compaction estimates and
+  fails closed when externally restored state is malformed or attached to a
+  non-assistant message. Tool-pair repair and compaction mutations clear stale
+  opaque items whenever their matching assistant message is changed.
+- For provider-managed state, set `ResponsesOptions.PreviousResponseID` or
+  `ConversationID` and send only new input. Those options are mutually exclusive
+  with each other and with manually replayed `ProviderState`. For manual
+  stateless reasoning (for example `store=false`), request
+  `reasoning.encrypted_content` through `ResponsesOptions.Include`, then retain
+  the returned `ProviderState` with the assistant message. OpenAI's Responses
+  guide requires prior output items to be supplied again when callers manage
+  context themselves.
 
 ## Anthropic Messages API
 - Extended thinking supports both manual budgets (`thinking.type="enabled"` +
