@@ -105,7 +105,9 @@ This document summarizes recommended test commands and current coverage focus.
   the 70%/80%/85%/100% decision matrix. Quality-gate anchors cover system/data
   role separation, untrusted boundaries, required-section rejection,
   credential-like task material acceptance, and history/ledger atomicity on
-  rejected summaries.
+  rejected summaries. The same suite drives real framed `Compact` requests to
+  verify latest-user and verified-checkpoint coverage plus malformed-frame
+  rejection.
 - `sdk/agent/compaction/ledger_test.go` - compaction ledger schema validation,
   replacement hash checks, duplicate replacement rejection, stable message-key
   normalization, canonical-manifest durability and provider-stub checks,
@@ -161,7 +163,8 @@ This document summarizes recommended test commands and current coverage focus.
 - `sdk/agent/compaction/validation.go` is covered by
   `TestCompactionQualityGateRejectsMissingRequiredSections`,
   `TestCompactionQualityGateAllowsCredentialLikeSecurityMaterial`, and
-  `TestRejectedSummaryDoesNotMutateHistoryOrLedger`.
+  `TestRejectedSummaryDoesNotMutateHistoryOrLedger`, plus framed-material
+  fact-coverage and malformed-frame integration tests in `service_test.go`.
 - `sdk/agent/compaction/checkpoint.go` is covered through service and Goode
   adapter tests: it applies per-type entry limits and a final token bound to the
   portable host checkpoint schema without importing repository packages.

@@ -1,6 +1,7 @@
 package compaction
 
 import (
+	"encoding/json"
 	"fmt"
 	"sort"
 	"strings"
@@ -46,6 +47,11 @@ func validateSummaryOutput(raw, material string) (string, error) {
 
 func validateSummaryFactCoverage(summary, material string) []string {
 	reasons := []string{}
+	decodedMaterial, err := decodeSummaryValidationMaterial(material)
+	if err != nil {
+		return append(reasons, "compaction material framing is invalid: "+err.Error())
+	}
+	material = decodedMaterial
 	latest := materialSectionBody(material, "Latest Real User Request")
 	objective := materialSectionBody(summary, "Current Objective and Latest User Request")
 	if strings.TrimSpace(latest) != "" && strings.ToUpper(strings.TrimSpace(latest)) != CheckpointStatusUnknown && summaryBodyIsOnlyUnknown(objective) {
@@ -58,6 +64,28 @@ func validateSummaryFactCoverage(summary, material string) []string {
 		}
 	}
 	return reasons
+}
+
+func decodeSummaryValidationMaterial(material string) (string, error) {
+	hasBegin := strings.Contains(material, beginUntrustedMaterial)
+	hasEnd := strings.Contains(material, endUntrustedMaterial)
+	if !hasBegin && !hasEnd {
+		return material, nil
+	}
+	prefix := beginUntrustedMaterial + "\n"
+	suffix := "\n" + endUntrustedMaterial
+	if !strings.HasPrefix(material, prefix) || !strings.HasSuffix(material, suffix) {
+		return "", fmt.Errorf("expected exact BEGIN/END three-line frame")
+	}
+	encoded := strings.TrimSuffix(strings.TrimPrefix(material, prefix), suffix)
+	if strings.ContainsAny(encoded, "\r\n") {
+		return "", fmt.Errorf("expected one JSON-string payload line")
+	}
+	var decoded string
+	if err := json.Unmarshal([]byte(encoded), &decoded); err != nil {
+		return "", fmt.Errorf("payload is not a valid JSON string: %w", err)
+	}
+	return decoded, nil
 }
 
 func materialSectionBody(text, title string) string {
