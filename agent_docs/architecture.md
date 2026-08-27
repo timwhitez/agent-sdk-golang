@@ -439,7 +439,9 @@ Mapping details:
 - Summary output is committed only after an atomic quality gate verifies exactly
   one summary block, all eight required Markdown-heading sections in order with
   non-empty content, supplied UNKNOWN state preservation, basic latest-user/
-  external-state coverage.
+  external-state coverage. Fact-coverage validation first decodes the exact
+  three-line JSON-string untrusted-material frame; malformed framing fails
+  closed instead of silently disabling source-section checks.
   If no canonical heading is found, the rejection includes an exact `## ...`
   syntax hint. Rejection returns structured warnings, preserves the original
   history, and does not update the ledger. Credential filtering is intentionally
