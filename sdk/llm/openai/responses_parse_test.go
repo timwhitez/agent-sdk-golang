@@ -73,3 +73,16 @@ func TestUsageFromResponsesKeepsCachedAndImageTokensAsBreakdown(t *testing.T) {
 		t.Fatalf("unexpected normalized usage quality: %#v", usage)
 	}
 }
+
+func TestParseResponsesUsesFunctionCallIDForToolOutputCorrelation(t *testing.T) {
+	comp, err := parseResponses([]byte(`{"id":"resp_tool","status":"completed","output":[{"id":"fc_123","call_id":"call_123","type":"function_call","name":"lookup","arguments":"{\"query\":\"go\"}"}]}`))
+	if err != nil {
+		t.Fatalf("parseResponses: %v", err)
+	}
+	if len(comp.ToolCalls) != 1 {
+		t.Fatalf("tool calls = %#v, want one", comp.ToolCalls)
+	}
+	if got := comp.ToolCalls[0].ID; got != "call_123" {
+		t.Fatalf("tool call ID = %q, want provider call_id %q", got, "call_123")
+	}
+}

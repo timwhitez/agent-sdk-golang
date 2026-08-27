@@ -584,11 +584,49 @@ func (c *ResponsesClient) InvokeStream(ctx context.Context, req llm.InvokeReques
 				}
 				return allocateIndex(-1, false)
 			}
+			getIndexForIDs := func(ids []string, autoKey string, preferred int, hasPreferred bool) int {
+				cleanIDs := make([]string, 0, len(ids))
+				for _, id := range ids {
+					id = strings.TrimSpace(id)
+					if id == "" {
+						continue
+					}
+					duplicate := false
+					for _, existing := range cleanIDs {
+						if existing == id {
+							duplicate = true
+							break
+						}
+					}
+					if !duplicate {
+						cleanIDs = append(cleanIDs, id)
+					}
+				}
+
+				idx := -1
+				for _, id := range cleanIDs {
+					if existing, ok := idToIndex[id]; ok {
+						idx = existing
+						break
+					}
+				}
+				if idx < 0 {
+					idx = getIndex("", autoKey, preferred, hasPreferred)
+				}
+				for _, id := range cleanIDs {
+					idToIndex[id] = idx
+				}
+				if autoKey = strings.TrimSpace(autoKey); autoKey != "" {
+					autoToIndex[autoKey] = idx
+				}
+				return idx
+			}
 
 			type streamedToolState struct {
 				hasName bool
 				hasID   bool
 				hasArgs bool
+				callID  string
 			}
 			toolState := map[int]*streamedToolState{}
 			ensureToolState := func(idx int) *streamedToolState {
@@ -716,20 +754,18 @@ func (c *ResponsesClient) InvokeStream(ctx context.Context, req llm.InvokeReques
 						}
 					}
 					if itType == "function_call" || itType == "tool_call" {
-						id, _ := item["id"].(string)
-						if id == "" {
-							id, _ = item["call_id"].(string)
-						}
+						itemID, callID := responsesToolCallIdentifiers(item)
 						name, _ := item["name"].(string)
 						idxHint, hasIdxHint := firstIndexHint(root["output_index"], root["item_index"], item["output_index"], item["index"])
 						autoKey := ""
 						if hasIdxHint {
 							autoKey = fmt.Sprintf("output:%d", idxHint)
 						}
-						idx := getIndex(id, autoKey, idxHint, hasIdxHint)
-						emitToolIdentity(idx, id, name)
+						idx := getIndexForIDs([]string{callID, itemID}, autoKey, idxHint, hasIdxHint)
+						ensureToolState(idx).callID = callID
+						emitToolIdentity(idx, callID, name)
 						if args, ok := item["arguments"].(string); ok && strings.TrimSpace(args) != "" {
-							emitToolArgs(idx, id, args)
+							emitToolArgs(idx, callID, args)
 						}
 					}
 				case "response.output_item.done":
@@ -782,24 +818,22 @@ func (c *ResponsesClient) InvokeStream(ctx context.Context, req llm.InvokeReques
 					if itType != "function_call" && itType != "tool_call" {
 						return nil
 					}
-					id, _ := item["id"].(string)
-					if id == "" {
-						id, _ = item["call_id"].(string)
-					}
+					itemID, callID := responsesToolCallIdentifiers(item)
 					name, _ := item["name"].(string)
 					idxHint, hasIdxHint := firstIndexHint(root["output_index"], root["item_index"], item["output_index"], item["index"])
 					autoKey := ""
 					if hasIdxHint {
 						autoKey = fmt.Sprintf("output:%d", idxHint)
 					}
-					idx := getIndex(id, autoKey, idxHint, hasIdxHint)
+					idx := getIndexForIDs([]string{callID, itemID}, autoKey, idxHint, hasIdxHint)
 					st := ensureToolState(idx)
-					needIdentity := (strings.TrimSpace(name) != "" && !st.hasName) || (strings.TrimSpace(id) != "" && !st.hasID)
+					st.callID = callID
+					needIdentity := (strings.TrimSpace(name) != "" && !st.hasName) || (strings.TrimSpace(callID) != "" && !st.hasID)
 					if needIdentity {
-						emitToolIdentity(idx, id, name)
+						emitToolIdentity(idx, callID, name)
 					}
 					if args := responsesToolArguments(item["arguments"]); strings.TrimSpace(args) != "" && !st.hasArgs {
-						emitToolArgs(idx, id, args)
+						emitToolArgs(idx, callID, args)
 					}
 				case "response.function_call_arguments.delta":
 					itemID, _ := root["item_id"].(string)
@@ -812,8 +846,12 @@ func (c *ResponsesClient) InvokeStream(ctx context.Context, req llm.InvokeReques
 						if hasIdxHint {
 							autoKey = fmt.Sprintf("output:%d", idxHint)
 						}
-						idx := getIndex(itemID, autoKey, idxHint, hasIdxHint)
-						emitToolArgs(idx, itemID, d)
+						idx := getIndexForIDs([]string{itemID}, autoKey, idxHint, hasIdxHint)
+						toolCallID := ensureToolState(idx).callID
+						if toolCallID == "" {
+							toolCallID = itemID
+						}
+						emitToolArgs(idx, toolCallID, d)
 					}
 				case "response.function_call_arguments.done":
 					itemID, _ := root["item_id"].(string)
@@ -830,9 +868,13 @@ func (c *ResponsesClient) InvokeStream(ctx context.Context, req llm.InvokeReques
 						if hasIdxHint {
 							autoKey = fmt.Sprintf("output:%d", idxHint)
 						}
-						idx := getIndex(itemID, autoKey, idxHint, hasIdxHint)
+						idx := getIndexForIDs([]string{itemID}, autoKey, idxHint, hasIdxHint)
 						if st := ensureToolState(idx); !st.hasArgs {
-							emitToolArgs(idx, itemID, args)
+							toolCallID := st.callID
+							if toolCallID == "" {
+								toolCallID = itemID
+							}
+							emitToolArgs(idx, toolCallID, args)
 						}
 					}
 				case "response.completed":
@@ -1686,10 +1728,7 @@ func parseResponses(data []byte) (*llm.Completion, error) {
 					}
 				}
 			case "function_call", "tool_call":
-				id, _ := item["id"].(string)
-				if id == "" {
-					id, _ = item["call_id"].(string)
-				}
+				_, id := responsesToolCallIdentifiers(item)
 				name, _ := item["name"].(string)
 				args := "{}"
 				if s, ok := item["arguments"].(string); ok && strings.TrimSpace(s) != "" {
@@ -1744,4 +1783,20 @@ func parseResponses(data []byte) (*llm.Completion, error) {
 		}
 	}
 	return &llm.Completion{Content: llm.Content{Blocks: blocks}, Thinking: thinking, ToolCalls: toolCalls, Usage: usage, StopReason: stopReason, ResponseID: responseID, Raw: append([]byte(nil), data...)}, nil
+}
+
+func responsesToolCallIdentifiers(item map[string]any) (itemID, callID string) {
+	if item == nil {
+		return "", ""
+	}
+	itemID, _ = item["id"].(string)
+	callID, _ = item["call_id"].(string)
+	itemID = strings.TrimSpace(itemID)
+	callID = strings.TrimSpace(callID)
+	if callID == "" {
+		// Compatibility gateways sometimes expose only one identifier and use
+		// it for both stream-item events and function output correlation.
+		callID = itemID
+	}
+	return itemID, callID
 }

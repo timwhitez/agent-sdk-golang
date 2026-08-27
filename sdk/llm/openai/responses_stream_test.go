@@ -381,3 +381,49 @@ func TestResponsesStreamAcceptsObjectArgumentsInOutputItemDone(t *testing.T) {
 		t.Fatalf("tool args = %q, want %q", toolArgs, `{"query":"golang"}`)
 	}
 }
+
+func TestResponsesStreamSeparatesItemIDFromFunctionCallID(t *testing.T) {
+	t.Parallel()
+	body := strings.Join([]string{
+		`data: {"type":"response.output_item.added","output_index":0,"item":{"id":"fc_stream","call_id":"call_stream","type":"function_call","name":"lookup","arguments":""}}`,
+		"",
+		`data: {"type":"response.function_call_arguments.delta","output_index":0,"item_id":"fc_stream","delta":"{\"query\":"}`,
+		"",
+		`data: {"type":"response.function_call_arguments.delta","output_index":0,"item_id":"fc_stream","delta":"\"golang\"}"}`,
+		"",
+		`data: {"type":"response.output_item.done","output_index":0,"item":{"id":"fc_stream","call_id":"call_stream","type":"function_call","name":"lookup","arguments":"{\"query\":\"golang\"}"}}`,
+		"",
+		"data: [DONE]",
+		"",
+	}, "\n")
+
+	httpClient := &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		return &http.Response{StatusCode: http.StatusOK, Status: "200 OK", Header: make(http.Header), Body: io.NopCloser(strings.NewReader(body)), Request: r}, nil
+	})}
+	client := &ResponsesClient{HTTPClient: httpClient, BaseURL: "https://example.com", ModelName: "test-model", MaxRetries: 1}
+	ch, err := client.InvokeStream(context.Background(), llm.InvokeRequest{Messages: []llm.Message{{Role: llm.RoleUser, Content: llm.TextContent("hi")}}})
+	if err != nil {
+		t.Fatalf("invoke stream: %v", err)
+	}
+
+	name := ""
+	args := ""
+	for ev := range ch {
+		switch e := ev.(type) {
+		case llm.StreamToolCallDeltaEvent:
+			if e.ID != "" && e.ID != "call_stream" {
+				t.Fatalf("stream exposed item id as tool-call id: %#v", e)
+			}
+			name += e.NameDelta
+			args += e.ArgumentsDelta
+		case llm.StreamErrorEvent:
+			t.Fatalf("unexpected stream error: %v", e.AsError())
+		}
+	}
+	if name != "lookup" {
+		t.Fatalf("tool name = %q, want lookup", name)
+	}
+	if args != `{"query":"golang"}` {
+		t.Fatalf("tool args = %q, want complete arguments", args)
+	}
+}
