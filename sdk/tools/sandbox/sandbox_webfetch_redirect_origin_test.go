@@ -135,3 +135,54 @@ func TestWebfetchRejectsEmbeddedURLCredentialsWithoutEchoingThem(t *testing.T) {
 		t.Fatalf("embedded credential error echoed userinfo: %q", err.Error())
 	}
 }
+
+func TestWebfetchRedirectErrorSanitizesCredentialBearingLocation(t *testing.T) {
+	useSandboxPublicWebfetchResolver(t)
+	tests := []struct {
+		name       string
+		location   string
+		wantOrigin string
+	}{
+		{name: "cross origin", location: "https://audit-user:audit-password@other.test/private?token=audit-query-secret", wantOrigin: "other.test:443"},
+		{name: "same origin userinfo", location: "https://audit-user:audit-password@example.test/private?token=audit-query-secret", wantOrigin: "example.test:443"},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			origDo := webfetchDoRequest
+			webfetchDoRequest = func(client *http.Client, initial *http.Request) (*http.Response, error) {
+				calls := 0
+				client.Transport = roundTripFunc(func(request *http.Request) (*http.Response, error) {
+					calls++
+					if calls > 1 {
+						t.Fatal("credential-bearing redirect reached a second transport request")
+					}
+					return &http.Response{
+						Status:     "302 Found",
+						StatusCode: http.StatusFound,
+						Header:     http.Header{"Location": []string{tc.location}},
+						Body:       io.NopCloser(strings.NewReader("")),
+						Request:    request,
+					}, nil
+				})
+				return client.Do(initial)
+			}
+			t.Cleanup(func() { webfetchDoRequest = origDo })
+
+			deps := tools.NewContainer()
+			tools.Provide(deps, ConfirmKey, func(context.Context) (Confirmer, error) { return allowConfirmer{}, nil })
+			result, err := webfetchTool().Execute(context.Background(), `{"url":"https://example.test/start"}`, deps)
+			if err == nil {
+				t.Fatalf("credential-bearing redirect unexpectedly succeeded: %q", result.PlainText())
+			}
+			combined := err.Error() + "\n" + result.PlainText()
+			for _, secret := range []string{"audit-user", "audit-password", "audit-query-secret", "/private"} {
+				if strings.Contains(combined, secret) {
+					t.Fatalf("redirect diagnostics leaked %q: %q", secret, combined)
+				}
+			}
+			if !strings.Contains(combined, tc.wantOrigin) {
+				t.Fatalf("sanitized diagnostics lost actionable origin: %q", combined)
+			}
+		})
+	}
+}

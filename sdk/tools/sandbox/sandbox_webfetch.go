@@ -2,6 +2,7 @@ package sandbox
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -145,7 +146,7 @@ func webfetchTool() tools.Tool {
 		}
 		resp, err := webfetchDoRequest(hc, req)
 		if err != nil {
-			return "", fmt.Errorf("request failed: %w", err)
+			return "", fmt.Errorf("request failed: %w", sanitizeWebfetchRequestError(err))
 		}
 		defer func() { _ = resp.Body.Close() }()
 
@@ -271,6 +272,21 @@ func webfetchOriginLabel(target *url.URL) string {
 		return "(invalid origin)"
 	}
 	return scheme + "://" + net.JoinHostPort(host, port)
+}
+
+func sanitizeWebfetchRequestError(err error) error {
+	if err == nil {
+		return nil
+	}
+	var urlErr *url.Error
+	if !errors.As(err, &urlErr) || urlErr == nil {
+		return err
+	}
+	safeURL := "(redacted URL)"
+	if parsed, parseErr := url.Parse(urlErr.URL); parseErr == nil {
+		safeURL = webfetchOriginLabel(parsed)
+	}
+	return &url.Error{Op: urlErr.Op, URL: safeURL, Err: urlErr.Err}
 }
 
 // validateWebfetchDestinationURL validates that a URL destination is safe.
