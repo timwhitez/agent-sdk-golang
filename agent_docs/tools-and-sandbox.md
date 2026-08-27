@@ -162,6 +162,11 @@ provider-facing schemas, metadata propagation, and sandbox safety gates.
 ## Confirmation-Gated Operations
 - Network fetch confirmation (`sdk/tools/sandbox/sandbox.go:377`, `sdk/tools/sandbox/sandbox.go:411`)
 - `webfetch` now reports response-body read failures with explicit partial-body diagnostics instead of silently returning incomplete content (`sdk/tools/sandbox/sandbox.go:446`)
+- `webfetch` follows redirects only within the confirmed URL origin (scheme,
+  host, and effective port). An origin-changing redirect fails before target
+  DNS lookup or connection and tells the caller to request the target URL
+  directly for a new confirmation; embedded URL userinfo is rejected without
+  echoing credential values (`sdk/tools/sandbox/sandbox_webfetch.go`).
 - Shell command confirmation and timeout-guarded execution (`sdk/tools/sandbox/sandbox.go:558`, `sdk/tools/sandbox/sandbox.go:572`)
 - Write/edit/multiedit/apply_patch confirmations with diff context (`sdk/tools/sandbox/sandbox.go:887`, `sdk/tools/sandbox/sandbox.go:938`, `sdk/tools/sandbox/sandbox.go:1006`, `sdk/tools/sandbox/sandbox.go:1083`)
 

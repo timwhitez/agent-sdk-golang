@@ -2,6 +2,7 @@ package sandbox
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -114,12 +115,26 @@ func webfetchTool() tools.Tool {
 		hc := newWebfetchHTTPClient(time.Duration(timeout) * time.Second)
 		hc.CheckRedirect = func(req *http.Request, via []*http.Request) error {
 			if len(via) >= webfetchMaxRedirects {
-				return fmt.Errorf("stopped after %d redirects", webfetchMaxRedirects)
+				return newWebfetchSafeRequestDiagnostic(fmt.Errorf("stopped after %d redirects", webfetchMaxRedirects))
 			}
 			if req == nil || req.URL == nil {
-				return fmt.Errorf("invalid redirect target")
+				return newWebfetchSafeRequestDiagnostic(errors.New("invalid redirect target"))
 			}
-			return validateWebfetchDestinationURL(req.Context(), req.URL, "redirect target")
+			if len(via) == 0 || via[len(via)-1] == nil || via[len(via)-1].URL == nil {
+				return newWebfetchSafeRequestDiagnostic(errors.New("invalid redirect source"))
+			}
+			previous := via[len(via)-1].URL
+			if !sameWebfetchOrigin(previous, req.URL) {
+				return newWebfetchSafeRequestDiagnostic(fmt.Errorf(
+					"redirect target changes origin from %s to %s; retry the target URL directly so the new origin is confirmed",
+					webfetchOriginLabel(previous),
+					webfetchOriginLabel(req.URL),
+				))
+			}
+			if err := validateWebfetchDestinationURL(req.Context(), req.URL, "redirect target"); err != nil {
+				return newWebfetchSafeRequestDiagnostic(err)
+			}
+			return nil
 		}
 		req, err := http.NewRequestWithContext(ctx, method, rawURL, nil)
 		if err != nil {
@@ -134,7 +149,7 @@ func webfetchTool() tools.Tool {
 		}
 		resp, err := webfetchDoRequest(hc, req)
 		if err != nil {
-			return "", fmt.Errorf("request failed: %w", err)
+			return "", fmt.Errorf("request failed: %w", sanitizeWebfetchRequestError(err))
 		}
 		defer func() { _ = resp.Body.Close() }()
 
@@ -185,11 +200,11 @@ func newWebfetchHTTPClient(timeout time.Duration) *http.Client {
 func dialValidatedWebfetchDestination(ctx context.Context, network, address string) (net.Conn, error) {
 	host, port, err := net.SplitHostPort(address)
 	if err != nil {
-		return nil, fmt.Errorf("invalid webfetch dial address %q: %w", address, err)
+		return nil, newWebfetchSafeRequestDiagnostic(fmt.Errorf("invalid webfetch dial address: %w", err))
 	}
 	addrs, err := resolveAndValidateWebfetchHost(ctx, host, "socket target")
 	if err != nil {
-		return nil, err
+		return nil, newWebfetchSafeRequestDiagnostic(err)
 	}
 	var dialErrors []string
 	for _, ip := range addrs {
@@ -199,7 +214,7 @@ func dialValidatedWebfetchDestination(ctx context.Context, network, address stri
 		}
 		dialErrors = append(dialErrors, dialErr.Error())
 	}
-	return nil, fmt.Errorf("cannot connect to validated socket target %q: %s", host, strings.Join(dialErrors, "; "))
+	return nil, newWebfetchSafeRequestDiagnostic(fmt.Errorf("cannot connect to validated socket target %q: %s", host, strings.Join(dialErrors, "; ")))
 }
 
 // validateWebfetchPreConfirmationURL performs only local checks. A hostname is
@@ -207,6 +222,9 @@ func dialValidatedWebfetchDestination(ctx context.Context, network, address stri
 func validateWebfetchPreConfirmationURL(target *url.URL, stage string) error {
 	if target == nil {
 		return fmt.Errorf("invalid url: missing host")
+	}
+	if target.User != nil {
+		return fmt.Errorf("%s must not include embedded URL credentials; remove userinfo and retry with an explicitly confirmed header", stage)
 	}
 	host := strings.TrimSpace(target.Hostname())
 	if host == "" {
@@ -220,10 +238,113 @@ func validateWebfetchPreConfirmationURL(target *url.URL, stage string) error {
 	return nil
 }
 
+func sameWebfetchOrigin(left, right *url.URL) bool {
+	if left == nil || right == nil {
+		return false
+	}
+	return strings.EqualFold(strings.TrimSpace(left.Scheme), strings.TrimSpace(right.Scheme)) &&
+		strings.EqualFold(strings.TrimSpace(left.Hostname()), strings.TrimSpace(right.Hostname())) &&
+		webfetchEffectivePort(left) == webfetchEffectivePort(right)
+}
+
+func webfetchEffectivePort(target *url.URL) string {
+	if target == nil {
+		return ""
+	}
+	if port := strings.TrimSpace(target.Port()); port != "" {
+		return port
+	}
+	switch strings.ToLower(strings.TrimSpace(target.Scheme)) {
+	case "http":
+		return "80"
+	case "https":
+		return "443"
+	default:
+		return ""
+	}
+}
+
+func webfetchOriginLabel(target *url.URL) string {
+	if target == nil {
+		return "(invalid origin)"
+	}
+	scheme := strings.ToLower(strings.TrimSpace(target.Scheme))
+	host := strings.ToLower(strings.TrimSpace(target.Hostname()))
+	port := webfetchEffectivePort(target)
+	if host == "" || port == "" {
+		return "(invalid origin)"
+	}
+	return scheme + "://" + net.JoinHostPort(host, port)
+}
+
+func sanitizeWebfetchRequestError(err error) error {
+	if err == nil {
+		return nil
+	}
+	var urlErr *url.Error
+	if !errors.As(err, &urlErr) || urlErr == nil {
+		return err
+	}
+	safeURL := "(redacted URL)"
+	if parsed, parseErr := url.Parse(urlErr.URL); parseErr == nil {
+		safeURL = webfetchOriginLabel(parsed)
+	}
+	var cause error = errors.New("HTTP request failed")
+	var safeDiagnostic *webfetchSafeRequestDiagnostic
+	if errors.As(urlErr.Err, &safeDiagnostic) && safeDiagnostic != nil {
+		cause = safeDiagnostic
+	} else if errors.Is(urlErr.Err, context.Canceled) {
+		cause = context.Canceled
+	} else if errors.Is(urlErr.Err, context.DeadlineExceeded) {
+		cause = context.DeadlineExceeded
+	} else {
+		var netErr net.Error
+		if errors.As(urlErr.Err, &netErr) && netErr.Timeout() {
+			cause = webfetchRequestTimeoutError{}
+		}
+	}
+	return &url.Error{Op: urlErr.Op, URL: safeURL, Err: cause}
+}
+
+// webfetchSafeRequestDiagnostic marks errors built exclusively from
+// destination-validation state controlled by this package. net/http may place
+// an untrusted Location header verbatim in a nested *url.Error; only marked
+// diagnostics are safe to expose after Client.Do returns.
+type webfetchSafeRequestDiagnostic struct {
+	err error
+}
+
+type webfetchRequestTimeoutError struct{}
+
+func (webfetchRequestTimeoutError) Error() string   { return "network request timed out" }
+func (webfetchRequestTimeoutError) Timeout() bool   { return true }
+func (webfetchRequestTimeoutError) Temporary() bool { return true }
+
+func newWebfetchSafeRequestDiagnostic(err error) *webfetchSafeRequestDiagnostic {
+	return &webfetchSafeRequestDiagnostic{err: err}
+}
+
+func (e *webfetchSafeRequestDiagnostic) Error() string {
+	if e == nil || e.err == nil {
+		return "HTTP request failed"
+	}
+	return e.err.Error()
+}
+
+func (e *webfetchSafeRequestDiagnostic) Unwrap() error {
+	if e == nil {
+		return nil
+	}
+	return e.err
+}
+
 // validateWebfetchDestinationURL validates that a URL destination is safe.
 func validateWebfetchDestinationURL(ctx context.Context, target *url.URL, stage string) error {
 	if target == nil {
 		return fmt.Errorf("invalid url: missing host")
+	}
+	if target.User != nil {
+		return fmt.Errorf("%s must not include embedded URL credentials", stage)
 	}
 	host := strings.TrimSpace(target.Hostname())
 	if host == "" {
