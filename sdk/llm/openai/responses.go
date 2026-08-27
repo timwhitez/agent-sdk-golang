@@ -497,7 +497,8 @@ func (c *ResponsesClient) InvokeStream(ctx context.Context, req llm.InvokeReques
 				return
 			}
 
-			idToIndex := map[string]int{}
+			itemIDToIndex := map[string]int{}
+			callIDToIndex := map[string]int{}
 			autoToIndex := map[string]int{}
 			usedIndices := map[int]struct{}{}
 			nextIndex := 0
@@ -551,44 +552,64 @@ func (c *ResponsesClient) InvokeStream(ctx context.Context, req llm.InvokeReques
 				}
 			}
 
-			getIndex := func(id, autoKey string, preferred int, hasPreferred bool) int {
-				id = strings.TrimSpace(id)
+			bindToolIndex := func(itemID, callID, autoKey string, preferred int, hasPreferred bool) (int, error) {
+				itemID = strings.TrimSpace(itemID)
+				callID = strings.TrimSpace(callID)
 				autoKey = strings.TrimSpace(autoKey)
-				if id != "" {
-					if idx, ok := idToIndex[id]; ok {
-						if autoKey != "" {
-							autoToIndex[autoKey] = idx
+				idx := -1
+				bindCandidate := func(kind, id string, candidate int) error {
+					if idx < 0 {
+						idx = candidate
+						return nil
+					}
+					if idx != candidate {
+						return fmt.Errorf("openai responses stream: conflicting %s %q maps to tool indexes %d and %d", kind, id, idx, candidate)
+					}
+					return nil
+				}
+				if itemID != "" {
+					if existing, ok := itemIDToIndex[itemID]; ok {
+						if err := bindCandidate("item_id", itemID, existing); err != nil {
+							return 0, err
 						}
-						return idx
 					}
-					if autoKey != "" {
-						if idx, ok := autoToIndex[autoKey]; ok {
-							idToIndex[id] = idx
-							return idx
+				}
+				if callID != "" {
+					if existing, ok := callIDToIndex[callID]; ok {
+						if err := bindCandidate("call_id", callID, existing); err != nil {
+							return 0, err
 						}
 					}
-					idx := allocateIndex(preferred, hasPreferred)
-					idToIndex[id] = idx
-					if autoKey != "" {
-						autoToIndex[autoKey] = idx
-					}
-					return idx
 				}
 				if autoKey != "" {
-					if idx, ok := autoToIndex[autoKey]; ok {
-						return idx
+					if existing, ok := autoToIndex[autoKey]; ok {
+						if err := bindCandidate("output index", autoKey, existing); err != nil {
+							return 0, err
+						}
 					}
-					idx := allocateIndex(preferred, hasPreferred)
-					autoToIndex[autoKey] = idx
-					return idx
 				}
-				return allocateIndex(-1, false)
+				if idx < 0 {
+					idx = allocateIndex(preferred, hasPreferred)
+				}
+				if itemID != "" {
+					itemIDToIndex[itemID] = idx
+				}
+				if callID != "" {
+					callIDToIndex[callID] = idx
+				}
+				if autoKey != "" {
+					autoToIndex[autoKey] = idx
+				}
+				return idx, nil
 			}
 
 			type streamedToolState struct {
-				hasName bool
-				hasID   bool
-				hasArgs bool
+				hasName     bool
+				hasID       bool
+				hasArgs     bool
+				itemID      string
+				callID      string
+				pendingArgs strings.Builder
 			}
 			toolState := map[int]*streamedToolState{}
 			ensureToolState := func(idx int) *streamedToolState {
@@ -622,6 +643,68 @@ func (c *ResponsesClient) InvokeStream(ctx context.Context, req llm.InvokeReques
 					st.hasID = true
 				}
 				st.hasArgs = true
+			}
+			applyToolIdentity := func(idx int, itemID, callID, name, args string) error {
+				st := ensureToolState(idx)
+				itemID = strings.TrimSpace(itemID)
+				callID = strings.TrimSpace(callID)
+				if st.itemID != "" && itemID != "" && st.itemID != itemID {
+					return fmt.Errorf("openai responses stream: tool index %d changed item_id from %q to %q", idx, st.itemID, itemID)
+				}
+				if st.callID != "" && callID != "" && st.callID != callID {
+					return fmt.Errorf("openai responses stream: tool index %d changed call_id from %q to %q", idx, st.callID, callID)
+				}
+				if itemID != "" {
+					st.itemID = itemID
+				}
+				if callID != "" {
+					st.callID = callID
+				}
+				needIdentity := (strings.TrimSpace(name) != "" && !st.hasName) || (st.callID != "" && !st.hasID)
+				if needIdentity {
+					emitToolIdentity(idx, st.callID, name)
+				}
+				if st.hasArgs {
+					return nil
+				}
+				if strings.TrimSpace(args) != "" {
+					st.pendingArgs.Reset()
+					emitToolArgs(idx, st.callID, args)
+					return nil
+				}
+				if st.callID != "" && st.pendingArgs.Len() > 0 {
+					pending := st.pendingArgs.String()
+					st.pendingArgs.Reset()
+					emitToolArgs(idx, st.callID, pending)
+				}
+				return nil
+			}
+			promoteCompatibilityItemID := func(idx int, itemID string) error {
+				st := ensureToolState(idx)
+				itemID = strings.TrimSpace(itemID)
+				if st.callID != "" || !st.hasName || itemID == "" {
+					return nil
+				}
+				if existing, ok := callIDToIndex[itemID]; ok && existing != idx {
+					return fmt.Errorf("openai responses stream: compatibility call_id %q maps to tool indexes %d and %d", itemID, existing, idx)
+				}
+				st.itemID = itemID
+				st.callID = itemID
+				callIDToIndex[itemID] = idx
+				emitToolIdentity(idx, itemID, "")
+				return nil
+			}
+			recordStreamItemID := func(idx int, itemID string) error {
+				itemID = strings.TrimSpace(itemID)
+				if itemID == "" {
+					return nil
+				}
+				st := ensureToolState(idx)
+				if st.itemID != "" && st.itemID != itemID {
+					return fmt.Errorf("openai responses stream: tool index %d changed item_id from %q to %q", idx, st.itemID, itemID)
+				}
+				st.itemID = itemID
+				return nil
 			}
 
 			stopReason := ""
@@ -716,20 +799,19 @@ func (c *ResponsesClient) InvokeStream(ctx context.Context, req llm.InvokeReques
 						}
 					}
 					if itType == "function_call" || itType == "tool_call" {
-						id, _ := item["id"].(string)
-						if id == "" {
-							id, _ = item["call_id"].(string)
-						}
+						itemID, callID := responsesToolCallIdentifiers(item)
 						name, _ := item["name"].(string)
 						idxHint, hasIdxHint := firstIndexHint(root["output_index"], root["item_index"], item["output_index"], item["index"])
 						autoKey := ""
 						if hasIdxHint {
 							autoKey = fmt.Sprintf("output:%d", idxHint)
 						}
-						idx := getIndex(id, autoKey, idxHint, hasIdxHint)
-						emitToolIdentity(idx, id, name)
-						if args, ok := item["arguments"].(string); ok && strings.TrimSpace(args) != "" {
-							emitToolArgs(idx, id, args)
+						idx, indexErr := bindToolIndex(itemID, callID, autoKey, idxHint, hasIdxHint)
+						if indexErr != nil {
+							return indexErr
+						}
+						if identityErr := applyToolIdentity(idx, itemID, callID, name, responsesToolArguments(item["arguments"])); identityErr != nil {
+							return identityErr
 						}
 					}
 				case "response.output_item.done":
@@ -782,24 +864,19 @@ func (c *ResponsesClient) InvokeStream(ctx context.Context, req llm.InvokeReques
 					if itType != "function_call" && itType != "tool_call" {
 						return nil
 					}
-					id, _ := item["id"].(string)
-					if id == "" {
-						id, _ = item["call_id"].(string)
-					}
+					itemID, callID := responsesToolCallIdentifiers(item)
 					name, _ := item["name"].(string)
 					idxHint, hasIdxHint := firstIndexHint(root["output_index"], root["item_index"], item["output_index"], item["index"])
 					autoKey := ""
 					if hasIdxHint {
 						autoKey = fmt.Sprintf("output:%d", idxHint)
 					}
-					idx := getIndex(id, autoKey, idxHint, hasIdxHint)
-					st := ensureToolState(idx)
-					needIdentity := (strings.TrimSpace(name) != "" && !st.hasName) || (strings.TrimSpace(id) != "" && !st.hasID)
-					if needIdentity {
-						emitToolIdentity(idx, id, name)
+					idx, indexErr := bindToolIndex(itemID, callID, autoKey, idxHint, hasIdxHint)
+					if indexErr != nil {
+						return indexErr
 					}
-					if args := responsesToolArguments(item["arguments"]); strings.TrimSpace(args) != "" && !st.hasArgs {
-						emitToolArgs(idx, id, args)
+					if identityErr := applyToolIdentity(idx, itemID, callID, name, responsesToolArguments(item["arguments"])); identityErr != nil {
+						return identityErr
 					}
 				case "response.function_call_arguments.delta":
 					itemID, _ := root["item_id"].(string)
@@ -812,8 +889,22 @@ func (c *ResponsesClient) InvokeStream(ctx context.Context, req llm.InvokeReques
 						if hasIdxHint {
 							autoKey = fmt.Sprintf("output:%d", idxHint)
 						}
-						idx := getIndex(itemID, autoKey, idxHint, hasIdxHint)
-						emitToolArgs(idx, itemID, d)
+						idx, indexErr := bindToolIndex(itemID, "", autoKey, idxHint, hasIdxHint)
+						if indexErr != nil {
+							return indexErr
+						}
+						if itemErr := recordStreamItemID(idx, itemID); itemErr != nil {
+							return itemErr
+						}
+						st := ensureToolState(idx)
+						if promoteErr := promoteCompatibilityItemID(idx, itemID); promoteErr != nil {
+							return promoteErr
+						}
+						if st.callID == "" {
+							st.pendingArgs.WriteString(d)
+						} else {
+							emitToolArgs(idx, st.callID, d)
+						}
 					}
 				case "response.function_call_arguments.done":
 					itemID, _ := root["item_id"].(string)
@@ -830,9 +921,23 @@ func (c *ResponsesClient) InvokeStream(ctx context.Context, req llm.InvokeReques
 						if hasIdxHint {
 							autoKey = fmt.Sprintf("output:%d", idxHint)
 						}
-						idx := getIndex(itemID, autoKey, idxHint, hasIdxHint)
+						idx, indexErr := bindToolIndex(itemID, "", autoKey, idxHint, hasIdxHint)
+						if indexErr != nil {
+							return indexErr
+						}
+						if itemErr := recordStreamItemID(idx, itemID); itemErr != nil {
+							return itemErr
+						}
+						if promoteErr := promoteCompatibilityItemID(idx, itemID); promoteErr != nil {
+							return promoteErr
+						}
 						if st := ensureToolState(idx); !st.hasArgs {
-							emitToolArgs(idx, itemID, args)
+							if st.callID == "" {
+								st.pendingArgs.Reset()
+								st.pendingArgs.WriteString(args)
+							} else {
+								emitToolArgs(idx, st.callID, args)
+							}
 						}
 					}
 				case "response.completed":
@@ -1686,10 +1791,7 @@ func parseResponses(data []byte) (*llm.Completion, error) {
 					}
 				}
 			case "function_call", "tool_call":
-				id, _ := item["id"].(string)
-				if id == "" {
-					id, _ = item["call_id"].(string)
-				}
+				_, id := responsesToolCallIdentifiers(item)
 				name, _ := item["name"].(string)
 				args := "{}"
 				if s, ok := item["arguments"].(string); ok && strings.TrimSpace(s) != "" {
@@ -1744,4 +1846,20 @@ func parseResponses(data []byte) (*llm.Completion, error) {
 		}
 	}
 	return &llm.Completion{Content: llm.Content{Blocks: blocks}, Thinking: thinking, ToolCalls: toolCalls, Usage: usage, StopReason: stopReason, ResponseID: responseID, Raw: append([]byte(nil), data...)}, nil
+}
+
+func responsesToolCallIdentifiers(item map[string]any) (itemID, callID string) {
+	if item == nil {
+		return "", ""
+	}
+	itemID, _ = item["id"].(string)
+	callID, _ = item["call_id"].(string)
+	itemID = strings.TrimSpace(itemID)
+	callID = strings.TrimSpace(callID)
+	if callID == "" {
+		// Compatibility gateways sometimes expose only one identifier and use
+		// it for both stream-item events and function output correlation.
+		callID = itemID
+	}
+	return itemID, callID
 }

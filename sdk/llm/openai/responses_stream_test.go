@@ -381,3 +381,189 @@ func TestResponsesStreamAcceptsObjectArgumentsInOutputItemDone(t *testing.T) {
 		t.Fatalf("tool args = %q, want %q", toolArgs, `{"query":"golang"}`)
 	}
 }
+
+func TestResponsesStreamSeparatesItemIDFromFunctionCallID(t *testing.T) {
+	t.Parallel()
+	body := strings.Join([]string{
+		`data: {"type":"response.output_item.added","output_index":0,"item":{"id":"fc_stream","call_id":"call_stream","type":"function_call","name":"lookup","arguments":""}}`,
+		"",
+		`data: {"type":"response.function_call_arguments.delta","output_index":0,"item_id":"fc_stream","delta":"{\"query\":"}`,
+		"",
+		`data: {"type":"response.function_call_arguments.delta","output_index":0,"item_id":"fc_stream","delta":"\"golang\"}"}`,
+		"",
+		`data: {"type":"response.output_item.done","output_index":0,"item":{"id":"fc_stream","call_id":"call_stream","type":"function_call","name":"lookup","arguments":"{\"query\":\"golang\"}"}}`,
+		"",
+		"data: [DONE]",
+		"",
+	}, "\n")
+
+	httpClient := &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		return &http.Response{StatusCode: http.StatusOK, Status: "200 OK", Header: make(http.Header), Body: io.NopCloser(strings.NewReader(body)), Request: r}, nil
+	})}
+	client := &ResponsesClient{HTTPClient: httpClient, BaseURL: "https://example.com", ModelName: "test-model", MaxRetries: 1}
+	ch, err := client.InvokeStream(context.Background(), llm.InvokeRequest{Messages: []llm.Message{{Role: llm.RoleUser, Content: llm.TextContent("hi")}}})
+	if err != nil {
+		t.Fatalf("invoke stream: %v", err)
+	}
+
+	name := ""
+	args := ""
+	for ev := range ch {
+		switch e := ev.(type) {
+		case llm.StreamToolCallDeltaEvent:
+			if e.ID != "" && e.ID != "call_stream" {
+				t.Fatalf("stream exposed item id as tool-call id: %#v", e)
+			}
+			name += e.NameDelta
+			args += e.ArgumentsDelta
+		case llm.StreamErrorEvent:
+			t.Fatalf("unexpected stream error: %v", e.AsError())
+		}
+	}
+	if name != "lookup" {
+		t.Fatalf("tool name = %q, want lookup", name)
+	}
+	if args != `{"query":"golang"}` {
+		t.Fatalf("tool args = %q, want complete arguments", args)
+	}
+}
+
+func TestResponsesStreamBuffersArgumentsUntilLateCallID(t *testing.T) {
+	t.Parallel()
+	body := strings.Join([]string{
+		`data: {"type":"response.function_call_arguments.delta","output_index":0,"item_id":"fc_late","delta":"{\"path\":\"notes.txt\"}"}`,
+		"",
+		`data: {"type":"response.output_item.added","output_index":0,"item":{"id":"fc_late","call_id":"call_late","type":"function_call","name":"read","arguments":""}}`,
+		"",
+		`data: {"type":"response.output_item.done","output_index":0,"item":{"id":"fc_late","call_id":"call_late","type":"function_call","name":"read","arguments":"{\"path\":\"notes.txt\"}"}}`,
+		"",
+		"data: [DONE]",
+		"",
+	}, "\n")
+
+	httpClient := &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		return &http.Response{StatusCode: http.StatusOK, Status: "200 OK", Header: make(http.Header), Body: io.NopCloser(strings.NewReader(body)), Request: r}, nil
+	})}
+	client := &ResponsesClient{HTTPClient: httpClient, BaseURL: "https://example.com", ModelName: "test-model", MaxRetries: 1}
+	ch, err := client.InvokeStream(context.Background(), llm.InvokeRequest{Messages: []llm.Message{{Role: llm.RoleUser, Content: llm.TextContent("hi")}}})
+	if err != nil {
+		t.Fatalf("invoke stream: %v", err)
+	}
+
+	name := ""
+	args := ""
+	for ev := range ch {
+		switch e := ev.(type) {
+		case llm.StreamToolCallDeltaEvent:
+			if e.ID != "" && e.ID != "call_late" {
+				t.Fatalf("late identity exposed wrong tool-call ID: %#v", e)
+			}
+			name += e.NameDelta
+			args += e.ArgumentsDelta
+		case llm.StreamErrorEvent:
+			t.Fatalf("unexpected stream error: %v", e.AsError())
+		}
+	}
+	if name != "read" || args != `{"path":"notes.txt"}` {
+		t.Fatalf("streamed tool = name %q args %q", name, args)
+	}
+}
+
+func TestResponsesStreamKeepsItemAndCallIDNamespacesSeparate(t *testing.T) {
+	t.Parallel()
+	body := strings.Join([]string{
+		`data: {"type":"response.output_item.added","output_index":0,"item":{"id":"fc_a","call_id":"shared_identifier","type":"function_call","name":"first","arguments":""}}`,
+		"",
+		`data: {"type":"response.output_item.added","output_index":1,"item":{"id":"shared_identifier","call_id":"call_b","type":"function_call","name":"second","arguments":""}}`,
+		"",
+		`data: {"type":"response.function_call_arguments.delta","output_index":0,"item_id":"fc_a","delta":"{\"value\":1}"}`,
+		"",
+		`data: {"type":"response.function_call_arguments.delta","output_index":1,"item_id":"shared_identifier","delta":"{\"value\":2}"}`,
+		"",
+		"data: [DONE]",
+		"",
+	}, "\n")
+
+	httpClient := &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		return &http.Response{StatusCode: http.StatusOK, Status: "200 OK", Header: make(http.Header), Body: io.NopCloser(strings.NewReader(body)), Request: r}, nil
+	})}
+	client := &ResponsesClient{HTTPClient: httpClient, BaseURL: "https://example.com", ModelName: "test-model", MaxRetries: 1}
+	ch, err := client.InvokeStream(context.Background(), llm.InvokeRequest{Messages: []llm.Message{{Role: llm.RoleUser, Content: llm.TextContent("hi")}}})
+	if err != nil {
+		t.Fatalf("invoke stream: %v", err)
+	}
+
+	names := map[int]string{}
+	args := map[int]string{}
+	ids := map[int]string{}
+	for ev := range ch {
+		switch e := ev.(type) {
+		case llm.StreamToolCallDeltaEvent:
+			names[e.Index] += e.NameDelta
+			args[e.Index] += e.ArgumentsDelta
+			if e.ID != "" {
+				ids[e.Index] = e.ID
+			}
+		case llm.StreamErrorEvent:
+			t.Fatalf("unexpected stream error: %v", e.AsError())
+		}
+	}
+	if names[0] != "first" || args[0] != `{"value":1}` || ids[0] != "shared_identifier" {
+		t.Fatalf("first tool identity collapsed: names=%#v args=%#v ids=%#v", names, args, ids)
+	}
+	if names[1] != "second" || args[1] != `{"value":2}` || ids[1] != "call_b" {
+		t.Fatalf("second tool identity collapsed: names=%#v args=%#v ids=%#v", names, args, ids)
+	}
+}
+
+func TestResponsesStreamRejectsIdentityFirstItemIDConflict(t *testing.T) {
+	t.Parallel()
+	body := strings.Join([]string{
+		`data: {"type":"response.output_item.added","output_index":0,"item":{"id":"fc_a","call_id":"call_a","type":"function_call","name":"lookup","arguments":""}}`,
+		"",
+		`data: {"type":"response.function_call_arguments.delta","output_index":0,"item_id":"fc_b","delta":"{\"wrong\":true}"}`,
+		"",
+	}, "\n")
+	assertResponsesStreamItemIDConflict(t, body)
+}
+
+func TestResponsesStreamRejectsDeltaFirstItemIDConflict(t *testing.T) {
+	t.Parallel()
+	body := strings.Join([]string{
+		`data: {"type":"response.function_call_arguments.delta","output_index":0,"item_id":"fc_a","delta":"{\"first\":true}"}`,
+		"",
+		`data: {"type":"response.function_call_arguments.delta","output_index":0,"item_id":"fc_b","delta":"{\"wrong\":true}"}`,
+		"",
+	}, "\n")
+	assertResponsesStreamItemIDConflict(t, body)
+}
+
+func assertResponsesStreamItemIDConflict(t *testing.T, body string) {
+	t.Helper()
+	httpClient := &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		return &http.Response{StatusCode: http.StatusOK, Status: "200 OK", Header: make(http.Header), Body: io.NopCloser(strings.NewReader(body)), Request: r}, nil
+	})}
+	client := &ResponsesClient{HTTPClient: httpClient, BaseURL: "https://example.com", ModelName: "test-model", MaxRetries: 1}
+	ch, err := client.InvokeStream(context.Background(), llm.InvokeRequest{Messages: []llm.Message{{Role: llm.RoleUser, Content: llm.TextContent("hi")}}})
+	if err != nil {
+		t.Fatalf("invoke stream: %v", err)
+	}
+
+	errSeen := false
+	for ev := range ch {
+		switch e := ev.(type) {
+		case llm.StreamToolCallDeltaEvent:
+			if strings.Contains(e.ArgumentsDelta, "wrong") {
+				t.Fatalf("conflicting item arguments were emitted before rejection: %#v", e)
+			}
+		case llm.StreamErrorEvent:
+			errSeen = true
+			if !strings.Contains(e.AsError().Error(), "changed item_id") {
+				t.Fatalf("conflict error = %v", e.AsError())
+			}
+		}
+	}
+	if !errSeen {
+		t.Fatal("conflicting stream item_id did not produce StreamErrorEvent")
+	}
+}
