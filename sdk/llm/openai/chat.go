@@ -123,6 +123,7 @@ func (c *ChatClient) Invoke(ctx context.Context, req llm.InvokeRequest) (*llm.Co
 		}
 
 		resp, err := client.Do(httpReq)
+		err = sanitizeOpenAIHTTPError(err)
 		if err == nil {
 			data, readErr := readResponseBodyLimited(resp.Body, endpoint)
 			if readErr != nil {
@@ -256,6 +257,7 @@ func (c *ChatClient) InvokeStream(ctx context.Context, req llm.InvokeRequest) (<
 			}
 
 			resp, err := client.Do(httpReq)
+			err = sanitizeOpenAIHTTPError(err)
 			if err != nil {
 				if ctxErr := ctx.Err(); ctxErr != nil {
 					out <- llm.StreamErrorEvent{Err: ctxErr}
@@ -593,9 +595,9 @@ func streamHTTPClient(base *http.Client) *http.Client {
 
 func (c *ChatClient) httpClient() *http.Client {
 	if c.HTTPClient != nil {
-		return c.HTTPClient
+		return redirectSafeOpenAIHTTPClient(c.HTTPClient)
 	}
-	return &http.Client{Timeout: 60 * time.Second}
+	return redirectSafeOpenAIHTTPClient(&http.Client{Timeout: 60 * time.Second})
 }
 
 func (c *ChatClient) baseURL() string {

@@ -100,6 +100,15 @@ stream normalization, and response metadata behavior.
 - Anthropic populates IDs in both sync and streaming paths (`sdk/llm/anthropic/client.go:718`, `sdk/llm/anthropic/client.go:1219`)
 - OpenAI Chat completions currently do not expose response IDs in parsed completion objects (`sdk/llm/openai/chat.go:904`)
 
+## OpenAI redirect credential boundary
+
+OpenAI Chat and Responses clients, in buffered and streaming modes, follow
+only same-origin redirects. Origin includes scheme, host, and effective port;
+HTTPS-to-HTTP downgrades are rejected before a redirected request is sent.
+Caller-provided redirect callbacks run only for an initially allowed target,
+and the target URL is checked again after the callback returns so it cannot
+move bearer credentials onto another origin.
+
 ## Usage and Optional Cost Calculation
 - Providers populate a versioned `Usage` contract; downstream cost calculation is optional (`sdk/llm/types.go`, `sdk/llm/usage.go`, `sdk/tokens/cost.go:80`).
 - Under `prompt_tokens_semantics=total_input_v1`, `PromptTokens` is the complete effective input size. `PromptCachedTokens`, `PromptCacheCreationTokens`, `PromptImageTokens`, and `PromptUncachedTokens` are breakdown fields and consumers must not add them to `PromptTokens` again.

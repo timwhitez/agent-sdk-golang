@@ -98,6 +98,7 @@ func (c *ResponsesClient) Invoke(ctx context.Context, req llm.InvokeRequest) (*l
 		}
 
 		resp, err := client.Do(httpReq)
+		err = sanitizeOpenAIHTTPError(err)
 		if err == nil {
 			data, readErr := readResponseBodyLimited(resp.Body, endpoint)
 			if readErr != nil {
@@ -184,9 +185,9 @@ func (c *ResponsesClient) Invoke(ctx context.Context, req llm.InvokeRequest) (*l
 
 func (c *ResponsesClient) httpClient() *http.Client {
 	if c.HTTPClient != nil {
-		return c.HTTPClient
+		return redirectSafeOpenAIHTTPClient(c.HTTPClient)
 	}
-	return &http.Client{Timeout: 60 * time.Second}
+	return redirectSafeOpenAIHTTPClient(&http.Client{Timeout: 60 * time.Second})
 }
 
 func (c *ResponsesClient) baseURL() string {
@@ -429,6 +430,7 @@ func (c *ResponsesClient) InvokeStream(ctx context.Context, req llm.InvokeReques
 			}
 
 			resp, err := client.Do(httpReq)
+			err = sanitizeOpenAIHTTPError(err)
 			if err != nil {
 				if ctxErr := ctx.Err(); ctxErr != nil {
 					out <- llm.StreamErrorEvent{Err: ctxErr}
