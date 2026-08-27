@@ -62,7 +62,7 @@ func validateSummaryFactCoverage(summary, material string) []string {
 }
 
 func materialSectionBody(text, title string) string {
-	re := regexp.MustCompile(`(?mi)^#{1,6}\s*` + regexp.QuoteMeta(title) + `\s*$`)
+	re := regexp.MustCompile(`(?m)^## ` + regexp.QuoteMeta(title) + `\r?$`)
 	loc := re.FindStringIndex(text)
 	if loc == nil {
 		return ""
@@ -112,13 +112,25 @@ func validateRequiredSummarySections(summary string) []string {
 	last := -1
 	missing := 0
 	for _, title := range requiredSummarySections {
-		re := regexp.MustCompile(`(?mi)^#{1,6}\s*` + regexp.QuoteMeta(title) + `\s*$`)
-		loc := re.FindStringIndex(summary)
-		if loc == nil {
+		exactPattern := regexp.MustCompile(`(?m)^## ` + regexp.QuoteMeta(title) + `\r?$`)
+		exactMatches := exactPattern.FindAllStringIndex(summary, -1)
+		broadPattern := regexp.MustCompile(`(?mi)^#{1,6}[\t ]*` + regexp.QuoteMeta(title) + `[\t ]*\r?$`)
+		broadMatches := broadPattern.FindAllStringIndex(summary, -1)
+		if len(exactMatches) == 0 {
 			missing++
 			reasons = append(reasons, "missing required section: "+title)
+			if len(broadMatches) > 0 {
+				reasons = append(reasons, "required section must use exact level-2 heading: ## "+title)
+			}
 			continue
 		}
+		if len(exactMatches) > 1 {
+			reasons = append(reasons, "duplicate required section: "+title)
+		}
+		if len(broadMatches) != len(exactMatches) {
+			reasons = append(reasons, "required section must use exact level-2 heading: ## "+title)
+		}
+		loc := exactMatches[0]
 		if loc[0] <= last {
 			reasons = append(reasons, "required section out of order: "+title)
 		}
@@ -130,7 +142,9 @@ func validateRequiredSummarySections(summary string) []string {
 	}
 	for i, section := range sections {
 		bodyEnd := len(summary)
-		if i+1 < len(sections) {
+		if nextHeading := regexp.MustCompile(`(?m)^#{1,6}[\t ]+.+\r?$`).FindStringIndex(summary[section.end:]); nextHeading != nil {
+			bodyEnd = section.end + nextHeading[0]
+		} else if i+1 < len(sections) {
 			bodyEnd = sections[i+1].start
 		}
 		if strings.TrimSpace(summary[section.end:bodyEnd]) == "" {

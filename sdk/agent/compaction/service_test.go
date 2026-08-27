@@ -207,6 +207,56 @@ func TestCompactionQualityGateRejectsMissingRequiredSections(t *testing.T) {
 	}
 }
 
+func TestCompactionQualityGateRequiresUniqueOrderedExactLevelTwoHeadings(t *testing.T) {
+	valid, reasons := validateSummaryEnvelope(structuredTestSummary("", ""))
+	if len(reasons) != 0 {
+		t.Fatalf("valid summary envelope: %v", reasons)
+	}
+	first := requiredSummarySections[0]
+	second := requiredSummarySections[1]
+	tests := []struct {
+		name       string
+		summary    string
+		wantReason string
+	}{
+		{
+			name:       "wrong level",
+			summary:    strings.Replace(valid, "## "+first, "# "+first, 1),
+			wantReason: "missing required section: " + first,
+		},
+		{
+			name:       "missing heading space",
+			summary:    strings.Replace(valid, "## "+first, "##"+first, 1),
+			wantReason: "missing required section: " + first,
+		},
+		{
+			name:       "duplicate",
+			summary:    strings.Replace(valid, "## "+second, "## "+first+"\nduplicate\n\n## "+second, 1),
+			wantReason: "duplicate required section: " + first,
+		},
+		{
+			name: "out of order",
+			summary: strings.Replace(
+				strings.Replace(
+					strings.Replace(valid, "## "+first, "## temporary-first", 1),
+					"## "+second, "## "+first, 1,
+				),
+				"## temporary-first", "## "+second, 1,
+			),
+			wantReason: "required section out of order: " + second,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			reasons := validateRequiredSummarySections(tc.summary)
+			if !strings.Contains(strings.Join(reasons, "; "), tc.wantReason) {
+				t.Fatalf("reasons = %v, want %q", reasons, tc.wantReason)
+			}
+		})
+	}
+}
+
 func TestCompactionQualityGateAllowsCredentialLikeSecurityMaterial(t *testing.T) {
 	material := `Cookie: user="adm\\073n" Authorization: Bearer lab-fixture-token`
 	model := mockCompactModel{response: structuredTestSummary("Verification Already Run and Still Required", material)}
