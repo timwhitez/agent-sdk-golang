@@ -430,18 +430,25 @@ Mapping details:
   entry limits plus a final `CheckpointMaxTokens` bound before placing that
   material in full or incremental summary requests. Provider failure produces
   explicit `Status: UNKNOWN` material and a `compaction.Result.Warnings` entry.
-- Full and incremental summary requests explicitly include the first and latest
-  real-user anchors available in current history. Selected key events retain
-  the newest 24 candidates in chronological order, and assistant prose without
-  tool/filesystem proof is labeled `UNVERIFIED assistant claim`. The default
-  prompt asks only for verified changed files and continuation-needed files; it
-  no longer requires every analyzed/read file.
+- Full and incremental summary requests use the same
+  `goode.compaction.material.v1` JSON envelope. The first/latest real-user
+  anchors and host checkpoint status are SDK-authored top-level fields; all
+  source Markdown is a separate string field, so headings, fences, quotes, JSON
+  fragments, and frame markers inside user/system/summary text cannot forge
+  validation facts. Selected key events retain the newest 24 candidates in
+  chronological order, and assistant prose without tool/filesystem proof is
+  labeled `UNVERIFIED assistant claim`. The default prompt asks only for
+  verified changed files and continuation-needed files; it does not require
+  every analyzed/read file.
 - Summary output is committed only after an atomic quality gate verifies exactly
   one summary block, all eight required Markdown-heading sections in order with
   non-empty content, supplied UNKNOWN state preservation, basic latest-user/
   external-state coverage. Fact-coverage validation first decodes the exact
-  three-line JSON-string untrusted-material frame; malformed framing fails
-  closed instead of silently disabling source-section checks.
+  three-line JSON-string untrusted-material frame, then strictly validates the
+  versioned inner envelope, including exact case-sensitive field names,
+  non-null string values, unknown/duplicate fields, checkpoint-status enums,
+  and anchor pairing. Malformed framing or structure fails closed instead of
+  silently disabling source-section checks.
   If no canonical heading is found, the rejection includes an exact `## ...`
   syntax hint. Rejection returns structured warnings, preserves the original
   history, and does not update the ledger. Credential filtering is intentionally
