@@ -1959,7 +1959,16 @@ func parseResponses(data []byte) (*llm.Completion, error) {
 func parseResponsesForProvider(provider string, data []byte) (*llm.Completion, error) {
 	var root map[string]any
 	if err := json.Unmarshal(data, &root); err != nil {
-		return nil, err
+		return nil, &llm.ProviderError{
+			Provider: provider,
+			Message:  "Responses response root must be a non-null JSON object: " + err.Error(),
+		}
+	}
+	if root == nil {
+		return nil, &llm.ProviderError{
+			Provider: provider,
+			Message:  "Responses response root must be a non-null JSON object",
+		}
 	}
 
 	blocks := []llm.ContentBlock{}
