@@ -1,6 +1,7 @@
 package openai
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -285,11 +286,11 @@ func TestResponsesOfficialOutputSuffixItemsArePreservedAndReplayable(t *testing.
 	}{
 		{
 			name: "program output",
-			item: `{"type":"program_output","id":"prog_out_123","call_id":"call_prog_123","result":"program-output-sentinel","status":"completed"}`,
+			item: `{"type":"program_output","id":"prog_out_123","call_id":"call_prog_123","result":"program-output-sentinel","status":"completed","future_counter":9007199254740993}`,
 		},
 		{
 			name: "tool search output",
-			item: `{"type":"tool_search_output","id":"tool_search_out_123","call_id":"call_search_123","execution":"server","status":"completed","tools":[],"created_by":"tool-search-sentinel"}`,
+			item: `{"type":"tool_search_output","id":"tool_search_out_123","call_id":"call_search_123","execution":"server","status":"completed","tools":[{"type":"function","name":"lookup","parameters":{"type":"object","properties":{"id":{"type":"integer","minimum":9007199254740993}}},"strict":true}],"created_by":"tool-search-sentinel"}`,
 		},
 	}
 	for _, tc := range tests {
@@ -351,7 +352,7 @@ func assertResponsesOfficialOutputItemState(t *testing.T, state []llm.ProviderSt
 	if state[0].Provider != responsesStateProvider || state[0].Kind != responsesOutputItemStateKind {
 		t.Fatalf("provider state identity = %#v", state[0])
 	}
-	if !responsesJSONEqual(state[0].Data, []byte(item)) {
+	if !bytes.Equal(bytes.TrimSpace(state[0].Data), bytes.TrimSpace([]byte(item))) {
 		t.Fatalf("provider state changed: got %s want %s", state[0].Data, item)
 	}
 }
@@ -377,7 +378,7 @@ func assertResponsesOfficialOutputItemReplay(t *testing.T, state []llm.ProviderS
 	if err := json.Unmarshal(wire, &payload); err != nil {
 		t.Fatal(err)
 	}
-	if len(payload.Input) != 1 || !responsesJSONEqual(payload.Input[0], []byte(item)) {
+	if len(payload.Input) != 1 || !bytes.Equal(bytes.TrimSpace(payload.Input[0]), bytes.TrimSpace([]byte(item))) {
 		t.Fatalf("official output item was not replayed exactly once: %s", wire)
 	}
 }

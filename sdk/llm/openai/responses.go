@@ -280,7 +280,7 @@ const (
 
 func (r responsesRequest) MarshalJSON() ([]byte, error) {
 	type alias responsesRequest
-	base := map[string]any{}
+	base := map[string]json.RawMessage{}
 	b, err := json.Marshal(alias(r))
 	if err != nil {
 		return nil, err
@@ -290,7 +290,11 @@ func (r responsesRequest) MarshalJSON() ([]byte, error) {
 	}
 	for k, v := range r.Extra {
 		if v != nil {
-			base[k] = v
+			encoded, err := json.Marshal(v)
+			if err != nil {
+				return nil, fmt.Errorf("openai responses: encode extra field %q: %w", k, err)
+			}
+			base[k] = encoded
 		}
 	}
 	return json.Marshal(base)

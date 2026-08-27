@@ -57,6 +57,9 @@ stream normalization, and response metadata behavior.
   content, and non-assistant message roles are rejected explicitly. Validation
   does not infer direction from an `_output` suffix: official output items such
   as `program_output` and `tool_search_output` remain opaque and replayable.
+  Request-level extra fields are merged through `json.RawMessage`; opaque items
+  are never decoded through `map[string]any`, which would round integers above
+  `2^53` or reorder provider-owned object fields.
 - Opaque Responses state is bounded to 1,024 items and 8 MiB per response and
   per outgoing manual history. It is included in token/compaction estimates and
   fails closed when externally restored state is malformed or attached to a
