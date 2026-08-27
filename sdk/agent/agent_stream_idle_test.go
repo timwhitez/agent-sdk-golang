@@ -72,7 +72,7 @@ func TestQueryStreamAutoRecoversFromIdleStream(t *testing.T) {
 	})
 
 	model := &streamIdleRecoveryModel{}
-	ag, err := New(Config{LLM: model})
+	ag, err := New(Config{LLM: model, StreamIdleMaxRecoveries: -1})
 	if err != nil {
 		t.Fatalf("new agent: %v", err)
 	}
@@ -117,7 +117,7 @@ func TestQueryStreamAutoRecoversFromIdleStreamWithPartialText(t *testing.T) {
 	})
 
 	model := &streamIdleRecoveryModel{partialFirst: true}
-	ag, err := New(Config{LLM: model})
+	ag, err := New(Config{LLM: model, StreamIdleMaxRecoveries: 2})
 	if err != nil {
 		t.Fatalf("new agent: %v", err)
 	}
@@ -167,7 +167,7 @@ func TestQueryStreamIdleRecoveryEventuallySurfacesError(t *testing.T) {
 	})
 
 	model := &streamIdleForeverModel{}
-	ag, err := New(Config{LLM: model})
+	ag, err := New(Config{LLM: model, StreamIdleMaxRecoveries: 1})
 	if err != nil {
 		t.Fatalf("new agent: %v", err)
 	}
@@ -193,5 +193,47 @@ func TestQueryStreamIdleRecoveryEventuallySurfacesError(t *testing.T) {
 	}
 	if got := model.calls.Load(); got != 2 {
 		t.Fatalf("expected one silent recovery before final error, got %d calls", got)
+	}
+}
+
+func TestQueryStreamIdleZeroDisablesRecovery(t *testing.T) {
+	origTimeout := agentStreamIdleTimeout
+	origRecoveries := agentStreamIdleMaxRecoveries
+	agentStreamIdleTimeout = 20 * time.Millisecond
+	agentStreamIdleMaxRecoveries = 2
+	t.Cleanup(func() {
+		agentStreamIdleTimeout = origTimeout
+		agentStreamIdleMaxRecoveries = origRecoveries
+	})
+
+	model := &streamIdleForeverModel{}
+	ag, err := New(Config{LLM: model, StreamIdleMaxRecoveries: 0})
+	if err != nil {
+		t.Fatalf("new agent: %v", err)
+	}
+
+	events := collectEvents(ag.QueryStream(context.Background(), llm.TextContent("hello")))
+	var errEvent ErrorEvent
+	found := false
+	for _, ev := range events {
+		if e, ok := ev.(ErrorEvent); ok {
+			errEvent = e
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Fatalf("expected first idle timeout to terminate the query, got events=%#v", events)
+	}
+	if errEvent.Kind != "timeout" || errEvent.StallRecoveries != 0 {
+		t.Fatalf("unexpected zero-recovery error: %#v", errEvent)
+	}
+	if got := model.calls.Load(); got != 1 {
+		t.Fatalf("configured zero made %d provider calls, want exactly one", got)
+	}
+	for _, message := range ag.Messages() {
+		if message.Name == "sdk_internal_stream_idle_recovery" {
+			t.Fatalf("zero recovery injected an internal retry message: %#v", ag.Messages())
+		}
 	}
 }

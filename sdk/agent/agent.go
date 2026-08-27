@@ -728,7 +728,7 @@ func (a *Agent) QueryStreamWithSteering(ctx context.Context, input llm.Content, 
 				var idleErr *llm.StreamIdleTimeoutError
 				if errors.As(err, &idleErr) {
 					maxRecov := agentStreamIdleMaxRecoveries
-					if a != nil && a.streamIdleMaxRecov > 0 {
+					if a != nil {
 						maxRecov = a.streamIdleMaxRecov
 					}
 					if streamIdleRecoveries < maxRecov {
