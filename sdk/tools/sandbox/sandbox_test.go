@@ -1798,7 +1798,12 @@ func TestWebfetchToolBlocksPrivateDestination(t *testing.T) {
 }
 
 func TestWebfetchToolBlocksRedirectToPrivateDestination(t *testing.T) {
-	useSandboxPublicWebfetchResolver(t)
+	useSandboxWebfetchResolver(t, func(_ context.Context, host string) ([]net.IPAddr, error) {
+		if host == "public.test" {
+			return []net.IPAddr{{IP: net.ParseIP("10.20.30.40")}}, nil
+		}
+		return nil, fmt.Errorf("lookup %s: no such host", host)
+	})
 
 	origDo := webfetchDoRequest
 	var calls int
@@ -1807,7 +1812,7 @@ func TestWebfetchToolBlocksRedirectToPrivateDestination(t *testing.T) {
 		if calls > 1 {
 			t.Fatalf("redirect request should not run for blocked private destination")
 		}
-		redirectRequest, requestErr := http.NewRequestWithContext(r.Context(), http.MethodGet, "http://internal.test/private", nil)
+		redirectRequest, requestErr := http.NewRequestWithContext(r.Context(), http.MethodGet, "http://public.test/private", nil)
 		if requestErr != nil {
 			return nil, requestErr
 		}

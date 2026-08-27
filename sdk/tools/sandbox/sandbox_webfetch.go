@@ -119,6 +119,17 @@ func webfetchTool() tools.Tool {
 			if req == nil || req.URL == nil {
 				return fmt.Errorf("invalid redirect target")
 			}
+			if len(via) == 0 || via[len(via)-1] == nil || via[len(via)-1].URL == nil {
+				return fmt.Errorf("invalid redirect source")
+			}
+			previous := via[len(via)-1].URL
+			if !sameWebfetchOrigin(previous, req.URL) {
+				return fmt.Errorf(
+					"redirect target changes origin from %s to %s; retry the target URL directly so the new origin is confirmed",
+					webfetchOriginLabel(previous),
+					webfetchOriginLabel(req.URL),
+				)
+			}
 			return validateWebfetchDestinationURL(req.Context(), req.URL, "redirect target")
 		}
 		req, err := http.NewRequestWithContext(ctx, method, rawURL, nil)
@@ -208,6 +219,9 @@ func validateWebfetchPreConfirmationURL(target *url.URL, stage string) error {
 	if target == nil {
 		return fmt.Errorf("invalid url: missing host")
 	}
+	if target.User != nil {
+		return fmt.Errorf("%s must not include embedded URL credentials; remove userinfo and retry with an explicitly confirmed header", stage)
+	}
 	host := strings.TrimSpace(target.Hostname())
 	if host == "" {
 		return fmt.Errorf("invalid url: missing host")
@@ -220,10 +234,52 @@ func validateWebfetchPreConfirmationURL(target *url.URL, stage string) error {
 	return nil
 }
 
+func sameWebfetchOrigin(left, right *url.URL) bool {
+	if left == nil || right == nil {
+		return false
+	}
+	return strings.EqualFold(strings.TrimSpace(left.Scheme), strings.TrimSpace(right.Scheme)) &&
+		strings.EqualFold(strings.TrimSpace(left.Hostname()), strings.TrimSpace(right.Hostname())) &&
+		webfetchEffectivePort(left) == webfetchEffectivePort(right)
+}
+
+func webfetchEffectivePort(target *url.URL) string {
+	if target == nil {
+		return ""
+	}
+	if port := strings.TrimSpace(target.Port()); port != "" {
+		return port
+	}
+	switch strings.ToLower(strings.TrimSpace(target.Scheme)) {
+	case "http":
+		return "80"
+	case "https":
+		return "443"
+	default:
+		return ""
+	}
+}
+
+func webfetchOriginLabel(target *url.URL) string {
+	if target == nil {
+		return "(invalid origin)"
+	}
+	scheme := strings.ToLower(strings.TrimSpace(target.Scheme))
+	host := strings.ToLower(strings.TrimSpace(target.Hostname()))
+	port := webfetchEffectivePort(target)
+	if host == "" || port == "" {
+		return "(invalid origin)"
+	}
+	return scheme + "://" + net.JoinHostPort(host, port)
+}
+
 // validateWebfetchDestinationURL validates that a URL destination is safe.
 func validateWebfetchDestinationURL(ctx context.Context, target *url.URL, stage string) error {
 	if target == nil {
 		return fmt.Errorf("invalid url: missing host")
+	}
+	if target.User != nil {
+		return fmt.Errorf("%s must not include embedded URL credentials", stage)
 	}
 	host := strings.TrimSpace(target.Hostname())
 	if host == "" {
