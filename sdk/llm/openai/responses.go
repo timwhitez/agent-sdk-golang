@@ -1961,6 +1961,9 @@ func parseResponsesForProvider(provider string, data []byte) (*llm.Completion, e
 	if err := json.Unmarshal(data, &root); err != nil {
 		return nil, err
 	}
+	if root == nil {
+		return nil, fmt.Errorf("openai responses: response root must be a non-null JSON object")
+	}
 
 	blocks := []llm.ContentBlock{}
 	thinkingParts := []string{}
