@@ -145,6 +145,7 @@ func TestWebfetchRedirectErrorSanitizesCredentialBearingLocation(t *testing.T) {
 	}{
 		{name: "cross origin", location: "https://audit-user:audit-password@other.test/private?token=audit-query-secret", wantOrigin: "other.test:443"},
 		{name: "same origin userinfo", location: "https://audit-user:audit-password@example.test/private?token=audit-query-secret", wantOrigin: "example.test:443"},
+		{name: "malformed location", location: "https://audit-user:audit-password@other.test/%zz?token=audit-query-secret", wantOrigin: "example.test:443"},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
