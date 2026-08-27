@@ -109,7 +109,7 @@ func responsesProviderStateFromRawItems(items []json.RawMessage) ([]llm.Provider
 
 func validateResponsesOutputItem(index int, itemType string, item map[string]json.RawMessage) error {
 	itemType = strings.TrimSpace(itemType)
-	if strings.HasPrefix(itemType, "input_") || strings.HasSuffix(itemType, "_output") || itemType == "item_reference" {
+	if responsesOutputItemTypeIsInputOnly(itemType) {
 		return fmt.Errorf("openai responses: output item %d uses input-only type %q", index, itemType)
 	}
 	if itemType != "message" {
@@ -139,6 +139,19 @@ func validateResponsesOutputItem(index int, itemType string, item map[string]jso
 		}
 	}
 	return nil
+}
+
+func responsesOutputItemTypeIsInputOnly(itemType string) bool {
+	itemType = strings.TrimSpace(itemType)
+	if strings.HasPrefix(itemType, "input_") {
+		return true
+	}
+	switch itemType {
+	case "function_call_output", "item_reference":
+		return true
+	default:
+		return false
+	}
 }
 
 func responsesOutputItemsFromMessage(message llm.Message) ([]json.RawMessage, bool, error) {

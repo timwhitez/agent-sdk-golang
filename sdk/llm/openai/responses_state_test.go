@@ -5,6 +5,8 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net/http"
+	"net/http/httptest"
 	"strings"
 	"testing"
 
@@ -273,6 +275,110 @@ func TestResponsesRestoredOutputItemsRejectInputInjection(t *testing.T) {
 	}
 	if !strings.Contains(string(wire), `"role":"assistant"`) || !strings.Contains(string(wire), `"type":"output_text"`) {
 		t.Fatalf("valid restored item was not replayed: %s", wire)
+	}
+}
+
+func TestResponsesOfficialOutputSuffixItemsArePreservedAndReplayable(t *testing.T) {
+	tests := []struct {
+		name string
+		item string
+	}{
+		{
+			name: "program output",
+			item: `{"type":"program_output","id":"prog_out_123","call_id":"call_prog_123","result":"program-output-sentinel","status":"completed"}`,
+		},
+		{
+			name: "tool search output",
+			item: `{"type":"tool_search_output","id":"tool_search_out_123","call_id":"call_search_123","execution":"server","status":"completed","tools":[],"created_by":"tool-search-sentinel"}`,
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Run("buffered", func(t *testing.T) {
+				server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+					w.Header().Set("Content-Type", "application/json")
+					_, _ = w.Write([]byte(`{"id":"resp_output_item","status":"completed","output":[` + tc.item + `]}`))
+				}))
+				defer server.Close()
+				client := &ResponsesClient{HTTPClient: server.Client(), BaseURL: server.URL, ModelName: "test-model", MaxRetries: 1}
+				completion, err := client.Invoke(context.Background(), llm.InvokeRequest{Messages: []llm.Message{llm.NewUserMessage("hello")}})
+				if err != nil {
+					t.Fatal(err)
+				}
+				state := responsesProviderStateFromCompletion(t, completion)
+				assertResponsesOfficialOutputItemState(t, state, tc.item)
+				assertResponsesOfficialOutputItemReplay(t, state, tc.item)
+			})
+
+			t.Run("streaming", func(t *testing.T) {
+				server := openAIStreamFixture(t,
+					`{"type":"response.output_item.done","output_index":0,"item":`+tc.item+`}`,
+					`{"type":"response.completed","response":{"id":"resp_output_item","status":"completed","output":[`+tc.item+`]}}`,
+				)
+				defer server.Close()
+				client := &ResponsesClient{HTTPClient: server.Client(), BaseURL: server.URL, ModelName: "test-model", MaxRetries: 1}
+				stream, err := client.InvokeStream(context.Background(), llm.InvokeRequest{Messages: []llm.Message{llm.NewUserMessage("hello")}})
+				if err != nil {
+					t.Fatal(err)
+				}
+				var state []llm.ProviderState
+				sawDone := false
+				for _, event := range collectOpenAIStream(stream) {
+					switch typed := event.(type) {
+					case llm.StreamProviderStateEvent:
+						state = append(state, typed.State...)
+					case llm.StreamDoneEvent:
+						sawDone = true
+					case llm.StreamErrorEvent:
+						t.Fatalf("unexpected stream error: %v", typed.AsError())
+					}
+				}
+				if !sawDone {
+					t.Fatal("stream did not complete")
+				}
+				assertResponsesOfficialOutputItemState(t, state, tc.item)
+				assertResponsesOfficialOutputItemReplay(t, state, tc.item)
+			})
+		})
+	}
+}
+
+func assertResponsesOfficialOutputItemState(t *testing.T, state []llm.ProviderState, item string) {
+	t.Helper()
+	if len(state) != 1 {
+		t.Fatalf("provider state count = %d, want 1", len(state))
+	}
+	if state[0].Provider != responsesStateProvider || state[0].Kind != responsesOutputItemStateKind {
+		t.Fatalf("provider state identity = %#v", state[0])
+	}
+	if !responsesJSONEqual(state[0].Data, []byte(item)) {
+		t.Fatalf("provider state changed: got %s want %s", state[0].Data, item)
+	}
+}
+
+func assertResponsesOfficialOutputItemReplay(t *testing.T, state []llm.ProviderState, item string) {
+	t.Helper()
+	useItems := true
+	client := &ResponsesClient{ModelName: "test-model"}
+	built, err := client.buildRequest(llm.InvokeRequest{
+		Messages:  []llm.Message{responsesStateMessage(t, llm.RoleAssistant, state)},
+		Responses: &llm.ResponsesOptions{UseResponseItems: &useItems},
+	})
+	if err != nil {
+		t.Fatalf("restored official output item was rejected: %v", err)
+	}
+	wire, err := json.Marshal(built)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var payload struct {
+		Input []json.RawMessage `json:"input"`
+	}
+	if err := json.Unmarshal(wire, &payload); err != nil {
+		t.Fatal(err)
+	}
+	if len(payload.Input) != 1 || !responsesJSONEqual(payload.Input[0], []byte(item)) {
+		t.Fatalf("official output item was not replayed exactly once: %s", wire)
 	}
 }
 

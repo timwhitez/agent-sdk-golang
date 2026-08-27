@@ -53,6 +53,10 @@ stream normalization, and response metadata behavior.
   matching `function_call_output` items. Legacy message mode fails closed rather
   than silently dropping opaque state. Buffered and streaming clients use the
   same path, including `id`, `call_id`, `phase`, and `encrypted_content` fields.
+  Restored input-only `function_call_output`, `item_reference`, `input_*`
+  content, and non-assistant message roles are rejected explicitly. Validation
+  does not infer direction from an `_output` suffix: official output items such
+  as `program_output` and `tool_search_output` remain opaque and replayable.
 - Opaque Responses state is bounded to 1,024 items and 8 MiB per response and
   per outgoing manual history. It is included in token/compaction estimates and
   fails closed when externally restored state is malformed or attached to a
