@@ -445,9 +445,10 @@ Mapping details:
   non-empty content, supplied UNKNOWN state preservation, basic latest-user/
   external-state coverage. Fact-coverage validation first decodes the exact
   three-line JSON-string untrusted-material frame, then strictly validates the
-  versioned inner envelope, including unknown/duplicate fields and anchor
-  pairing. Malformed framing or structure fails closed instead of silently
-  disabling source-section checks.
+  versioned inner envelope, including exact case-sensitive field names,
+  non-null string values, unknown/duplicate fields, checkpoint-status enums,
+  and anchor pairing. Malformed framing or structure fails closed instead of
+  silently disabling source-section checks.
   If no canonical heading is found, the rejection includes an exact `## ...`
   syntax hint. Rejection returns structured warnings, preserves the original
   history, and does not update the ledger. Credential filtering is intentionally

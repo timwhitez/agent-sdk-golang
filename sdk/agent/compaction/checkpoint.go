@@ -177,10 +177,14 @@ func renderCheckpointContext(snapshot CheckpointContext, maxTokens int, estimate
 
 func checkpointContextStatus(snapshot CheckpointContext) string {
 	status := strings.ToUpper(strings.TrimSpace(snapshot.Status))
-	if status == "" {
+	switch status {
+	case "":
 		return CheckpointStatusVerified
+	case CheckpointStatusVerified, CheckpointStatusUnverified, CheckpointStatusUnknown:
+		return status
+	default:
+		return CheckpointStatusUnknown
 	}
-	return status
 }
 
 func writeCheckpointValue(b *strings.Builder, label string, value CheckpointValue, estimate tokenEstimator) {

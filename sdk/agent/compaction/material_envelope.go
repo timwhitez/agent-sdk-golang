@@ -55,7 +55,7 @@ func wrapCompactionMaterial(material string, anchors realUserAnchors, hostCheckp
 		Schema:                compactionMaterialSchemaV1,
 		FirstRealUserRequest:  cloneStringPointer(anchors.First),
 		LatestRealUserRequest: cloneStringPointer(anchors.Latest),
-		HostCheckpointStatus:  strings.ToUpper(strings.TrimSpace(hostCheckpointStatus)),
+		HostCheckpointStatus:  normalizeCompactionHostCheckpointStatus(hostCheckpointStatus),
 		Material:              material,
 	}
 	encoded, _ := json.Marshal(envelope)
@@ -71,7 +71,7 @@ func decodeCompactionMaterialEnvelope(material string) (compactionMaterialEnvelo
 	if !framed {
 		return compactionMaterialEnvelope{Material: decoded}, false, nil
 	}
-	if err := rejectDuplicateCompactionEnvelopeKeys(decoded); err != nil {
+	if err := validateCompactionEnvelopeObject(decoded); err != nil {
 		return compactionMaterialEnvelope{}, true, err
 	}
 	decoder := json.NewDecoder(bytes.NewBufferString(decoded))
@@ -89,13 +89,16 @@ func decodeCompactionMaterialEnvelope(material string) (compactionMaterialEnvelo
 	if (envelope.FirstRealUserRequest == nil) != (envelope.LatestRealUserRequest == nil) {
 		return compactionMaterialEnvelope{}, true, fmt.Errorf("first/latest real-user anchors must either both be present or both be absent")
 	}
+	if !validCompactionHostCheckpointStatus(envelope.HostCheckpointStatus) {
+		return compactionMaterialEnvelope{}, true, fmt.Errorf("invalid host checkpoint status %q", envelope.HostCheckpointStatus)
+	}
 	if strings.TrimSpace(envelope.Material) == "" {
 		return compactionMaterialEnvelope{}, true, fmt.Errorf("compaction material body is empty")
 	}
 	return envelope, true, nil
 }
 
-func rejectDuplicateCompactionEnvelopeKeys(data string) error {
+func validateCompactionEnvelopeObject(data string) error {
 	decoder := json.NewDecoder(strings.NewReader(data))
 	start, err := decoder.Token()
 	if err != nil {
@@ -103,6 +106,13 @@ func rejectDuplicateCompactionEnvelopeKeys(data string) error {
 	}
 	if delimiter, ok := start.(json.Delim); !ok || delimiter != '{' {
 		return fmt.Errorf("payload must be a JSON object")
+	}
+	allowed := map[string]struct{}{
+		"schema":                   {},
+		"first_real_user_request":  {},
+		"latest_real_user_request": {},
+		"host_checkpoint_status":   {},
+		"material":                 {},
 	}
 	seen := map[string]struct{}{}
 	for decoder.More() {
@@ -114,6 +124,9 @@ func rejectDuplicateCompactionEnvelopeKeys(data string) error {
 		if !ok {
 			return fmt.Errorf("compaction material object key must be a string")
 		}
+		if _, allowedKey := allowed[key]; !allowedKey {
+			return fmt.Errorf("unknown compaction material field %q", key)
+		}
 		if _, duplicate := seen[key]; duplicate {
 			return fmt.Errorf("duplicate compaction material field %q", key)
 		}
@@ -122,11 +135,46 @@ func rejectDuplicateCompactionEnvelopeKeys(data string) error {
 		if err := decoder.Decode(&value); err != nil {
 			return fmt.Errorf("decode compaction material field %q: %w", key, err)
 		}
+		if bytes.Equal(bytes.TrimSpace(value), []byte("null")) {
+			return fmt.Errorf("compaction material field %q must not be null", key)
+		}
+		var stringValue string
+		if err := json.Unmarshal(value, &stringValue); err != nil {
+			return fmt.Errorf("compaction material field %q must be a string: %w", key, err)
+		}
+		if key == "host_checkpoint_status" && stringValue == "" {
+			return fmt.Errorf("compaction material field %q must not be empty when present", key)
+		}
 	}
 	if _, err := decoder.Token(); err != nil {
 		return fmt.Errorf("close compaction material object: %w", err)
 	}
-	return ensureJSONDecoderEOF(decoder)
+	if err := ensureJSONDecoderEOF(decoder); err != nil {
+		return err
+	}
+	for _, required := range []string{"schema", "material"} {
+		if _, ok := seen[required]; !ok {
+			return fmt.Errorf("missing required compaction material field %q", required)
+		}
+	}
+	return nil
+}
+
+func normalizeCompactionHostCheckpointStatus(status string) string {
+	status = strings.ToUpper(strings.TrimSpace(status))
+	if validCompactionHostCheckpointStatus(status) {
+		return status
+	}
+	return CheckpointStatusUnknown
+}
+
+func validCompactionHostCheckpointStatus(status string) bool {
+	switch status {
+	case "", CheckpointStatusVerified, CheckpointStatusUnverified, CheckpointStatusUnknown:
+		return true
+	default:
+		return false
+	}
 }
 
 func ensureJSONDecoderEOF(decoder *json.Decoder) error {
