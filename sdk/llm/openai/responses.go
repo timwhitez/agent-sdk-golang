@@ -694,6 +694,18 @@ func (c *ResponsesClient) InvokeStream(ctx context.Context, req llm.InvokeReques
 				emitToolIdentity(idx, itemID, "")
 				return nil
 			}
+			recordStreamItemID := func(idx int, itemID string) error {
+				itemID = strings.TrimSpace(itemID)
+				if itemID == "" {
+					return nil
+				}
+				st := ensureToolState(idx)
+				if st.itemID != "" && st.itemID != itemID {
+					return fmt.Errorf("openai responses stream: tool index %d changed item_id from %q to %q", idx, st.itemID, itemID)
+				}
+				st.itemID = itemID
+				return nil
+			}
 
 			stopReason := ""
 			sawCompleted := false
@@ -881,6 +893,9 @@ func (c *ResponsesClient) InvokeStream(ctx context.Context, req llm.InvokeReques
 						if indexErr != nil {
 							return indexErr
 						}
+						if itemErr := recordStreamItemID(idx, itemID); itemErr != nil {
+							return itemErr
+						}
 						st := ensureToolState(idx)
 						if promoteErr := promoteCompatibilityItemID(idx, itemID); promoteErr != nil {
 							return promoteErr
@@ -909,6 +924,9 @@ func (c *ResponsesClient) InvokeStream(ctx context.Context, req llm.InvokeReques
 						idx, indexErr := bindToolIndex(itemID, "", autoKey, idxHint, hasIdxHint)
 						if indexErr != nil {
 							return indexErr
+						}
+						if itemErr := recordStreamItemID(idx, itemID); itemErr != nil {
+							return itemErr
 						}
 						if promoteErr := promoteCompatibilityItemID(idx, itemID); promoteErr != nil {
 							return promoteErr

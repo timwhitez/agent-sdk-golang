@@ -515,3 +515,55 @@ func TestResponsesStreamKeepsItemAndCallIDNamespacesSeparate(t *testing.T) {
 		t.Fatalf("second tool identity collapsed: names=%#v args=%#v ids=%#v", names, args, ids)
 	}
 }
+
+func TestResponsesStreamRejectsIdentityFirstItemIDConflict(t *testing.T) {
+	t.Parallel()
+	body := strings.Join([]string{
+		`data: {"type":"response.output_item.added","output_index":0,"item":{"id":"fc_a","call_id":"call_a","type":"function_call","name":"lookup","arguments":""}}`,
+		"",
+		`data: {"type":"response.function_call_arguments.delta","output_index":0,"item_id":"fc_b","delta":"{\"wrong\":true}"}`,
+		"",
+	}, "\n")
+	assertResponsesStreamItemIDConflict(t, body)
+}
+
+func TestResponsesStreamRejectsDeltaFirstItemIDConflict(t *testing.T) {
+	t.Parallel()
+	body := strings.Join([]string{
+		`data: {"type":"response.function_call_arguments.delta","output_index":0,"item_id":"fc_a","delta":"{\"first\":true}"}`,
+		"",
+		`data: {"type":"response.function_call_arguments.delta","output_index":0,"item_id":"fc_b","delta":"{\"wrong\":true}"}`,
+		"",
+	}, "\n")
+	assertResponsesStreamItemIDConflict(t, body)
+}
+
+func assertResponsesStreamItemIDConflict(t *testing.T, body string) {
+	t.Helper()
+	httpClient := &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		return &http.Response{StatusCode: http.StatusOK, Status: "200 OK", Header: make(http.Header), Body: io.NopCloser(strings.NewReader(body)), Request: r}, nil
+	})}
+	client := &ResponsesClient{HTTPClient: httpClient, BaseURL: "https://example.com", ModelName: "test-model", MaxRetries: 1}
+	ch, err := client.InvokeStream(context.Background(), llm.InvokeRequest{Messages: []llm.Message{{Role: llm.RoleUser, Content: llm.TextContent("hi")}}})
+	if err != nil {
+		t.Fatalf("invoke stream: %v", err)
+	}
+
+	errSeen := false
+	for ev := range ch {
+		switch e := ev.(type) {
+		case llm.StreamToolCallDeltaEvent:
+			if strings.Contains(e.ArgumentsDelta, "wrong") {
+				t.Fatalf("conflicting item arguments were emitted before rejection: %#v", e)
+			}
+		case llm.StreamErrorEvent:
+			errSeen = true
+			if !strings.Contains(e.AsError().Error(), "changed item_id") {
+				t.Fatalf("conflict error = %v", e.AsError())
+			}
+		}
+	}
+	if !errSeen {
+		t.Fatal("conflicting stream item_id did not produce StreamErrorEvent")
+	}
+}
