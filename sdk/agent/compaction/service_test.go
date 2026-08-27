@@ -207,6 +207,142 @@ func TestCompactionQualityGateRejectsMissingRequiredSections(t *testing.T) {
 	}
 }
 
+func TestCompactionQualityGateRequiresUniqueOrderedExactLevelTwoHeadings(t *testing.T) {
+	valid, reasons := validateSummaryEnvelope(structuredTestSummary("", ""))
+	if len(reasons) != 0 {
+		t.Fatalf("valid summary envelope: %v", reasons)
+	}
+	first := requiredSummarySections[0]
+	second := requiredSummarySections[1]
+	tests := []struct {
+		name       string
+		summary    string
+		wantReason string
+	}{
+		{
+			name:       "wrong level",
+			summary:    strings.Replace(valid, "## "+first, "# "+first, 1),
+			wantReason: "missing required section: " + first,
+		},
+		{
+			name:       "missing heading space",
+			summary:    strings.Replace(valid, "## "+first, "##"+first, 1),
+			wantReason: "missing required section: " + first,
+		},
+		{
+			name:       "duplicate",
+			summary:    strings.Replace(valid, "## "+second, "## "+first+"\nduplicate\n\n## "+second, 1),
+			wantReason: "duplicate required section: " + first,
+		},
+		{
+			name: "out of order",
+			summary: strings.Replace(
+				strings.Replace(
+					strings.Replace(valid, "## "+first, "## temporary-first", 1),
+					"## "+second, "## "+first, 1,
+				),
+				"## temporary-first", "## "+second, 1,
+			),
+			wantReason: "required section out of order: " + second,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			reasons := validateRequiredSummarySections(tc.summary)
+			if !strings.Contains(strings.Join(reasons, "; "), tc.wantReason) {
+				t.Fatalf("reasons = %v, want %q", reasons, tc.wantReason)
+			}
+		})
+	}
+}
+
+func TestCompactionQualityGateIgnoresFencedHeadingLookalikes(t *testing.T) {
+	valid, envelopeReasons := validateSummaryEnvelope(structuredTestSummary("", ""))
+	if len(envelopeReasons) != 0 {
+		t.Fatalf("valid summary envelope: %v", envelopeReasons)
+	}
+	fenced := "```markdown\n" + valid + "\n```"
+	reasons := validateRequiredSummarySections(fenced)
+	if len(reasons) == 0 || !strings.Contains(strings.Join(reasons, "; "), "missing required section") {
+		t.Fatalf("fenced heading lookalikes passed validation: %v", reasons)
+	}
+}
+
+func TestCompactionQualityGateIgnoresTildeFencedHeadingLookalikes(t *testing.T) {
+	valid, envelopeReasons := validateSummaryEnvelope(structuredTestSummary("", ""))
+	if len(envelopeReasons) != 0 {
+		t.Fatalf("valid summary envelope: %v", envelopeReasons)
+	}
+	fenced := "~~~markdown\n" + valid + "\n~~~"
+	if reasons := validateRequiredSummarySections(fenced); len(reasons) == 0 {
+		t.Fatal("tilde-fenced heading lookalikes passed validation")
+	}
+}
+
+func TestCompactionQualityGateDoesNotCloseFenceOnUnicodeWhitespace(t *testing.T) {
+	valid, envelopeReasons := validateSummaryEnvelope(structuredTestSummary("", ""))
+	if len(envelopeReasons) != 0 {
+		t.Fatalf("valid summary envelope: %v", envelopeReasons)
+	}
+	fenced := "```markdown\nignored\n```\u00a0\n" + valid
+	if reasons := validateRequiredSummarySections(fenced); len(reasons) == 0 {
+		t.Fatal("non-CommonMark Unicode whitespace closed a code fence")
+	}
+}
+
+func TestCompactionQualityGateAcceptsCRLFHeadings(t *testing.T) {
+	valid, envelopeReasons := validateSummaryEnvelope(structuredTestSummary("", ""))
+	if len(envelopeReasons) != 0 {
+		t.Fatalf("valid summary envelope: %v", envelopeReasons)
+	}
+	if reasons := validateRequiredSummarySections(strings.ReplaceAll(valid, "\n", "\r\n")); len(reasons) != 0 {
+		t.Fatalf("CRLF summary rejected: %v", reasons)
+	}
+}
+
+func TestCompactionQualityGateDoesNotCountAnotherHeadingAsSectionBody(t *testing.T) {
+	valid, envelopeReasons := validateSummaryEnvelope(structuredTestSummary("", ""))
+	if len(envelopeReasons) != 0 {
+		t.Fatalf("valid summary envelope: %v", envelopeReasons)
+	}
+	first := requiredSummarySections[0]
+	withEmptyBody := strings.Replace(valid, "## "+first+"\nuser request preserved", "## "+first+"\n### unrelated heading\ntext", 1)
+	reasons := validateRequiredSummarySections(withEmptyBody)
+	if !strings.Contains(strings.Join(reasons, "; "), "empty required section: "+first) {
+		t.Fatalf("extra heading masqueraded as required-section body: %v", reasons)
+	}
+}
+
+func TestCompactionQualityGateRecognizesIndentedMarkdownHeadingBoundary(t *testing.T) {
+	valid, envelopeReasons := validateSummaryEnvelope(structuredTestSummary("", ""))
+	if len(envelopeReasons) != 0 {
+		t.Fatalf("valid summary envelope: %v", envelopeReasons)
+	}
+	first := requiredSummarySections[0]
+	withEmptyBody := strings.Replace(valid, "## "+first+"\nuser request preserved", "## "+first+"\n   ### indented heading\ntext", 1)
+	reasons := validateRequiredSummarySections(withEmptyBody)
+	if !strings.Contains(strings.Join(reasons, "; "), "empty required section: "+first) {
+		t.Fatalf("indented Markdown heading masqueraded as required-section body: %v", reasons)
+	}
+}
+
+func TestMaterialSectionBodyIgnoresFencedHeadingLookalike(t *testing.T) {
+	material := strings.Join([]string{
+		"```markdown",
+		"## Latest Real User Request",
+		"wrong fenced value",
+		"```",
+		"## Latest Real User Request",
+		"real request",
+		"## Host Checkpoint Context",
+		"Status: VERIFIED",
+	}, "\n")
+	if got := materialSectionBody(material, "Latest Real User Request"); got != "real request" {
+		t.Fatalf("material section body = %q, want real request", got)
+	}
+}
+
 func TestCompactionQualityGateAllowsCredentialLikeSecurityMaterial(t *testing.T) {
 	material := `Cookie: user="adm\\073n" Authorization: Bearer lab-fixture-token`
 	model := mockCompactModel{response: structuredTestSummary("Verification Already Run and Still Required", material)}

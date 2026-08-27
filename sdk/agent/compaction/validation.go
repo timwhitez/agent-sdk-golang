@@ -2,7 +2,6 @@ package compaction
 
 import (
 	"fmt"
-	"regexp"
 	"sort"
 	"strings"
 )
@@ -62,16 +61,23 @@ func validateSummaryFactCoverage(summary, material string) []string {
 }
 
 func materialSectionBody(text, title string) string {
-	re := regexp.MustCompile(`(?mi)^#{1,6}\s*` + regexp.QuoteMeta(title) + `\s*$`)
-	loc := re.FindStringIndex(text)
-	if loc == nil {
+	headings := scanMarkdownHeadings(text)
+	sectionIndex := -1
+	for i, heading := range headings {
+		if heading.line == "## "+title {
+			sectionIndex = i
+			break
+		}
+	}
+	if sectionIndex < 0 {
 		return ""
 	}
-	rest := text[loc[1]:]
-	nextHeading := regexp.MustCompile(`(?m)^#{1,6}\s+.+$`).FindStringIndex(rest)
-	if nextHeading != nil {
-		rest = rest[:nextHeading[0]]
+	section := headings[sectionIndex]
+	bodyEnd := len(text)
+	if sectionIndex+1 < len(headings) {
+		bodyEnd = headings[sectionIndex+1].start
 	}
+	rest := text[section.end:bodyEnd]
 	if end := strings.Index(rest, endUntrustedMaterial); end >= 0 {
 		rest = rest[:end]
 	}
@@ -109,33 +115,151 @@ func validateRequiredSummarySections(summary string) []string {
 	}
 	sections := make([]locatedSection, 0, len(requiredSummarySections))
 	reasons := []string{}
+	headings := scanMarkdownHeadings(summary)
 	last := -1
 	missing := 0
 	for _, title := range requiredSummarySections {
-		re := regexp.MustCompile(`(?mi)^#{1,6}\s*` + regexp.QuoteMeta(title) + `\s*$`)
-		loc := re.FindStringIndex(summary)
-		if loc == nil {
+		exactMatches := make([]markdownHeading, 0, 1)
+		broadMatches := make([]markdownHeading, 0, 1)
+		for _, heading := range headings {
+			if strings.EqualFold(heading.title, title) {
+				broadMatches = append(broadMatches, heading)
+			}
+			if heading.line == "## "+title {
+				exactMatches = append(exactMatches, heading)
+			}
+		}
+		if len(exactMatches) == 0 {
 			missing++
 			reasons = append(reasons, "missing required section: "+title)
+			if len(broadMatches) > 0 {
+				reasons = append(reasons, "required section must use exact level-2 heading: ## "+title)
+			}
 			continue
 		}
-		if loc[0] <= last {
+		if len(exactMatches) > 1 {
+			reasons = append(reasons, "duplicate required section: "+title)
+		}
+		if len(broadMatches) != len(exactMatches) {
+			reasons = append(reasons, "required section must use exact level-2 heading: ## "+title)
+		}
+		loc := exactMatches[0]
+		if loc.start <= last {
 			reasons = append(reasons, "required section out of order: "+title)
 		}
-		last = loc[0]
-		sections = append(sections, locatedSection{title: title, start: loc[0], end: loc[1]})
+		last = loc.start
+		sections = append(sections, locatedSection{title: title, start: loc.start, end: loc.end})
 	}
 	if missing == len(requiredSummarySections) {
 		reasons = append(reasons, "required sections must use exact Markdown heading lines (for example: ## Current Objective and Latest User Request)")
 	}
-	for i, section := range sections {
+	for _, section := range sections {
 		bodyEnd := len(summary)
-		if i+1 < len(sections) {
-			bodyEnd = sections[i+1].start
+		for _, heading := range headings {
+			if heading.start >= section.end {
+				bodyEnd = heading.start
+				break
+			}
 		}
 		if strings.TrimSpace(summary[section.end:bodyEnd]) == "" {
 			reasons = append(reasons, "empty required section: "+section.title)
 		}
 	}
 	return reasons
+}
+
+type markdownHeading struct {
+	line  string
+	title string
+	start int
+	end   int
+}
+
+func scanMarkdownHeadings(text string) []markdownHeading {
+	headings := []markdownHeading{}
+	fenceChar := byte(0)
+	fenceWidth := 0
+	for start := 0; start <= len(text); {
+		lineEnd := strings.IndexByte(text[start:], '\n')
+		next := len(text) + 1
+		if lineEnd < 0 {
+			lineEnd = len(text)
+		} else {
+			lineEnd += start
+			next = lineEnd + 1
+		}
+		line := strings.TrimSuffix(text[start:lineEnd], "\r")
+
+		if marker, width, closing := markdownFenceMarker(line, fenceChar, fenceWidth); marker != 0 {
+			if fenceChar == 0 && !closing {
+				fenceChar = marker
+				fenceWidth = width
+			} else if fenceChar == marker && closing {
+				fenceChar = 0
+				fenceWidth = 0
+			}
+		} else if fenceChar == 0 {
+			headingOffset := 0
+			for headingOffset < len(line) && headingOffset < 4 && line[headingOffset] == ' ' {
+				headingOffset++
+			}
+			if headingOffset > 3 || headingOffset >= len(line) || line[headingOffset] != '#' {
+				if next > len(text) {
+					break
+				}
+				start = next
+				continue
+			}
+			level := 0
+			for headingOffset+level < len(line) && level < 6 && line[headingOffset+level] == '#' {
+				level++
+			}
+			if level > 0 {
+				title := strings.TrimSpace(line[headingOffset+level:])
+				headings = append(headings, markdownHeading{line: line, title: title, start: start, end: min(next, len(text))})
+			}
+		}
+
+		if next > len(text) {
+			break
+		}
+		start = next
+	}
+	return headings
+}
+
+func markdownFenceMarker(line string, active byte, activeWidth int) (marker byte, width int, closing bool) {
+	indent := 0
+	for indent < len(line) && indent < 4 && line[indent] == ' ' {
+		indent++
+	}
+	if indent > 3 || indent >= len(line) {
+		return 0, 0, false
+	}
+	marker = line[indent]
+	if marker != '`' && marker != '~' {
+		return 0, 0, false
+	}
+	for indent+width < len(line) && line[indent+width] == marker {
+		width++
+	}
+	if width < 3 {
+		return 0, 0, false
+	}
+	if active == 0 {
+		return marker, width, false
+	}
+	if marker != active || width < activeWidth || !onlyASCIISpaceOrTab(line[indent+width:]) {
+		return 0, 0, false
+	}
+	return marker, width, true
+}
+
+func onlyASCIISpaceOrTab(text string) bool {
+	for i := 0; i < len(text); i++ {
+		if text[i] != ' ' && text[i] != '\t' {
+			return false
+		}
+	}
+	return true
 }
