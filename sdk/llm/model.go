@@ -76,6 +76,15 @@ type StreamResponseEvent struct {
 
 func (StreamResponseEvent) isStreamEvent() {}
 
+// StreamProviderStateEvent carries opaque provider history for the completed
+// response. Consumers persist it with the assistant message but never render
+// its Data as text.
+type StreamProviderStateEvent struct {
+	State []ProviderState
+}
+
+func (StreamProviderStateEvent) isStreamEvent() {}
+
 // StreamRetryEvent reports a non-fatal provider retry that is about to wait.
 // It lets interactive clients surface backoff progress without treating the
 // transient failure as a terminal stream error.

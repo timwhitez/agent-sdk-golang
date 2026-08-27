@@ -180,6 +180,16 @@ This document summarizes recommended test commands and current coverage focus.
 - `sdk/llm/openai/responses_root_shape_test.go` - buffered parser and HTTP
   invocation reject null, array, and scalar response roots while preserving
   valid object responses.
+- `sdk/llm/openai/responses_agent_history_test.go` drives strict buffered and
+  streaming two-request Agent/tool fixtures that reject continuations unless
+  reasoning and function-call output items are replayed faithfully, including
+  a max-token partial tool-call boundary.
+- `sdk/llm/openai/responses_state_test.go` covers opaque parsing, non-rendering,
+  bounded restore validation, input-item injection rejection, the official
+  `conversation` wire key, stateful option conflicts, `[DONE]` fallback, and
+  streamed/terminal item-conflict rejection. Buffered and streaming fixtures
+  also preserve and replay official `program_output` and `tool_search_output`
+  variants without weakening the explicit input-only rejection matrix.
 - `sdk/llm/openai/responses_terminal_test.go` - buffered and streaming Responses terminal-state, usage/ID ordering, refusal visibility, and typed-error coverage
 - `sdk/llm/anthropic/client_test.go` - usage/response-id mapping, downgrade retries, stream error behavior, retryable error classification, jitter entropy bounds, and tool-ID normalization warning payloads (`sdk/llm/anthropic/client_test.go:47`, `sdk/llm/anthropic/client_test.go:84`, `sdk/llm/anthropic/client_test.go:146`, `sdk/llm/anthropic/client_test.go:654`, `sdk/llm/anthropic/client_test.go:670`)
 - `sdk/llm/anthropic/client_agent_history_test.go` uses a strict two-request

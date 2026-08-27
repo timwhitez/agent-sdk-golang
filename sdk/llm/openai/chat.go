@@ -1125,7 +1125,7 @@ func toChatMessage(m llm.Message) (*messageParam, error) {
 				mp.ToolCalls = append([]llm.ToolCall(nil), m.ToolCalls...)
 			}
 			// content may be empty when tool_calls exist
-			if strings.TrimSpace(m.Content.Text) != "" || len(m.Content.Blocks) > 0 {
+			if strings.TrimSpace(m.Content.Text) != "" || hasProviderNeutralContentBlocks(m.Content) {
 				mp.Content = contentToOpenAI(m.Content)
 			}
 			return mp, nil
@@ -1140,7 +1140,7 @@ func toChatMessage(m llm.Message) (*messageParam, error) {
 }
 
 func contentToOpenAI(c llm.Content) any {
-	if len(c.Blocks) == 0 {
+	if !hasProviderNeutralContentBlocks(c) {
 		return c.Text
 	}
 	parts := make([]map[string]any, 0, len(c.Blocks)+1)
@@ -1148,6 +1148,9 @@ func contentToOpenAI(c llm.Content) any {
 		parts = append(parts, map[string]any{"type": "text", "text": c.Text})
 	}
 	for _, b := range c.Blocks {
+		if llm.IsProviderStateBlock(b) {
+			continue
+		}
 		switch b.Type {
 		case "text":
 			if strings.TrimSpace(b.Text) != "" {
@@ -1171,6 +1174,15 @@ func contentToOpenAI(c llm.Content) any {
 		return c.PlainText()
 	}
 	return parts
+}
+
+func hasProviderNeutralContentBlocks(content llm.Content) bool {
+	for _, block := range content.Blocks {
+		if !llm.IsProviderStateBlock(block) {
+			return true
+		}
+	}
+	return false
 }
 
 func openAIContentFallbackText(block llm.ContentBlock) string {

@@ -483,6 +483,11 @@ func (s *Service) approximateMessageTokens(messages []llm.Message) int {
 			total += s.estimateTextTokens(call.Function.Name)
 			total += s.estimateTextTokens(call.Function.Arguments)
 		}
+		for _, block := range msg.Content.Blocks {
+			if llm.IsProviderStateBlock(block) {
+				total += s.estimateTextTokens(block.Data)
+			}
+		}
 		total += 4
 	}
 	return total
@@ -828,6 +833,7 @@ func prepareForSummary(messages []llm.Message) []llm.Message {
 		if isLast && m.Role == llm.RoleAssistant && len(m.ToolCalls) > 0 {
 			// Remove tool_calls from last assistant message to avoid provider errors.
 			m.ToolCalls = nil
+			m.Content = llm.WithoutProviderState(m.Content)
 			if m.Content.IsEmpty() {
 				continue
 			}
@@ -866,6 +872,7 @@ func repairSummaryToolCallPairs(messages []llm.Message) []llm.Message {
 			out = append(out, messages[i+1:j]...)
 		} else {
 			m.ToolCalls = nil
+			m.Content = llm.WithoutProviderState(m.Content)
 			out = append(out, m)
 		}
 		i = j - 1

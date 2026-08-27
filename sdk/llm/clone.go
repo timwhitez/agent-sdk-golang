@@ -27,6 +27,19 @@ func CloneMessage(message Message) Message {
 	return out
 }
 
+// CloneProviderState returns a deep copy of opaque provider history.
+func CloneProviderState(state []ProviderState) []ProviderState {
+	if state == nil {
+		return nil
+	}
+	out := make([]ProviderState, len(state))
+	for i := range state {
+		out[i] = state[i]
+		out[i].Data = append([]byte(nil), state[i].Data...)
+	}
+	return out
+}
+
 // CloneContent returns a deep copy of message content and its pointer-bearing
 // blocks.
 func CloneContent(content Content) Content {

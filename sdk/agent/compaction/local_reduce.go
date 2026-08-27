@@ -132,6 +132,7 @@ func removeDestroyedToolBlocks(messages []llm.Message) ([]llm.Message, bool) {
 		}
 		if clearedCalls[i] {
 			msg.ToolCalls = nil
+			msg.Content = llm.WithoutProviderState(msg.Content)
 		}
 		out = append(out, msg)
 	}

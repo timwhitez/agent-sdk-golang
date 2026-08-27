@@ -72,10 +72,28 @@ type Content struct {
 	Blocks []ContentBlock `json:"blocks,omitempty"`
 }
 
+// ProviderState carries provider-owned conversation state that must be replayed
+// without interpreting provider fields, but must never be rendered as
+// user-visible content. Provider adapters define their own Provider/Kind values
+// and validate Data before use.
+type ProviderState struct {
+	Provider string          `json:"provider"`
+	Kind     string          `json:"kind"`
+	Data     json.RawMessage `json:"data"`
+}
+
 func TextContent(s string) Content { return Content{Text: s} }
 
 func (c Content) IsEmpty() bool {
-	return strings.TrimSpace(c.Text) == "" && len(c.Blocks) == 0
+	if strings.TrimSpace(c.Text) != "" {
+		return false
+	}
+	for _, block := range c.Blocks {
+		if !IsProviderStateBlock(block) {
+			return false
+		}
+	}
+	return true
 }
 
 func (c Content) PlainText() string {

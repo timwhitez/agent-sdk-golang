@@ -31,6 +31,7 @@ type ResponsesOptions struct {
 	// Instructions sets/overrides the top-level instructions field.
 	Instructions string `json:"-"`
 
+	// ConversationID is serialized on the Responses wire as "conversation".
 	ConversationID string `json:"conversation_id,omitempty"`
 	PromptCacheKey string `json:"prompt_cache_key,omitempty"`
 	Include        []string
