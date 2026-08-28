@@ -170,6 +170,14 @@ Entry point: `QueryStreamWithSteering` (`sdk/agent/agent.go:197`).
 	 synthetic skipped results so provider history remains valid.
    - References: `sdk/agent/agent.go:448`, `sdk/agent/agent.go:959`
 
+   Root-turn cancellation is checked separately at the start of every loop
+   iteration, again at the final provider-admission boundary, and after each
+   tool execution. A tool handler that cancels the root context therefore
+   terminates the turn with a cancellation event: task-complete cannot override
+   it, unstarted sibling calls receive cancellation-specific skipped results
+   without executing, and even context-ignoring providers are not invoked for
+   another request.
+
 10. **Compaction gate and completion decision**
     - Check token thresholds and compact if needed.
     - If no further tool calls are required, emit final response.

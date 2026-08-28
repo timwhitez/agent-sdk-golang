@@ -641,6 +641,13 @@ func (a *Agent) QueryStreamWithSteering(ctx context.Context, input llm.Content, 
 		// tool-loop guards, idle detection, and context cancellation.
 		unlimitedIter := a.maxIterations < 0
 		for iter := 0; unlimitedIter || iter < a.maxIterations; iter++ {
+			// A synchronous tool callback may cancel the turn after returning its
+			// result. Enforce cancellation at the provider-admission boundary so a
+			// context-ignoring model cannot receive one more stale request.
+			if err := ctx.Err(); err != nil {
+				emitErr(a.errEvent(err))
+				return
+			}
 			if a.compactionInFlight.Load() {
 				if err := a.waitForCompactionIdle(ctx, out); err != nil {
 					emitErr(a.errEvent(err))
@@ -676,6 +683,13 @@ func (a *Agent) QueryStreamWithSteering(ctx context.Context, input llm.Content, 
 				case "", "auto":
 					requestToolChoice = llm.ToolChoice("required")
 				}
+			}
+			// Steering delivery and request preparation above can synchronously
+			// unblock a host that cancels the root turn. Recheck at the actual
+			// provider-admission boundary, not only at iteration entry.
+			if err := ctx.Err(); err != nil {
+				emitErr(a.errEvent(err))
+				return
 			}
 			comp, streamedText, err := a.invokeCompletionWithRetryAndSteering(ctx, llm.InvokeRequest{
 				Messages:   messages,
@@ -1120,6 +1134,15 @@ func (a *Agent) QueryStreamWithSteering(ctx context.Context, input llm.Content, 
 			// once every tool_use in the block has a matching tool_result.
 			var pendingBlockMessages []llm.Message
 			for idx, tc := range comp.ToolCalls {
+				if err := ctx.Err(); err != nil {
+					// Close every unstarted tool call before terminating so a later
+					// turn never inherits an unpaired assistant tool-call block.
+					a.appendCancellationSkippedToolResults(comp.ToolCalls[idx:])
+					a.appendMessages(pendingBlockMessages)
+					pendingBlockMessages = nil
+					emitErr(a.errEvent(err))
+					return
+				}
 				step := idx + 1
 				originalName := tc.Function.Name
 
@@ -1285,6 +1308,13 @@ func (a *Agent) QueryStreamWithSteering(ctx context.Context, input llm.Content, 
 				ctxTool, finishToolStage := a.beginSteeringInterruptibleStage(ctxToolBase)
 				content, toolErr := a.executeToolSafely(ctxTool, tool, execArgs)
 				stageInterruptedForSteering := finishToolStage()
+				rootCancelErr := ctx.Err()
+				if rootCancelErr != nil {
+					// Root cancellation outranks a tool's ordinary or task-complete
+					// return. Keep a contiguous result for this call, then terminate.
+					toolErr = rootCancelErr
+					content = llm.TextContent("Tool execution canceled before turn continuation: " + rootCancelErr.Error())
+				}
 				isError := toolErr != nil
 				if unknownToolFallback {
 					isError = true
@@ -1307,7 +1337,7 @@ func (a *Agent) QueryStreamWithSteering(ctx context.Context, input llm.Content, 
 
 				// Tool completion special-case.
 				var tce *tools.TaskCompleteError
-				if errors.As(toolErr, &tce) {
+				if rootCancelErr == nil && errors.As(toolErr, &tce) {
 					isError = false
 					status = "completed"
 					content = llm.TextContent("Task completed: " + tce.Message)
@@ -1319,6 +1349,13 @@ func (a *Agent) QueryStreamWithSteering(ctx context.Context, input llm.Content, 
 					a.mu.Unlock()
 					a.emitToolResultWithAccounting(out, ToolResultEvent{Tool: resolvedName, Result: content.PlainText(), ToolCallID: tc.ID, IsError: false, Metadata: meta}, originalResult, time.Since(start))
 					a.emitEvent(out, StepCompleteEvent{StepID: tc.ID, Status: status, DurationMS: time.Since(start).Milliseconds()})
+					if err := ctx.Err(); err != nil {
+						a.appendCancellationSkippedToolResults(comp.ToolCalls[idx+1:])
+						a.appendMessages(pendingBlockMessages)
+						pendingBlockMessages = nil
+						emitErr(a.errEvent(err))
+						return
+					}
 					// The turn ends here, but the assistant tool-call block must
 					// still be closed: a parallel `done` that is not the last
 					// call would otherwise leave tool_use blocks with no result,
@@ -1357,6 +1394,16 @@ func (a *Agent) QueryStreamWithSteering(ctx context.Context, input llm.Content, 
 
 				a.emitToolResultWithAccounting(out, ToolResultEvent{Tool: resolvedName, Result: content.PlainText(), ToolCallID: tc.ID, IsError: isError, Metadata: meta}, originalResult, time.Since(start))
 				a.emitEvent(out, StepCompleteEvent{StepID: tc.ID, Status: status, DurationMS: time.Since(start).Milliseconds()})
+				if rootCancelErr == nil {
+					rootCancelErr = ctx.Err()
+				}
+				if rootCancelErr != nil {
+					a.appendCancellationSkippedToolResults(comp.ToolCalls[idx+1:])
+					a.appendMessages(pendingBlockMessages)
+					pendingBlockMessages = nil
+					emitErr(a.errEvent(rootCancelErr))
+					return
+				}
 				if strings.EqualFold(strings.TrimSpace(resolvedName), "done") {
 					requireDoneRecoveryDisableThinkingActive = false
 				}
@@ -1843,9 +1890,15 @@ func (a *Agent) invokeCompletionWithSteering(ctx context.Context, req llm.Invoke
 		}
 		req.Messages = repaired
 	}
+	if err := ctx.Err(); err != nil {
+		return nil, false, err
+	}
 	if sm, ok := a.llm.(llm.StreamingChatModel); ok {
 		invokeCtx, finishStage := a.beginSteeringInterruptibleStage(ctx)
 		defer finishStage()
+		if err := invokeCtx.Err(); err != nil {
+			return nil, false, err
+		}
 		finishProviderStage := func(comp *llm.Completion, streamedText bool, fallbackErr error) (*llm.Completion, bool, error) {
 			stageInterruptedForSteering := finishStage()
 			if ctx.Err() == nil && stageInterruptedForSteering {
@@ -2060,6 +2113,10 @@ func (a *Agent) invokeCompletionWithSteering(ctx context.Context, req llm.Invoke
 		}
 	}
 	invokeCtx, finishStage := a.beginSteeringInterruptibleStage(ctx)
+	if err := invokeCtx.Err(); err != nil {
+		finishStage()
+		return nil, false, err
+	}
 	comp, err := a.llm.Invoke(invokeCtx, req)
 	stageInterruptedForSteering := finishStage()
 	if ctx.Err() == nil && stageInterruptedForSteering {
@@ -2067,6 +2124,9 @@ func (a *Agent) invokeCompletionWithSteering(ctx context.Context, req llm.Invoke
 			return comp, false, &llm.SteeringInterruptError{Message: msg.Content}
 		}
 		return comp, false, &llm.SteeringInterruptError{}
+	}
+	if err == nil && ctx.Err() != nil {
+		err = ctx.Err()
 	}
 	return comp, false, err
 }
@@ -2091,6 +2151,9 @@ func (a *Agent) invokeCompletionWithRetryAndSteering(ctx context.Context, req ll
 	var lastStreamed bool
 	var lastErr error
 	for attempt := 1; attempt <= maxAttempts; attempt++ {
+		if err := ctx.Err(); err != nil {
+			return lastComp, lastStreamed, err
+		}
 		comp, streamedText, err := a.invokeCompletionWithSteering(ctx, req, out, steeringCh)
 		if err == nil {
 			return comp, streamedText, nil
@@ -2263,9 +2326,19 @@ func (a *Agent) appendTurnEndSkippedToolResults(calls []llm.ToolCall) {
 	a.appendMessages(skippedToolResults(calls, toolSkippedByTurnEndText))
 }
 
+// appendCancellationSkippedToolResults closes a tool-call block whose
+// remaining calls were never executed because the root turn was canceled.
+func (a *Agent) appendCancellationSkippedToolResults(calls []llm.ToolCall) {
+	if a == nil || len(calls) == 0 {
+		return
+	}
+	a.appendMessages(skippedToolResults(calls, toolSkippedByCancellationText))
+}
+
 const (
-	toolSkippedBySteeringText = "[INFO] Tool call skipped because user steering changed the current direction before execution."
-	toolSkippedByTurnEndText  = "[INFO] Tool call skipped because the task was completed before this call ran."
+	toolSkippedBySteeringText     = "[INFO] Tool call skipped because user steering changed the current direction before execution."
+	toolSkippedByTurnEndText      = "[INFO] Tool call skipped because the task was completed before this call ran."
+	toolSkippedByCancellationText = "[ERROR] Tool call skipped because the active turn was canceled before this call ran."
 )
 
 // skippedToolResults builds the synthetic tool results that close an assistant

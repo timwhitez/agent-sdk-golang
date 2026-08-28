@@ -60,6 +60,12 @@ This document summarizes recommended test commands and current coverage focus.
   cancellation, partial history, continuation after steering, and the delayed
   host-acknowledgement race where steering is already in history before the
   current provider stage is canceled.
+- `sdk/agent/agent_cancel_boundary_test.go` proves that root-context
+  cancellation inside a tool handler stops before the next provider admission,
+  takes precedence over task-complete, closes but does not execute unstarted
+  sibling tool calls with cancellation-specific results (never false task-
+  completion text), and is rechecked after pre-provider steering delivery,
+  including with fake tools/models that intentionally ignore their context.
 - `sdk/agent/agent_max_iterations_test.go` covers max-iteration error/final
   events plus require-done recovery: an empty/text-only post-tool stop forces
   the next auto request to `tool_choice=required` with `DisableThinking` set (so
