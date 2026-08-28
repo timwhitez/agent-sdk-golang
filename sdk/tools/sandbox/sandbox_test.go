@@ -11,10 +11,12 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"runtime"
 	"strings"
 	"sync"
+	"syscall"
 	"testing"
 
 	"github.com/timwhitez/agent-sdk-golang/sdk/tools"
@@ -106,34 +108,89 @@ func useSandboxReadAllHook(t *testing.T, hook func(io.Reader) ([]byte, error)) {
 
 func requireObservableSymlink(t *testing.T, target, link string) {
 	t.Helper()
-	if err := os.Symlink(target, link); err != nil {
-		t.Skipf("symlink creation is unavailable: %v", err)
-	}
-	linkInfo, err := os.Lstat(link)
-	if err != nil {
-		t.Skipf("symlink creation reported success but Lstat cannot observe %q: %v", link, err)
-	}
-	if linkInfo.Mode()&os.ModeSymlink == 0 {
-		t.Skipf("symlink creation reported success but %q is not observable as a symlink (mode %v)", link, linkInfo.Mode())
-	}
-	resolved, err := filepath.EvalSymlinks(link)
-	if err != nil {
-		t.Skipf("symlink %q is not resolvable after successful creation: %v", link, err)
-	}
 	targetResolved, err := filepath.EvalSymlinks(target)
 	if err != nil {
 		t.Fatalf("resolve known symlink target %q: %v", target, err)
-	}
-	resolvedInfo, err := os.Stat(resolved)
-	if err != nil {
-		t.Skipf("stat resolved symlink %q -> %q: %v", link, resolved, err)
 	}
 	targetInfo, err := os.Stat(targetResolved)
 	if err != nil {
 		t.Fatalf("stat known symlink target %q: %v", targetResolved, err)
 	}
+	if err := os.Symlink(target, link); err != nil {
+		if symlinkCreationUnavailable(err) {
+			t.Skipf("symlink creation is unavailable: %v", err)
+		}
+		t.Fatalf("create symlink %q -> %q: %v", link, target, err)
+	}
+	linkInfo, err := os.Lstat(link)
+	if err != nil {
+		if runtime.GOOS == "windows" && errors.Is(err, fs.ErrNotExist) {
+			t.Skipf("Windows reported successful symlink creation but Lstat cannot observe %q: %v", link, err)
+		}
+		t.Fatalf("Lstat created symlink %q: %v", link, err)
+	}
+	if linkInfo.Mode()&os.ModeSymlink == 0 {
+		t.Fatalf("symlink creation reported success but %q is not a symlink (mode %v)", link, linkInfo.Mode())
+	}
+	resolved, err := filepath.EvalSymlinks(link)
+	if err != nil {
+		t.Fatalf("resolve created symlink %q: %v", link, err)
+	}
+	resolvedInfo, err := os.Stat(resolved)
+	if err != nil {
+		t.Fatalf("stat resolved symlink %q -> %q: %v", link, resolved, err)
+	}
 	if !os.SameFile(resolvedInfo, targetInfo) {
 		t.Fatalf("symlink %q resolved to %q instead of target %q", link, resolved, targetResolved)
+	}
+}
+
+func symlinkCreationUnavailable(err error) bool {
+	if errors.Is(err, fs.ErrPermission) || errors.Is(err, errors.ErrUnsupported) {
+		return true
+	}
+	if runtime.GOOS != "windows" {
+		return false
+	}
+	var errno syscall.Errno
+	return errors.As(err, &errno) && errno == syscall.Errno(1314) // ERROR_PRIVILEGE_NOT_HELD
+}
+
+func TestRequireObservableSymlinkRejectsInvalidFixtures(t *testing.T) {
+	const scenarioEnv = "GOODE_SANDBOX_SYMLINK_FIXTURE_SCENARIO"
+	if scenario := os.Getenv(scenarioEnv); scenario != "" {
+		root := t.TempDir()
+		target := filepath.Join(root, "target")
+		link := filepath.Join(root, "link")
+		switch scenario {
+		case "missing-target":
+			// Leave target absent.
+		case "preexisting-link":
+			if err := os.WriteFile(target, []byte("target"), 0o600); err != nil {
+				t.Fatalf("write target: %v", err)
+			}
+			if err := os.WriteFile(link, []byte("occupied"), 0o600); err != nil {
+				t.Fatalf("write preexisting link path: %v", err)
+			}
+		default:
+			t.Fatalf("unknown helper scenario %q", scenario)
+		}
+		requireObservableSymlink(t, target, link)
+		t.Fatalf("invalid symlink fixture %q unexpectedly passed", scenario)
+	}
+
+	for _, scenario := range []string{"missing-target", "preexisting-link"} {
+		t.Run(scenario, func(t *testing.T) {
+			cmd := exec.Command(os.Args[0], "-test.run=^TestRequireObservableSymlinkRejectsInvalidFixtures$", "-test.v")
+			cmd.Env = append(os.Environ(), scenarioEnv+"="+scenario)
+			output, err := cmd.CombinedOutput()
+			if err == nil {
+				t.Fatalf("invalid fixture child unexpectedly passed:\n%s", output)
+			}
+			if bytes.Contains(output, []byte("--- SKIP")) {
+				t.Fatalf("invalid fixture child was skipped instead of rejected:\n%s", output)
+			}
+		})
 	}
 }
 
