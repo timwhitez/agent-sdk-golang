@@ -104,6 +104,39 @@ func useSandboxReadAllHook(t *testing.T, hook func(io.Reader) ([]byte, error)) {
 	})
 }
 
+func requireObservableSymlink(t *testing.T, target, link string) {
+	t.Helper()
+	if err := os.Symlink(target, link); err != nil {
+		t.Skipf("symlink creation is unavailable: %v", err)
+	}
+	linkInfo, err := os.Lstat(link)
+	if err != nil {
+		t.Skipf("symlink creation reported success but Lstat cannot observe %q: %v", link, err)
+	}
+	if linkInfo.Mode()&os.ModeSymlink == 0 {
+		t.Skipf("symlink creation reported success but %q is not observable as a symlink (mode %v)", link, linkInfo.Mode())
+	}
+	resolved, err := filepath.EvalSymlinks(link)
+	if err != nil {
+		t.Skipf("symlink %q is not resolvable after successful creation: %v", link, err)
+	}
+	targetResolved, err := filepath.EvalSymlinks(target)
+	if err != nil {
+		t.Fatalf("resolve known symlink target %q: %v", target, err)
+	}
+	resolvedInfo, err := os.Stat(resolved)
+	if err != nil {
+		t.Skipf("stat resolved symlink %q -> %q: %v", link, resolved, err)
+	}
+	targetInfo, err := os.Stat(targetResolved)
+	if err != nil {
+		t.Fatalf("stat known symlink target %q: %v", targetResolved, err)
+	}
+	if !os.SameFile(resolvedInfo, targetInfo) {
+		t.Fatalf("symlink %q resolved to %q instead of target %q", link, resolved, targetResolved)
+	}
+}
+
 type failAfterReader struct {
 	data []byte
 }
@@ -193,9 +226,7 @@ func TestSandboxAllowExternalDirectoryResolvesSymlinks(t *testing.T) {
 	root := t.TempDir()
 	ext := t.TempDir()
 	link := filepath.Join(t.TempDir(), "ext-link")
-	if err := os.Symlink(ext, link); err != nil {
-		t.Skipf("symlink not supported: %v", err)
-	}
+	requireObservableSymlink(t, ext, link)
 	s, err := New(root)
 	if err != nil {
 		t.Fatalf("new: %v", err)
@@ -241,9 +272,7 @@ func TestSandboxResolveBlocksSymlinkEscape(t *testing.T) {
 	root := t.TempDir()
 	ext := t.TempDir()
 	link := filepath.Join(root, "ext-link")
-	if err := os.Symlink(ext, link); err != nil {
-		t.Skipf("symlink not supported: %v", err)
-	}
+	requireObservableSymlink(t, ext, link)
 	s, err := New(root)
 	if err != nil {
 		t.Fatalf("new: %v", err)
@@ -260,9 +289,7 @@ func TestSandboxResolveAllowsSymlinkInsideRoot(t *testing.T) {
 		t.Fatalf("mkdir: %v", err)
 	}
 	link := filepath.Join(root, "link")
-	if err := os.Symlink(target, link); err != nil {
-		t.Skipf("symlink not supported: %v", err)
-	}
+	requireObservableSymlink(t, target, link)
 	s, err := New(root)
 	if err != nil {
 		t.Fatalf("new: %v", err)
@@ -1854,9 +1881,7 @@ func TestReadTool_BlocksSymlinkSwapAfterResolve(t *testing.T) {
 		t.Fatalf("write outside file: %v", err)
 	}
 	link := filepath.Join(root, "swap")
-	if err := os.Symlink(insideDir, link); err != nil {
-		t.Skipf("symlink not supported: %v", err)
-	}
+	requireObservableSymlink(t, insideDir, link)
 
 	s, err := New(root)
 	if err != nil {
@@ -1916,9 +1941,7 @@ func TestWriteTool_BlocksSymlinkSwapAfterResolve(t *testing.T) {
 		t.Fatalf("write outside file: %v", err)
 	}
 	link := filepath.Join(root, "swap")
-	if err := os.Symlink(insideDir, link); err != nil {
-		t.Skipf("symlink not supported: %v", err)
-	}
+	requireObservableSymlink(t, insideDir, link)
 
 	s, err := New(root)
 	if err != nil {
@@ -1990,9 +2013,7 @@ func TestEditTool_BlocksSymlinkSwapAfterResolve(t *testing.T) {
 		t.Fatalf("write outside file: %v", err)
 	}
 	link := filepath.Join(root, "swap")
-	if err := os.Symlink(insideDir, link); err != nil {
-		t.Skipf("symlink not supported: %v", err)
-	}
+	requireObservableSymlink(t, insideDir, link)
 
 	s, err := New(root)
 	if err != nil {
@@ -2062,9 +2083,7 @@ func TestLsTool_BlocksSymlinkSwapAfterResolve(t *testing.T) {
 		t.Fatalf("write outside file: %v", err)
 	}
 	link := filepath.Join(root, "swap")
-	if err := os.Symlink(insideDir, link); err != nil {
-		t.Skipf("symlink not supported: %v", err)
-	}
+	requireObservableSymlink(t, insideDir, link)
 
 	s, err := New(root)
 	if err != nil {
@@ -2119,9 +2138,7 @@ func TestGlobTool_BlocksSymlinkSwapAfterResolve(t *testing.T) {
 		t.Fatalf("write outside file: %v", err)
 	}
 	link := filepath.Join(root, "swap")
-	if err := os.Symlink(insideDir, link); err != nil {
-		t.Skipf("symlink not supported: %v", err)
-	}
+	requireObservableSymlink(t, insideDir, link)
 
 	s, err := New(root)
 	if err != nil {
@@ -2176,9 +2193,7 @@ func TestGrepTool_BlocksSymlinkSwapAfterResolve(t *testing.T) {
 		t.Fatalf("write outside file: %v", err)
 	}
 	link := filepath.Join(root, "swap")
-	if err := os.Symlink(insideDir, link); err != nil {
-		t.Skipf("symlink not supported: %v", err)
-	}
+	requireObservableSymlink(t, insideDir, link)
 
 	s, err := New(root)
 	if err != nil {
@@ -2230,9 +2245,7 @@ func TestGlobTool_BlocksSymlinkFileEscapeOutsideSandbox(t *testing.T) {
 		t.Fatalf("write outside file: %v", err)
 	}
 	link := filepath.Join(root, "link.txt")
-	if err := os.Symlink(outsideFile, link); err != nil {
-		t.Skipf("symlink not supported: %v", err)
-	}
+	requireObservableSymlink(t, outsideFile, link)
 
 	s, err := New(root)
 	if err != nil {
@@ -2284,9 +2297,7 @@ func TestGrepTool_BlocksSymlinkFileEscapeOutsideSandbox(t *testing.T) {
 		t.Fatalf("write outside file: %v", err)
 	}
 	link := filepath.Join(root, "link.txt")
-	if err := os.Symlink(outsideFile, link); err != nil {
-		t.Skipf("symlink not supported: %v", err)
-	}
+	requireObservableSymlink(t, outsideFile, link)
 
 	s, err := New(root)
 	if err != nil {
@@ -2342,9 +2353,7 @@ func TestGlobTool_BlocksSymlinkFileSwapOutsideSandbox(t *testing.T) {
 		t.Fatalf("write outside file: %v", err)
 	}
 	probe := filepath.Join(root, "probe-link")
-	if err := os.Symlink(outsideFile, probe); err != nil {
-		t.Skipf("symlink not supported: %v", err)
-	}
+	requireObservableSymlink(t, outsideFile, probe)
 	if err := os.Remove(probe); err != nil {
 		t.Fatalf("remove symlink probe: %v", err)
 	}
@@ -2428,9 +2437,7 @@ func TestGrepTool_BlocksSymlinkFileSwapOutsideSandbox(t *testing.T) {
 		t.Fatalf("write outside file: %v", err)
 	}
 	probe := filepath.Join(root, "probe-link")
-	if err := os.Symlink(outsideFile, probe); err != nil {
-		t.Skipf("symlink not supported: %v", err)
-	}
+	requireObservableSymlink(t, outsideFile, probe)
 	if err := os.Remove(probe); err != nil {
 		t.Fatalf("remove symlink probe: %v", err)
 	}
