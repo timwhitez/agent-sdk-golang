@@ -1,4 +1,4 @@
-//go:build aix || android || darwin || dragonfly || freebsd || illumos || linux || netbsd || openbsd || solaris
+//go:build unix
 
 package sandbox
 
