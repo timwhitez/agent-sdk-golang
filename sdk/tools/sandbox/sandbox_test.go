@@ -826,13 +826,7 @@ func TestWriteToolPreservesMode(t *testing.T) {
 	if err := os.WriteFile(path, []byte("echo hi\n"), 0o755); err != nil {
 		t.Fatalf("write: %v", err)
 	}
-	if runtime.GOOS != "windows" {
-		if st, err := os.Stat(path); err != nil {
-			t.Fatalf("stat: %v", err)
-		} else if st.Mode().Perm() != 0o755 {
-			t.Skipf("filesystem does not preserve exec perms (got %o)", st.Mode().Perm())
-		}
-	}
+	wantMode := observableModeForPreservationTest(t, path, 0o755)
 	deps := tools.NewContainer()
 	tools.Provide(deps, Key, func(context.Context) (*Sandbox, error) { return s, nil })
 	tools.Provide(deps, ConfirmKey, func(context.Context) (Confirmer, error) { return allowConfirmer{}, nil })
@@ -845,9 +839,32 @@ func TestWriteToolPreservesMode(t *testing.T) {
 	if err != nil {
 		t.Fatalf("stat: %v", err)
 	}
-	if st.Mode().Perm() != 0o755 {
-		t.Fatalf("expected mode 0755, got %o", st.Mode().Perm())
+	if st.Mode().Perm() != wantMode {
+		t.Fatalf("expected observable mode %04o to be preserved, got %04o", wantMode, st.Mode().Perm())
 	}
+}
+
+func observableModeForPreservationTest(t *testing.T, path string, requested os.FileMode) os.FileMode {
+	t.Helper()
+	st, err := os.Stat(path)
+	if err != nil {
+		t.Fatalf("stat mode fixture: %v", err)
+	}
+	observed := st.Mode().Perm()
+	requested = requested.Perm()
+	if observed == requested {
+		return observed
+	}
+	if runtime.GOOS != "windows" {
+		t.Skipf("filesystem does not preserve requested mode %04o (observed %04o)", requested, observed)
+	}
+	// Windows projects the writable/read-only file attribute into Go mode
+	// bits; executable bits are not part of its filesystem contract. Keep the
+	// test active and verify that the writable projection itself is preserved.
+	if requested&0o200 != 0 && observed&0o200 == 0 {
+		t.Fatalf("writable fixture became read-only: requested %04o, observed %04o", requested, observed)
+	}
+	return observed
 }
 
 func TestWriteTool_DiffPreviewLimitsLargeExistingFile(t *testing.T) {
@@ -3428,13 +3445,7 @@ func TestApplyUpdateFilePreservesMode(t *testing.T) {
 	if err := os.WriteFile(path, []byte("hello\n"), 0o755); err != nil {
 		t.Fatalf("write: %v", err)
 	}
-	if runtime.GOOS != "windows" {
-		if st, err := os.Stat(path); err != nil {
-			t.Fatalf("stat: %v", err)
-		} else if st.Mode().Perm() != 0o755 {
-			t.Skipf("filesystem does not preserve exec perms (got %o)", st.Mode().Perm())
-		}
-	}
+	wantMode := observableModeForPreservationTest(t, path, 0o755)
 	if err := applyUpdateFile(s, "script.sh", []patchHunk{{lines: []string{"-hello", "+hi"}}}); err != nil {
 		t.Fatalf("applyUpdateFile: %v", err)
 	}
@@ -3442,8 +3453,8 @@ func TestApplyUpdateFilePreservesMode(t *testing.T) {
 	if err != nil {
 		t.Fatalf("stat: %v", err)
 	}
-	if st.Mode().Perm() != 0o755 {
-		t.Fatalf("expected mode 0755, got %o", st.Mode().Perm())
+	if st.Mode().Perm() != wantMode {
+		t.Fatalf("expected observable mode %04o to be preserved, got %04o", wantMode, st.Mode().Perm())
 	}
 }
 
