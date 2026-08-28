@@ -19,7 +19,7 @@ and progressive disclosure through `agent_docs/`.
 - Compaction service: `compaction.Service` (`sdk/agent/compaction/service.go:10`)
 
 ### Runtime Capabilities
-- Boundary-aware steering before LLM calls and after each tool call (`sdk/agent/agent.go:226`, `sdk/agent/agent.go:448`, `sdk/agent/agent.go:959`)
+- Boundary-aware steering before LLM calls and after each tool call, plus a root-context cancellation gate before every provider admission (`sdk/agent/agent.go`, `sdk/agent/agent_cancel_boundary_test.go`)
 - Stream delta aggregation into a unified `Completion`, with response metadata propagated into `Completion.ResponseID` and surfaced on `UsageEvent` / `AutoContinueEvent` / `FinalResponseEvent` for downstream UI/aggregators (`sdk/agent/agent.go:255`, `sdk/agent/agent.go:285`, `sdk/agent/agent.go:348`, `sdk/agent/agent.go:646`)
 - Versioned prompt-usage normalization (`total_input_v1`) keeps cache/image counters as breakdowns, preserves raw provider zeroes, and falls back to one SDK history estimate plus a deduplicated warning when compatible gateways omit prompt tokens (`sdk/llm/usage.go`, `sdk/agent/agent.go`).
 - Versioned accounting projection emits one bounded, allowlisted
