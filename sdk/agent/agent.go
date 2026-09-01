@@ -1708,19 +1708,16 @@ func duplicateToolCallIDPositions(toolCalls []llm.ToolCall) (first, second int, 
 
 func (a *toolCallAccumulator) finalize() []llm.ToolCall {
 	out := []llm.ToolCall{}
-	for i, it := range a.items {
+	for _, it := range a.items {
 		name := strings.TrimSpace(it.name.String())
 		args := strings.TrimSpace(it.args.String())
 		if name == "" {
 			continue
 		}
 		id := strings.TrimSpace(it.id)
-		if id == "" {
-			id = fmt.Sprintf("%s%d", syntheticToolCallIDPrefix, i)
-		}
 		out = append(out, llm.ToolCall{ID: id, Type: "function", Function: llm.FunctionCall{Name: name, Arguments: args}})
 	}
-	return out
+	return ensureSyntheticToolCallIDs(out)
 }
 
 type repeatedToolSignatureGuard struct {
