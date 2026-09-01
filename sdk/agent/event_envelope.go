@@ -89,7 +89,14 @@ func newEventOutput(bufferSize int, enveloped bool, queryID string, clock func()
 }
 
 func (o *eventOutput) next(ev Event) EventEnvelope {
-	kind, origin := classifyEvent(ev)
+	return o.nextFrom(ev, "")
+}
+
+func (o *eventOutput) nextFrom(ev Event, origin EventOrigin) EventEnvelope {
+	kind, classifiedOrigin := classifyEvent(ev)
+	if origin == "" {
+		origin = classifiedOrigin
+	}
 	now := time.Now()
 	if o != nil && o.clock != nil {
 		now = o.clock()

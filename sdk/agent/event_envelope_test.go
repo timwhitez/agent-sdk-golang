@@ -16,6 +16,18 @@ type envelopeFinalModel struct{}
 
 type envelopeToolLoopModel struct{}
 
+type envelopeErrorModel struct {
+	calls atomic.Int64
+	err   error
+}
+
+func (m *envelopeErrorModel) Provider() string { return "fixture" }
+func (m *envelopeErrorModel) Model() string    { return "fixture" }
+func (m *envelopeErrorModel) Invoke(context.Context, llm.InvokeRequest) (*llm.Completion, error) {
+	m.calls.Add(1)
+	return nil, m.err
+}
+
 func (envelopeToolLoopModel) Provider() string { return "fixture" }
 func (envelopeToolLoopModel) Model() string    { return "fixture" }
 func (envelopeToolLoopModel) Invoke(context.Context, llm.InvokeRequest) (*llm.Completion, error) {
@@ -145,6 +157,32 @@ func TestEventEnvelopeSDKTerminalErrorsKeepSDKOrigin(t *testing.T) {
 	}
 	maximum := collectEnvelopes(maxAgent.QueryStreamEnveloped(context.Background(), llm.TextContent("run")))
 	assertEnvelopeErrorOrigin(t, maximum, "max_iterations", EventOriginSDKDriver)
+}
+
+func TestEventEnvelopeTimeoutOriginUsesEmissionBoundary(t *testing.T) {
+	rootModel := &envelopeErrorModel{err: context.DeadlineExceeded}
+	rootAgent, err := New(Config{LLM: rootModel})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithDeadline(context.Background(), time.Now().Add(-time.Second))
+	defer cancel()
+	rootTimeout := collectEnvelopes(rootAgent.QueryStreamEnveloped(ctx, llm.TextContent("run")))
+	assertEnvelopeErrorOrigin(t, rootTimeout, "timeout", EventOriginSDKDriver)
+	if calls := rootModel.calls.Load(); calls != 0 {
+		t.Fatalf("expired root deadline invoked provider %d times", calls)
+	}
+
+	providerModel := &envelopeErrorModel{err: context.DeadlineExceeded}
+	providerAgent, err := New(Config{LLM: providerModel})
+	if err != nil {
+		t.Fatal(err)
+	}
+	providerTimeout := collectEnvelopes(providerAgent.QueryStreamEnveloped(context.Background(), llm.TextContent("run")))
+	assertEnvelopeErrorOrigin(t, providerTimeout, "timeout", EventOriginProvider)
+	if calls := providerModel.calls.Load(); calls == 0 {
+		t.Fatal("provider timeout did not invoke provider")
+	}
 }
 
 func assertEnvelopeErrorOrigin(t *testing.T, envelopes []EventEnvelope, kind string, want EventOrigin) {

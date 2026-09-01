@@ -592,7 +592,7 @@ func (a *Agent) queryStreamWithSteering(ctx context.Context, input llm.Content, 
 			var err error
 			releaseCompactionRuntime, err = a.beginCompactionRuntimeUse(ctx)
 			if err != nil {
-				a.emitEvent(out, a.errEvent(err))
+				a.emitEventFrom(out, a.errEvent(err), EventOriginSDKDriver)
 				return
 			}
 		}
@@ -663,6 +663,10 @@ func (a *Agent) queryStreamWithSteering(ctx context.Context, input llm.Content, 
 			e.StallRecoveries = streamIdleRecoveryTotal
 			a.emitEvent(out, e)
 		}
+		emitSDKErr := func(e ErrorEvent) {
+			e.StallRecoveries = streamIdleRecoveryTotal
+			a.emitEventFrom(out, e, EventOriginSDKDriver)
+		}
 
 		// maxIterations < 0 means unlimited: the loop is then bounded only by
 		// tool-loop guards, idle detection, and context cancellation.
@@ -672,12 +676,12 @@ func (a *Agent) queryStreamWithSteering(ctx context.Context, input llm.Content, 
 			// result. Enforce cancellation at the provider-admission boundary so a
 			// context-ignoring model cannot receive one more stale request.
 			if err := ctx.Err(); err != nil {
-				emitErr(a.errEvent(err))
+				emitSDKErr(a.errEvent(err))
 				return
 			}
 			if a.compactionInFlight.Load() {
 				if err := a.waitForCompactionIdle(ctx, out); err != nil {
-					emitErr(a.errEvent(err))
+					emitSDKErr(a.errEvent(err))
 					return
 				}
 			}
@@ -715,7 +719,7 @@ func (a *Agent) queryStreamWithSteering(ctx context.Context, input llm.Content, 
 			// unblock a host that cancels the root turn. Recheck at the actual
 			// provider-admission boundary, not only at iteration entry.
 			if err := ctx.Err(); err != nil {
-				emitErr(a.errEvent(err))
+				emitSDKErr(a.errEvent(err))
 				return
 			}
 			comp, streamedText, err := a.invokeCompletionWithRetryAndSteering(ctx, llm.InvokeRequest{
@@ -1180,7 +1184,7 @@ func (a *Agent) queryStreamWithSteering(ctx context.Context, input llm.Content, 
 					a.appendCancellationSkippedToolResults(comp.ToolCalls[idx:])
 					a.appendMessages(pendingBlockMessages)
 					pendingBlockMessages = nil
-					emitErr(a.errEvent(err))
+					emitSDKErr(a.errEvent(err))
 					return
 				}
 				step := idx + 1
@@ -1393,7 +1397,7 @@ func (a *Agent) queryStreamWithSteering(ctx context.Context, input llm.Content, 
 						a.appendCancellationSkippedToolResults(comp.ToolCalls[idx+1:])
 						a.appendMessages(pendingBlockMessages)
 						pendingBlockMessages = nil
-						emitErr(a.errEvent(err))
+						emitSDKErr(a.errEvent(err))
 						return
 					}
 					// The turn ends here, but the assistant tool-call block must
@@ -1441,7 +1445,7 @@ func (a *Agent) queryStreamWithSteering(ctx context.Context, input llm.Content, 
 					a.appendCancellationSkippedToolResults(comp.ToolCalls[idx+1:])
 					a.appendMessages(pendingBlockMessages)
 					pendingBlockMessages = nil
-					emitErr(a.errEvent(rootCancelErr))
+					emitSDKErr(a.errEvent(rootCancelErr))
 					return
 				}
 				if strings.EqualFold(strings.TrimSpace(resolvedName), "done") {
@@ -2652,7 +2656,17 @@ func (a *Agent) emitEvent(out *eventOutput, ev Event) bool {
 	if out == nil {
 		return false
 	}
-	envelope := out.next(ev)
+	return a.emitEnvelope(out, ev, out.next(ev))
+}
+
+func (a *Agent) emitEventFrom(out *eventOutput, ev Event, origin EventOrigin) bool {
+	if out == nil {
+		return false
+	}
+	return a.emitEnvelope(out, ev, out.nextFrom(ev, origin))
+}
+
+func (a *Agent) emitEnvelope(out *eventOutput, ev Event, envelope EventEnvelope) bool {
 	if out.trySend(envelope) {
 		return true
 	}
