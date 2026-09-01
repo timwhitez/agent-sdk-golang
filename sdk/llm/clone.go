@@ -6,7 +6,9 @@ import (
 )
 
 // CloneInvokeRequest returns a deep copy of a provider request. The clone owns
-// all mutable message, tool-schema, option, slice, map, and pointer state.
+// all mutable message, tool-schema, option, slice, map, and pointer state. It
+// fails closed when a concrete value hides mutable state that reflection cannot
+// safely copy without unsafe access.
 func CloneInvokeRequest(request InvokeRequest) (InvokeRequest, error) {
 	out := request
 	out.Messages = CloneMessages(request.Messages)
@@ -171,7 +173,11 @@ func cloneJSONValue(value reflect.Value, depth int) (reflect.Value, error) {
 		out := reflect.New(value.Type()).Elem()
 		out.Set(value)
 		for i := 0; i < value.NumField(); i++ {
-			if !out.Field(i).CanSet() || !value.Field(i).CanInterface() {
+			field := value.Type().Field(i)
+			if !value.Field(i).CanInterface() {
+				if typeContainsMutableState(field.Type, make(map[reflect.Type]bool)) {
+					return reflect.Value{}, fmt.Errorf("cannot deep clone unexported mutable field %s.%s", value.Type(), field.Name)
+				}
 				continue
 			}
 			item, err := cloneJSONValue(value.Field(i), depth+1)
@@ -186,6 +192,30 @@ func cloneJSONValue(value reflect.Value, depth int) (reflect.Value, error) {
 	default:
 		return value, nil
 	}
+}
+
+func typeContainsMutableState(value reflect.Type, visiting map[reflect.Type]bool) bool {
+	if value == nil {
+		return false
+	}
+	switch value.Kind() {
+	case reflect.Chan, reflect.Func, reflect.Interface, reflect.Map, reflect.Pointer, reflect.Slice, reflect.UnsafePointer:
+		return true
+	case reflect.Array:
+		return typeContainsMutableState(value.Elem(), visiting)
+	case reflect.Struct:
+		if visiting[value] {
+			return false
+		}
+		visiting[value] = true
+		defer delete(visiting, value)
+		for i := 0; i < value.NumField(); i++ {
+			if typeContainsMutableState(value.Field(i).Type, visiting) {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 // CloneMessages returns a deep copy of a conversation history. The returned

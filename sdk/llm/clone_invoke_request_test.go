@@ -2,8 +2,17 @@ package llm
 
 import (
 	"encoding/json"
+	"strings"
 	"testing"
 )
+
+type marshalOnlySchemaValue struct {
+	state map[string]any
+}
+
+func (value marshalOnlySchemaValue) MarshalJSON() ([]byte, error) {
+	return json.Marshal(value.state)
+}
 
 func TestCloneInvokeRequestOwnsNestedMutableState(t *testing.T) {
 	enabled := true
@@ -78,5 +87,15 @@ func TestCloneInvokeRequestPreservesNonNilEmptyInclude(t *testing.T) {
 	}
 	if cloned.Responses.Include == nil {
 		t.Fatal("non-nil empty Include became nil")
+	}
+}
+
+func TestCloneInvokeRequestRejectsUnexportedMutableState(t *testing.T) {
+	_, err := CloneInvokeRequest(InvokeRequest{Tools: []ToolDefinition{{
+		Name:       "custom",
+		Parameters: map[string]any{"custom": marshalOnlySchemaValue{state: map[string]any{"type": "string"}}},
+	}}})
+	if err == nil || !strings.Contains(err.Error(), "unexported mutable field") {
+		t.Fatalf("error = %v, want unexported mutable field rejection", err)
 	}
 }
