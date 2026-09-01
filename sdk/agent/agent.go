@@ -2683,8 +2683,11 @@ func (a *Agent) emitEvent(out *eventOutput, ev Event) bool {
 	}
 	floored := false
 	if isTerminalAgentEvent(ev) {
-		if a.tryEnqueueTerminalEvent(out, envelope) {
+		switch a.tryEnqueueTerminalEvent(out, envelope) {
+		case terminalEnqueued:
 			return true
+		case terminalRejected:
+			return false
 		}
 		// Terminal events are not charged against the per-turn floor budget:
 		// there is at most one FinalResponseEvent/ErrorEvent per turn, so they
@@ -2864,15 +2867,23 @@ func (a *Agent) turnCancellation(out *eventOutput) <-chan struct{} {
 	return nil
 }
 
-func (a *Agent) tryEnqueueTerminalEvent(out *eventOutput, envelope EventEnvelope) bool {
+type terminalEnqueueOutcome uint8
+
+const (
+	terminalUnavailable terminalEnqueueOutcome = iota
+	terminalEnqueued
+	terminalRejected
+)
+
+func (a *Agent) tryEnqueueTerminalEvent(out *eventOutput, envelope EventEnvelope) terminalEnqueueOutcome {
 	buffered, ok := out.tryReceive()
 	if !ok {
-		return false
+		return terminalUnavailable
 	}
 	if isTerminalAgentEvent(buffered.Event) && terminalEventPriority(buffered.Event) > terminalEventPriority(envelope.Event) {
 		out.sendAfterReceive(buffered)
 		a.logDroppedEvent(envelope.Event, "terminal_priority_loss")
-		return false
+		return terminalRejected
 	}
 	a.logDroppedEvent(buffered.Event, "evicted_for_terminal")
 	if final, ok := envelope.Event.(FinalResponseEvent); ok {
@@ -2881,7 +2892,7 @@ func (a *Agent) tryEnqueueTerminalEvent(out *eventOutput, envelope EventEnvelope
 		envelope.Event = final
 	}
 	out.sendAfterReceive(envelope)
-	return true
+	return terminalEnqueued
 }
 
 func terminalEventPriority(ev Event) int {

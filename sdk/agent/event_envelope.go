@@ -198,10 +198,7 @@ func classifyEvent(event Event) (EventKind, EventOrigin) {
 	case ThinkingDeltaEvent:
 		return EventKindThinkingDelta, EventOriginModel
 	case ErrorEvent:
-		if strings.TrimSpace(event.Provider) != "" {
-			return EventKindError, EventOriginProvider
-		}
-		return EventKindError, EventOriginSDKDriver
+		return EventKindError, classifyErrorOrigin(event)
 	case WarnEvent:
 		return EventKindWarning, EventOriginSDKDriver
 	case HiddenUserMessageEvent:
@@ -229,6 +226,17 @@ func classifyEvent(event Event) (EventKind, EventOrigin) {
 	default:
 		panic(fmt.Sprintf("agent: unclassified event type %T", event))
 	}
+}
+
+func classifyErrorOrigin(event ErrorEvent) EventOrigin {
+	switch strings.TrimSpace(event.Kind) {
+	case "agent_busy", "canceled", "invalid_tool_call_block", "max_iterations", "loop_guard", "doom_loop":
+		return EventOriginSDKDriver
+	}
+	if strings.TrimSpace(event.Provider) != "" {
+		return EventOriginProvider
+	}
+	return EventOriginSDKDriver
 }
 
 var fallbackQueryID atomic.Uint64

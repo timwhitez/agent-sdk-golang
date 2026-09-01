@@ -14,6 +14,14 @@ import (
 
 type envelopeFinalModel struct{}
 
+type envelopeToolLoopModel struct{}
+
+func (envelopeToolLoopModel) Provider() string { return "fixture" }
+func (envelopeToolLoopModel) Model() string    { return "fixture" }
+func (envelopeToolLoopModel) Invoke(context.Context, llm.InvokeRequest) (*llm.Completion, error) {
+	return &llm.Completion{ToolCalls: []llm.ToolCall{{ID: "call-loop", Type: "function", Function: llm.FunctionCall{Name: "missing", Arguments: `{}`}}}, StopReason: "tool_calls"}, nil
+}
+
 func wrapLegacyEventOutput(ch chan Event) *eventOutput {
 	return &eventOutput{legacy: ch, queryID: "test-query", clock: time.Now}
 }
@@ -73,6 +81,8 @@ func TestEventEnvelopeClassifiesAllTypedEvents(t *testing.T) {
 		{ThinkingDeltaEvent{}, EventKindThinkingDelta, EventOriginModel},
 		{ErrorEvent{}, EventKindError, EventOriginSDKDriver},
 		{ErrorEvent{Provider: "fixture"}, EventKindError, EventOriginProvider},
+		{ErrorEvent{Provider: "fixture", Kind: "canceled"}, EventKindError, EventOriginSDKDriver},
+		{ErrorEvent{Provider: "fixture", Kind: "max_iterations"}, EventKindError, EventOriginSDKDriver},
 		{WarnEvent{}, EventKindWarning, EventOriginSDKDriver},
 		{HiddenUserMessageEvent{}, EventKindHiddenUserMessage, EventOriginSDKDriver},
 		{StepStartEvent{}, EventKindStepStart, EventOriginToolRuntime},
@@ -92,6 +102,63 @@ func TestEventEnvelopeClassifiesAllTypedEvents(t *testing.T) {
 			t.Fatalf("%T classified as %q/%q want %q/%q", test.event, kind, origin, test.kind, test.origin)
 		}
 	}
+}
+
+func TestEventEnvelopeTerminalPriorityRejectsOnce(t *testing.T) {
+	agent := &Agent{eventSendTimeout: time.Millisecond}
+	out := newEventOutput(1, true, "query-test", time.Now)
+	errorEnvelope := out.next(ErrorEvent{Provider: "fixture", Kind: "provider", Message: "failed"})
+	if !out.trySend(errorEnvelope) {
+		t.Fatal("failed to fill envelope channel")
+	}
+
+	if agent.emitEvent(out, FinalResponseEvent{Content: "must not follow error"}) {
+		t.Fatal("lower-priority final was delivered after terminal error")
+	}
+	if got := agent.eventDropCount.Load(); got != 1 {
+		t.Fatalf("drop count=%d want exactly 1", got)
+	}
+	buffered := <-out.enveloped
+	if buffered.Sequence != 1 || buffered.Kind != EventKindError {
+		t.Fatalf("buffered terminal changed: %#v", buffered)
+	}
+	select {
+	case extra := <-out.enveloped:
+		t.Fatalf("lower-priority terminal remained deliverable: %#v", extra)
+	default:
+	}
+}
+
+func TestEventEnvelopeSDKTerminalErrorsKeepSDKOrigin(t *testing.T) {
+	canceledAgent, err := New(Config{LLM: envelopeFinalModel{}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	canceled := collectEnvelopes(canceledAgent.QueryStreamEnveloped(ctx, llm.TextContent("run")))
+	assertEnvelopeErrorOrigin(t, canceled, "canceled", EventOriginSDKDriver)
+
+	maxAgent, err := New(Config{LLM: envelopeToolLoopModel{}, MaxIterations: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	maximum := collectEnvelopes(maxAgent.QueryStreamEnveloped(context.Background(), llm.TextContent("run")))
+	assertEnvelopeErrorOrigin(t, maximum, "max_iterations", EventOriginSDKDriver)
+}
+
+func assertEnvelopeErrorOrigin(t *testing.T, envelopes []EventEnvelope, kind string, want EventOrigin) {
+	t.Helper()
+	for _, envelope := range envelopes {
+		event, ok := envelope.Event.(ErrorEvent)
+		if ok && event.Kind == kind {
+			if envelope.Origin != want {
+				t.Fatalf("%s origin=%q want %q: %#v", kind, envelope.Origin, want, envelope)
+			}
+			return
+		}
+	}
+	t.Fatalf("missing %s error envelope: %#v", kind, envelopes)
 }
 
 func TestEventEnvelopeLegacyProjectionPreservesPayloadOrder(t *testing.T) {
