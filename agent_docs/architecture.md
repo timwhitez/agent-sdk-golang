@@ -51,10 +51,15 @@ Entry point: `QueryStreamWithSteering` (`sdk/agent/agent.go:197`).
 
 4. **Build tool definitions for provider**
    - Only non-hidden tools are sent to the model.
+   - Agent construction owns a deep copy of every tool schema, so the
+     provider-visible definition and runtime resolver cannot drift through a
+     caller-owned map mutation.
    - References: `sdk/agent/agent.go:233`, `sdk/tools/tool.go:30`
 
 5. **Invoke provider and emit immediate content/usage events**
    - Streaming is used when provider implements `StreamingChatModel`.
+   - Framework retries keep one captured model interface and give every
+     attempt an independent deep copy of the same logical request.
    - Provider usage is normalized to the versioned prompt-token contract. A
      zero/missing prompt count inside an otherwise present usage object is
      replaced with the shared history estimate and emits one quality warning
