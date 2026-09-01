@@ -375,6 +375,7 @@ func New(cfg Config) (*Agent, error) {
 		setter.SetWarningf(cfg.Warningf)
 	}
 
+	ownedTools := make([]tools.Tool, len(cfg.Tools))
 	toolMap := map[string]tools.Tool{}
 	toolPositions := map[string]int{}
 	for i, t := range cfg.Tools {
@@ -384,6 +385,12 @@ func New(cfg Config) (*Agent, error) {
 		if previous, exists := toolPositions[t.Name]; exists {
 			return nil, fmt.Errorf("agent: duplicate tool name %q at positions %d and %d", t.Name, previous+1, i+1)
 		}
+		cloned, err := llm.CloneInvokeRequest(llm.InvokeRequest{Tools: []llm.ToolDefinition{t.Definition()}})
+		if err != nil {
+			return nil, fmt.Errorf("agent: clone tool %q schema: %w", t.Name, err)
+		}
+		t.Schema = cloned.Tools[0].Parameters
+		ownedTools[i] = t
 		toolPositions[t.Name] = i
 		toolMap[t.Name] = t
 	}
@@ -428,9 +435,9 @@ func New(cfg Config) (*Agent, error) {
 		requireDone:           cfg.RequireDoneTool,
 		warningf:              cfg.Warningf,
 		hasCompactor:          hasCompactor,
-		tools:                 append([]tools.Tool(nil), cfg.Tools...),
+		tools:                 ownedTools,
 		toolMap:               toolMap,
-		toolMapNormalized:     buildNormalizedToolMap(toolMap, cfg.Tools),
+		toolMapNormalized:     buildNormalizedToolMap(toolMap, ownedTools),
 		deps:                  cfg.Deps,
 		compactor:             compSvc,
 		toolResultDumps:       make(map[string]toolResultDumpLifecycleEntry),
@@ -1865,8 +1872,20 @@ func (a *Agent) invokeCompletion(ctx context.Context, req llm.InvokeRequest, out
 // sends a steering message. The function returns a SteeringInterruptError in that case,
 // allowing the caller to immediately incorporate the steering message into the conversation.
 func (a *Agent) invokeCompletionWithSteering(ctx context.Context, req llm.InvokeRequest, out chan Event, steeringCh <-chan SteeringMsg) (*llm.Completion, bool, error) {
-	if a == nil || a.llm == nil {
+	if a == nil {
 		return nil, false, fmt.Errorf("agent: nil llm")
+	}
+	return a.invokeModelCompletionWithSteering(ctx, a.llm, req, out, steeringCh)
+}
+
+func (a *Agent) invokeModelCompletionWithSteering(ctx context.Context, model llm.ChatModel, req llm.InvokeRequest, out chan Event, steeringCh <-chan SteeringMsg) (*llm.Completion, bool, error) {
+	if model == nil {
+		return nil, false, fmt.Errorf("agent: nil llm")
+	}
+	var err error
+	req, err = llm.CloneInvokeRequest(req)
+	if err != nil {
+		return nil, false, fmt.Errorf("agent: clone invoke request: %w", err)
 	}
 	if ctx == nil {
 		ctx = context.Background()
@@ -1893,7 +1912,7 @@ func (a *Agent) invokeCompletionWithSteering(ctx context.Context, req llm.Invoke
 	if err := ctx.Err(); err != nil {
 		return nil, false, err
 	}
-	if sm, ok := a.llm.(llm.StreamingChatModel); ok {
+	if sm, ok := model.(llm.StreamingChatModel); ok {
 		invokeCtx, finishStage := a.beginSteeringInterruptibleStage(ctx)
 		defer finishStage()
 		if err := invokeCtx.Err(); err != nil {
@@ -2059,8 +2078,8 @@ func (a *Agent) invokeCompletionWithSteering(ctx context.Context, req llm.Invoke
 					}
 					if !sawDone {
 						return finishPartial(&llm.IncompleteStreamError{
-							Provider: a.llm.Provider(),
-							Model:    a.llm.Model(),
+							Provider: model.Provider(),
+							Model:    model.Model(),
 							Message:  "provider event channel closed before StreamDoneEvent",
 						})
 					}
@@ -2117,7 +2136,7 @@ func (a *Agent) invokeCompletionWithSteering(ctx context.Context, req llm.Invoke
 		finishStage()
 		return nil, false, err
 	}
-	comp, err := a.llm.Invoke(invokeCtx, req)
+	comp, err := model.Invoke(invokeCtx, req)
 	stageInterruptedForSteering := finishStage()
 	if ctx.Err() == nil && stageInterruptedForSteering {
 		if msg, ok := takeNextSteering(steeringCh); ok {
@@ -2139,12 +2158,19 @@ func (a *Agent) invokeCompletionWithRetry(ctx context.Context, req llm.InvokeReq
 // When a steering interrupt occurs, it immediately returns the partial completion along with
 // the SteeringInterruptError, allowing the agent loop to process the steering message.
 func (a *Agent) invokeCompletionWithRetryAndSteering(ctx context.Context, req llm.InvokeRequest, out chan Event, steeringCh <-chan SteeringMsg) (*llm.Completion, bool, error) {
+	if a == nil {
+		return nil, false, fmt.Errorf("agent: nil llm")
+	}
+	return a.invokeModelCompletionWithRetryAndSteering(ctx, a.llm, req, out, steeringCh)
+}
+
+func (a *Agent) invokeModelCompletionWithRetryAndSteering(ctx context.Context, model llm.ChatModel, req llm.InvokeRequest, out chan Event, steeringCh <-chan SteeringMsg) (*llm.Completion, bool, error) {
 	maxAttempts := defaultInvokeRetryMax
 	if a != nil && a.invokeRetryMax > 0 {
 		maxAttempts = a.invokeRetryMax
 	}
 	if maxAttempts <= 1 {
-		return a.invokeCompletionWithSteering(ctx, req, out, steeringCh)
+		return a.invokeModelCompletionWithSteering(ctx, model, req, out, steeringCh)
 	}
 
 	var lastComp *llm.Completion
@@ -2154,7 +2180,7 @@ func (a *Agent) invokeCompletionWithRetryAndSteering(ctx context.Context, req ll
 		if err := ctx.Err(); err != nil {
 			return lastComp, lastStreamed, err
 		}
-		comp, streamedText, err := a.invokeCompletionWithSteering(ctx, req, out, steeringCh)
+		comp, streamedText, err := a.invokeModelCompletionWithSteering(ctx, model, req, out, steeringCh)
 		if err == nil {
 			return comp, streamedText, nil
 		}
