@@ -842,6 +842,11 @@ func (a *Agent) QueryStreamWithSteering(ctx context.Context, input llm.Content, 
 				a.emitUsageWithAccounting(out, *comp.Usage, responseID)
 			}
 			if first, second, duplicate := duplicateToolCallIDPositions(comp.ToolCalls); duplicate {
+				if cont.hasPending() {
+					a.mu.Lock()
+					cont.discardPartialToolCalls(a.messages)
+					a.mu.Unlock()
+				}
 				emitErr(ErrorEvent{
 					Provider: a.llm.Provider(),
 					Kind:     "invalid_tool_call_block",
