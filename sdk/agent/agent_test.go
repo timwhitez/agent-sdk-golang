@@ -12,6 +12,7 @@ import (
 	"unicode/utf8"
 
 	"github.com/timwhitez/agent-sdk-golang/sdk/agent/compaction"
+	"github.com/timwhitez/agent-sdk-golang/sdk/agent/messageorigin"
 	"github.com/timwhitez/agent-sdk-golang/sdk/llm"
 	"github.com/timwhitez/agent-sdk-golang/sdk/tools"
 )
@@ -1014,15 +1015,16 @@ func TestToolCallContinuationClearsPartialAfterIndexShift(t *testing.T) {
 	messages := []llm.Message{
 		{Role: llm.RoleSystem, Content: llm.TextContent("sys")},
 		{Role: llm.RoleAssistant, Content: llm.TextContent(""), ToolCalls: cloneToolCalls(partial)},
+		messageorigin.NewInternalUserMessage(messageorigin.KindToolCallContinuation, messageorigin.ResponseTruncatedContinuationText),
 		{Role: llm.RoleAssistant, Content: llm.TextContent(""), ToolCalls: cloneToolCalls(merged)},
 	}
 
-	cont.clearPartialToolCalls(messages, 2)
+	cont.clearPartialToolCalls(messages, 3)
 
 	if len(messages[1].ToolCalls) != 0 {
 		t.Fatalf("expected stale partial assistant message to be cleared")
 	}
-	if !sameToolCalls(messages[2].ToolCalls, merged) {
+	if !sameToolCalls(messages[3].ToolCalls, merged) {
 		t.Fatalf("expected merged assistant tool calls to stay intact")
 	}
 }

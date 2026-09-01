@@ -5008,31 +5008,30 @@ func (c *toolCallContinuation) clearPartialToolCalls(messages []llm.Message, cur
 	if len(c.partialCalls) == 0 {
 		return
 	}
-	ids := make(map[string]bool)
-	for _, tc := range c.partialCalls {
-		if id := strings.TrimSpace(tc.ID); id != "" {
-			ids[id] = true
-		}
-	}
-	if len(ids) == 0 {
-		c.reset()
-		return
-	}
-	for i := 0; i < currentIndex && i < len(messages); i++ {
-		if messages[i].Role != llm.RoleAssistant {
+	for i := 0; i+1 < currentIndex && i+1 < len(messages); i++ {
+		if messages[i].Role != llm.RoleAssistant || len(messages[i].ToolCalls) == 0 {
 			continue
 		}
-		hasPartial := false
-		for _, tc := range messages[i].ToolCalls {
-			if ids[strings.TrimSpace(tc.ID)] {
-				hasPartial = true
+		if messages[i+1].Role != llm.RoleUser || messages[i+1].Name != messageorigin.Name(messageorigin.KindToolCallContinuation) {
+			continue
+		}
+		matchesPending := false
+		for _, historical := range messages[i].ToolCalls {
+			for _, pending := range c.partialCalls {
+				if sameStableToolCallID(historical.ID, pending.ID) {
+					matchesPending = true
+					break
+				}
+			}
+			if matchesPending {
 				break
 			}
 		}
-		if hasPartial {
-			messages[i].ToolCalls = nil
-			messages[i].Content = llm.WithoutProviderState(messages[i].Content)
+		if !matchesPending {
+			continue
 		}
+		messages[i].ToolCalls = nil
+		messages[i].Content = llm.WithoutProviderState(messages[i].Content)
 	}
 	c.reset()
 }
