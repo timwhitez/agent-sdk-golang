@@ -1,8 +1,8 @@
 package llm
 
 import (
-	"encoding/json"
 	"fmt"
+	"reflect"
 )
 
 // CloneInvokeRequest returns a deep copy of a provider request. The clone owns
@@ -44,7 +44,10 @@ func cloneResponsesOptions(options *ResponsesOptions) (*ResponsesOptions, error)
 	out.UseInstructions = cloneBool(options.UseInstructions)
 	out.ParallelToolCalls = cloneBool(options.ParallelToolCalls)
 	out.Store = cloneBool(options.Store)
-	out.Include = append([]string(nil), options.Include...)
+	if options.Include != nil {
+		out.Include = make([]string, len(options.Include))
+		copy(out.Include, options.Include)
+	}
 	if options.Text != nil {
 		text := *options.Text
 		if options.Text.Format != nil {
@@ -82,15 +85,107 @@ func cloneJSONMap(value map[string]any) (map[string]any, error) {
 	if value == nil {
 		return nil, nil
 	}
-	data, err := json.Marshal(value)
+	cloned, err := cloneJSONValue(reflect.ValueOf(value), 0)
 	if err != nil {
 		return nil, err
 	}
-	var out map[string]any
-	if err := json.Unmarshal(data, &out); err != nil {
-		return nil, err
+	out, ok := cloned.Interface().(map[string]any)
+	if !ok {
+		return nil, fmt.Errorf("cloned JSON map has type %T", cloned.Interface())
 	}
 	return out, nil
+}
+
+func cloneJSONValue(value reflect.Value, depth int) (reflect.Value, error) {
+	if !value.IsValid() {
+		return value, nil
+	}
+	if depth > 128 {
+		return reflect.Value{}, fmt.Errorf("JSON value nesting exceeds 128 levels")
+	}
+	switch value.Kind() {
+	case reflect.Interface:
+		if value.IsNil() {
+			return reflect.Zero(value.Type()), nil
+		}
+		item, err := cloneJSONValue(value.Elem(), depth+1)
+		if err != nil {
+			return reflect.Value{}, err
+		}
+		out := reflect.New(value.Type()).Elem()
+		out.Set(item)
+		return out, nil
+	case reflect.Pointer:
+		if value.IsNil() {
+			return reflect.Zero(value.Type()), nil
+		}
+		item, err := cloneJSONValue(value.Elem(), depth+1)
+		if err != nil {
+			return reflect.Value{}, err
+		}
+		out := reflect.New(value.Type().Elem())
+		out.Elem().Set(item)
+		return out, nil
+	case reflect.Map:
+		if value.IsNil() {
+			return reflect.Zero(value.Type()), nil
+		}
+		out := reflect.MakeMapWithSize(value.Type(), value.Len())
+		iter := value.MapRange()
+		for iter.Next() {
+			key, err := cloneJSONValue(iter.Key(), depth+1)
+			if err != nil {
+				return reflect.Value{}, err
+			}
+			item, err := cloneJSONValue(iter.Value(), depth+1)
+			if err != nil {
+				return reflect.Value{}, err
+			}
+			out.SetMapIndex(key, item)
+		}
+		return out, nil
+	case reflect.Slice:
+		if value.IsNil() {
+			return reflect.Zero(value.Type()), nil
+		}
+		out := reflect.MakeSlice(value.Type(), value.Len(), value.Len())
+		for i := 0; i < value.Len(); i++ {
+			item, err := cloneJSONValue(value.Index(i), depth+1)
+			if err != nil {
+				return reflect.Value{}, err
+			}
+			out.Index(i).Set(item)
+		}
+		return out, nil
+	case reflect.Array:
+		out := reflect.New(value.Type()).Elem()
+		for i := 0; i < value.Len(); i++ {
+			item, err := cloneJSONValue(value.Index(i), depth+1)
+			if err != nil {
+				return reflect.Value{}, err
+			}
+			out.Index(i).Set(item)
+		}
+		return out, nil
+	case reflect.Struct:
+		out := reflect.New(value.Type()).Elem()
+		out.Set(value)
+		for i := 0; i < value.NumField(); i++ {
+			if !out.Field(i).CanSet() || !value.Field(i).CanInterface() {
+				continue
+			}
+			item, err := cloneJSONValue(value.Field(i), depth+1)
+			if err != nil {
+				return reflect.Value{}, err
+			}
+			out.Field(i).Set(item)
+		}
+		return out, nil
+	case reflect.Chan, reflect.Func, reflect.UnsafePointer:
+		return reflect.Value{}, fmt.Errorf("unsupported JSON value type %s", value.Type())
+	default:
+		return value, nil
+	}
 }
 
 // CloneMessages returns a deep copy of a conversation history. The returned
