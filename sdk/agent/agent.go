@@ -5008,31 +5008,18 @@ func (c *toolCallContinuation) clearPartialToolCalls(messages []llm.Message, cur
 	if len(c.partialCalls) == 0 {
 		return
 	}
-	ids := make(map[string]bool)
-	for _, tc := range c.partialCalls {
-		if id := strings.TrimSpace(tc.ID); id != "" {
-			ids[id] = true
-		}
-	}
-	if len(ids) == 0 {
-		c.reset()
-		return
-	}
-	for i := 0; i < currentIndex && i < len(messages); i++ {
-		if messages[i].Role != llm.RoleAssistant {
+	for i := 0; i+1 < currentIndex && i+1 < len(messages); i++ {
+		if messages[i].Role != llm.RoleAssistant || len(messages[i].ToolCalls) == 0 {
 			continue
 		}
-		hasPartial := false
-		for _, tc := range messages[i].ToolCalls {
-			if ids[strings.TrimSpace(tc.ID)] {
-				hasPartial = true
-				break
-			}
+		// The SDK reminder owns the preceding unfinished block. IDs cannot
+		// identify the episode: providers may rotate them between fragments,
+		// while synthetic IDs are reused by later completed responses.
+		if messages[i+1].Role != llm.RoleUser || messages[i+1].Name != messageorigin.Name(messageorigin.KindToolCallContinuation) {
+			continue
 		}
-		if hasPartial {
-			messages[i].ToolCalls = nil
-			messages[i].Content = llm.WithoutProviderState(messages[i].Content)
-		}
+		messages[i].ToolCalls = nil
+		messages[i].Content = llm.WithoutProviderState(messages[i].Content)
 	}
 	c.reset()
 }

@@ -119,10 +119,13 @@ func TestToolContinuationCleanupClearsStaleProviderState(t *testing.T) {
 			Data:     json.RawMessage(`{"type":"function_call","call_id":"call_1"}`),
 		}}),
 		ToolCalls: []llm.ToolCall{call},
-	}}
+	}, messageorigin.NewInternalUserMessage(
+		messageorigin.KindToolCallContinuation,
+		messageorigin.ResponseTruncatedContinuationText,
+	)}
 	continuation := newToolCallContinuation(2)
 	continuation.addPartial(0, []llm.ToolCall{call})
-	continuation.clearPartialToolCalls(messages, 1)
+	continuation.clearPartialToolCalls(messages, 2)
 	if len(messages[0].ToolCalls) != 0 || providerStateCount(t, messages[0].Content) != 0 {
 		t.Fatalf("continuation cleanup retained stale state: %#v", messages[0])
 	}
