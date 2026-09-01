@@ -841,6 +841,14 @@ func (a *Agent) QueryStreamWithSteering(ctx context.Context, input llm.Content, 
 			if comp.Usage != nil {
 				a.emitUsageWithAccounting(out, *comp.Usage, responseID)
 			}
+			if first, second, duplicate := duplicateToolCallIDPositions(comp.ToolCalls); duplicate {
+				emitErr(ErrorEvent{
+					Provider: a.llm.Provider(),
+					Kind:     "invalid_tool_call_block",
+					Message:  fmt.Sprintf("provider returned duplicate tool_call_id values at positions %d and %d; no tools were executed", first+1, second+1),
+				})
+				return
+			}
 
 			if comp.Thinking != "" {
 				a.emitEvent(out, ThinkingEvent{Content: comp.Thinking})
@@ -1684,6 +1692,18 @@ func ensureSyntheticToolCallIDs(toolCalls []llm.ToolCall) []llm.ToolCall {
 		}
 	}
 	return out
+}
+
+func duplicateToolCallIDPositions(toolCalls []llm.ToolCall) (first, second int, duplicate bool) {
+	seen := make(map[string]int, len(toolCalls))
+	for i, toolCall := range toolCalls {
+		id := strings.TrimSpace(toolCall.ID)
+		if previous, exists := seen[id]; exists {
+			return previous, i, true
+		}
+		seen[id] = i
+	}
+	return 0, 0, false
 }
 
 func (a *toolCallAccumulator) finalize() []llm.ToolCall {

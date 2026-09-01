@@ -74,6 +74,9 @@ Entry point: `QueryStreamWithSteering` (`sdk/agent/agent.go:197`).
      thinking blocks retain their opaque signature alongside the exact thinking
      text so a following tool-result request can serialize the assistant turn
      without dropping provider-required state.
+   - A provider response containing duplicate non-empty tool-call IDs is
+     rejected before the assistant block enters history or any handler runs;
+     already-reported usage remains accounted.
    - References: `sdk/agent/agent.go:268`
 
 7. **Continuation gate**
