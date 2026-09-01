@@ -80,7 +80,7 @@ func TestInvokeRetryUsesFreshRequestClone(t *testing.T) {
 			OutputSchema: map[string]any{"type": "object"},
 		},
 	}
-	if _, _, err := agent.invokeCompletionWithRetry(context.Background(), request, make(chan Event, 8)); err != nil {
+	if _, _, err := agent.invokeCompletionWithRetry(context.Background(), request, wrapLegacyEventOutput(make(chan Event, 8))); err != nil {
 		t.Fatal(err)
 	}
 	if model.calls != 2 {

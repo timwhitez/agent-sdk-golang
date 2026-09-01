@@ -421,7 +421,7 @@ func TestAutomaticCompactionCheckpointFailurePreservesHistory(t *testing.T) {
 		},
 	}
 	out := make(chan Event, 1)
-	ag.applyPendingCompaction(out)
+	ag.applyPendingCompaction(wrapLegacyEventOutput(out))
 	if writes != 1 {
 		t.Fatalf("automatic checkpoint writes = %d, want 1", writes)
 	}

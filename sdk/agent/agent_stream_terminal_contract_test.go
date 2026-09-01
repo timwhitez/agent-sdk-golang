@@ -33,7 +33,7 @@ func invokeTerminalContract(t *testing.T, events ...llm.StreamEvent) (*llm.Compl
 		t.Fatal(err)
 	}
 	out := make(chan Event, 32)
-	completion, _, err := agent.invokeCompletion(context.Background(), llm.InvokeRequest{}, out)
+	completion, _, err := agent.invokeCompletion(context.Background(), llm.InvokeRequest{}, wrapLegacyEventOutput(out))
 	return completion, err
 }
 

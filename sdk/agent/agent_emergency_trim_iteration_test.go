@@ -343,7 +343,7 @@ func TestCompactSyncOverflowPropagatesFailedEmergencyTrim(t *testing.T) {
 
 	out := make(chan Event, 64)
 	completion := &llm.Completion{Usage: &llm.Usage{TotalTokens: 4000, PromptTokens: 4000}}
-	compactErr := ag.compactSyncOverflow(context.Background(), completion, completion.Usage, out)
+	compactErr := ag.compactSyncOverflow(context.Background(), completion, completion.Usage, wrapLegacyEventOutput(out))
 	budget := ag.compactor.ThresholdTokens()
 	estimate := ag.compactor.EstimateMessages(ag.Messages())
 	if estimate <= budget {
