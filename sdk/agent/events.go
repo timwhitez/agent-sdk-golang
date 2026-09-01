@@ -151,8 +151,10 @@ type AccountingEvent struct {
 	CorrelationKind string
 	ToolCallID      string
 	ResponseID      string
-	Sequence        uint64
-	DurationMS      int64
+	// Sequence is the legacy accounting-only counter. EventEnvelope.Sequence is
+	// the query-wide ordering authority shared by every event kind.
+	Sequence   uint64
+	DurationMS int64
 }
 
 func (AccountingEvent) isEvent() {}

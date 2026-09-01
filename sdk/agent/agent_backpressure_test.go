@@ -375,13 +375,14 @@ func TestCriticalEventFloorIsSkippedForCanceledTurn(t *testing.T) {
 	}
 
 	canceledOut := make(chan Event, 1)
+	canceledDelivery := wrapLegacyEventOutput(canceledOut)
 	canceledOut <- WarnEvent{Message: "filler"} // channel is now full
 	canceledCtx, cancel := context.WithCancel(context.Background())
-	defer ag.registerTurnCancellation(canceledOut, canceledCtx)()
+	defer ag.registerTurnCancellation(canceledDelivery, canceledCtx)()
 	cancel()
 
 	start := time.Now()
-	if ag.emitEvent(canceledOut, ToolResultEvent{Tool: "read"}) {
+	if ag.emitEvent(canceledDelivery, ToolResultEvent{Tool: "read"}) {
 		t.Fatal("expected the send into a full channel to fail")
 	}
 	if elapsed := time.Since(start); elapsed >= criticalEventSendTimeoutFloor {
@@ -390,7 +391,7 @@ func TestCriticalEventFloorIsSkippedForCanceledTurn(t *testing.T) {
 
 	start = time.Now()
 	for i := 0; i < 6; i++ {
-		ag.emitEvent(canceledOut, ToolResultEvent{Tool: "read"})
+		ag.emitEvent(canceledDelivery, ToolResultEvent{Tool: "read"})
 	}
 	if elapsed := time.Since(start); elapsed >= criticalEventSendTimeoutFloor {
 		t.Fatalf("6 critical events on a canceled turn cost %v; expected far below one %v floor",
@@ -398,12 +399,13 @@ func TestCriticalEventFloorIsSkippedForCanceledTurn(t *testing.T) {
 	}
 
 	liveOut := make(chan Event, 1)
+	liveDelivery := wrapLegacyEventOutput(liveOut)
 	liveOut <- WarnEvent{Message: "filler"}
 	liveCtx, liveCancel := context.WithCancel(context.Background())
 	defer liveCancel()
-	defer ag.registerTurnCancellation(liveOut, liveCtx)()
+	defer ag.registerTurnCancellation(liveDelivery, liveCtx)()
 	start = time.Now()
-	ag.emitEvent(liveOut, ToolResultEvent{Tool: "read"})
+	ag.emitEvent(liveDelivery, ToolResultEvent{Tool: "read"})
 	if elapsed := time.Since(start); elapsed < criticalEventSendTimeoutFloor {
 		t.Fatalf("live turn lost the deliberate critical-event floor: %v < %v", elapsed, criticalEventSendTimeoutFloor)
 	}
@@ -467,15 +469,16 @@ func TestCriticalEventFloorIsBoundedPerTurn(t *testing.T) {
 		t.Fatalf("new agent: %v", err)
 	}
 	out := make(chan Event, 1)
+	delivery := wrapLegacyEventOutput(out)
 	out <- WarnEvent{Message: "filler"} // full channel, and nothing drains it
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	defer ag.registerTurnCancellation(out, ctx)()
+	defer ag.registerTurnCancellation(delivery, ctx)()
 
 	const events = 700 // ~100 tool calls x ~7 critical events
 	start := time.Now()
 	for i := 0; i < events; i++ {
-		ag.emitEvent(out, ToolResultEvent{Tool: "read"})
+		ag.emitEvent(delivery, ToolResultEvent{Tool: "read"})
 	}
 	elapsed := time.Since(start)
 
@@ -510,13 +513,14 @@ func TestCriticalEventFloorBudgetStillPaysTheFirstEvents(t *testing.T) {
 		t.Fatalf("new agent: %v", err)
 	}
 	out := make(chan Event, 1)
+	delivery := wrapLegacyEventOutput(out)
 	out <- WarnEvent{Message: "filler"}
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	defer ag.registerTurnCancellation(out, ctx)()
+	defer ag.registerTurnCancellation(delivery, ctx)()
 
 	start := time.Now()
-	ag.emitEvent(out, ToolResultEvent{Tool: "read"})
+	ag.emitEvent(delivery, ToolResultEvent{Tool: "read"})
 	if elapsed := time.Since(start); elapsed < criticalEventSendTimeoutFloor {
 		t.Fatalf("the first critical event of a turn lost the deliberate floor: %v < %v",
 			elapsed, criticalEventSendTimeoutFloor)
@@ -526,25 +530,26 @@ func TestCriticalEventFloorBudgetStillPaysTheFirstEvents(t *testing.T) {
 	deadline := time.Now().Add(2 * criticalEventFloorTurnBudget)
 	for time.Now().Before(deadline) {
 		before := time.Now()
-		ag.emitEvent(out, ToolResultEvent{Tool: "read"})
+		ag.emitEvent(delivery, ToolResultEvent{Tool: "read"})
 		if time.Since(before) < criticalEventSendTimeoutFloor {
 			break // budget spent, critical events fell back to the ordinary budget
 		}
 	}
 	start = time.Now()
-	ag.emitEvent(out, ToolResultEvent{Tool: "read"})
+	ag.emitEvent(delivery, ToolResultEvent{Tool: "read"})
 	if elapsed := time.Since(start); elapsed >= criticalEventSendTimeoutFloor {
 		t.Fatalf("a critical event still paid the full floor after the turn budget was spent: %v", elapsed)
 	}
 
 	// A fresh turn gets a fresh budget.
 	freshOut := make(chan Event, 1)
+	freshDelivery := wrapLegacyEventOutput(freshOut)
 	freshOut <- WarnEvent{Message: "filler"}
 	freshCtx, freshCancel := context.WithCancel(context.Background())
 	defer freshCancel()
-	defer ag.registerTurnCancellation(freshOut, freshCtx)()
+	defer ag.registerTurnCancellation(freshDelivery, freshCtx)()
 	start = time.Now()
-	ag.emitEvent(freshOut, ToolResultEvent{Tool: "read"})
+	ag.emitEvent(freshDelivery, ToolResultEvent{Tool: "read"})
 	if elapsed := time.Since(start); elapsed < criticalEventSendTimeoutFloor {
 		t.Fatalf("a new turn did not get a fresh floor budget: %v < %v", elapsed, criticalEventSendTimeoutFloor)
 	}

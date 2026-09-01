@@ -331,7 +331,7 @@ func TestTodoCheckpointAtEligibleWatermarkUsesNormalPipeline(t *testing.T) {
 	}
 
 	out := make(chan Event, 1)
-	ag.applyPendingCompaction(out)
+	ag.applyPendingCompaction(wrapLegacyEventOutput(out))
 	close(out)
 	var got CompactionEvent
 	for event := range out {
@@ -374,7 +374,7 @@ func TestPlaceholderPressureUsesLocalDeterministicCleanup(t *testing.T) {
 	}
 
 	out := make(chan Event, 1)
-	ag.applyPendingCompaction(out)
+	ag.applyPendingCompaction(wrapLegacyEventOutput(out))
 	close(out)
 	var compacted CompactionEvent
 	for event := range out {

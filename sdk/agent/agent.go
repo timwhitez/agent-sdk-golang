@@ -108,6 +108,14 @@ type Config struct {
 	// EventDropLogEvery controls backpressure drop log frequency.
 	// Values <= 0 use a safe default.
 	EventDropLogEvery int
+	// QueryIDGenerator optionally supplies opaque query IDs for EventEnvelope.
+	// It may be called concurrently. Empty or whitespace-only results fall back
+	// to an SDK-generated ID.
+	QueryIDGenerator func() string
+	// EventClock supplies observational EventEnvelope timestamps. Sequence is
+	// the only ordering authority. It may be called concurrently. Nil uses
+	// time.Now.
+	EventClock func() time.Time
 	// StreamIdleTimeout bounds how long a streaming response may go without any
 	// event before it is treated as stalled (and auto-recovered). Values <= 0
 	// use the package default (75s). Use a larger value for long single-step
@@ -150,6 +158,8 @@ type Agent struct {
 	eventBufferSize            int
 	eventSendTimeout           time.Duration
 	eventDropLogEvery          uint64
+	queryIDGenerator           func() string
+	eventClock                 func() time.Time
 	streamIdleTimeout          time.Duration
 	streamIdleMaxRecov         int
 	toolChoice                 llm.ToolChoice
@@ -234,7 +244,7 @@ type Agent struct {
 	// preventing overlapping submissions from mutating shared turn state.
 	turnActive      atomic.Bool
 	turnCancelMu    sync.Mutex
-	turnCancelByOut map[chan Event]*turnBackpressure
+	turnCancelByOut map[*eventOutput]*turnBackpressure
 }
 
 // turnBackpressure carries the per-turn state emitEvent needs on the slow path:
@@ -429,6 +439,8 @@ func New(cfg Config) (*Agent, error) {
 		eventBufferSize:       cfg.EventBufferSize,
 		eventSendTimeout:      cfg.EventSendTimeout,
 		eventDropLogEvery:     uint64(cfg.EventDropLogEvery),
+		queryIDGenerator:      cfg.QueryIDGenerator,
+		eventClock:            cfg.EventClock,
 		streamIdleTimeout:     cfg.StreamIdleTimeout,
 		streamIdleMaxRecov:    cfg.StreamIdleMaxRecoveries,
 		toolChoice:            cfg.ToolChoice,
@@ -527,6 +539,13 @@ func (a *Agent) QueryStream(ctx context.Context, input llm.Content) <-chan Event
 	return a.QueryStreamWithSteering(ctx, input, nil)
 }
 
+// QueryStreamEnveloped returns the same typed events as QueryStream with
+// query-wide ordering metadata. It uses the same delivery and backpressure
+// path; only the public channel projection differs.
+func (a *Agent) QueryStreamEnveloped(ctx context.Context, input llm.Content) <-chan EventEnvelope {
+	return a.QueryStreamEnvelopedWithSteering(ctx, input, nil)
+}
+
 // QueryStreamWithSteering is like QueryStream but accepts an optional steering channel.
 // When steeringCh is non-nil, the agent checks for new user messages at natural breakpoints
 // (before each LLM invocation and after each tool execution). Any received steering messages
@@ -535,16 +554,26 @@ func (a *Agent) QueryStream(ctx context.Context, input llm.Content) <-chan Event
 //
 // The steering channel is caller-owned. The agent only reads from it and never closes it.
 func (a *Agent) QueryStreamWithSteering(ctx context.Context, input llm.Content, steeringCh <-chan SteeringMsg) <-chan Event {
+	return a.queryStreamWithSteering(ctx, input, steeringCh, false).legacy
+}
+
+// QueryStreamEnvelopedWithSteering is the enveloped form of
+// QueryStreamWithSteering. The steering channel remains caller-owned.
+func (a *Agent) QueryStreamEnvelopedWithSteering(ctx context.Context, input llm.Content, steeringCh <-chan SteeringMsg) <-chan EventEnvelope {
+	return a.queryStreamWithSteering(ctx, input, steeringCh, true).enveloped
+}
+
+func (a *Agent) queryStreamWithSteering(ctx context.Context, input llm.Content, steeringCh <-chan SteeringMsg, enveloped bool) *eventOutput {
 	bufferSize := defaultEventBufferSize
 	if a != nil && a.eventBufferSize > 0 {
 		bufferSize = a.eventBufferSize
 	}
-	out := make(chan Event, bufferSize)
+	out := newEventOutput(bufferSize, enveloped, a.newQueryID(), a.eventClock)
 	if !a.turnActive.CompareAndSwap(false, true) {
 		// Admission is synchronous and out is buffered, so callers receive a
 		// deterministic terminal rejection without scheduling another goroutine.
-		out <- ErrorEvent{Kind: "agent_busy", Message: ErrAgentBusy.Error()}
-		close(out)
+		out.trySend(out.next(ErrorEvent{Kind: "agent_busy", Message: ErrAgentBusy.Error()}))
+		out.close()
 		return out
 	}
 	// Reserve synchronously when possible so an update made after this call
@@ -556,7 +585,7 @@ func (a *Agent) QueryStreamWithSteering(ctx context.Context, input llm.Content, 
 		// Later defers execute first. Runtime release happens before admission
 		// is reopened and before channel close, so the next accepted operation
 		// observes any queued replacement.
-		defer close(out)
+		defer out.close()
 		defer a.turnActive.Store(false)
 		defer unregisterTurn()
 		if !acquired {
@@ -602,21 +631,12 @@ func (a *Agent) QueryStreamWithSteering(ctx context.Context, input llm.Content, 
 		progressLedger := newEvidenceProgressLedger(a.deps, a.compactionGeneration.Load())
 		loopGuardStrikes := 0
 		hasDoneTool := a.hasToolNamed("done")
-		droppedAtTurnStart := a.eventDropCount.Load()
+		out.setDropBaseline(a.eventDropCount.Load(), a.criticalEventDropCount.Load())
 		droppedThisTurn := func() uint64 {
-			current := a.eventDropCount.Load()
-			if current <= droppedAtTurnStart {
-				return 0
-			}
-			return current - droppedAtTurnStart
+			return dropsSince(a.eventDropCount.Load(), out.dropStart)
 		}
-		criticalDroppedAtTurnStart := a.criticalEventDropCount.Load()
 		criticalDroppedThisTurn := func() uint64 {
-			current := a.criticalEventDropCount.Load()
-			if current <= criticalDroppedAtTurnStart {
-				return 0
-			}
-			return current - criticalDroppedAtTurnStart
+			return dropsSince(a.criticalEventDropCount.Load(), out.criticalDropStart)
 		}
 		emitFinal := func(content, responseID string) {
 			a.emitEvent(out, FinalResponseEvent{
@@ -1466,6 +1486,15 @@ func (a *Agent) QueryStreamWithSteering(ctx context.Context, input llm.Content, 
 	return out
 }
 
+func (a *Agent) newQueryID() string {
+	if a != nil && a.queryIDGenerator != nil {
+		if id := strings.TrimSpace(a.queryIDGenerator()); id != "" {
+			return id
+		}
+	}
+	return newDefaultQueryID()
+}
+
 func (a *Agent) applyToolResultTruncation(ctx context.Context, content llm.Content, meta map[string]any, toolName, toolCallID string) (llm.Content, map[string]any) {
 	return a.applyToolResultBoundary(ctx, content, meta, toolName, toolCallID)
 }
@@ -1885,7 +1914,7 @@ func isVisibleProviderStreamEvent(ev llm.StreamEvent) bool {
 // It returns the completion (possibly partial on error), whether text was streamed, and error.
 // On streaming errors, the partial completion contains whatever text/tools were accumulated
 // before the error occurred, allowing callers to preserve partial output in history.
-func (a *Agent) invokeCompletion(ctx context.Context, req llm.InvokeRequest, out chan Event) (*llm.Completion, bool, error) {
+func (a *Agent) invokeCompletion(ctx context.Context, req llm.InvokeRequest, out *eventOutput) (*llm.Completion, bool, error) {
 	return a.invokeCompletionWithSteering(ctx, req, out, nil)
 }
 
@@ -1893,14 +1922,14 @@ func (a *Agent) invokeCompletion(ctx context.Context, req llm.InvokeRequest, out
 // When steeringCh is non-nil, the stream can be interrupted mid-generation if the user
 // sends a steering message. The function returns a SteeringInterruptError in that case,
 // allowing the caller to immediately incorporate the steering message into the conversation.
-func (a *Agent) invokeCompletionWithSteering(ctx context.Context, req llm.InvokeRequest, out chan Event, steeringCh <-chan SteeringMsg) (*llm.Completion, bool, error) {
+func (a *Agent) invokeCompletionWithSteering(ctx context.Context, req llm.InvokeRequest, out *eventOutput, steeringCh <-chan SteeringMsg) (*llm.Completion, bool, error) {
 	if a == nil {
 		return nil, false, fmt.Errorf("agent: nil llm")
 	}
 	return a.invokeModelCompletionWithSteering(ctx, a.llm, req, out, steeringCh)
 }
 
-func (a *Agent) invokeModelCompletionWithSteering(ctx context.Context, model llm.ChatModel, req llm.InvokeRequest, out chan Event, steeringCh <-chan SteeringMsg) (*llm.Completion, bool, error) {
+func (a *Agent) invokeModelCompletionWithSteering(ctx context.Context, model llm.ChatModel, req llm.InvokeRequest, out *eventOutput, steeringCh <-chan SteeringMsg) (*llm.Completion, bool, error) {
 	if model == nil {
 		return nil, false, fmt.Errorf("agent: nil llm")
 	}
@@ -2172,21 +2201,21 @@ func (a *Agent) invokeModelCompletionWithSteering(ctx context.Context, model llm
 	return comp, false, err
 }
 
-func (a *Agent) invokeCompletionWithRetry(ctx context.Context, req llm.InvokeRequest, out chan Event) (*llm.Completion, bool, error) {
+func (a *Agent) invokeCompletionWithRetry(ctx context.Context, req llm.InvokeRequest, out *eventOutput) (*llm.Completion, bool, error) {
 	return a.invokeCompletionWithRetryAndSteering(ctx, req, out, nil)
 }
 
 // invokeCompletionWithRetryAndSteering extends invokeCompletionWithRetry with steering support.
 // When a steering interrupt occurs, it immediately returns the partial completion along with
 // the SteeringInterruptError, allowing the agent loop to process the steering message.
-func (a *Agent) invokeCompletionWithRetryAndSteering(ctx context.Context, req llm.InvokeRequest, out chan Event, steeringCh <-chan SteeringMsg) (*llm.Completion, bool, error) {
+func (a *Agent) invokeCompletionWithRetryAndSteering(ctx context.Context, req llm.InvokeRequest, out *eventOutput, steeringCh <-chan SteeringMsg) (*llm.Completion, bool, error) {
 	if a == nil {
 		return nil, false, fmt.Errorf("agent: nil llm")
 	}
 	return a.invokeModelCompletionWithRetryAndSteering(ctx, a.llm, req, out, steeringCh)
 }
 
-func (a *Agent) invokeModelCompletionWithRetryAndSteering(ctx context.Context, model llm.ChatModel, req llm.InvokeRequest, out chan Event, steeringCh <-chan SteeringMsg) (*llm.Completion, bool, error) {
+func (a *Agent) invokeModelCompletionWithRetryAndSteering(ctx context.Context, model llm.ChatModel, req llm.InvokeRequest, out *eventOutput, steeringCh <-chan SteeringMsg) (*llm.Completion, bool, error) {
 	maxAttempts := defaultInvokeRetryMax
 	if a != nil && a.invokeRetryMax > 0 {
 		maxAttempts = a.invokeRetryMax
@@ -2564,7 +2593,7 @@ func (a *Agent) executeToolSafely(ctx context.Context, tool tools.Tool, raw stri
 // normal success path (terminal stream error, steering interrupt, idle-timeout
 // recovery, context cancellation). The provider already billed the tokens it
 // produced, so skipping this leaves the accounting journal under-counted.
-func (a *Agent) emitPartialUsage(out chan Event, comp *llm.Completion) {
+func (a *Agent) emitPartialUsage(out *eventOutput, comp *llm.Completion) {
 	if comp == nil || comp.Usage == nil {
 		return
 	}
@@ -2575,7 +2604,7 @@ func (a *Agent) emitPartialUsage(out chan Event, comp *llm.Completion) {
 	a.emitUsageWithAccounting(out, *usage, strings.TrimSpace(comp.ResponseID))
 }
 
-func (a *Agent) emitUsageWithAccounting(out chan Event, usage llm.Usage, responseID string) {
+func (a *Agent) emitUsageWithAccounting(out *eventOutput, usage llm.Usage, responseID string) {
 	if !a.emitEvent(out, UsageEvent{Usage: usage, ResponseID: responseID}) {
 		return
 	}
@@ -2586,7 +2615,7 @@ func (a *Agent) emitUsageWithAccounting(out chan Event, usage llm.Usage, respons
 	})
 }
 
-func (a *Agent) emitToolResultWithAccounting(out chan Event, event ToolResultEvent, original string, duration time.Duration) {
+func (a *Agent) emitToolResultWithAccounting(out *eventOutput, event ToolResultEvent, original string, duration time.Duration) {
 	if !a.emitEvent(out, event) {
 		return
 	}
@@ -2604,7 +2633,7 @@ func (a *Agent) emitToolResultWithAccounting(out chan Event, event ToolResultEve
 	})
 }
 
-func (a *Agent) emitCompactionWithAccounting(out chan Event, event CompactionEvent) {
+func (a *Agent) emitCompactionWithAccounting(out *eventOutput, event CompactionEvent) {
 	if !a.emitEvent(out, event) {
 		return
 	}
@@ -2614,19 +2643,18 @@ func (a *Agent) emitCompactionWithAccounting(out chan Event, event CompactionEve
 	})
 }
 
-func (a *Agent) emitAccounting(out chan Event, event AccountingEvent) {
+func (a *Agent) emitAccounting(out *eventOutput, event AccountingEvent) {
 	event.Sequence = a.accountingSequence.Add(1)
 	a.emitEvent(out, event)
 }
 
-func (a *Agent) emitEvent(out chan Event, ev Event) bool {
+func (a *Agent) emitEvent(out *eventOutput, ev Event) bool {
 	if out == nil {
 		return false
 	}
-	select {
-	case out <- ev:
+	envelope := out.next(ev)
+	if out.trySend(envelope) {
 		return true
-	default:
 	}
 
 	timeout := defaultEventSendTimeout
@@ -2655,7 +2683,7 @@ func (a *Agent) emitEvent(out chan Event, ev Event) bool {
 	}
 	floored := false
 	if isTerminalAgentEvent(ev) {
-		if a.tryEnqueueTerminalEvent(out, ev) {
+		if a.tryEnqueueTerminalEvent(out, envelope) {
 			return true
 		}
 		// Terminal events are not charged against the per-turn floor budget:
@@ -2708,13 +2736,13 @@ func (a *Agent) emitEvent(out chan Event, ev Event) bool {
 	}()
 	// A turn cancelled while this send is already waiting aborts the wait for the
 	// same reason: nothing is going to read the channel any more.
-	select {
-	case out <- ev:
+	switch out.sendUntil(envelope, turnDone, timer.C) {
+	case eventSent:
 		return true
-	case <-turnDone:
+	case eventTurnCanceled:
 		a.logDroppedEvent(ev, "turn_canceled")
 		return false
-	case <-timer.C:
+	default:
 		a.logDroppedEvent(ev, fmt.Sprintf("send_timeout_%s", timeout))
 		return false
 	}
@@ -2796,13 +2824,13 @@ func (t *turnBackpressure) chargeFloorSpent(d time.Duration) {
 // emitEvent can stop paying the critical-event floor once the turn is abandoned,
 // and gives the turn a fresh floor budget (see criticalEventFloorTurnBudget).
 // The returned function must be called when the turn ends.
-func (a *Agent) registerTurnCancellation(out chan Event, ctx context.Context) func() {
+func (a *Agent) registerTurnCancellation(out *eventOutput, ctx context.Context) func() {
 	if a == nil || out == nil || ctx == nil || ctx.Done() == nil {
 		return func() {}
 	}
 	a.turnCancelMu.Lock()
 	if a.turnCancelByOut == nil {
-		a.turnCancelByOut = make(map[chan Event]*turnBackpressure, 1)
+		a.turnCancelByOut = make(map[*eventOutput]*turnBackpressure, 1)
 	}
 	a.turnCancelByOut[out] = &turnBackpressure{done: ctx.Done()}
 	a.turnCancelMu.Unlock()
@@ -2816,7 +2844,7 @@ func (a *Agent) registerTurnCancellation(out chan Event, ctx context.Context) fu
 // turnBackpressureState returns the backpressure state of the turn that owns out,
 // or nil when the channel belongs to no registered turn (e.g. a direct unit-test
 // call or a library caller driving the loop itself).
-func (a *Agent) turnBackpressureState(out chan Event) *turnBackpressure {
+func (a *Agent) turnBackpressureState(out *eventOutput) *turnBackpressure {
 	if a == nil || out == nil {
 		return nil
 	}
@@ -2829,27 +2857,31 @@ func (a *Agent) turnBackpressureState(out chan Event) *turnBackpressure {
 // when the channel belongs to no registered turn (e.g. a direct unit-test call).
 // A nil channel blocks forever in a select, which is exactly the previous
 // behavior for unregistered channels.
-func (a *Agent) turnCancellation(out chan Event) <-chan struct{} {
+func (a *Agent) turnCancellation(out *eventOutput) <-chan struct{} {
 	if state := a.turnBackpressureState(out); state != nil {
 		return state.done
 	}
 	return nil
 }
 
-func (a *Agent) tryEnqueueTerminalEvent(out chan Event, ev Event) bool {
-	select {
-	case buffered := <-out:
-		if isTerminalAgentEvent(buffered) && terminalEventPriority(buffered) > terminalEventPriority(ev) {
-			out <- buffered
-			a.logDroppedEvent(ev, "terminal_priority_loss")
-			return false
-		}
-		a.logDroppedEvent(buffered, "evicted_for_terminal")
-		out <- ev
-		return true
-	default:
+func (a *Agent) tryEnqueueTerminalEvent(out *eventOutput, envelope EventEnvelope) bool {
+	buffered, ok := out.tryReceive()
+	if !ok {
 		return false
 	}
+	if isTerminalAgentEvent(buffered.Event) && terminalEventPriority(buffered.Event) > terminalEventPriority(envelope.Event) {
+		out.sendAfterReceive(buffered)
+		a.logDroppedEvent(envelope.Event, "terminal_priority_loss")
+		return false
+	}
+	a.logDroppedEvent(buffered.Event, "evicted_for_terminal")
+	if final, ok := envelope.Event.(FinalResponseEvent); ok {
+		final.DroppedEvents = dropsSince(a.eventDropCount.Load(), out.dropStart)
+		final.DroppedCriticalEvents = dropsSince(a.criticalEventDropCount.Load(), out.criticalDropStart)
+		envelope.Event = final
+	}
+	out.sendAfterReceive(envelope)
+	return true
 }
 
 func terminalEventPriority(ev Event) int {
@@ -2948,7 +2980,7 @@ func (a *Agent) logDroppedEvent(ev Event, reason string) {
 	}
 }
 
-func (a *Agent) emitAutoContinue(out chan Event, reason string, responseID string) {
+func (a *Agent) emitAutoContinue(out *eventOutput, reason string, responseID string) {
 	a.emitEvent(out, AutoContinueEvent{Reason: reason, ResponseID: strings.TrimSpace(responseID)})
 }
 
@@ -3109,7 +3141,7 @@ func (a *Agent) NotifyTodoCompletion() {
 	a.todoCompactionPending.Store(true)
 }
 
-func (a *Agent) checkAndCompact(ctx context.Context, last *llm.Completion, out chan Event, additionalTokens ...int) error {
+func (a *Agent) checkAndCompact(ctx context.Context, last *llm.Completion, out *eventOutput, additionalTokens ...int) error {
 	currentHistoryGrowth := 0
 	for _, value := range additionalTokens {
 		if value > 0 {
@@ -3119,7 +3151,7 @@ func (a *Agent) checkAndCompact(ctx context.Context, last *llm.Completion, out c
 	return a.checkAndCompactWithGrowth(ctx, last, out, currentHistoryGrowth, 0)
 }
 
-func (a *Agent) checkAndCompactWithGrowth(ctx context.Context, last *llm.Completion, out chan Event, currentHistoryGrowth, pendingHistoryGrowth int) error {
+func (a *Agent) checkAndCompactWithGrowth(ctx context.Context, last *llm.Completion, out *eventOutput, currentHistoryGrowth, pendingHistoryGrowth int) error {
 	if !a.hasCompactor || a.compactor == nil || last == nil {
 		return nil
 	}
@@ -3163,7 +3195,7 @@ func (a *Agent) checkAndCompactWithGrowth(ctx context.Context, last *llm.Complet
 // leaves the SDK: the pipeline result reports the raw trigger usage instead. So
 // without this event the estimator-versus-provider drift that moves every
 // watermark stays unobservable, which is what makes the mixed decision unsafe.
-func (a *Agent) emitCompactionDecisionProvenance(out chan Event, decisionUsage *llm.Usage) {
+func (a *Agent) emitCompactionDecisionProvenance(out *eventOutput, decisionUsage *llm.Usage) {
 	if a == nil || out == nil || decisionUsage == nil {
 		return
 	}
@@ -3254,7 +3286,7 @@ func asyncCompactionContext(parent context.Context) (context.Context, context.Ca
 	return ctx, cancel
 }
 
-func (a *Agent) compactSyncOverflow(ctx context.Context, last *llm.Completion, decisionUsage *llm.Usage, out chan Event) error {
+func (a *Agent) compactSyncOverflow(ctx context.Context, last *llm.Completion, decisionUsage *llm.Usage, out *eventOutput) error {
 	if !a.hasCompactor || a.compactor == nil || last == nil {
 		return nil
 	}
@@ -3337,7 +3369,7 @@ func (a *Agent) compactSyncOverflow(ctx context.Context, last *llm.Completion, d
 // applyEmergencyTrim publishes an emergency-trimmed history as a compaction
 // result. It reports false when the trim could not produce a legal sendable
 // history, in which case the caller must keep surfacing the original failure.
-func (a *Agent) applyEmergencyTrim(messages []llm.Message, snapshotLen int, triggerUsage *llm.Usage, cause error, out chan Event) bool {
+func (a *Agent) applyEmergencyTrim(messages []llm.Message, snapshotLen int, triggerUsage *llm.Usage, cause error, out *eventOutput) bool {
 	trimmed, trimmedOK := a.emergencyTrimHistory(messages)
 	if !trimmedOK {
 		return false
@@ -3849,7 +3881,7 @@ func (a *Agent) compactOverflowWithPlan(ctx context.Context, messages []llm.Mess
 // in-flight compaction that never completes must not hang the turn forever,
 // because its result is only published into pendingCompaction and is picked up
 // at the next boundary anyway.
-func (a *Agent) waitForCompactionIdle(ctx context.Context, out chan Event) error {
+func (a *Agent) waitForCompactionIdle(ctx context.Context, out *eventOutput) error {
 	if a == nil || !a.compactionInFlight.Load() {
 		return nil
 	}
@@ -3942,7 +3974,7 @@ func (a *Agent) hasPendingCompaction() bool {
 	return a.pendingCompaction != nil
 }
 
-func (a *Agent) applyPendingCompaction(out chan Event) {
+func (a *Agent) applyPendingCompaction(out *eventOutput) {
 	if !a.hasCompactor {
 		return
 	}
@@ -4733,7 +4765,7 @@ func (a *Agent) errEvent(err error) ErrorEvent {
 //
 // The function returns immediately if the channel is nil or empty.
 // Each received message triggers a SteeringReceivedEvent to notify the CLI layer.
-func (a *Agent) drainSteering(ch <-chan SteeringMsg, out chan Event) int {
+func (a *Agent) drainSteering(ch <-chan SteeringMsg, out *eventOutput) int {
 	messages := a.collectSteering(ch, out)
 	if len(messages) == 0 {
 		return 0
@@ -4747,7 +4779,7 @@ func (a *Agent) drainSteering(ch <-chan SteeringMsg, out chan Event) int {
 // assistant tool-call block must first complete the tool_result block and only
 // then append the returned messages: a provider rejects a tool_use block whose
 // tool results are interleaved with user text.
-func (a *Agent) collectSteering(ch <-chan SteeringMsg, out chan Event) []llm.Message {
+func (a *Agent) collectSteering(ch <-chan SteeringMsg, out *eventOutput) []llm.Message {
 	if ch == nil {
 		return nil
 	}

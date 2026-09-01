@@ -34,13 +34,14 @@ func TestCriticalEventFloorOverrideOfHostConfigIsReported(t *testing.T) {
 			}
 
 			out := make(chan Event, 1)
+			delivery := wrapLegacyEventOutput(out)
 			out <- WarnEvent{Message: "filler"} // channel is now full
 			ctx, cancel := context.WithCancel(context.Background())
 			defer cancel()
-			defer ag.registerTurnCancellation(out, ctx)()
+			defer ag.registerTurnCancellation(delivery, ctx)()
 
 			start := time.Now()
-			if ag.emitEvent(out, ToolResultEvent{Tool: "read"}) {
+			if ag.emitEvent(delivery, ToolResultEvent{Tool: "read"}) {
 				t.Fatal("expected the send into a full channel to fail")
 			}
 			// The floor still wins over the configured value: ISS-129b.
@@ -63,7 +64,7 @@ func TestCriticalEventFloorOverrideOfHostConfigIsReported(t *testing.T) {
 			// One line per turn, not one per event: a tool-heavy turn must not
 			// flood the host's log with the same notice.
 			for i := 0; i < 5; i++ {
-				ag.emitEvent(out, ToolResultEvent{Tool: "read"})
+				ag.emitEvent(delivery, ToolResultEvent{Tool: "read"})
 			}
 			lines := 0
 			for _, line := range strings.Split(warnings.String(), "\n") {
@@ -94,12 +95,13 @@ func TestCriticalEventFloorDoesNotReportWhenHostConfigMeetsTheFloor(t *testing.T
 		t.Fatalf("new agent: %v", err)
 	}
 	out := make(chan Event, 1)
+	delivery := wrapLegacyEventOutput(out)
 	out <- WarnEvent{Message: "filler"}
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	defer ag.registerTurnCancellation(out, ctx)()
+	defer ag.registerTurnCancellation(delivery, ctx)()
 
-	ag.emitEvent(out, ToolResultEvent{Tool: "read"})
+	ag.emitEvent(delivery, ToolResultEvent{Tool: "read"})
 	if got := warnings.String(); strings.Contains(got, "critical-event floor instead of") {
 		t.Fatalf("warned about an override that did not happen; warnings = %q", got)
 	}
@@ -121,12 +123,13 @@ func TestCriticalEventFloorDoesNotReportForCanceledTurn(t *testing.T) {
 		t.Fatalf("new agent: %v", err)
 	}
 	out := make(chan Event, 1)
+	delivery := wrapLegacyEventOutput(out)
 	out <- WarnEvent{Message: "filler"}
 	ctx, cancel := context.WithCancel(context.Background())
-	defer ag.registerTurnCancellation(out, ctx)()
+	defer ag.registerTurnCancellation(delivery, ctx)()
 	cancel()
 
-	ag.emitEvent(out, ToolResultEvent{Tool: "read"})
+	ag.emitEvent(delivery, ToolResultEvent{Tool: "read"})
 	if got := warnings.String(); strings.Contains(got, "critical-event floor instead of") {
 		t.Fatalf("a canceled turn reported a floor override it never paid; warnings = %q", got)
 	}

@@ -28,6 +28,11 @@ and progressive disclosure through `agent_docs/`.
   no session, path, raw result, command, or arbitrary metadata; hosts add
   identity, persistence, rollup, and reporting (`sdk/accounting`,
   `sdk/agent/events.go`).
+- `QueryStreamEnveloped` preserves typed Event payloads while adding a
+  versioned, per-query `QueryID`, pre-delivery monotonic sequence, stable
+  kind/origin, and observational timestamp. Legacy `QueryStream` uses the same
+  direct delivery/backpressure path without metadata; sequence gaps expose
+  dropped events (`sdk/agent/event_envelope.go`, `sdk/agent/agent.go`).
 - Auto-continue on `max_tokens` (including partial tool-call merge) now emits metadata-only `AutoContinueEvent` instead of text markers (`sdk/agent/agent.go:259`, `sdk/agent/agent.go:275`, `sdk/agent/agent.go:298`, `sdk/agent/events.go:113`)
 - Tool resolution via exact + normalized + alias matching (`sdk/agent/tool_resolve.go:107`, `sdk/agent/tool_resolve.go:30`)
 - Argument normalization with conservative loose-object repair + schema-key retry, including schema-derived single-string wrapping for custom tools and tool-specific alias handling for ambiguous keys like `line`/`offset` (`sdk/tools/args_normalize.go:21`, `sdk/tools/args_normalize.go:247`, `sdk/tools/tool.go:363`)
