@@ -93,7 +93,7 @@ func TestEventEnvelopeClassifiesAllTypedEvents(t *testing.T) {
 		{ThinkingDeltaEvent{}, EventKindThinkingDelta, EventOriginModel},
 		{ErrorEvent{}, EventKindError, EventOriginSDKDriver},
 		{ErrorEvent{Provider: "fixture"}, EventKindError, EventOriginProvider},
-		{ErrorEvent{Provider: "fixture", Kind: "canceled"}, EventKindError, EventOriginSDKDriver},
+		{ErrorEvent{Provider: "fixture", Kind: "canceled"}, EventKindError, EventOriginProvider},
 		{ErrorEvent{Provider: "fixture", Kind: "max_iterations"}, EventKindError, EventOriginSDKDriver},
 		{WarnEvent{}, EventKindWarning, EventOriginSDKDriver},
 		{HiddenUserMessageEvent{}, EventKindHiddenUserMessage, EventOriginSDKDriver},
@@ -159,7 +159,7 @@ func TestEventEnvelopeSDKTerminalErrorsKeepSDKOrigin(t *testing.T) {
 	assertEnvelopeErrorOrigin(t, maximum, "max_iterations", EventOriginSDKDriver)
 }
 
-func TestEventEnvelopeTimeoutOriginUsesEmissionBoundary(t *testing.T) {
+func TestEventEnvelopeCancellationOriginUsesEmissionBoundary(t *testing.T) {
 	rootModel := &envelopeErrorModel{err: context.DeadlineExceeded}
 	rootAgent, err := New(Config{LLM: rootModel})
 	if err != nil {
@@ -173,15 +173,26 @@ func TestEventEnvelopeTimeoutOriginUsesEmissionBoundary(t *testing.T) {
 		t.Fatalf("expired root deadline invoked provider %d times", calls)
 	}
 
-	providerModel := &envelopeErrorModel{err: context.DeadlineExceeded}
-	providerAgent, err := New(Config{LLM: providerModel})
-	if err != nil {
-		t.Fatal(err)
-	}
-	providerTimeout := collectEnvelopes(providerAgent.QueryStreamEnveloped(context.Background(), llm.TextContent("run")))
-	assertEnvelopeErrorOrigin(t, providerTimeout, "timeout", EventOriginProvider)
-	if calls := providerModel.calls.Load(); calls == 0 {
-		t.Fatal("provider timeout did not invoke provider")
+	for _, test := range []struct {
+		name string
+		err  error
+		kind string
+	}{
+		{name: "deadline", err: context.DeadlineExceeded, kind: "timeout"},
+		{name: "canceled", err: context.Canceled, kind: "canceled"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			providerModel := &envelopeErrorModel{err: test.err}
+			providerAgent, err := New(Config{LLM: providerModel})
+			if err != nil {
+				t.Fatal(err)
+			}
+			providerError := collectEnvelopes(providerAgent.QueryStreamEnveloped(context.Background(), llm.TextContent("run")))
+			assertEnvelopeErrorOrigin(t, providerError, test.kind, EventOriginProvider)
+			if calls := providerModel.calls.Load(); calls == 0 {
+				t.Fatalf("provider %s did not invoke provider", test.name)
+			}
+		})
 	}
 }
 

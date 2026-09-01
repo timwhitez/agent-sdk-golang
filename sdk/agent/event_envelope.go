@@ -237,7 +237,7 @@ func classifyEvent(event Event) (EventKind, EventOrigin) {
 
 func classifyErrorOrigin(event ErrorEvent) EventOrigin {
 	switch strings.TrimSpace(event.Kind) {
-	case "agent_busy", "canceled", "invalid_tool_call_block", "max_iterations", "loop_guard", "doom_loop":
+	case "agent_busy", "invalid_tool_call_block", "max_iterations", "loop_guard", "doom_loop":
 		return EventOriginSDKDriver
 	}
 	if strings.TrimSpace(event.Provider) != "" {

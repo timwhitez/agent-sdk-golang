@@ -659,13 +659,19 @@ func (a *Agent) queryStreamWithSteering(ctx context.Context, input llm.Content, 
 				DroppedCriticalEvents: criticalDroppedThisTurn(),
 			})
 		}
-		emitErr := func(e ErrorEvent) {
+		emitErr := func(e ErrorEvent, origin EventOrigin) {
 			e.StallRecoveries = streamIdleRecoveryTotal
-			a.emitEvent(out, e)
+			a.emitEventFrom(out, e, origin)
 		}
 		emitSDKErr := func(e ErrorEvent) {
-			e.StallRecoveries = streamIdleRecoveryTotal
-			a.emitEventFrom(out, e, EventOriginSDKDriver)
+			emitErr(e, EventOriginSDKDriver)
+		}
+		emitCompactionErr := func(e ErrorEvent) {
+			origin := EventOriginCompaction
+			if ctx.Err() != nil {
+				origin = EventOriginSDKDriver
+			}
+			emitErr(e, origin)
 		}
 
 		// maxIterations < 0 means unlimited: the loop is then bounded only by
@@ -821,7 +827,11 @@ func (a *Agent) queryStreamWithSteering(ctx context.Context, input llm.Content, 
 				// before the terminal error or the tokens never reach the
 				// accounting journal, which silently under-counts the ledger.
 				a.emitPartialUsage(out, comp)
-				emitErr(a.errEvent(err))
+				origin := EventOriginProvider
+				if ctx.Err() != nil {
+					origin = EventOriginSDKDriver
+				}
+				emitErr(a.errEvent(err), origin)
 				return
 			}
 			streamIdleRecoveries = 0
@@ -875,7 +885,7 @@ func (a *Agent) queryStreamWithSteering(ctx context.Context, input llm.Content, 
 					Provider: a.llm.Provider(),
 					Kind:     "invalid_tool_call_block",
 					Message:  fmt.Sprintf("provider returned duplicate tool_call_id values at positions %d and %d; no tools were executed", first+1, second+1),
-				})
+				}, EventOriginSDKDriver)
 				return
 			}
 
@@ -939,7 +949,7 @@ func (a *Agent) queryStreamWithSteering(ctx context.Context, input llm.Content, 
 					reminder := messageorigin.NewInternalUserMessage(messageorigin.KindToolCallContinuation, messageorigin.ToolCallContinuationLimitText)
 					if a.hasCompactor {
 						if err := a.checkAndCompactWithGrowth(ctx, comp, out, additionalSinceCompletion(), pendingMessageTokens(reminder)); err != nil {
-							emitErr(a.errEvent(err))
+							emitCompactionErr(a.errEvent(err))
 							return
 						}
 					}
@@ -956,7 +966,7 @@ func (a *Agent) queryStreamWithSteering(ctx context.Context, input llm.Content, 
 				reminder := messageorigin.NewInternalUserMessage(messageorigin.KindToolCallContinuation, messageorigin.ResponseTruncatedContinuationText)
 				if a.hasCompactor {
 					if err := a.checkAndCompactWithGrowth(ctx, comp, out, additionalSinceCompletion(), pendingMessageTokens(reminder)); err != nil {
-						emitErr(a.errEvent(err))
+						emitCompactionErr(a.errEvent(err))
 						return
 					}
 				}
@@ -988,7 +998,7 @@ func (a *Agent) queryStreamWithSteering(ctx context.Context, input llm.Content, 
 						reminder := messageorigin.NewInternalUserMessage(messageorigin.KindToolCallContinuation, messageorigin.InvalidToolCallContinuationText)
 						if a.hasCompactor {
 							if err := a.checkAndCompactWithGrowth(ctx, comp, out, additionalSinceCompletion(), pendingMessageTokens(reminder)); err != nil {
-								emitErr(a.errEvent(err))
+								emitCompactionErr(a.errEvent(err))
 								return
 							}
 						}
@@ -1006,7 +1016,7 @@ func (a *Agent) queryStreamWithSteering(ctx context.Context, input llm.Content, 
 					reminder := messageorigin.NewInternalUserMessage(messageorigin.KindToolCallContinuation, messageorigin.ResponseTruncatedContinuationText)
 					if a.hasCompactor {
 						if err := a.checkAndCompactWithGrowth(ctx, comp, out, additionalSinceCompletion(), pendingMessageTokens(reminder)); err != nil {
-							emitErr(a.errEvent(err))
+							emitCompactionErr(a.errEvent(err))
 							return
 						}
 					}
@@ -1059,7 +1069,7 @@ func (a *Agent) queryStreamWithSteering(ctx context.Context, input llm.Content, 
 					reminder := messageorigin.NewInternalUserMessage(messageorigin.KindMaxTokensContinuation, messageorigin.ResponseTruncatedContinuationText)
 					if a.hasCompactor {
 						if err := a.checkAndCompactWithGrowth(ctx, comp, out, additionalSinceCompletion(), pendingMessageTokens(reminder)); err != nil {
-							emitErr(a.errEvent(err))
+							emitCompactionErr(a.errEvent(err))
 							return
 						}
 					}
@@ -1081,7 +1091,7 @@ func (a *Agent) queryStreamWithSteering(ctx context.Context, input llm.Content, 
 						reminder := messageorigin.NewInternalUserMessage(messageorigin.KindEarlyStop, earlyStopReminderText)
 						if a.hasCompactor {
 							if err := a.checkAndCompactWithGrowth(ctx, comp, out, additionalSinceCompletion(), pendingMessageTokens(reminder)); err != nil {
-								emitErr(a.errEvent(err))
+								emitCompactionErr(a.errEvent(err))
 								return
 							}
 						}
@@ -1155,7 +1165,7 @@ func (a *Agent) queryStreamWithSteering(ctx context.Context, input llm.Content, 
 					reminder := messageorigin.NewInternalUserMessage(messageorigin.KindRequireDone, requireDoneReminderText)
 					if a.hasCompactor {
 						if err := a.checkAndCompactWithGrowth(ctx, comp, out, additionalSinceCompletion(), pendingMessageTokens(reminder)); err != nil {
-							emitErr(a.errEvent(err))
+							emitCompactionErr(a.errEvent(err))
 							return
 						}
 					}
@@ -1475,7 +1485,7 @@ func (a *Agent) queryStreamWithSteering(ctx context.Context, input llm.Content, 
 			pendingBlockMessages = nil
 			if a.hasCompactor {
 				if err := a.checkAndCompact(ctx, comp, out, additionalSinceCompletion()); err != nil {
-					emitErr(a.errEvent(err))
+					emitCompactionErr(a.errEvent(err))
 					return
 				}
 			}
@@ -1484,7 +1494,7 @@ func (a *Agent) queryStreamWithSteering(ctx context.Context, input llm.Content, 
 		// Max iterations reached — emit both error and final events.
 		// Unreachable when maxIterations < 0 (unlimited).
 		msg := fmt.Sprintf("Max iterations reached (%d)", a.maxIterations)
-		emitErr(ErrorEvent{Provider: a.llm.Provider(), Message: msg, Kind: "max_iterations"})
+		emitErr(ErrorEvent{Provider: a.llm.Provider(), Message: msg, Kind: "max_iterations"}, EventOriginSDKDriver)
 		emitFinal(fmt.Sprintf("[Max iterations reached] %d", a.maxIterations), lastResponseID)
 	}(runtimeRelease, runtimeAcquired)
 	return out
