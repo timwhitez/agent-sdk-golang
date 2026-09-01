@@ -5012,22 +5012,10 @@ func (c *toolCallContinuation) clearPartialToolCalls(messages []llm.Message, cur
 		if messages[i].Role != llm.RoleAssistant || len(messages[i].ToolCalls) == 0 {
 			continue
 		}
+		// The SDK reminder owns the preceding unfinished block. IDs cannot
+		// identify the episode: providers may rotate them between fragments,
+		// while synthetic IDs are reused by later completed responses.
 		if messages[i+1].Role != llm.RoleUser || messages[i+1].Name != messageorigin.Name(messageorigin.KindToolCallContinuation) {
-			continue
-		}
-		matchesPending := false
-		for _, historical := range messages[i].ToolCalls {
-			for _, pending := range c.partialCalls {
-				if sameStableToolCallID(historical.ID, pending.ID) {
-					matchesPending = true
-					break
-				}
-			}
-			if matchesPending {
-				break
-			}
-		}
-		if !matchesPending {
 			continue
 		}
 		messages[i].ToolCalls = nil
