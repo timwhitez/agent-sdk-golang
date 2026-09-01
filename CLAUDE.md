@@ -14,6 +14,10 @@ and progressive disclosure through `agent_docs/`.
 - Agent orchestration and runtime state: `Config`, `Agent` (`sdk/agent/agent.go:20`, `sdk/agent/agent.go:39`)
 - Provider abstraction: `ChatModel`, `StreamingChatModel`, `InvokeRequest`, `StreamEvent` (`sdk/llm/model.go:8`, `sdk/llm/model.go:17`, `sdk/llm/model.go:82`, `sdk/llm/model.go:24`)
 - Message and tool-call model: `ToolChoice`, `ToolDefinition`, `ToolCall`, `Content`, `Message`, `Completion` (`sdk/llm/types.go:17`, `sdk/llm/types.go:25`, `sdk/llm/types.go:37`, `sdk/llm/types.go:68`, `sdk/llm/types.go:100`, `sdk/llm/types.go:133`)
+- Request-local prompt-cache intent and concrete-client capability types:
+  `CachePlan`, `CacheDirective`, `CacheTarget`, `PromptCacheCapabilities`, and
+  `PromptCacheCapabilityProvider` (`sdk/llm/cache_plan.go`). These types are not
+  yet attached to `InvokeRequest` or consumed by Provider serializers.
 - Tool system primitives: `Tool`, `Func`, `SchemaFor`, `SerializeResult` (`sdk/tools/tool.go:15`, `sdk/tools/tool.go:701`, `sdk/tools/schema.go:8`, `sdk/tools/result.go:10`)
 - Tool dependency context and metadata: `Container`, `WithToolCallID`, `WithToolResultMetadata` (`sdk/tools/deps.go:156`, `sdk/tools/deps.go:27`, `sdk/tools/deps.go:56`)
 - Compaction service: `compaction.Service` (`sdk/agent/compaction/service.go:10`)
