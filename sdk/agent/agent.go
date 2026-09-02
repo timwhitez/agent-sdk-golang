@@ -169,6 +169,7 @@ type Agent struct {
 
 	compactionAdmissionObserved func()
 	compactionShadowObserved    func()
+	toolBlockStateObserved      func(*toolBlockState)
 
 	tools             []tools.Tool
 	toolMap           map[string]tools.Tool
@@ -680,8 +681,14 @@ func (a *Agent) queryStreamWithSteering(ctx context.Context, input llm.Content, 
 		finishToolBlock := func() {
 			block := activeToolBlock
 			activeToolBlock = nil
+			if block == nil {
+				return
+			}
 			if err := block.validateClosed(); err != nil {
 				a.warnf("warning: tool block shadow invariant mismatch: %v", err)
+			}
+			if a.toolBlockStateObserved != nil {
+				a.toolBlockStateObserved(block)
 			}
 		}
 		defer finishToolBlock()
@@ -1380,6 +1387,7 @@ func (a *Agent) queryStreamWithSteering(ctx context.Context, input llm.Content, 
 				content, toolErr := a.executeToolSafely(ctxTool, tool, execArgs)
 				stageInterruptedForSteering := finishToolStage()
 				rootCancelErr := ctx.Err()
+				activeToolBlock.markAttemptReturned(idx, rootCancelErr != nil)
 				if rootCancelErr != nil {
 					// Root cancellation outranks a tool's ordinary or task-complete
 					// return. Keep a contiguous result for this call, then terminate.

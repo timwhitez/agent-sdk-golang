@@ -9,16 +9,40 @@ import (
 
 type toolCallPhase string
 
+type toolExecutionKnowledge uint8
+
 const (
 	toolCallAccepted toolCallPhase = "accepted"
 	toolCallRunning  toolCallPhase = "running"
 	toolCallTerminal toolCallPhase = "terminal"
+
+	toolExecutionUnknown toolExecutionKnowledge = iota
+	toolExecutionNotStarted
+	toolExecutionAttemptStarted
+	toolExecutionOutcomeObserved
+	toolExecutionIndeterminate
 )
 
 type toolCallState struct {
-	phase         toolCallPhase
-	terminalCount int
-	closure       string
+	phase              toolCallPhase
+	executionKnowledge toolExecutionKnowledge
+	terminalCount      int
+	closure            string
+}
+
+func (k toolExecutionKnowledge) String() string {
+	switch k {
+	case toolExecutionNotStarted:
+		return "not_started"
+	case toolExecutionAttemptStarted:
+		return "attempt_started"
+	case toolExecutionOutcomeObserved:
+		return "outcome_observed"
+	case toolExecutionIndeterminate:
+		return "indeterminate"
+	default:
+		return "unknown"
+	}
 }
 
 // toolBlockState is an observe-only mirror of the sequential Tool Loop. It is
@@ -33,7 +57,7 @@ func newToolBlockState(calls []llm.ToolCall) *toolBlockState {
 	seen := make(map[string]int, len(calls))
 	for i, call := range calls {
 		id := strings.TrimSpace(call.ID)
-		block.calls[i] = toolCallState{phase: toolCallAccepted}
+		block.calls[i] = toolCallState{phase: toolCallAccepted, executionKnowledge: toolExecutionNotStarted}
 		if id == "" {
 			block.addViolation("call[%d] has empty id", i)
 			continue
@@ -56,7 +80,27 @@ func (b *toolBlockState) markRunning(index int) {
 		b.addViolation("call[%d] cannot start from phase %q", index, call.phase)
 		return
 	}
+	if call.executionKnowledge != toolExecutionNotStarted {
+		b.addViolation("call[%d] cannot start from execution %q", index, call.executionKnowledge)
+		return
+	}
 	call.phase = toolCallRunning
+	call.executionKnowledge = toolExecutionAttemptStarted
+}
+
+func (b *toolBlockState) markAttemptReturned(index int, rootCanceled bool) {
+	call, ok := b.call(index)
+	if !ok {
+		return
+	}
+	if call.phase != toolCallRunning || call.executionKnowledge != toolExecutionAttemptStarted {
+		b.addViolation("call[%d] cannot observe attempt return from phase %q execution %q", index, call.phase, call.executionKnowledge)
+		return
+	}
+	call.executionKnowledge = toolExecutionOutcomeObserved
+	if rootCanceled {
+		call.executionKnowledge = toolExecutionIndeterminate
+	}
 }
 
 func (b *toolBlockState) markTerminal(index int, expected toolCallPhase, closure string) {
@@ -72,6 +116,12 @@ func (b *toolBlockState) markTerminal(index int, expected toolCallPhase, closure
 	if call.phase != expected {
 		b.addViolation("call[%d] closed by %q from phase %q, want %q", index, closure, call.phase, expected)
 		return
+	}
+	if expected == toolCallAccepted && call.executionKnowledge != toolExecutionNotStarted {
+		b.addViolation("call[%d] closed by %q from execution %q, want %q", index, closure, call.executionKnowledge, toolExecutionNotStarted)
+	}
+	if expected == toolCallRunning && call.executionKnowledge != toolExecutionOutcomeObserved && call.executionKnowledge != toolExecutionIndeterminate {
+		b.addViolation("call[%d] closed by %q from execution %q, want terminal execution knowledge", index, closure, call.executionKnowledge)
 	}
 	call.phase = toolCallTerminal
 	call.closure = closure
@@ -96,8 +146,8 @@ func (b *toolBlockState) validateClosed() error {
 	}
 	violations := append([]string(nil), b.violations...)
 	for i, call := range b.calls {
-		if call.phase != toolCallTerminal || call.terminalCount != 1 {
-			violations = append(violations, fmt.Sprintf("call[%d] remains phase=%q terminal_count=%d", i, call.phase, call.terminalCount))
+		if call.phase != toolCallTerminal || call.terminalCount != 1 || call.executionKnowledge == toolExecutionUnknown || call.executionKnowledge == toolExecutionAttemptStarted {
+			violations = append(violations, fmt.Sprintf("call[%d] remains phase=%q execution=%q terminal_count=%d", i, call.phase, call.executionKnowledge, call.terminalCount))
 		}
 	}
 	if len(violations) == 0 {
