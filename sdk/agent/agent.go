@@ -673,6 +673,15 @@ func (a *Agent) queryStreamWithSteering(ctx context.Context, input llm.Content, 
 			}
 			emitErr(e, origin)
 		}
+		var activeToolBlock *toolBlockState
+		finishToolBlock := func() {
+			block := activeToolBlock
+			activeToolBlock = nil
+			if err := block.validateClosed(); err != nil {
+				a.warnf("warning: tool block shadow invariant mismatch: %v", err)
+			}
+		}
+		defer finishToolBlock()
 
 		// maxIterations < 0 means unlimited: the loop is then bounded only by
 		// tool-loop guards, idle detection, and context cancellation.
@@ -1186,12 +1195,14 @@ func (a *Agent) queryStreamWithSteering(ctx context.Context, input llm.Content, 
 			// interleaved with user text, and the malformed history would stay
 			// in place and fail every later turn — so these are only appended
 			// once every tool_use in the block has a matching tool_result.
+			activeToolBlock = newToolBlockState(comp.ToolCalls)
 			var pendingBlockMessages []llm.Message
 			for idx, tc := range comp.ToolCalls {
 				if err := ctx.Err(); err != nil {
 					// Close every unstarted tool call before terminating so a later
 					// turn never inherits an unpaired assistant tool-call block.
 					a.appendCancellationSkippedToolResults(comp.ToolCalls[idx:])
+					activeToolBlock.markTerminalRange(idx, toolCallAccepted, "root_cancel_before_start")
 					a.appendMessages(pendingBlockMessages)
 					pendingBlockMessages = nil
 					emitSDKErr(a.errEvent(err))
@@ -1242,6 +1253,7 @@ func (a *Agent) queryStreamWithSteering(ctx context.Context, input llm.Content, 
 					if blocked {
 						loopGuardStrikes++
 						a.appendLoopGuardSkippedToolResult(tc, resolvedName)
+						activeToolBlock.markTerminal(idx, toolCallAccepted, "loop_guard")
 						reminder := strings.TrimSpace(a.loopGuardUserMsg)
 						if repeatGuard.exhausted {
 							// The default reminder can mislead here ("reuse prior
@@ -1328,6 +1340,7 @@ func (a *Agent) queryStreamWithSteering(ctx context.Context, input llm.Content, 
 							Content: content, IsError: false, Ephemeral: tool.EphemeralKeep > 0,
 						})
 						a.mu.Unlock()
+						activeToolBlock.markTerminal(idx, toolCallAccepted, "evidence_suppressed")
 						suppressedResult := ToolResultEvent{
 							Tool: resolvedName, Result: content.PlainText(), ToolCallID: tc.ID,
 							IsError: false, Metadata: decision.metadata,
@@ -1360,6 +1373,7 @@ func (a *Agent) queryStreamWithSteering(ctx context.Context, input llm.Content, 
 				ctxToolBase := tools.WithToolCallID(ctx, tc.ID)
 				ctxToolBase = tools.WithToolResultMetadata(ctxToolBase)
 				ctxTool, finishToolStage := a.beginSteeringInterruptibleStage(ctxToolBase)
+				activeToolBlock.markRunning(idx)
 				content, toolErr := a.executeToolSafely(ctxTool, tool, execArgs)
 				stageInterruptedForSteering := finishToolStage()
 				rootCancelErr := ctx.Err()
@@ -1401,10 +1415,12 @@ func (a *Agent) queryStreamWithSteering(ctx context.Context, input llm.Content, 
 					a.mu.Lock()
 					a.messages = append(a.messages, llm.Message{Role: llm.RoleTool, ToolCallID: tc.ID, ToolName: resolvedName, Content: content, IsError: false, Ephemeral: ephemeral})
 					a.mu.Unlock()
+					activeToolBlock.markTerminal(idx, toolCallRunning, "task_complete")
 					a.emitToolResultWithAccounting(out, ToolResultEvent{Tool: resolvedName, Result: content.PlainText(), ToolCallID: tc.ID, IsError: false, Metadata: meta}, originalResult, time.Since(start))
 					a.emitEvent(out, StepCompleteEvent{StepID: tc.ID, Status: status, DurationMS: time.Since(start).Milliseconds()})
 					if err := ctx.Err(); err != nil {
 						a.appendCancellationSkippedToolResults(comp.ToolCalls[idx+1:])
+						activeToolBlock.markTerminalRange(idx+1, toolCallAccepted, "root_cancel_after_task_complete")
 						a.appendMessages(pendingBlockMessages)
 						pendingBlockMessages = nil
 						emitSDKErr(a.errEvent(err))
@@ -1415,6 +1431,7 @@ func (a *Agent) queryStreamWithSteering(ctx context.Context, input llm.Content, 
 					// call would otherwise leave tool_use blocks with no result,
 					// making the *next* turn's first provider request invalid.
 					a.appendTurnEndSkippedToolResults(comp.ToolCalls[idx+1:])
+					activeToolBlock.markTerminalRange(idx+1, toolCallAccepted, "task_complete_tail")
 					a.appendMessages(pendingBlockMessages)
 					pendingBlockMessages = nil
 					if a.hasCompactor {
@@ -1429,6 +1446,7 @@ func (a *Agent) queryStreamWithSteering(ctx context.Context, input llm.Content, 
 						}
 					}
 					requireDoneRecoveryDisableThinkingActive = false
+					finishToolBlock()
 					emitFinal(finalContent, finalResponseID)
 					return
 				}
@@ -1445,6 +1463,7 @@ func (a *Agent) queryStreamWithSteering(ctx context.Context, input llm.Content, 
 				a.mu.Lock()
 				a.messages = append(a.messages, llm.Message{Role: llm.RoleTool, ToolCallID: tc.ID, ToolName: resolvedName, Content: content, IsError: isError, Ephemeral: ephemeral})
 				a.mu.Unlock()
+				activeToolBlock.markTerminal(idx, toolCallRunning, "handler_return")
 
 				a.emitToolResultWithAccounting(out, ToolResultEvent{Tool: resolvedName, Result: content.PlainText(), ToolCallID: tc.ID, IsError: isError, Metadata: meta}, originalResult, time.Since(start))
 				a.emitEvent(out, StepCompleteEvent{StepID: tc.ID, Status: status, DurationMS: time.Since(start).Milliseconds()})
@@ -1453,6 +1472,7 @@ func (a *Agent) queryStreamWithSteering(ctx context.Context, input llm.Content, 
 				}
 				if rootCancelErr != nil {
 					a.appendCancellationSkippedToolResults(comp.ToolCalls[idx+1:])
+					activeToolBlock.markTerminalRange(idx+1, toolCallAccepted, "root_cancel_after_handler")
 					a.appendMessages(pendingBlockMessages)
 					pendingBlockMessages = nil
 					emitSDKErr(a.errEvent(rootCancelErr))
@@ -1475,12 +1495,14 @@ func (a *Agent) queryStreamWithSteering(ctx context.Context, input llm.Content, 
 					// between two tool results of the same assistant block makes
 					// the whole conversation permanently unsendable.
 					a.appendSteeringSkippedToolResults(comp.ToolCalls[idx+1:])
+					activeToolBlock.markTerminalRange(idx+1, toolCallAccepted, "steering")
 					pendingBlockMessages = append(pendingBlockMessages, steeringMessages...)
 					break
 				}
 			}
 			// The assistant tool-call block is now closed: every tool_use has a
 			// tool_result. Only here may user-role messages enter history.
+			finishToolBlock()
 			a.appendMessages(pendingBlockMessages)
 			pendingBlockMessages = nil
 			if a.hasCompactor {

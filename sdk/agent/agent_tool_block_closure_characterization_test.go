@@ -12,6 +12,24 @@ import (
 
 type mixedToolBlockModel struct{}
 
+type reusedToolCallIDAcrossBlocksModel struct {
+	calls int
+}
+
+func (m *reusedToolCallIDAcrossBlocksModel) Provider() string { return "fixture" }
+func (m *reusedToolCallIDAcrossBlocksModel) Model() string    { return "reused-id-blocks" }
+func (m *reusedToolCallIDAcrossBlocksModel) Invoke(context.Context, llm.InvokeRequest) (*llm.Completion, error) {
+	m.calls++
+	name := "echo"
+	if m.calls == 2 {
+		name = "done"
+	}
+	return &llm.Completion{
+		ToolCalls:  []llm.ToolCall{{ID: "reused", Type: "function", Function: llm.FunctionCall{Name: name, Arguments: `{}`}}},
+		StopReason: "tool_calls",
+	}, nil
+}
+
 func (mixedToolBlockModel) Provider() string { return "fixture" }
 func (mixedToolBlockModel) Model() string    { return "mixed-tool-block" }
 func (mixedToolBlockModel) Invoke(context.Context, llm.InvokeRequest) (*llm.Completion, error) {
@@ -63,8 +81,9 @@ func TestToolBlockSequentialClosureCharacterization(t *testing.T) {
 	})
 
 	agent, err := New(Config{
-		LLM:   mixedToolBlockModel{},
-		Tools: []tools.Tool{invalid, panicTool, errorTool, done, tail},
+		LLM:      mixedToolBlockModel{},
+		Tools:    []tools.Tool{invalid, panicTool, errorTool, done, tail},
+		Warningf: failOnToolBlockShadowWarning(t),
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -119,6 +138,59 @@ func TestToolBlockSequentialClosureCharacterization(t *testing.T) {
 
 	if _, changed, unexpected := repairToolCallPairsDetailed(messages); changed || unexpected {
 		t.Fatalf("closed block required outbound repair: changed=%v unexpected=%v", changed, unexpected)
+	}
+	var final FinalResponseEvent
+	for _, event := range events {
+		if candidate, ok := event.(FinalResponseEvent); ok {
+			final = candidate
+		}
+	}
+	if final.Content != "finished" {
+		t.Fatalf("final=%#v want finished", final)
+	}
+}
+
+func TestToolBlockShadowAllowsIDsReusedAcrossBlocks(t *testing.T) {
+	model := &reusedToolCallIDAcrossBlocksModel{}
+	echoStarts := 0
+	doneStarts := 0
+	echo := tools.Func[struct{}]("echo", "echo", func(context.Context, struct{}, *tools.Container) (any, error) {
+		echoStarts++
+		return "echoed", nil
+	})
+	done := tools.Func[struct{}]("done", "done", func(context.Context, struct{}, *tools.Container) (any, error) {
+		doneStarts++
+		return nil, &tools.TaskCompleteError{Message: "finished"}
+	})
+	agent, err := New(Config{
+		LLM:      model,
+		Tools:    []tools.Tool{echo, done},
+		Warningf: failOnToolBlockShadowWarning(t),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	events := collectEvents(agent.QueryStream(context.Background(), llm.TextContent("run")))
+	if echoStarts != 1 || doneStarts != 1 || model.calls != 2 {
+		t.Fatalf("echo_starts=%d done_starts=%d provider_calls=%d; want 1/1/2", echoStarts, doneStarts, model.calls)
+	}
+
+	messages := agent.Messages()
+	blocks := 0
+	for i, message := range messages {
+		if message.Role != llm.RoleAssistant || len(message.ToolCalls) != 1 || message.ToolCalls[0].ID != "reused" {
+			continue
+		}
+		blocks++
+		if i+1 >= len(messages) || messages[i+1].Role != llm.RoleTool || messages[i+1].ToolCallID != "reused" {
+			t.Fatalf("block %d is not immediately closed: %#v", blocks, messages)
+		}
+	}
+	if blocks != 2 {
+		t.Fatalf("reused-id blocks=%d want 2: %#v", blocks, messages)
+	}
+	if _, changed, unexpected := repairToolCallPairsDetailed(messages); changed || unexpected {
+		t.Fatalf("reused IDs across blocks required repair: changed=%v unexpected=%v", changed, unexpected)
 	}
 	var final FinalResponseEvent
 	for _, event := range events {

@@ -70,7 +70,7 @@ func TestEvidenceProgressSuppressesCoveredReadAndPreservesMixedBatch(t *testing.
 	})
 	ag, err := New(Config{
 		LLM: model, Tools: []tools.Tool{readTool, readAlias, doneTool},
-		MaxIterations: -1, RequireDoneTool: true,
+		MaxIterations: -1, RequireDoneTool: true, Warningf: failOnToolBlockShadowWarning(t),
 	})
 	if err != nil {
 		t.Fatal(err)
