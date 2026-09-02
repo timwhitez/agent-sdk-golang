@@ -6,6 +6,7 @@ import (
 	"strings"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/timwhitez/agent-sdk-golang/sdk/llm"
 	"github.com/timwhitez/agent-sdk-golang/sdk/tools"
@@ -23,6 +24,34 @@ type cancelBoundaryScriptModel struct {
 type cancelOnInvokeBoundaryModel struct {
 	cancel context.CancelFunc
 	calls  atomic.Int32
+}
+
+type cancelBeforeToolStartModel struct{}
+
+func (cancelBeforeToolStartModel) Provider() string { return "fake" }
+func (cancelBeforeToolStartModel) Model() string    { return "cancel-before-tool-start" }
+func (cancelBeforeToolStartModel) Invoke(context.Context, llm.InvokeRequest) (*llm.Completion, error) {
+	return &llm.Completion{
+		Thinking:   "fill-buffer",
+		Content:    llm.TextContent("force-drop"),
+		StopReason: "tool_calls",
+		ToolCalls:  []llm.ToolCall{cancelBoundaryCall("never-start", "mutate")},
+	}, nil
+}
+
+type cancelAsTaskComplete struct {
+	cancel context.CancelFunc
+}
+
+func (e cancelAsTaskComplete) Error() string { return "task complete" }
+func (e cancelAsTaskComplete) As(target any) bool {
+	taskComplete, ok := target.(**tools.TaskCompleteError)
+	if !ok {
+		return false
+	}
+	e.cancel()
+	*taskComplete = &tools.TaskCompleteError{Message: "done"}
+	return true
 }
 
 func (m *cancelOnInvokeBoundaryModel) Provider() string { return "fake" }
@@ -173,6 +202,79 @@ func TestRootCancellationSkipsUnstartedSiblingTools(t *testing.T) {
 	if !foundSkipped {
 		t.Fatalf("canceled sibling tool topology was not closed: %#v", ag.Messages())
 	}
+}
+
+func TestRootCancellationBeforeFirstToolClosesAcceptedBlock(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	var runs atomic.Int32
+	dropped := make(chan struct{})
+	var sawDrop atomic.Bool
+	failShadow := failOnToolBlockShadowWarning(t)
+	ag, err := New(Config{
+		LLM:               cancelBeforeToolStartModel{},
+		Tools:             []tools.Tool{tools.Func[struct{}]("mutate", "must not run", func(context.Context, struct{}, *tools.Container) (any, error) { runs.Add(1); return "mutated", nil })},
+		EventBufferSize:   1,
+		EventSendTimeout:  time.Millisecond,
+		EventDropLogEvery: 1,
+		Warningf: func(format string, args ...any) {
+			failShadow(format, args...)
+			if strings.Contains(format, "dropping agent event") && sawDrop.CompareAndSwap(false, true) {
+				cancel()
+				close(dropped)
+			}
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	events := ag.QueryStream(ctx, llm.TextContent("run"))
+	select {
+	case <-dropped:
+	case <-time.After(2 * time.Second):
+		t.Fatal("timeout waiting for controlled event drop")
+	}
+	got := collectCancelBoundaryTerminals(events)
+	if runs.Load() != 0 || got.canceled != 1 || got.finals != 0 {
+		t.Fatalf("runs=%d canceled=%d finals=%d; want 0/1/0", runs.Load(), got.canceled, got.finals)
+	}
+	assertCanceledToolResult(t, ag.Messages(), "never-start")
+}
+
+func TestRootCancellationAfterTaskCompleteClosesUnstartedTail(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	model := &cancelBoundaryScriptModel{toolCalls: []llm.ToolCall{
+		cancelBoundaryCall("done-1", "done"),
+		cancelBoundaryCall("tail-2", "tail"),
+	}}
+	var tailRuns atomic.Int32
+	done := tools.Func[struct{}]("done", "done", func(context.Context, struct{}, *tools.Container) (any, error) {
+		return nil, cancelAsTaskComplete{cancel: cancel}
+	})
+	tail := tools.Func[struct{}]("tail", "must not run", func(context.Context, struct{}, *tools.Container) (any, error) {
+		tailRuns.Add(1)
+		return "mutated", nil
+	})
+	ag, err := New(Config{LLM: model, Tools: []tools.Tool{done, tail}, Warningf: failOnToolBlockShadowWarning(t)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := collectCancelBoundaryTerminals(ag.QueryStream(ctx, llm.TextContent("run")))
+	if tailRuns.Load() != 0 || got.canceled != 1 || got.finals != 0 {
+		t.Fatalf("tail_runs=%d canceled=%d finals=%d; want 0/1/0", tailRuns.Load(), got.canceled, got.finals)
+	}
+	assertCanceledToolResult(t, ag.Messages(), "tail-2")
+}
+
+func assertCanceledToolResult(t *testing.T, messages []llm.Message, callID string) {
+	t.Helper()
+	for _, message := range messages {
+		if message.Role == llm.RoleTool && message.ToolCallID == callID && message.IsError && strings.Contains(strings.ToLower(message.Content.PlainText()), "cancel") {
+			return
+		}
+	}
+	t.Fatalf("missing cancellation Tool Result for %q: %#v", callID, messages)
 }
 
 func TestCancellationDuringPreProviderSteeringDrainPreventsAdmission(t *testing.T) {
