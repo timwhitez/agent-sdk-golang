@@ -553,6 +553,7 @@ func TestSteeringCanCancelActiveToolWithoutCancelingQuery(t *testing.T) {
 		LLM:             model,
 		Tools:           []tools.Tool{waitTool, skippedTool, doneTool},
 		RequireDoneTool: true,
+		Warningf:        failOnToolBlockShadowWarning(t),
 	})
 	if err != nil {
 		t.Fatalf("new agent: %v", err)

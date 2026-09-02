@@ -493,6 +493,7 @@ func TestRepeatToolSignatureGuardRetreatsAfterStrikeThreshold(t *testing.T) {
 		RepeatToolSignatureWindow:    6,
 		LoopGuardStrikeThreshold:     1,
 		LoopGuardUserMessage:         "stop repeating",
+		Warningf:                     failOnToolBlockShadowWarning(t),
 	})
 	if err != nil {
 		t.Fatalf("new agent: %v", err)

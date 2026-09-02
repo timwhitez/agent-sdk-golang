@@ -63,8 +63,9 @@ func TestToolBlockSequentialClosureCharacterization(t *testing.T) {
 	})
 
 	agent, err := New(Config{
-		LLM:   mixedToolBlockModel{},
-		Tools: []tools.Tool{invalid, panicTool, errorTool, done, tail},
+		LLM:      mixedToolBlockModel{},
+		Tools:    []tools.Tool{invalid, panicTool, errorTool, done, tail},
+		Warningf: failOnToolBlockShadowWarning(t),
 	})
 	if err != nil {
 		t.Fatal(err)

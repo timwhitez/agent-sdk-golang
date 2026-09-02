@@ -149,7 +149,7 @@ func TestRootCancellationSkipsUnstartedSiblingTools(t *testing.T) {
 		secondRuns.Add(1)
 		return "mutated", nil
 	})
-	ag, err := New(Config{LLM: model, Tools: []tools.Tool{cancelTool, secondTool}, MaxIterations: 4})
+	ag, err := New(Config{LLM: model, Tools: []tools.Tool{cancelTool, secondTool}, MaxIterations: 4, Warningf: failOnToolBlockShadowWarning(t)})
 	if err != nil {
 		t.Fatal(err)
 	}
