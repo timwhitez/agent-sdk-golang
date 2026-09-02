@@ -135,37 +135,38 @@ type Config struct {
 }
 
 type Agent struct {
-	llm                         llm.ChatModel
-	systemPrompt                string
-	maxIterations               int
-	invokeRetryMax              int
-	invokeRetryBackoff          time.Duration
-	repeatSigThreshold          int
-	repeatSigWindow             int
-	loopGuardStrikeMax          int
-	loopGuardUserMsg            string
-	maxToolResultBytes          int
-	maxToolResultTokens         int
-	toolResultTokenEstimator    func(string) int
-	accountingEstimator         sdkaccounting.Estimator
-	artifactOwner               artifact.Owner
-	artifactOwnerProvider       ArtifactOwnerProvider
-	artifactSink                artifact.Sink
-	artifactResolver            artifact.Resolver
-	artifactResolverCapability  artifact.ResolverCapability
-	artifactEnvelopeCodec       artifact.EnvelopeCodec
-	toolResultDumpTTL           time.Duration
-	eventBufferSize             int
-	eventSendTimeout            time.Duration
-	eventDropLogEvery           uint64
-	queryIDGenerator            func() string
-	eventClock                  func() time.Time
-	streamIdleTimeout           time.Duration
-	streamIdleMaxRecov          int
-	toolChoice                  llm.ToolChoice
-	requireDone                 bool
-	warningf                    func(format string, args ...any)
-	hasCompactor                bool
+	llm                        llm.ChatModel
+	systemPrompt               string
+	maxIterations              int
+	invokeRetryMax             int
+	invokeRetryBackoff         time.Duration
+	repeatSigThreshold         int
+	repeatSigWindow            int
+	loopGuardStrikeMax         int
+	loopGuardUserMsg           string
+	maxToolResultBytes         int
+	maxToolResultTokens        int
+	toolResultTokenEstimator   func(string) int
+	accountingEstimator        sdkaccounting.Estimator
+	artifactOwner              artifact.Owner
+	artifactOwnerProvider      ArtifactOwnerProvider
+	artifactSink               artifact.Sink
+	artifactResolver           artifact.Resolver
+	artifactResolverCapability artifact.ResolverCapability
+	artifactEnvelopeCodec      artifact.EnvelopeCodec
+	toolResultDumpTTL          time.Duration
+	eventBufferSize            int
+	eventSendTimeout           time.Duration
+	eventDropLogEvery          uint64
+	queryIDGenerator           func() string
+	eventClock                 func() time.Time
+	streamIdleTimeout          time.Duration
+	streamIdleMaxRecov         int
+	toolChoice                 llm.ToolChoice
+	requireDone                bool
+	warningf                   func(format string, args ...any)
+	hasCompactor               bool
+
 	compactionAdmissionObserved func()
 	compactionShadowObserved    func()
 
