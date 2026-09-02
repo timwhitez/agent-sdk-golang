@@ -4,10 +4,12 @@ import (
 	"context"
 	"errors"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
 
+	sdkaccounting "github.com/timwhitez/agent-sdk-golang/sdk/accounting"
 	"github.com/timwhitez/agent-sdk-golang/sdk/llm"
 	"github.com/timwhitez/agent-sdk-golang/sdk/tools"
 )
@@ -27,6 +29,37 @@ type cancelOnInvokeBoundaryModel struct {
 }
 
 type cancelBeforeToolStartModel struct{}
+
+type runningCancelOutcomeModel struct {
+	calls atomic.Int32
+	mu    sync.Mutex
+	reqs  []llm.InvokeRequest
+}
+
+func (m *runningCancelOutcomeModel) Provider() string { return "fake" }
+func (m *runningCancelOutcomeModel) Model() string    { return "running-cancel-outcome" }
+func (m *runningCancelOutcomeModel) Invoke(_ context.Context, request llm.InvokeRequest) (*llm.Completion, error) {
+	cloned, err := llm.CloneInvokeRequest(request)
+	if err != nil {
+		return nil, err
+	}
+	m.mu.Lock()
+	m.reqs = append(m.reqs, cloned)
+	m.mu.Unlock()
+	if m.calls.Add(1) == 1 {
+		return &llm.Completion{StopReason: "tool_calls", ToolCalls: []llm.ToolCall{
+			cancelBoundaryCall("running-1", "running"),
+			cancelBoundaryCall("tail-2", "tail"),
+		}}, nil
+	}
+	return &llm.Completion{Content: llm.TextContent("next turn")}, nil
+}
+
+func (m *runningCancelOutcomeModel) requests() []llm.InvokeRequest {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return append([]llm.InvokeRequest(nil), m.reqs...)
+}
 
 func (cancelBeforeToolStartModel) Provider() string { return "fake" }
 func (cancelBeforeToolStartModel) Model() string    { return "cancel-before-tool-start" }
@@ -201,6 +234,177 @@ func TestRootCancellationSkipsUnstartedSiblingTools(t *testing.T) {
 	}
 	if !foundSkipped {
 		t.Fatalf("canceled sibling tool topology was not closed: %#v", ag.Messages())
+	}
+}
+
+func TestRunningToolCancellationOutcomeCharacterization(t *testing.T) {
+	for _, test := range []struct {
+		name    string
+		toolErr error
+	}{
+		{name: "handler success"},
+		{name: "handler error", toolErr: errors.New("handler failed after side effect")},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			model := &runningCancelOutcomeModel{}
+			var sideEffects, tailRuns atomic.Int32
+			running := tools.Func[struct{}]("running", "running", func(context.Context, struct{}, *tools.Container) (any, error) {
+				sideEffects.Add(1)
+				cancel()
+				return "handler result must be overwritten", test.toolErr
+			})
+			tail := tools.Func[struct{}]("tail", "tail", func(context.Context, struct{}, *tools.Container) (any, error) {
+				tailRuns.Add(1)
+				return "must not run", nil
+			})
+			ag, err := New(Config{LLM: model, Tools: []tools.Tool{running, tail}, MaxIterations: 4, Warningf: failOnToolBlockShadowWarning(t)})
+			if err != nil {
+				t.Fatal(err)
+			}
+			events := collectEvents(ag.QueryStream(ctx, llm.TextContent("run")))
+			if sideEffects.Load() != 1 || tailRuns.Load() != 0 || model.calls.Load() != 1 {
+				t.Fatalf("side_effects=%d tail_runs=%d provider_calls=%d want 1/0/1", sideEffects.Load(), tailRuns.Load(), model.calls.Load())
+			}
+
+			const runningResult = "Tool execution canceled before turn continuation: context canceled"
+			const tailResult = "[ERROR] Tool call skipped because the active turn was canceled before this call ran."
+			history := ag.Messages()
+			assertContiguousToolResults(t, history)
+			assertCancellationToolHistory(t, history, runningResult, tailResult)
+			if _, changed, unexpected := repairToolCallPairsDetailed(history); changed || unexpected {
+				t.Fatalf("closed canceled block required repair: changed=%t unexpected=%t", changed, unexpected)
+			}
+			assertRunningCancellationEvents(t, events, runningResult)
+
+			next := collectEvents(ag.QueryStream(context.Background(), llm.TextContent("next")))
+			if model.calls.Load() != 2 || finalText(next) != "next turn" {
+				t.Fatalf("next provider calls=%d final=%q", model.calls.Load(), finalText(next))
+			}
+			for _, event := range next {
+				if warning, ok := event.(WarnEvent); ok && warning.Kind == "tool_pairing_repaired" {
+					t.Fatalf("next admission repaired already-closed block: %#v", warning)
+				}
+			}
+			requests := model.requests()
+			if len(requests) != 2 {
+				t.Fatalf("provider requests=%d want 2", len(requests))
+			}
+			assertContiguousToolResults(t, requests[1].Messages)
+		})
+	}
+}
+
+func assertCancellationToolHistory(t *testing.T, history []llm.Message, runningResult, tailResult string) {
+	t.Helper()
+	for i, message := range history {
+		if message.Role != llm.RoleAssistant || len(message.ToolCalls) != 2 || message.ToolCalls[0].ID != "running-1" {
+			continue
+		}
+		if i+2 >= len(history) {
+			t.Fatalf("canceled tool block truncated: %#v", history)
+		}
+		running, tail := history[i+1], history[i+2]
+		if running.Role != llm.RoleTool || running.ToolCallID != "running-1" || !running.IsError || running.Content.PlainText() != runningResult {
+			t.Fatalf("running cancellation result=%#v", running)
+		}
+		if tail.Role != llm.RoleTool || tail.ToolCallID != "tail-2" || !tail.IsError || tail.Content.PlainText() != tailResult {
+			t.Fatalf("unstarted tail result=%#v", tail)
+		}
+		return
+	}
+	t.Fatalf("missing canceled tool block: %#v", history)
+}
+
+func assertRunningCancellationEvents(t *testing.T, events []Event, runningResult string) {
+	t.Helper()
+	var order []string
+	for _, event := range events {
+		switch event := event.(type) {
+		case StepStartEvent:
+			if event.StepID == "tail-2" {
+				t.Fatalf("unstarted tail emitted StepStart: %#v", event)
+			}
+			if event.StepID == "running-1" {
+				order = append(order, "step_start")
+			}
+		case ToolCallEvent:
+			if event.ToolCallID == "tail-2" {
+				t.Fatalf("unstarted tail emitted ToolCall: %#v", event)
+			}
+			if event.ToolCallID == "running-1" {
+				order = append(order, "tool_call")
+			}
+		case ToolResultEvent:
+			if event.ToolCallID == "tail-2" {
+				t.Fatalf("unstarted tail emitted ToolResult: %#v", event)
+			}
+			if event.ToolCallID == "running-1" {
+				if !event.IsError || event.Result != runningResult {
+					t.Fatalf("running ToolResult=%#v", event)
+				}
+				order = append(order, "tool_result")
+			}
+		case AccountingEvent:
+			if event.ToolCallID == "tail-2" {
+				t.Fatalf("unstarted tail emitted Accounting: %#v", event)
+			}
+			if event.ToolCallID == "running-1" {
+				if event.CorrelationKind != "tool_call" || event.Payload.EventKind != sdkaccounting.EventKindToolResult || event.Payload.Status != sdkaccounting.StatusError {
+					t.Fatalf("running Accounting=%#v", event)
+				}
+				if err := event.Payload.Validate(); err != nil {
+					t.Fatalf("running Accounting payload: %v", err)
+				}
+				order = append(order, "accounting")
+			}
+		case StepCompleteEvent:
+			if event.StepID == "tail-2" {
+				t.Fatalf("unstarted tail emitted StepComplete: %#v", event)
+			}
+			if event.StepID == "running-1" {
+				order = append(order, "step_complete")
+			}
+		case ErrorEvent:
+			if event.Kind == "canceled" {
+				order = append(order, "canceled")
+			}
+		case FinalResponseEvent:
+			t.Fatalf("canceled turn emitted Final: %#v", event)
+		}
+	}
+	want := []string{"step_start", "tool_call", "tool_result", "accounting", "step_complete", "canceled"}
+	if strings.Join(order, ",") != strings.Join(want, ",") {
+		t.Fatalf("running cancellation event order=%v want %v", order, want)
+	}
+}
+
+func finalText(events []Event) string {
+	for _, event := range events {
+		if final, ok := event.(FinalResponseEvent); ok {
+			return final.Content
+		}
+	}
+	return ""
+}
+
+func BenchmarkToolBlockShadowLifecycle(b *testing.B) {
+	ids := []string{"a", "b", "c", "d", "e", "f", "g", "h"}
+	calls := make([]llm.ToolCall, len(ids))
+	for i, id := range ids {
+		calls[i] = cancelBoundaryCall(id, "tool")
+	}
+	b.ReportAllocs()
+	for i := 0; i < b.N; i++ {
+		state := newToolBlockState(calls)
+		for ordinal := range calls {
+			state.markRunning(ordinal)
+			state.markTerminal(ordinal, toolCallRunning, "handler_return")
+		}
+		if err := state.validateClosed(); err != nil {
+			b.Fatal(err)
+		}
 	}
 }
 
