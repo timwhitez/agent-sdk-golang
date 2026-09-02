@@ -292,6 +292,7 @@ func TestRunningToolCancellationOutcomeCharacterization(t *testing.T) {
 				t.Fatalf("provider requests=%d want 2", len(requests))
 			}
 			assertContiguousToolResults(t, requests[1].Messages)
+			assertCancellationToolHistory(t, requests[1].Messages, runningResult, tailResult)
 		})
 	}
 }
@@ -320,7 +321,8 @@ func assertCancellationToolHistory(t *testing.T, history []llm.Message, runningR
 func assertRunningCancellationEvents(t *testing.T, events []Event, runningResult string) {
 	t.Helper()
 	var order []string
-	for _, event := range events {
+	resultIndex, accountingIndex := -1, -1
+	for i, event := range events {
 		switch event := event.(type) {
 		case StepStartEvent:
 			if event.StepID == "tail-2" {
@@ -345,6 +347,7 @@ func assertRunningCancellationEvents(t *testing.T, events []Event, runningResult
 					t.Fatalf("running ToolResult=%#v", event)
 				}
 				order = append(order, "tool_result")
+				resultIndex = i
 			}
 		case AccountingEvent:
 			if event.ToolCallID == "tail-2" {
@@ -358,6 +361,7 @@ func assertRunningCancellationEvents(t *testing.T, events []Event, runningResult
 					t.Fatalf("running Accounting payload: %v", err)
 				}
 				order = append(order, "accounting")
+				accountingIndex = i
 			}
 		case StepCompleteEvent:
 			if event.StepID == "tail-2" {
@@ -377,6 +381,9 @@ func assertRunningCancellationEvents(t *testing.T, events []Event, runningResult
 	want := []string{"step_start", "tool_call", "tool_result", "accounting", "step_complete", "canceled"}
 	if strings.Join(order, ",") != strings.Join(want, ",") {
 		t.Fatalf("running cancellation event order=%v want %v", order, want)
+	}
+	if resultIndex < 0 || accountingIndex != resultIndex+1 {
+		t.Fatalf("ToolResult/Accounting adjacency result=%d accounting=%d", resultIndex, accountingIndex)
 	}
 }
 
