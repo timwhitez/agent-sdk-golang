@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"reflect"
 	"strings"
 	"testing"
 
@@ -82,6 +83,37 @@ func (m *streamingMetadataTransientErrorModel) InvokeStream(_ context.Context, _
 
 type repeatedSignatureModel struct {
 	calls int
+}
+
+type repeatedInterventionRecordingModel struct {
+	requests              []llm.InvokeRequest
+	failAfterIntervention bool
+}
+
+func (m *repeatedInterventionRecordingModel) Provider() string { return "fixture" }
+func (m *repeatedInterventionRecordingModel) Model() string    { return "repeated-intervention" }
+func (m *repeatedInterventionRecordingModel) Invoke(_ context.Context, req llm.InvokeRequest) (*llm.Completion, error) {
+	owned, err := llm.CloneInvokeRequest(req)
+	if err != nil {
+		return nil, err
+	}
+	m.requests = append(m.requests, owned)
+	call := len(m.requests)
+	if call == 4 {
+		if m.failAfterIntervention {
+			return nil, &llm.ProviderError{Provider: "fixture", StatusCode: 400, Message: "injected terminal failure"}
+		}
+		return &llm.Completion{ToolCalls: []llm.ToolCall{{
+			ID:       "done-call",
+			Type:     "function",
+			Function: llm.FunctionCall{Name: "done", Arguments: `{"message":"finished"}`},
+		}}, StopReason: "tool_calls"}, nil
+	}
+	return &llm.Completion{ToolCalls: []llm.ToolCall{{
+		ID:       fmt.Sprintf("call-%d", call),
+		Type:     "function",
+		Function: llm.FunctionCall{Name: "echo", Arguments: `{"text":"repeat"}`},
+	}}, StopReason: "tool_calls"}, nil
 }
 
 func (m *repeatedSignatureModel) Provider() string { return "stub" }
@@ -463,6 +495,221 @@ func TestRepeatToolSignatureGuardInjectsReminderAndContinuesUntilDone(t *testing
 	}
 	if !foundSkippedResult {
 		t.Fatalf("expected synthetic skipped tool result for blocked repeated call in history")
+	}
+}
+
+func TestRepeatToolSignatureGuardProviderHistoryCharacterization(t *testing.T) {
+	model := &repeatedInterventionRecordingModel{}
+	ag, echoCalls := newRepeatedInterventionCharacterizationAgent(t, model, 3)
+	events := collectEvents(ag.QueryStream(context.Background(), llm.TextContent("loop")))
+	if *echoCalls != 2 || len(model.requests) != 4 {
+		t.Fatalf("echo_calls=%d provider_calls=%d want 2/4", *echoCalls, len(model.requests))
+	}
+
+	wantTools := []string{"echo", "done"}
+	for i, request := range model.requests {
+		if request.ToolChoice != "" {
+			t.Fatalf("request[%d] tool_choice=%q want empty", i, request.ToolChoice)
+		}
+		var names []string
+		for _, tool := range request.Tools {
+			names = append(names, tool.Name)
+		}
+		if !reflect.DeepEqual(names, wantTools) || !reflect.DeepEqual(request.Tools, model.requests[0].Tools) {
+			t.Fatalf("request[%d] tools=%#v want stable %v", i, request.Tools, wantTools)
+		}
+	}
+
+	want := repeatedInterventionExpectedRequests(true)
+	for i, request := range model.requests {
+		if got := interventionRequestTranscript(request); !reflect.DeepEqual(got, want[i]) {
+			t.Fatalf("request[%d] transcript\n got: %#v\nwant: %#v", i, got, want[i])
+		}
+	}
+	wantEventOrder := []string{"hidden", "warn", "step_start", "tool_call", "tool_result", "accounting", "step_complete"}
+	if got := repeatedInterventionEventOrder(events, "call-3"); !reflect.DeepEqual(got, wantEventOrder) {
+		t.Fatalf("intervention event order=%v want %v", got, wantEventOrder)
+	}
+	for _, event := range events {
+		result, ok := event.(ToolResultEvent)
+		if !ok || result.ToolCallID != "call-3" {
+			continue
+		}
+		if !result.IsError || result.Result != "[ERROR] Tool call skipped by loop guard - Repeated identical tool call blocked before execution." || result.Metadata["loop_guard_suppressed"] != true {
+			t.Fatalf("blocked ToolResult event=%#v", result)
+		}
+		return
+	}
+	t.Fatal("missing blocked ToolResult event")
+}
+
+func TestRepeatToolSignatureGuardProviderFailureCharacterization(t *testing.T) {
+	model := &repeatedInterventionRecordingModel{failAfterIntervention: true}
+	ag, echoCalls := newRepeatedInterventionCharacterizationAgent(t, model, 3)
+	events := collectEvents(ag.QueryStream(context.Background(), llm.TextContent("loop")))
+	if *echoCalls != 2 || len(model.requests) != 4 {
+		t.Fatalf("echo_calls=%d provider_calls=%d want 2/4", *echoCalls, len(model.requests))
+	}
+	wantLast := repeatedInterventionExpectedRequests(true)[3]
+	if got := interventionRequestTranscript(model.requests[3]); !reflect.DeepEqual(got, wantLast) {
+		t.Fatalf("terminal request transcript\n got: %#v\nwant: %#v", got, wantLast)
+	}
+	errorsSeen := 0
+	finals := 0
+	for _, event := range events {
+		switch event := event.(type) {
+		case ErrorEvent:
+			errorsSeen++
+			if event.Provider != "fixture" || event.StatusCode != 400 || event.Kind != "invalid_request" || event.Message != "injected terminal failure" {
+				t.Fatalf("terminal error=%#v", event)
+			}
+		case FinalResponseEvent:
+			finals++
+		}
+	}
+	if errorsSeen != 1 || finals != 0 {
+		t.Fatalf("errors=%d finals=%d want 1/0", errorsSeen, finals)
+	}
+}
+
+func TestRepeatToolSignatureGuardDisabledByDefaultCharacterization(t *testing.T) {
+	model := &repeatedInterventionRecordingModel{}
+	ag, echoCalls := newRepeatedInterventionCharacterizationAgent(t, model, 0)
+	events := collectEvents(ag.QueryStream(context.Background(), llm.TextContent("loop")))
+	if *echoCalls != 3 || len(model.requests) != 4 {
+		t.Fatalf("echo_calls=%d provider_calls=%d want 3/4", *echoCalls, len(model.requests))
+	}
+	wantLast := repeatedInterventionExpectedRequests(false)[3]
+	if got := interventionRequestTranscript(model.requests[3]); !reflect.DeepEqual(got, wantLast) {
+		t.Fatalf("default-disabled transcript\n got: %#v\nwant: %#v", got, wantLast)
+	}
+	for _, event := range events {
+		switch event := event.(type) {
+		case HiddenUserMessageEvent:
+			t.Fatalf("default-disabled guard emitted hidden reminder: %#v", event)
+		case WarnEvent:
+			if event.Kind == "loop_guard" {
+				t.Fatalf("default-disabled guard emitted warning: %#v", event)
+			}
+		}
+	}
+}
+
+func newRepeatedInterventionCharacterizationAgent(t *testing.T, model llm.ChatModel, threshold int) (*Agent, *int) {
+	t.Helper()
+	echoCalls := new(int)
+	echo := tools.Func[struct {
+		Text string `json:"text"`
+	}]("echo", "echo", func(context.Context, struct {
+		Text string `json:"text"`
+	}, *tools.Container) (any, error) {
+		(*echoCalls)++
+		return "ok", nil
+	})
+	done := tools.Func[struct {
+		Message string `json:"message"`
+	}]("done", "done", func(_ context.Context, args struct {
+		Message string `json:"message"`
+	}, _ *tools.Container) (any, error) {
+		return nil, tools.TaskComplete(args.Message)
+	})
+	ag, err := New(Config{
+		LLM:                          model,
+		Tools:                        []tools.Tool{echo, done},
+		SystemPrompt:                 "stable system prompt",
+		MaxIterations:                10,
+		RepeatToolSignatureThreshold: threshold,
+		RepeatToolSignatureWindow:    6,
+		LoopGuardStrikeThreshold:     2,
+		LoopGuardUserMessage:         "stop loop and continue",
+		Warningf:                     failOnToolBlockShadowWarning(t),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return ag, echoCalls
+}
+
+func repeatedInterventionExpectedRequests(intervened bool) [][]string {
+	requests := [][]string{{"system::stable system prompt", "user::loop"}}
+	history := []string{"system::stable system prompt", "user::loop"}
+	for i := 1; i <= 3; i++ {
+		history = append(history, fmt.Sprintf(`assistant:call-%d:echo:{"text":"repeat"}`, i))
+		result := fmt.Sprintf("tool:call-%d:echo:false:ok", i)
+		if intervened && i == 3 {
+			result = "tool:call-3:echo:true:[ERROR] Tool call skipped by loop guard - Repeated identical tool call blocked before execution. Reuse previous results, change arguments, or call done if the task is complete."
+		}
+		history = append(history, result)
+		if intervened && i == 3 {
+			history = append(history, "user:sdk_internal_loop_guard:stop loop and continue")
+		}
+		requests = append(requests, append([]string(nil), history...))
+	}
+	return requests
+}
+
+func interventionRequestTranscript(request llm.InvokeRequest) []string {
+	var transcript []string
+	for _, message := range request.Messages {
+		switch message.Role {
+		case llm.RoleUser:
+			transcript = append(transcript, fmt.Sprintf("user:%s:%s", message.Name, message.Content.PlainText()))
+		case llm.RoleAssistant:
+			for _, call := range message.ToolCalls {
+				transcript = append(transcript, fmt.Sprintf("assistant:%s:%s:%s", call.ID, call.Function.Name, call.Function.Arguments))
+			}
+		case llm.RoleTool:
+			transcript = append(transcript, fmt.Sprintf("tool:%s:%s:%t:%s", message.ToolCallID, message.ToolName, message.IsError, message.Content.PlainText()))
+		default:
+			transcript = append(transcript, fmt.Sprintf("%s:%s:%s", message.Role, message.Name, message.Content.PlainText()))
+		}
+	}
+	return transcript
+}
+
+func repeatedInterventionEventOrder(events []Event, callID string) []string {
+	var order []string
+	for _, event := range events {
+		switch event := event.(type) {
+		case HiddenUserMessageEvent:
+			if event.Content == "stop loop and continue" {
+				order = append(order, "hidden")
+			}
+		case WarnEvent:
+			if event.Kind == "loop_guard" && strings.Contains(event.Message, "repeated tool-call signature") {
+				order = append(order, "warn")
+			}
+		case StepStartEvent:
+			if event.StepID == callID {
+				order = append(order, "step_start")
+			}
+		case ToolCallEvent:
+			if event.ToolCallID == callID {
+				order = append(order, "tool_call")
+			}
+		case ToolResultEvent:
+			if event.ToolCallID == callID {
+				order = append(order, "tool_result")
+			}
+		case AccountingEvent:
+			if event.ToolCallID == callID {
+				order = append(order, "accounting")
+			}
+		case StepCompleteEvent:
+			if event.StepID == callID {
+				order = append(order, "step_complete")
+			}
+		}
+	}
+	return order
+}
+
+func BenchmarkRepeatedToolSignatureGuardObserve(b *testing.B) {
+	guard := newRepeatedToolSignatureGuard(3, 6)
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		guard.observe("echo|{\"text\":\"repeat\"}")
 	}
 }
 
