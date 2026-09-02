@@ -171,7 +171,9 @@ type Agent struct {
 	compactionShadowObserved    func()
 	toolBlockStateObserved      func(*toolBlockState)
 
-	repeatInterventionShadowObserved func(interventionDecision, interventionDecision)
+	repeatInterventionShadowObserved  func(interventionDecision, interventionDecision)
+	repeatInterventionShadowEvaluator func(repeatedSignatureObservation) interventionDecision
+	repeatResultRecycled              func(string) bool
 
 	tools             []tools.Tool
 	toolMap           map[string]tools.Tool
@@ -1257,7 +1259,11 @@ func (a *Agent) queryStreamWithSteering(ctx context.Context, input llm.Content, 
 					detected := blocked
 					lastResultRecycled := false
 					if blocked && repeatGuard.exhausted {
-						lastResultRecycled = a.lastResultForSignatureIsRecycled(signature)
+						if a.repeatResultRecycled != nil {
+							lastResultRecycled = a.repeatResultRecycled(signature)
+						} else {
+							lastResultRecycled = a.lastResultForSignatureIsRecycled(signature)
+						}
 					}
 					if blocked && repeatGuard.exhausted && !lastResultRecycled {
 						// In downgraded mode the guard only keeps intercepting the
@@ -1278,7 +1284,7 @@ func (a *Agent) queryStreamWithSteering(ctx context.Context, input llm.Content, 
 						queueReminder:  blocked && (repeatGuard.exhausted || reminderConfigured),
 						downgradeGuard: blocked && !repeatGuard.exhausted && a.loopGuardStrikeMax > 0 && loopGuardStrikes+1 >= a.loopGuardStrikeMax,
 					}
-					a.observeRepeatedSignatureIntervention(legacyDecision, shadowRepeatedSignatureIntervention(repeatedSignatureObservation{
+					observation := repeatedSignatureObservation{
 						count:              seen,
 						threshold:          repeatGuard.threshold,
 						exhausted:          repeatGuard.exhausted,
@@ -1286,7 +1292,12 @@ func (a *Agent) queryStreamWithSteering(ctx context.Context, input llm.Content, 
 						reminderConfigured: reminderConfigured,
 						nextStrike:         loopGuardStrikes + 1,
 						strikeLimit:        a.loopGuardStrikeMax,
-					}))
+					}
+					shadowDecision := shadowRepeatedSignatureIntervention(observation)
+					if a.repeatInterventionShadowEvaluator != nil {
+						shadowDecision = a.repeatInterventionShadowEvaluator(observation)
+					}
+					a.observeRepeatedSignatureIntervention(legacyDecision, shadowDecision)
 					if blocked {
 						loopGuardStrikes++
 						a.appendLoopGuardSkippedToolResult(tc, resolvedName)
