@@ -167,6 +167,9 @@ type Agent struct {
 	warningf                   func(format string, args ...any)
 	hasCompactor               bool
 
+	compactionAdmissionObserved func()
+	compactionShadowObserved    func()
+
 	tools             []tools.Tool
 	toolMap           map[string]tools.Tool
 	toolMapNormalized map[string]tools.Tool
@@ -3218,10 +3221,26 @@ func (a *Agent) checkAndCompactWithGrowth(ctx context.Context, last *llm.Complet
 	a.applyPendingCompaction(out)
 	decisionUsage := a.effectiveCompactionUsageWithGrowth(last.Usage, currentHistoryGrowth, pendingHistoryGrowth)
 	trigger, watermark := a.compactionTriggerAndWatermarkForUsage(decisionUsage)
-	if watermark == "overflow" {
+	overflow := watermark == "overflow"
+	ordinaryAdmission := false
+	if !overflow {
+		ordinaryAdmission = a.shouldAttemptCompactionUsage(ctx, decisionUsage)
+	}
+	legacyDecision := compactionDecision{
+		run:             overflow || ordinaryAdmission,
+		trigger:         trigger,
+		targetWatermark: watermark,
+	}
+	a.observeAutomaticCompactionDecision(legacyDecision, shadowAutomaticCompactionDecision(automaticCompactionObservation{
+		overflow:          overflow,
+		ordinaryAdmission: ordinaryAdmission,
+		trigger:           trigger,
+		targetWatermark:   watermark,
+	}))
+	if legacyDecision.targetWatermark == "overflow" {
 		return a.compactSyncOverflow(ctx, last, decisionUsage, out)
 	}
-	if !a.shouldAttemptCompactionUsage(ctx, decisionUsage) {
+	if !legacyDecision.run {
 		return nil
 	}
 	if !a.compactionInFlight.CompareAndSwap(false, true) {
@@ -4285,6 +4304,9 @@ func (a *Agent) shouldAttemptCompaction(ctx context.Context, last *llm.Completio
 func (a *Agent) shouldAttemptCompactionUsage(ctx context.Context, usage *llm.Usage) bool {
 	if !a.hasCompactor || a.compactor == nil {
 		return false
+	}
+	if a.compactionAdmissionObserved != nil {
+		a.compactionAdmissionObserved()
 	}
 	if ctx != nil && ctx.Err() != nil {
 		return false
