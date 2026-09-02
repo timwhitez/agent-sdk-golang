@@ -3218,10 +3218,26 @@ func (a *Agent) checkAndCompactWithGrowth(ctx context.Context, last *llm.Complet
 	a.applyPendingCompaction(out)
 	decisionUsage := a.effectiveCompactionUsageWithGrowth(last.Usage, currentHistoryGrowth, pendingHistoryGrowth)
 	trigger, watermark := a.compactionTriggerAndWatermarkForUsage(decisionUsage)
-	if watermark == "overflow" {
+	overflow := watermark == "overflow"
+	ordinaryAdmission := false
+	if !overflow {
+		ordinaryAdmission = a.shouldAttemptCompactionUsage(ctx, decisionUsage)
+	}
+	legacyDecision := compactionDecision{
+		run:             overflow || ordinaryAdmission,
+		trigger:         trigger,
+		targetWatermark: watermark,
+	}
+	a.observeAutomaticCompactionDecision(legacyDecision, shadowAutomaticCompactionDecision(automaticCompactionObservation{
+		overflow:          overflow,
+		ordinaryAdmission: ordinaryAdmission,
+		trigger:           trigger,
+		targetWatermark:   watermark,
+	}))
+	if legacyDecision.targetWatermark == "overflow" {
 		return a.compactSyncOverflow(ctx, last, decisionUsage, out)
 	}
-	if !a.shouldAttemptCompactionUsage(ctx, decisionUsage) {
+	if !legacyDecision.run {
 		return nil
 	}
 	if !a.compactionInFlight.CompareAndSwap(false, true) {
