@@ -56,6 +56,36 @@ type countingCompactionModel struct {
 	calls int
 }
 
+type providerContextOverflowModel struct {
+	mu           sync.Mutex
+	requests     []llm.InvokeRequest
+	summaryCalls int
+}
+
+func (m *providerContextOverflowModel) Provider() string { return "fixture" }
+func (m *providerContextOverflowModel) Model() string    { return "context-overflow" }
+func (m *providerContextOverflowModel) Invoke(_ context.Context, req llm.InvokeRequest) (*llm.Completion, error) {
+	owned, err := llm.CloneInvokeRequest(req)
+	if err != nil {
+		return nil, err
+	}
+	m.mu.Lock()
+	m.requests = append(m.requests, owned)
+	for _, message := range owned.Messages {
+		if message.Role == llm.RoleSystem && strings.Contains(message.Content.PlainText(), "operational checkpoint") {
+			m.summaryCalls++
+		}
+	}
+	m.mu.Unlock()
+	return nil, &llm.ProviderError{Provider: "fixture", StatusCode: 400, Message: "maximum context length exceeded"}
+}
+
+func (m *providerContextOverflowModel) Snapshot() ([]llm.InvokeRequest, int) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return append([]llm.InvokeRequest(nil), m.requests...), m.summaryCalls
+}
+
 func (m *countingCompactionModel) Provider() string { return "stub" }
 func (m *countingCompactionModel) Model() string    { return "stub" }
 func (m *countingCompactionModel) Invoke(_ context.Context, _ llm.InvokeRequest) (*llm.Completion, error) {
@@ -380,6 +410,141 @@ func TestCheckAndCompactSkipsInvokeWhenContextCanceled(t *testing.T) {
 	}
 	if ag.compactionInFlight.Load() {
 		t.Fatal("expected compactionInFlight=false when context is canceled")
+	}
+}
+
+func TestCompactionLegacyDecisionParity(t *testing.T) {
+	ag, err := New(Config{
+		LLM: &countingCompactionModel{},
+		Compaction: &compaction.Config{
+			Enabled:             true,
+			ContextWindow:       100,
+			ReserveOutputTokens: 0,
+			SnipThresholdRatio:  0.70,
+			PruneThresholdRatio: 0.80,
+			ThresholdRatio:      0.85,
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	for _, test := range []struct {
+		tokens    int
+		trigger   string
+		watermark string
+		attempt   bool
+	}{
+		{tokens: 69, trigger: "usage", watermark: "", attempt: false},
+		{tokens: 70, trigger: "usage", watermark: "snip", attempt: true},
+		{tokens: 80, trigger: "usage", watermark: "prune", attempt: true},
+		{tokens: 85, trigger: "usage", watermark: "summarize", attempt: true},
+		{tokens: 100, trigger: "overflow", watermark: "overflow", attempt: true},
+	} {
+		usage := llm.WithPromptEstimate(nil, test.tokens)
+		trigger, watermark := ag.compactionTriggerAndWatermarkForUsage(usage)
+		if trigger != test.trigger || watermark != test.watermark {
+			t.Errorf("tokens=%d decision=%q/%q want %q/%q", test.tokens, trigger, watermark, test.trigger, test.watermark)
+		}
+		if got := ag.shouldAttemptCompactionUsage(context.Background(), usage); got != test.attempt {
+			t.Errorf("tokens=%d attempt=%v want %v", test.tokens, got, test.attempt)
+		}
+	}
+
+	eligible := llm.WithPromptEstimate(nil, 70)
+	ag.todoCompactionPending.Store(true)
+	ag.compactionRetryPending.Store(true)
+	if trigger, _ := ag.compactionTriggerAndWatermarkForUsage(eligible); trigger != "todo_checkpoint" {
+		t.Fatalf("todo+retry trigger=%q want todo_checkpoint", trigger)
+	}
+	ag.todoCompactionPending.Store(false)
+	if trigger, _ := ag.compactionTriggerAndWatermarkForUsage(eligible); trigger != "retry_checkpoint" {
+		t.Fatalf("retry trigger=%q want retry_checkpoint", trigger)
+	}
+	ag.compactionRetryPending.Store(false)
+	if trigger, _ := ag.compactionTriggerAndWatermarkForUsage(eligible); trigger != "usage" {
+		t.Fatalf("plain trigger=%q want usage", trigger)
+	}
+
+	destroyed := []llm.Message{llm.NewUserMessage("request")}
+	for i := 0; i < defaultDestroyedToolCompactThreshold; i++ {
+		destroyed = append(destroyed, llm.Message{Role: llm.RoleTool, Destroyed: true, Content: llm.TextContent(ephemeralReleasedPlaceholder)})
+	}
+	ag.ReplaceHistory(destroyed)
+	low := llm.WithPromptEstimate(nil, 1)
+	if trigger, watermark := ag.compactionTriggerAndWatermarkForUsage(low); trigger != "placeholder_pressure" || watermark != "placeholder_cleanup" {
+		t.Fatalf("placeholder decision=%q/%q", trigger, watermark)
+	}
+
+	ag.compactionInFlight.Store(true)
+	if ag.shouldAttemptCompactionUsage(context.Background(), eligible) {
+		t.Fatal("in-flight compaction did not suppress eligible trigger")
+	}
+	ag.compactionInFlight.Store(false)
+	ag.pendingCompactionMu.Lock()
+	ag.pendingCompaction = &pendingCompaction{}
+	ag.pendingCompactionMu.Unlock()
+	if ag.shouldAttemptCompactionUsage(context.Background(), eligible) {
+		t.Fatal("pending compaction did not suppress eligible trigger")
+	}
+	ag.pendingCompactionMu.Lock()
+	ag.pendingCompaction = nil
+	ag.pendingCompactionMu.Unlock()
+	ag.compactionCooldownUntil.Store(time.Now().Add(time.Hour).UnixNano())
+	if ag.shouldAttemptCompactionUsage(context.Background(), eligible) {
+		t.Fatal("cooldown did not suppress eligible non-overflow trigger")
+	}
+	if !ag.shouldAttemptCompactionUsage(context.Background(), llm.WithPromptEstimate(nil, 100)) {
+		t.Fatal("overflow did not bypass cooldown")
+	}
+}
+
+func TestProviderRejectedContextOverflowIsTerminal(t *testing.T) {
+	model := &providerContextOverflowModel{}
+	ag, err := New(Config{
+		LLM:                    model,
+		InvokeRetryMaxAttempts: 3,
+		Compaction: &compaction.Config{
+			Enabled:        true,
+			ContextWindow:  100,
+			ThresholdRatio: 0.85,
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	errorsSeen := 0
+	compactions := 0
+	finals := 0
+	for event := range ag.QueryStream(context.Background(), llm.TextContent("bounded request")) {
+		switch event := event.(type) {
+		case ErrorEvent:
+			errorsSeen++
+			if event.Kind != "invalid_request" || event.StatusCode != 400 {
+				t.Fatalf("terminal error=%#v want invalid_request/400", event)
+			}
+		case CompactionEvent:
+			compactions++
+		case FinalResponseEvent:
+			finals++
+		}
+	}
+
+	requests, summaryCalls := model.Snapshot()
+	if len(requests) != 1 || summaryCalls != 0 {
+		t.Fatalf("provider admissions=%d summary_calls=%d want 1/0", len(requests), summaryCalls)
+	}
+	if errorsSeen != 1 || compactions != 0 || finals != 0 {
+		t.Fatalf("errors=%d compactions=%d finals=%d want 1/0/0", errorsSeen, compactions, finals)
+	}
+	if ag.hasPendingCompaction() || ag.compactionInFlight.Load() || ag.compactionRetryPending.Load() || ag.todoCompactionPending.Load() || ag.compactionGeneration.Load() != 0 {
+		t.Fatalf("provider rejection changed compaction state: pending=%v in_flight=%v retry=%v todo=%v generation=%d",
+			ag.hasPendingCompaction(), ag.compactionInFlight.Load(), ag.compactionRetryPending.Load(), ag.todoCompactionPending.Load(), ag.compactionGeneration.Load())
+	}
+	request := requests[0]
+	if len(request.Messages) != 1 || request.Messages[0].Role != llm.RoleUser || request.Messages[0].Content.PlainText() != "bounded request" {
+		t.Fatalf("first provider payload changed: %#v", request.Messages)
 	}
 }
 
