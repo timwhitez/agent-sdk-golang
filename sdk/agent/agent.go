@@ -174,6 +174,7 @@ type Agent struct {
 	repeatInterventionShadowObserved  func(interventionDecision, interventionDecision)
 	repeatInterventionShadowEvaluator func(repeatedSignatureObservation) interventionDecision
 	repeatResultRecycled              func(string) bool
+	toolPlanShadowEvaluator           func(toolPlanningObservation) toolCallPlan
 
 	tools             []tools.Tool
 	toolMap           map[string]tools.Tool
@@ -1226,7 +1227,7 @@ func (a *Agent) queryStreamWithSteering(ctx context.Context, input llm.Content, 
 				originalName := tc.Function.Name
 
 				// Resolve tool: exact match → normalized/alias match → fallback
-				tool, resolvedName, found, _ := a.resolveToolByName(tc.Function.Name)
+				tool, resolvedName, found, normalizedAlias := a.resolveToolByName(tc.Function.Name)
 				unknownToolFallback := false
 				execArgs := tc.Function.Arguments
 
@@ -1242,6 +1243,23 @@ func (a *Agent) queryStreamWithSteering(ctx context.Context, input llm.Content, 
 				}
 
 				norm := tools.NormalizeToolArgs(resolvedName, execArgs, tool.Schema)
+				resolution := toolResolutionExact
+				if unknownToolFallback {
+					resolution = toolResolutionUnknownFallback
+				} else if normalizedAlias {
+					resolution = toolResolutionNormalizedAlias
+				}
+				argsState := toolArgsNormalized
+				if norm.Err != nil {
+					argsState = toolArgsInvalid
+				}
+				planningObservation := toolPlanningObservation{ordinal: idx, resolution: resolution, args: argsState}
+				legacyPlan := toolCallPlan{ordinal: idx, class: toolPlanExclusive}
+				shadowPlan := shadowToolCallPlan(planningObservation)
+				if a.toolPlanShadowEvaluator != nil {
+					shadowPlan = a.toolPlanShadowEvaluator(planningObservation)
+				}
+				a.observeToolCallPlan(legacyPlan, shadowPlan)
 				evidenceReq, evidenceTool := newEvidenceRequest(resolvedName, norm.Normalized, execArgs, a.deps)
 				if !strings.EqualFold(strings.TrimSpace(resolvedName), "done") {
 					pendingRequireDoneFinalText = ""
