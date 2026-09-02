@@ -535,7 +535,8 @@ func TestRepeatToolSignatureGuardProviderHistoryCharacterization(t *testing.T) {
 		if !ok || result.ToolCallID != "call-3" {
 			continue
 		}
-		if !result.IsError || result.Result != "[ERROR] Tool call skipped by loop guard - Repeated identical tool call blocked before execution." || result.Metadata["loop_guard_suppressed"] != true {
+		wantMetadata := map[string]any{"loop_guard_suppressed": true}
+		if !result.IsError || result.Result != "[ERROR] Tool call skipped by loop guard - Repeated identical tool call blocked before execution." || !reflect.DeepEqual(result.Metadata, wantMetadata) {
 			t.Fatalf("blocked ToolResult event=%#v", result)
 		}
 		return
@@ -634,7 +635,10 @@ func repeatedInterventionExpectedRequests(intervened bool) [][]string {
 	requests := [][]string{{"system::stable system prompt", "user::loop"}}
 	history := []string{"system::stable system prompt", "user::loop"}
 	for i := 1; i <= 3; i++ {
-		history = append(history, fmt.Sprintf(`assistant:call-%d:echo:{"text":"repeat"}`, i))
+		history = append(history,
+			"assistant::",
+			fmt.Sprintf(`assistant_call:call-%d:echo:{"text":"repeat"}`, i),
+		)
 		result := fmt.Sprintf("tool:call-%d:echo:false:ok", i)
 		if intervened && i == 3 {
 			result = "tool:call-3:echo:true:[ERROR] Tool call skipped by loop guard - Repeated identical tool call blocked before execution. Reuse previous results, change arguments, or call done if the task is complete."
@@ -655,8 +659,9 @@ func interventionRequestTranscript(request llm.InvokeRequest) []string {
 		case llm.RoleUser:
 			transcript = append(transcript, fmt.Sprintf("user:%s:%s", message.Name, message.Content.PlainText()))
 		case llm.RoleAssistant:
+			transcript = append(transcript, fmt.Sprintf("assistant:%s:%s", message.Name, message.Content.PlainText()))
 			for _, call := range message.ToolCalls {
-				transcript = append(transcript, fmt.Sprintf("assistant:%s:%s:%s", call.ID, call.Function.Name, call.Function.Arguments))
+				transcript = append(transcript, fmt.Sprintf("assistant_call:%s:%s:%s", call.ID, call.Function.Name, call.Function.Arguments))
 			}
 		case llm.RoleTool:
 			transcript = append(transcript, fmt.Sprintf("tool:%s:%s:%t:%s", message.ToolCallID, message.ToolName, message.IsError, message.Content.PlainText()))
