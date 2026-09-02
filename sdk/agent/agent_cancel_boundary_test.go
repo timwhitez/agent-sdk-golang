@@ -407,6 +407,7 @@ func BenchmarkToolBlockShadowLifecycle(b *testing.B) {
 		state := newToolBlockState(calls)
 		for ordinal := range calls {
 			state.markRunning(ordinal)
+			state.markAttemptReturned(ordinal, false)
 			state.markTerminal(ordinal, toolCallRunning, "handler_return")
 		}
 		if err := state.validateClosed(); err != nil {
