@@ -112,7 +112,8 @@ func TestDuplicateToolCallIDsFailBeforeAnyHandler(t *testing.T) {
 	var executions atomic.Int32
 	model := &duplicateToolCallIDModel{}
 	agent, err := New(Config{
-		LLM: model,
+		LLM:      model,
+		Warningf: failOnToolBlockShadowWarning(t),
 		Tools: []tools.Tool{{
 			Name: "mutate",
 			Handler: func(context.Context, json.RawMessage, *tools.Container) (llm.Content, error) {
@@ -164,7 +165,8 @@ func TestDuplicateAfterContinuationKeepsOlderSyntheticIDBlock(t *testing.T) {
 	var executions atomic.Int32
 	model := &repeatedSyntheticIDContinuationModel{}
 	agent, err := New(Config{
-		LLM: model,
+		LLM:      model,
+		Warningf: failOnToolBlockShadowWarning(t),
 		Tools: []tools.Tool{{
 			Name: "mutate",
 			Handler: func(context.Context, json.RawMessage, *tools.Container) (llm.Content, error) {
@@ -235,7 +237,7 @@ func TestDuplicateAfterRotatingContinuationIDsClearsWholeEpisode(t *testing.T) {
 		mustProviderStateContent(t, llm.Content{}, []llm.ProviderState{{Provider: "openai-responses", Kind: "response.output_item.v1", Data: json.RawMessage(`{"type":"function_call","call_id":"old-partial"}`)}}),
 		mustProviderStateContent(t, llm.Content{}, []llm.ProviderState{{Provider: "openai-responses", Kind: "response.output_item.v1", Data: json.RawMessage(`{"type":"function_call","call_id":"new-partial"}`)}}),
 	}}
-	agent, err := New(Config{LLM: model})
+	agent, err := New(Config{LLM: model, Warningf: failOnToolBlockShadowWarning(t)})
 	if err != nil {
 		t.Fatal(err)
 	}
