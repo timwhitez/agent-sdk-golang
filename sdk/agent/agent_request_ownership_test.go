@@ -119,6 +119,7 @@ func (m *providerAdmissionModel) Invoke(_ context.Context, request llm.InvokeReq
 	if call == 1 && m.retryFirst {
 		request.Messages[0].Content.Blocks[0].Text = "mutated"
 		request.Tools[1].Parameters["limit"] = int64(99)
+		request.Tools[1].Parameters["items"].([]any)[0] = "mutated"
 		*request.Temperature = 9
 		*request.Responses.UseResponseItems = false
 		*request.Responses.UseInstructions = true
@@ -128,7 +129,7 @@ func (m *providerAdmissionModel) Invoke(_ context.Context, request llm.InvokeReq
 		*request.Responses.Store = true
 		request.Responses.Text.Verbosity = "mutated"
 		request.Responses.Text.Format.Name = "mutated"
-		request.Responses.Text.Format.Schema["required"] = []any{"mutated"}
+		request.Responses.Text.Format.Schema["required"].([]any)[0] = "mutated"
 		request.Responses.Reasoning.Effort = "mutated"
 		request.Responses.Reasoning.Summary = "mutated"
 		request.Responses.OutputSchema["type"] = "mutated"
@@ -182,7 +183,7 @@ func TestFrameworkRetryCapturesOuterModelInterface(t *testing.T) {
 	if err != nil || completion == nil || completion.PlainText() != "captured" {
 		t.Fatalf("completion=%#v err=%v", completion, err)
 	}
-	assertProviderAdmissionRequests(t, primary.snapshots(), request, 2)
+	assertProviderAdmissionRequests(t, primary.snapshots(), providerAdmissionRequest(), 2)
 	if got := len(replacement.snapshots()); got != 0 {
 		t.Fatalf("replacement calls during retry=%d want 0", got)
 	}
@@ -190,7 +191,7 @@ func TestFrameworkRetryCapturesOuterModelInterface(t *testing.T) {
 	if err != nil || next == nil || next.PlainText() != "replacement" {
 		t.Fatalf("next admission completion=%#v err=%v", next, err)
 	}
-	assertProviderAdmissionRequests(t, replacement.snapshots(), request, 1)
+	assertProviderAdmissionRequests(t, replacement.snapshots(), providerAdmissionRequest(), 1)
 }
 
 func TestFrameworkRetryDoesNotSnapshotDynamicModelTarget(t *testing.T) {
@@ -207,8 +208,8 @@ func TestFrameworkRetryDoesNotSnapshotDynamicModelTarget(t *testing.T) {
 	if err != nil || completion == nil || completion.PlainText() != "new" {
 		t.Fatalf("completion=%#v err=%v want new", completion, err)
 	}
-	assertProviderAdmissionRequests(t, oldModel.snapshots(), request, 1)
-	assertProviderAdmissionRequests(t, newModel.snapshots(), request, 1)
+	assertProviderAdmissionRequests(t, oldModel.snapshots(), providerAdmissionRequest(), 1)
+	assertProviderAdmissionRequests(t, newModel.snapshots(), providerAdmissionRequest(), 1)
 	if got := dynamic.callCount(); got != 2 {
 		t.Fatalf("outer model calls=%d want 2", got)
 	}
@@ -226,7 +227,7 @@ func providerAdmissionRequest() llm.InvokeRequest {
 		}},
 		Tools: []llm.ToolDefinition{
 			{Name: "nil-schema", Parameters: nil},
-			{Name: "typed-schema", Strict: true, Parameters: map[string]any{"type": "object", "limit": int64(7), "empty": []any{}}},
+			{Name: "typed-schema", Strict: true, Parameters: map[string]any{"type": "object", "limit": int64(7), "items": []any{"stable"}, "empty": []any{}}},
 		},
 		ToolChoice:      llm.ToolChoice("required"),
 		Temperature:     &temperature,
