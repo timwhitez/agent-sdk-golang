@@ -2,6 +2,7 @@ package agent
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"slices"
 	"strings"
@@ -81,6 +82,38 @@ func TestToolBlockStateObservesRunningCancellationAsIndeterminate(t *testing.T) 
 	}
 }
 
+func TestToolBlockStateObservesOrdinaryAttemptOutcomes(t *testing.T) {
+	for _, test := range []struct {
+		name    string
+		handler func() (any, error)
+	}{
+		{name: "success", handler: func() (any, error) { return "ok", nil }},
+		{name: "error", handler: func() (any, error) { return nil, errors.New("failed") }},
+		{name: "panic", handler: func() (any, error) { panic("failed") }},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			model := &cancelBoundaryScriptModel{toolCalls: []llm.ToolCall{cancelBoundaryCall("ordinary-1", "ordinary")}}
+			tool := tools.Func[struct{}]("ordinary", "ordinary", func(context.Context, struct{}, *tools.Container) (any, error) {
+				return test.handler()
+			})
+			agent, err := New(Config{LLM: model, Tools: []tools.Tool{tool}, MaxIterations: 4, Warningf: failOnToolBlockShadowWarning(t)})
+			if err != nil {
+				t.Fatal(err)
+			}
+			var observed []toolExecutionKnowledge
+			agent.toolBlockStateObserved = func(block *toolBlockState) {
+				for _, call := range block.calls {
+					observed = append(observed, call.executionKnowledge)
+				}
+			}
+			collectEvents(agent.QueryStream(context.Background(), llm.TextContent("run")))
+			if want := []toolExecutionKnowledge{toolExecutionOutcomeObserved}; !slices.Equal(observed, want) {
+				t.Fatalf("execution knowledge=%v want %v", observed, want)
+			}
+		})
+	}
+}
+
 func TestToolBlockStateReportsInvariantViolations(t *testing.T) {
 	tests := []struct {
 		name string
@@ -99,6 +132,10 @@ func TestToolBlockStateReportsInvariantViolations(t *testing.T) {
 			block.markRunning(0)
 			block.markTerminal(0, toolCallRunning, "handler_return")
 		}, want: "want terminal execution knowledge"},
+		{name: "terminal unknown execution", run: func(block *toolBlockState) {
+			block.markTerminal(0, toolCallAccepted, "turn_end")
+			block.calls[0].executionKnowledge = toolExecutionUnknown
+		}, want: "execution=\"unknown\""},
 		{name: "out of range", run: func(block *toolBlockState) {
 			block.markRunning(1)
 			block.markTerminal(0, toolCallAccepted, "turn_end")
