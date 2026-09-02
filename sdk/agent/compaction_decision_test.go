@@ -1,9 +1,13 @@
 package agent
 
 import (
+	"context"
 	"fmt"
 	"strings"
 	"testing"
+
+	"github.com/timwhitez/agent-sdk-golang/sdk/agent/compaction"
+	"github.com/timwhitez/agent-sdk-golang/sdk/llm"
 )
 
 func TestShadowAutomaticCompactionDecision(t *testing.T) {
@@ -66,6 +70,34 @@ func TestObserveAutomaticCompactionDecisionKeepsLegacyAuthorityAndSafeWarning(t 
 	)
 	if !strings.Contains(warning, "legacy_run=true shadow_run=false legacy_trigger=unknown shadow_trigger=usage legacy_watermark=unknown shadow_watermark=snip") || strings.Contains(warning, "secret") {
 		t.Fatalf("unsafe mismatch warning: %q", warning)
+	}
+}
+
+func TestAutomaticCompactionDecisionRuntimeObservesOnce(t *testing.T) {
+	agent, err := New(Config{
+		LLM: &countingCompactionModel{},
+		Compaction: &compaction.Config{
+			Enabled:             true,
+			ContextWindow:       100,
+			ReserveOutputTokens: 0,
+			SnipThresholdRatio:  0.70,
+			PruneThresholdRatio: 0.80,
+			ThresholdRatio:      0.85,
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	admissions, shadows := 0, 0
+	agent.compactionAdmissionObserved = func() { admissions++ }
+	agent.compactionShadowObserved = func() { shadows++ }
+
+	err = agent.checkAndCompactWithGrowth(context.Background(), &llm.Completion{Usage: llm.WithPromptEstimate(nil, 69)}, nil, 0, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if admissions != 1 || shadows != 1 {
+		t.Fatalf("observations admission=%d shadow=%d want 1/1", admissions, shadows)
 	}
 }
 

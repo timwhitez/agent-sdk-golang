@@ -22,6 +22,9 @@ func shadowAutomaticCompactionDecision(observation automaticCompactionObservatio
 }
 
 func (a *Agent) observeAutomaticCompactionDecision(legacy, shadow compactionDecision) {
+	if a.compactionShadowObserved != nil {
+		a.compactionShadowObserved()
+	}
 	if legacy != shadow {
 		a.warnf(
 			"agent: automatic compaction decision shadow mismatch: legacy_run=%t shadow_run=%t legacy_trigger=%s shadow_trigger=%s legacy_watermark=%s shadow_watermark=%s",
