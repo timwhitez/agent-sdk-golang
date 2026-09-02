@@ -119,7 +119,19 @@ func (m *providerAdmissionModel) Invoke(_ context.Context, request llm.InvokeReq
 	if call == 1 && m.retryFirst {
 		request.Messages[0].Content.Blocks[0].Text = "mutated"
 		request.Tools[1].Parameters["limit"] = int64(99)
+		*request.Temperature = 9
+		*request.Responses.UseResponseItems = false
+		*request.Responses.UseInstructions = true
+		request.Responses.Instructions = "mutated"
+		request.Responses.Include[0] = "mutated"
+		*request.Responses.ParallelToolCalls = true
+		*request.Responses.Store = true
+		request.Responses.Text.Verbosity = "mutated"
+		request.Responses.Text.Format.Name = "mutated"
 		request.Responses.Text.Format.Schema["required"] = []any{"mutated"}
+		request.Responses.Reasoning.Effort = "mutated"
+		request.Responses.Reasoning.Summary = "mutated"
+		request.Responses.OutputSchema["type"] = "mutated"
 		return nil, &net.DNSError{Err: "i/o timeout", IsTimeout: true}
 	}
 	return &llm.Completion{Content: llm.TextContent(m.name), StopReason: "stop"}, nil
@@ -225,7 +237,7 @@ func providerAdmissionRequest() llm.InvokeRequest {
 			Instructions:      "stable",
 			ConversationID:    "conversation",
 			PromptCacheKey:    "cache",
-			Include:           []string{},
+			Include:           []string{"trace"},
 			ParallelToolCalls: &no,
 			Store:             &no,
 			Text: &llm.ResponsesTextControls{
