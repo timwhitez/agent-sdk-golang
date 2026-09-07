@@ -3,6 +3,8 @@ package agent
 import (
 	"context"
 	"errors"
+	"os"
+	"path/filepath"
 	"reflect"
 	"strconv"
 	"strings"
@@ -12,6 +14,50 @@ import (
 	"github.com/timwhitez/agent-sdk-golang/sdk/agent/compaction"
 	"github.com/timwhitez/agent-sdk-golang/sdk/llm"
 )
+
+func TestCompactionPublicationPreservesLiveDumpsUntilTTL(t *testing.T) {
+	for _, mode := range []string{"success", "stale", "busy", "noop"} {
+		t.Run(mode, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "owned-result.txt")
+			if err := os.WriteFile(path, []byte("fixture"), 0600); err != nil {
+				t.Fatal(err)
+			}
+			source := []llm.Message{llm.NewUserMessage("read"), llm.NewAssistantMessage("", []llm.ToolCall{{ID: "call", Function: llm.FunctionCall{Name: "read", Arguments: "{}"}}}), llm.NewToolMessage("call", "read", llm.TextContent("retained result at "+path), false)}
+			ag, err := New(Config{LLM: &countingCompactionModel{}, InitialMessages: source})
+			if err != nil {
+				t.Fatal(err)
+			}
+			now := time.Now()
+			ag.toolResultDumps[path] = toolResultDumpLifecycleEntry{CreatedAt: now, ExpiresAt: now.Add(time.Hour)}
+			expected := ag.Messages()
+			res := compaction.Result{Compacted: true}
+			var want error
+			switch mode {
+			case "stale":
+				expected[0].Name = "stale"
+				want = ErrStaleCompactionHistory
+			case "busy":
+				ag.turnActive.Store(true)
+				want = ErrAgentBusy
+			case "noop":
+				res.Compacted = false
+			}
+			_, err = ag.CommitCompactionHistory(context.Background(), expected, source, res)
+			if !errors.Is(err, want) {
+				t.Fatalf("publication=%v", err)
+			}
+			ag.turnActive.Store(false)
+			data, readErr := os.ReadFile(path)
+			if readErr != nil || string(data) != "fixture" || len(ag.toolResultDumps) != 1 || !reflect.DeepEqual(source, ag.Messages()) {
+				t.Fatalf("live recovery reference lost: registered=%d read=%v", len(ag.toolResultDumps), readErr)
+			}
+			ag.cleanupToolResultDumps(now.Add(2*time.Hour), false)
+			if _, err := os.Stat(path); !errors.Is(err, os.ErrNotExist) || len(ag.toolResultDumps) != 0 {
+				t.Fatalf("normal TTL cleanup changed: error=%v", err)
+			}
+		})
+	}
+}
 
 func BenchmarkCompactionHistoryPublication(b *testing.B) {
 	for _, count := range []int{1, 32, 256} {

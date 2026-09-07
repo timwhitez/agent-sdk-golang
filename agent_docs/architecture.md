@@ -621,6 +621,10 @@ and clear any caller-supplied CheckpointID/count rather than imply a new commit;
 without a writer, publication is memory-only with no invented checkpoint ID.
 Successful application advances compactionGeneration, as manual compaction does;
 that counter is not a configuration/session revision.
+It does not inherit the destructive dump cleanup of a history reset: live legacy
+recovery files remain available under the existing TTL/orphan-GC policy, like
+native compaction. Retaining history/checkpoint values does not imply retaining
+the old split ReplaceHistory cleanup side effect.
 
 Exact ErrAgentBusy/ErrStaleCompactionHistory/context sentinel returns occur
 before persistence. A writer/ledger failure wraps its cause; callers must not

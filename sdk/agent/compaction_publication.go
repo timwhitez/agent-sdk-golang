@@ -88,6 +88,5 @@ func (a *Agent) CommitCompactionHistory(ctx context.Context, expected, messages 
 	if commit.persisted {
 		a.compactor.FinalizePendingLedger(&commit.transaction)
 	}
-	a.cleanupToolResultDumps(toolResultDumpNow(), true)
 	return commit.result, nil
 }
