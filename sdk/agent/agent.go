@@ -683,6 +683,14 @@ func (a *Agent) queryStreamWithSteering(ctx context.Context, input llm.Content, 
 			emitErr(e, origin)
 		}
 		var activeToolBlock *toolBlockState
+		// All accepted Tool Result history commits pass through this writer.
+		// Event/accounting projection stays at each existing emission boundary.
+		closeToolResults := func(start int, expected toolCallPhase, reason string, messages ...llm.Message) {
+			a.appendMessages(messages)
+			for offset := range messages {
+				activeToolBlock.markTerminal(start+offset, expected, reason)
+			}
+		}
 		finishToolBlock := func() {
 			block := activeToolBlock
 			activeToolBlock = nil
@@ -1216,8 +1224,7 @@ func (a *Agent) queryStreamWithSteering(ctx context.Context, input llm.Content, 
 				if err := ctx.Err(); err != nil {
 					// Close every unstarted tool call before terminating so a later
 					// turn never inherits an unpaired assistant tool-call block.
-					a.appendCancellationSkippedToolResults(comp.ToolCalls[idx:])
-					activeToolBlock.markTerminalRange(idx, toolCallAccepted, "root_cancel_before_start")
+					closeToolResults(idx, toolCallAccepted, "root_cancel_before_start", skippedToolResults(comp.ToolCalls[idx:], toolSkippedByCancellationText)...)
 					a.appendMessages(pendingBlockMessages)
 					pendingBlockMessages = nil
 					emitSDKErr(a.errEvent(err))
@@ -1318,8 +1325,7 @@ func (a *Agent) queryStreamWithSteering(ctx context.Context, input llm.Content, 
 					a.observeRepeatedSignatureIntervention(legacyDecision, shadowDecision)
 					if blocked {
 						loopGuardStrikes++
-						a.appendLoopGuardSkippedToolResult(tc, resolvedName)
-						activeToolBlock.markTerminal(idx, toolCallAccepted, "loop_guard")
+						closeToolResults(idx, toolCallAccepted, "loop_guard", loopGuardSkippedToolResults(tc, resolvedName)...)
 						reminder := strings.TrimSpace(a.loopGuardUserMsg)
 						if repeatGuard.exhausted {
 							// The default reminder can mislead here ("reuse prior
@@ -1400,13 +1406,10 @@ func (a *Agent) queryStreamWithSteering(ctx context.Context, input llm.Content, 
 					decision := progressLedger.preflight(evidenceReq, a.compactionGeneration.Load())
 					if decision.suppress {
 						content := llm.TextContent(decision.content)
-						a.mu.Lock()
-						a.messages = append(a.messages, llm.Message{
+						closeToolResults(idx, toolCallAccepted, "evidence_suppressed", llm.Message{
 							Role: llm.RoleTool, ToolCallID: tc.ID, ToolName: resolvedName,
 							Content: content, IsError: false, Ephemeral: tool.EphemeralKeep > 0,
 						})
-						a.mu.Unlock()
-						activeToolBlock.markTerminal(idx, toolCallAccepted, "evidence_suppressed")
 						suppressedResult := ToolResultEvent{
 							Tool: resolvedName, Result: content.PlainText(), ToolCallID: tc.ID,
 							IsError: false, Metadata: decision.metadata,
@@ -1479,15 +1482,11 @@ func (a *Agent) queryStreamWithSteering(ctx context.Context, input llm.Content, 
 					originalResult := content.PlainText()
 					content, meta = a.applyToolResultTruncation(ctx, content, meta, resolvedName, tc.ID)
 					// append tool message and finish
-					a.mu.Lock()
-					a.messages = append(a.messages, llm.Message{Role: llm.RoleTool, ToolCallID: tc.ID, ToolName: resolvedName, Content: content, IsError: false, Ephemeral: ephemeral})
-					a.mu.Unlock()
-					activeToolBlock.markTerminal(idx, toolCallRunning, "task_complete")
+					closeToolResults(idx, toolCallRunning, "task_complete", llm.Message{Role: llm.RoleTool, ToolCallID: tc.ID, ToolName: resolvedName, Content: content, IsError: false, Ephemeral: ephemeral})
 					a.emitToolResultWithAccounting(out, ToolResultEvent{Tool: resolvedName, Result: content.PlainText(), ToolCallID: tc.ID, IsError: false, Metadata: meta}, originalResult, time.Since(start))
 					a.emitEvent(out, StepCompleteEvent{StepID: tc.ID, Status: status, DurationMS: time.Since(start).Milliseconds()})
 					if err := ctx.Err(); err != nil {
-						a.appendCancellationSkippedToolResults(comp.ToolCalls[idx+1:])
-						activeToolBlock.markTerminalRange(idx+1, toolCallAccepted, "root_cancel_after_task_complete")
+						closeToolResults(idx+1, toolCallAccepted, "root_cancel_after_task_complete", skippedToolResults(comp.ToolCalls[idx+1:], toolSkippedByCancellationText)...)
 						a.appendMessages(pendingBlockMessages)
 						pendingBlockMessages = nil
 						emitSDKErr(a.errEvent(err))
@@ -1497,8 +1496,7 @@ func (a *Agent) queryStreamWithSteering(ctx context.Context, input llm.Content, 
 					// still be closed: a parallel `done` that is not the last
 					// call would otherwise leave tool_use blocks with no result,
 					// making the *next* turn's first provider request invalid.
-					a.appendTurnEndSkippedToolResults(comp.ToolCalls[idx+1:])
-					activeToolBlock.markTerminalRange(idx+1, toolCallAccepted, "task_complete_tail")
+					closeToolResults(idx+1, toolCallAccepted, "task_complete_tail", skippedToolResults(comp.ToolCalls[idx+1:], toolSkippedByTurnEndText)...)
 					a.appendMessages(pendingBlockMessages)
 					pendingBlockMessages = nil
 					if a.hasCompactor {
@@ -1527,10 +1525,7 @@ func (a *Agent) queryStreamWithSteering(ctx context.Context, input llm.Content, 
 				content, meta = a.applyToolResultTruncation(ctx, content, meta, resolvedName, tc.ID)
 
 				// append tool message
-				a.mu.Lock()
-				a.messages = append(a.messages, llm.Message{Role: llm.RoleTool, ToolCallID: tc.ID, ToolName: resolvedName, Content: content, IsError: isError, Ephemeral: ephemeral})
-				a.mu.Unlock()
-				activeToolBlock.markTerminal(idx, toolCallRunning, "handler_return")
+				closeToolResults(idx, toolCallRunning, "handler_return", llm.Message{Role: llm.RoleTool, ToolCallID: tc.ID, ToolName: resolvedName, Content: content, IsError: isError, Ephemeral: ephemeral})
 
 				a.emitToolResultWithAccounting(out, ToolResultEvent{Tool: resolvedName, Result: content.PlainText(), ToolCallID: tc.ID, IsError: isError, Metadata: meta}, originalResult, time.Since(start))
 				a.emitEvent(out, StepCompleteEvent{StepID: tc.ID, Status: status, DurationMS: time.Since(start).Milliseconds()})
@@ -1538,8 +1533,7 @@ func (a *Agent) queryStreamWithSteering(ctx context.Context, input llm.Content, 
 					rootCancelErr = ctx.Err()
 				}
 				if rootCancelErr != nil {
-					a.appendCancellationSkippedToolResults(comp.ToolCalls[idx+1:])
-					activeToolBlock.markTerminalRange(idx+1, toolCallAccepted, "root_cancel_after_handler")
+					closeToolResults(idx+1, toolCallAccepted, "root_cancel_after_handler", skippedToolResults(comp.ToolCalls[idx+1:], toolSkippedByCancellationText)...)
 					a.appendMessages(pendingBlockMessages)
 					pendingBlockMessages = nil
 					emitSDKErr(a.errEvent(rootCancelErr))
@@ -1561,8 +1555,7 @@ func (a *Agent) queryStreamWithSteering(ctx context.Context, input llm.Content, 
 					// *before* the steering text enters history. A user message
 					// between two tool results of the same assistant block makes
 					// the whole conversation permanently unsendable.
-					a.appendSteeringSkippedToolResults(comp.ToolCalls[idx+1:])
-					activeToolBlock.markTerminalRange(idx+1, toolCallAccepted, "steering")
+					closeToolResults(idx+1, toolCallAccepted, "steering", skippedToolResults(comp.ToolCalls[idx+1:], toolSkippedBySteeringText)...)
 					pendingBlockMessages = append(pendingBlockMessages, steeringMessages...)
 					break
 				}
@@ -2472,10 +2465,10 @@ func stopTimerDrain(t *time.Timer) {
 	}
 }
 
-func (a *Agent) appendLoopGuardSkippedToolResult(call llm.ToolCall, currentResolvedName string) {
+func loopGuardSkippedToolResults(call llm.ToolCall, currentResolvedName string) []llm.Message {
 	id := strings.TrimSpace(call.ID)
 	if id == "" {
-		return
+		return nil
 	}
 	content := llm.TextContent("[ERROR] Tool call skipped by loop guard - Repeated identical tool call blocked before execution. Reuse previous results, change arguments, or call done if the task is complete.")
 	name := strings.TrimSpace(currentResolvedName)
@@ -2485,34 +2478,7 @@ func (a *Agent) appendLoopGuardSkippedToolResult(call llm.ToolCall, currentResol
 	if name == "" {
 		name = "unknown"
 	}
-	a.mu.Lock()
-	a.messages = append(a.messages, llm.NewToolMessage(id, name, content, true))
-	a.mu.Unlock()
-}
-
-func (a *Agent) appendSteeringSkippedToolResults(calls []llm.ToolCall) {
-	if a == nil || len(calls) == 0 {
-		return
-	}
-	a.appendMessages(skippedToolResults(calls, toolSkippedBySteeringText))
-}
-
-// appendTurnEndSkippedToolResults closes a tool-call block whose remaining calls
-// were never executed because the turn completed early (e.g. a parallel `done`).
-func (a *Agent) appendTurnEndSkippedToolResults(calls []llm.ToolCall) {
-	if a == nil || len(calls) == 0 {
-		return
-	}
-	a.appendMessages(skippedToolResults(calls, toolSkippedByTurnEndText))
-}
-
-// appendCancellationSkippedToolResults closes a tool-call block whose
-// remaining calls were never executed because the root turn was canceled.
-func (a *Agent) appendCancellationSkippedToolResults(calls []llm.ToolCall) {
-	if a == nil || len(calls) == 0 {
-		return
-	}
-	a.appendMessages(skippedToolResults(calls, toolSkippedByCancellationText))
+	return []llm.Message{llm.NewToolMessage(id, name, content, true)}
 }
 
 const (

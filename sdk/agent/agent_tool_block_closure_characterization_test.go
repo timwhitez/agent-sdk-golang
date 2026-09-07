@@ -150,6 +150,69 @@ func TestToolBlockSequentialClosureCharacterization(t *testing.T) {
 	}
 }
 
+func TestToolBlockClosureWriterPreservesSyntheticIDDoneTail(t *testing.T) {
+	model := &cancelBoundaryScriptModel{toolCalls: []llm.ToolCall{
+		cancelBoundaryCall("", "done"), cancelBoundaryCall("", "tail"),
+	}}
+	done := tools.Func[struct{}]("done", "done", func(context.Context, struct{}, *tools.Container) (any, error) {
+		return nil, tools.TaskComplete("finished")
+	})
+	done.EphemeralKeep = 3
+	tail := tools.Func[struct{}]("tail", "tail", func(context.Context, struct{}, *tools.Container) (any, error) {
+		t.Error("unstarted tail ran")
+		return "unexpected", nil
+	})
+	tail.EphemeralKeep = 3
+	ag, err := New(Config{LLM: model, Tools: []tools.Tool{done, tail}, Warningf: failOnToolBlockShadowWarning(t)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var states []toolCallState
+	ag.toolBlockStateObserved = func(block *toolBlockState) { states = append(states, block.calls...) }
+	events := collectEvents(ag.QueryStream(context.Background(), llm.TextContent("run")))
+	if len(states) != 2 || states[0].terminalCount != 1 || states[1].terminalCount != 1 ||
+		states[0].closure != "task_complete" || states[1].closure != "task_complete_tail" ||
+		states[0].executionKnowledge != toolExecutionOutcomeObserved || states[1].executionKnowledge != toolExecutionNotStarted {
+		t.Fatalf("closure states=%#v", states)
+	}
+	var results []llm.Message
+	for _, message := range ag.Messages() {
+		if message.Role == llm.RoleTool {
+			results = append(results, message)
+		}
+	}
+	if len(results) != 2 {
+		t.Fatalf("results=%#v", results)
+	}
+	if results[0].ToolCallID != "call_0" || results[1].ToolCallID != "call_1" ||
+		results[0].ToolName != "done" || results[1].ToolName != "tail" ||
+		!results[0].Ephemeral || results[1].Ephemeral || results[0].IsError || !results[1].IsError ||
+		results[0].PlainText() != "Task completed: finished" || results[1].PlainText() != toolSkippedByTurnEndText {
+		t.Fatalf("result fields changed: %#v", results)
+	}
+	if _, changed, unexpected := repairToolCallPairsDetailed(ag.Messages()); changed || unexpected {
+		t.Fatal("synthetic-ID block required outbound repair")
+	}
+	for _, event := range events {
+		id := ""
+		switch event := event.(type) {
+		case ToolResultEvent:
+			id = event.ToolCallID
+		case ToolCallEvent:
+			id = event.ToolCallID
+		case AccountingEvent:
+			id = event.ToolCallID
+		case StepStartEvent:
+			id = event.StepID
+		case StepCompleteEvent:
+			id = event.StepID
+		}
+		if id == "call_1" {
+			t.Fatalf("history-only tail gained event: %#v", event)
+		}
+	}
+}
+
 func TestToolBlockShadowAllowsIDsReusedAcrossBlocks(t *testing.T) {
 	model := &reusedToolCallIDAcrossBlocksModel{}
 	echoStarts := 0
