@@ -849,6 +849,11 @@ func (a *Agent) queryStreamWithSteering(ctx context.Context, input llm.Content, 
 					}
 				}
 
+				// A failed continuation was never accepted for execution. Remove
+				// its staged tool topology before publishing the terminal error.
+				if cont.hasPending() {
+					a.discardContinuationToolCalls(&cont, -1)
+				}
 				// Save partial assistant message if any text was streamed,
 				// so the conversation history reflects what the user saw.
 				if comp != nil && !comp.Content.IsEmpty() {
