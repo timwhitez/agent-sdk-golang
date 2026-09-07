@@ -439,8 +439,11 @@ func TestInvokeCompletionWithSteeringNilChannel(t *testing.T) {
 // TestSteeringInterruptErrorIsNotRetryable verifies that steering
 // interrupt errors are not retried.
 func TestSteeringInterruptErrorIsNotRetryable(t *testing.T) {
+	// Retry-looking text must not override the typed steering disposition.
+	interrupt := &llm.SteeringInterruptError{Message: "HTTP 429 timeout"}
+	model := &transientInvokeModel{failFor: 5, err: interrupt}
 	ag, err := New(Config{
-		LLM:                    &slowStreamingModel{},
+		LLM:                    model,
 		InvokeRetryMaxAttempts: 5,
 		InvokeRetryBackoff:     time.Millisecond,
 	})
@@ -448,28 +451,16 @@ func TestSteeringInterruptErrorIsNotRetryable(t *testing.T) {
 		t.Fatalf("new agent: %v", err)
 	}
 
-	steering := make(chan SteeringMsg, 1)
-	ctx := context.Background()
-
-	// Send steering immediately
-	steering <- SteeringMsg{Content: "stop"}
-
-	// invokeCompletionWithRetryAndSteering should return immediately
-	// without retrying
-	start := time.Now()
-	_, _, err = ag.invokeCompletionWithRetryAndSteering(ctx, llm.InvokeRequest{
+	_, _, err = ag.invokeCompletionWithRetryAndSteering(context.Background(), llm.InvokeRequest{
 		Messages: []llm.Message{{Role: llm.RoleUser, Content: llm.TextContent("hi")}},
-	}, nil, steering)
-	elapsed := time.Since(start)
-
-	// Should return quickly (not after multiple retries)
-	if elapsed > 200*time.Millisecond {
-		t.Errorf("expected quick return on steering interrupt, got %v", elapsed)
+	}, nil, nil)
+	if model.calls != 1 {
+		t.Errorf("steering interrupt invoked provider %d times, want 1", model.calls)
 	}
 
 	// Error should be SteeringInterruptError
 	var steerErr *llm.SteeringInterruptError
-	if !errors.As(err, &steerErr) {
+	if !errors.As(err, &steerErr) || steerErr != interrupt {
 		t.Errorf("expected SteeringInterruptError, got %T: %v", err, err)
 	}
 }
