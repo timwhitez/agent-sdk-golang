@@ -54,6 +54,36 @@ func TestObserveToolCallPlanComparesEveryFieldSafely(t *testing.T) {
 	}
 }
 
+func TestToolPlanShadowRuntimeDefaultsReadAndBatchToExclusive(t *testing.T) {
+	call := func(id, name string) llm.ToolCall {
+		return llm.ToolCall{ID: id, Type: "function", Function: llm.FunctionCall{Name: name, Arguments: `{}`}}
+	}
+	model := &toolPlanScriptModel{toolCalls: []llm.ToolCall{call("read-1", "read"), call("batch-2", "batch")}}
+	var starts []string
+	makeTool := func(name string) tools.Tool {
+		return tools.Func[struct{}](name, name, func(context.Context, struct{}, *tools.Container) (any, error) {
+			starts = append(starts, name)
+			return "ok", nil
+		})
+	}
+	agent, err := New(Config{
+		LLM:   model,
+		Tools: []tools.Tool{makeTool("read_file"), makeTool("batch")},
+		Warningf: func(format string, args ...any) {
+			if strings.Contains(format, "tool planner shadow mismatch") {
+				t.Errorf("unexpected planner warning: %s", fmt.Sprintf(format, args...))
+			}
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	collectEvents(agent.QueryStream(context.Background(), llm.TextContent("run")))
+	if !slices.Equal(starts, []string{"read_file", "batch"}) || model.calls != 2 {
+		t.Fatalf("starts=%v provider_calls=%d", starts, model.calls)
+	}
+}
+
 func TestToolPlanShadowObservesResolutionWithoutChangingExecution(t *testing.T) {
 	const secret = "secret-tool-or-args-sentinel"
 	call := func(id, name, args string) llm.ToolCall {
