@@ -608,8 +608,27 @@ and all external history replacements (including System updates) are rejected.
 No history mutex is held across model or host callbacks. Query-owned automatic
 compaction retains its existing private lifecycle. Hosts must not treat busy as
 permission for emergency fallback. Public checkpoint-only commit followed by
-host history replacement still has a separate publication boundary; this does
-not add an atomic host transaction or freeze mutable runtime dependency handles.
+host history replacement still has a separate publication boundary.
+
+Hosts can instead use CommitCompactionHistory with the exact source snapshot
+used to compute their candidate. It reuses that same admission gate, fails fast
+when a runtime replacement is pending, claims in-flight compaction before
+checking pending results, and compares complete source-message JSON before I/O.
+The candidate is owned before callbacks; checkpoint acknowledgement precedes
+history publication and deferred-ledger finalization. A successful acknowledged
+commit still publishes after cancellation. No-op results do not change history
+and clear any caller-supplied CheckpointID/count rather than imply a new commit;
+without a writer, publication is memory-only with no invented checkpoint ID.
+Successful application advances compactionGeneration, as manual compaction does;
+that counter is not a configuration/session revision.
+
+Exact ErrAgentBusy/ErrStaleCompactionHistory/context sentinel returns occur
+before persistence. A writer/ledger failure wraps its cause; callers must not
+mistake a nested admission-like cause for proof that no checkpoint was attempted.
+This boundary covers SDK query/manual/history admission, not the host's prior
+candidate computation or recovery snapshot write. Source-content equality is
+not session/runtime revision binding, and external writers or legacy independent
+checkpoint-only calls remain outside the lease. No persistence schema changes.
 
 ## Runtime Compaction Configuration Updates
 

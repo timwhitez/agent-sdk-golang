@@ -4316,22 +4316,11 @@ func (a *Agent) CompactNow(ctx context.Context) (compaction.Result, error) {
 // It returns ErrAgentBusy instead of overlapping an active query or another
 // public compaction. Hosts must not turn this rejection into a local fallback.
 func (a *Agent) CompactPipelineNow(ctx context.Context, req compaction.PipelineRequest) (compaction.Result, error) {
-	if ctx != nil && ctx.Err() != nil {
-		return compaction.Result{}, ctx.Err()
+	releasePublication, err := a.beginManualCompaction(ctx)
+	if err != nil {
+		return compaction.Result{}, err
 	}
-	a.mu.Lock()
-	if !a.turnActive.CompareAndSwap(false, true) {
-		a.mu.Unlock()
-		return compaction.Result{}, ErrAgentBusy
-	}
-	a.manualCompactionActive = true
-	a.mu.Unlock()
-	defer func() {
-		a.mu.Lock()
-		a.manualCompactionActive = false
-		a.turnActive.Store(false)
-		a.mu.Unlock()
-	}()
+	defer releasePublication()
 
 	releaseCompactionRuntime, err := a.beginCompactionRuntimeUse(ctx)
 	if err != nil {
@@ -4433,6 +4422,8 @@ func (a *Agent) persistCompactionCheckpoint(ctx context.Context, messages []llm.
 // CommitCompactionCheckpoint durably records compacted provider history before
 // callers replace in-memory history. A persistence failure is fail-closed: the
 // returned result is not reported as compacted and the caller keeps old state.
+// This checkpoint-only API does not own subsequent history publication. Hosts
+// publishing a computed candidate should use CommitCompactionHistory instead.
 func (a *Agent) CommitCompactionCheckpoint(ctx context.Context, messages []llm.Message, res compaction.Result) (compaction.Result, error) {
 	releaseCompactionRuntime, err := a.beginCompactionRuntimeUse(ctx)
 	if err != nil {
