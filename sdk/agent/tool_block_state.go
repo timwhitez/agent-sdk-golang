@@ -8,14 +8,12 @@ import (
 )
 
 type toolCallPhase string
-
 type toolExecutionKnowledge uint8
 
 const (
-	toolCallAccepted toolCallPhase = "accepted"
-	toolCallRunning  toolCallPhase = "running"
-	toolCallTerminal toolCallPhase = "terminal"
-
+	toolCallAccepted     toolCallPhase          = "accepted"
+	toolCallRunning      toolCallPhase          = "running"
+	toolCallTerminal     toolCallPhase          = "terminal"
 	toolExecutionUnknown toolExecutionKnowledge = iota
 	toolExecutionNotStarted
 	toolExecutionAttemptStarted
@@ -23,11 +21,32 @@ const (
 	toolExecutionIndeterminate
 )
 
+type toolPublication uint8
+
+const (
+	toolPublicationNone toolPublication = iota // history-only terminal
+	toolPublicationPending
+	toolPublicationClaimed // not a claim of delivery
+	toolPublicationAborted
+)
+
 type toolCallState struct {
+	id, name           string
 	phase              toolCallPhase
 	executionKnowledge toolExecutionKnowledge
 	terminalCount      int
 	closure            string
+	publication        toolPublication
+	result             *toolResultProjection
+}
+
+type toolBlockTransitionError struct {
+	index int
+	code  string
+}
+
+func (e *toolBlockTransitionError) Error() string {
+	return fmt.Sprintf("tool lifecycle call[%d]: %s", e.index, e.code)
 }
 
 func (k toolExecutionKnowledge) String() string {
@@ -45,131 +64,179 @@ func (k toolExecutionKnowledge) String() string {
 	}
 }
 
-// toolBlockState is an observe-only mirror of the sequential Tool Loop. It is
-// deliberately query-local and does not construct history, events, or results.
+// toolBlockState is query/block-local terminal and publication authority, owned
+// by the sequential driver (not a concurrent scheduler or a durable ledger).
+// It retains accepted identity, never arguments. Pending projection payloads
+// are released on publication claim or abort; claim does not imply delivery.
 type toolBlockState struct {
-	calls      []toolCallState
-	violations []string
+	calls        []toolCallState
+	nextTerminal int
 }
 
-func newToolBlockState(calls []llm.ToolCall) *toolBlockState {
-	block := &toolBlockState{calls: make([]toolCallState, len(calls))}
-	seen := make(map[string]int, len(calls))
+func newToolBlockState(calls []llm.ToolCall) (*toolBlockState, error) {
+	b := &toolBlockState{calls: make([]toolCallState, len(calls))}
+	seen := make(map[string]bool, len(calls))
 	for i, call := range calls {
 		id := strings.TrimSpace(call.ID)
-		block.calls[i] = toolCallState{phase: toolCallAccepted, executionKnowledge: toolExecutionNotStarted}
 		if id == "" {
-			block.addViolation("call[%d] has empty id", i)
-			continue
+			return nil, &toolBlockTransitionError{i, "empty_id"}
 		}
-		if first, ok := seen[id]; ok {
-			block.addViolation("call[%d] duplicates the id from call[%d]", i, first)
-			continue
+		if seen[id] {
+			return nil, &toolBlockTransitionError{i, "duplicate_id"}
 		}
-		seen[id] = i
+		seen[id] = true
+		name := strings.TrimSpace(call.Function.Name)
+		if name == "" {
+			name = "unknown"
+		}
+		b.calls[i] = toolCallState{id: id, name: name, phase: toolCallAccepted, executionKnowledge: toolExecutionNotStarted}
 	}
-	return block
+	return b, nil
 }
 
-func (b *toolBlockState) markRunning(index int) {
-	call, ok := b.call(index)
-	if !ok {
-		return
+func (b *toolBlockState) call(index int) (*toolCallState, error) {
+	if b == nil || index < 0 || index >= len(b.calls) {
+		return nil, &toolBlockTransitionError{index, "out_of_range"}
 	}
-	if call.phase != toolCallAccepted {
-		b.addViolation("call[%d] cannot start from phase %q", index, call.phase)
-		return
+	return &b.calls[index], nil
+}
+
+func (b *toolBlockState) markRunning(index int) error {
+	call, err := b.call(index)
+	if err != nil {
+		return err
 	}
-	if call.executionKnowledge != toolExecutionNotStarted {
-		b.addViolation("call[%d] cannot start from execution %q", index, call.executionKnowledge)
-		return
+	if call.phase != toolCallAccepted || call.executionKnowledge != toolExecutionNotStarted || call.terminalCount != 0 {
+		return &toolBlockTransitionError{index, "cannot_start"}
 	}
 	call.phase = toolCallRunning
 	call.executionKnowledge = toolExecutionAttemptStarted
+	return nil
 }
 
-func (b *toolBlockState) markAttemptReturned(index int, rootCanceled bool) {
-	call, ok := b.call(index)
-	if !ok {
-		return
+func (b *toolBlockState) markAttemptReturned(index int, rootCanceled bool) error {
+	call, err := b.call(index)
+	if err != nil {
+		return err
 	}
-	if call.phase != toolCallRunning || call.executionKnowledge != toolExecutionAttemptStarted {
-		b.addViolation("call[%d] cannot observe attempt return from phase %q execution %q", index, call.phase, call.executionKnowledge)
-		return
+	if call.phase != toolCallRunning || call.executionKnowledge != toolExecutionAttemptStarted || call.terminalCount != 0 {
+		return &toolBlockTransitionError{index, "cannot_observe_return"}
 	}
 	call.executionKnowledge = toolExecutionOutcomeObserved
 	if rootCanceled {
 		call.executionKnowledge = toolExecutionIndeterminate
 	}
+	return nil
 }
 
-func (b *toolBlockState) markTerminal(index int, expected toolCallPhase, closure string) {
-	call, ok := b.call(index)
-	if !ok {
-		return
+// acceptResults validates the entire batch before accepting any result. The
+// caller appends returned history exactly once; rejected proposals have no effect.
+func (b *toolBlockState) acceptResults(start int, expected toolCallPhase, closure string, results []toolResultProjection) ([]llm.Message, error) {
+	if b == nil || start < 0 || start > len(b.calls) || len(results) > len(b.calls)-start {
+		return nil, &toolBlockTransitionError{start, "invalid_range"}
 	}
-	call.terminalCount++
-	if call.terminalCount != 1 {
-		b.addViolation("call[%d] has %d terminal transitions", index, call.terminalCount)
-		return
+	if expected != toolCallAccepted && expected != toolCallRunning {
+		return nil, &toolBlockTransitionError{start, "invalid_expected_phase"}
 	}
-	if call.phase != expected {
-		b.addViolation("call[%d] closed by %q from phase %q, want %q", index, closure, call.phase, expected)
-		return
+	if start != b.nextTerminal {
+		if start < b.nextTerminal && len(results) > 0 {
+			return nil, &toolBlockTransitionError{start, "duplicate_terminal"}
+		}
+		return nil, &toolBlockTransitionError{start, "out_of_order_terminal"}
 	}
-	if expected == toolCallAccepted && call.executionKnowledge != toolExecutionNotStarted {
-		b.addViolation("call[%d] closed by %q from execution %q, want %q", index, closure, call.executionKnowledge, toolExecutionNotStarted)
+	for offset, result := range results {
+		index := start + offset
+		call := &b.calls[index]
+		if call.phase == toolCallTerminal || call.terminalCount != 0 {
+			return nil, &toolBlockTransitionError{index, "duplicate_terminal"}
+		}
+		if call.phase != expected {
+			return nil, &toolBlockTransitionError{index, "wrong_phase"}
+		}
+		if (expected == toolCallAccepted && call.executionKnowledge != toolExecutionNotStarted) || (expected == toolCallRunning && call.executionKnowledge != toolExecutionOutcomeObserved && call.executionKnowledge != toolExecutionIndeterminate) {
+			return nil, &toolBlockTransitionError{index, "invalid_execution_knowledge"}
+		}
+		if result.history.Role != llm.RoleTool || result.history.ToolCallID != call.id || len(result.history.ToolCalls) != 0 {
+			return nil, &toolBlockTransitionError{index, "invalid_result_identity"}
+		}
 	}
-	if expected == toolCallRunning && call.executionKnowledge != toolExecutionOutcomeObserved && call.executionKnowledge != toolExecutionIndeterminate {
-		b.addViolation("call[%d] closed by %q from execution %q, want terminal execution knowledge", index, closure, call.executionKnowledge)
+	history := make([]llm.Message, len(results))
+	for offset, result := range results {
+		call := &b.calls[start+offset]
+		result.history = llm.CloneMessage(result.history)
+		if result.metadata != nil {
+			result.metadata = cloneToolResultMetadata(result.metadata)
+		}
+		history[offset] = llm.CloneMessage(result.history)
+		call.phase = toolCallTerminal
+		call.terminalCount = 1
+		call.closure = closure
+		if result.publish {
+			call.publication = toolPublicationPending
+			call.result = &result
+		}
 	}
-	call.phase = toolCallTerminal
-	call.closure = closure
+	b.nextTerminal += len(results)
+	return history, nil
 }
 
-func (b *toolBlockState) markTerminalRange(start int, expected toolCallPhase, closure string) {
+func (b *toolBlockState) takePublication(index int) (toolResultProjection, error) {
+	call, err := b.call(index)
+	if err != nil {
+		return toolResultProjection{}, err
+	}
+	if call.phase != toolCallTerminal || call.terminalCount != 1 || index >= b.nextTerminal || call.publication != toolPublicationPending || call.result == nil {
+		return toolResultProjection{}, &toolBlockTransitionError{index, "publication_unavailable"}
+	}
+	result := *call.result
+	call.result = nil
+	call.publication = toolPublicationClaimed
+	return result, nil
+}
+
+// abortOpen is an idempotent, non-reentrant recovery path. It never rewrites
+// terminal history. Observed execution and failed projection remain distinct.
+func (b *toolBlockState) abortOpen() []llm.Message {
 	if b == nil {
-		return
+		return nil
 	}
-	if start < 0 || start > len(b.calls) {
-		b.addViolation("terminal range start %d outside block length %d", start, len(b.calls))
-		return
+	var rows []llm.Message
+	for i := range b.calls {
+		call := &b.calls[i]
+		call.result = nil
+		if call.publication == toolPublicationPending {
+			call.publication = toolPublicationAborted
+		}
+		if call.terminalCount > 0 {
+			call.phase = toolCallTerminal
+			continue
+		}
+		text := "[ERROR] Tool result unavailable after an internal lifecycle failure; result is indeterminate and execution may have occurred."
+		if call.phase == toolCallAccepted && call.executionKnowledge == toolExecutionNotStarted {
+			text = "[ERROR] Tool skipped before execution because of an internal lifecycle failure."
+		} else if call.executionKnowledge != toolExecutionOutcomeObserved {
+			call.executionKnowledge = toolExecutionIndeterminate
+		}
+		rows = append(rows, llm.NewToolMessage(call.id, call.name, llm.TextContent(text), true))
+		call.phase = toolCallTerminal
+		call.terminalCount = 1
+		call.closure = "lifecycle_failure"
 	}
-	for i := start; i < len(b.calls); i++ {
-		b.markTerminal(i, expected, closure)
-	}
+	b.nextTerminal = len(b.calls)
+	return rows
 }
 
 func (b *toolBlockState) validateClosed() error {
 	if b == nil {
 		return nil
 	}
-	violations := append([]string(nil), b.violations...)
+	if b.nextTerminal != len(b.calls) {
+		return &toolBlockTransitionError{b.nextTerminal, "incomplete_block"}
+	}
 	for i, call := range b.calls {
-		if call.phase != toolCallTerminal || call.terminalCount != 1 || call.executionKnowledge == toolExecutionUnknown || call.executionKnowledge == toolExecutionAttemptStarted {
-			violations = append(violations, fmt.Sprintf("call[%d] remains phase=%q execution=%q terminal_count=%d", i, call.phase, call.executionKnowledge, call.terminalCount))
+		if call.phase != toolCallTerminal || call.terminalCount != 1 || call.executionKnowledge == toolExecutionUnknown || call.executionKnowledge == toolExecutionAttemptStarted || call.publication == toolPublicationPending || call.result != nil {
+			return &toolBlockTransitionError{i, "incomplete_block"}
 		}
 	}
-	if len(violations) == 0 {
-		return nil
-	}
-	return fmt.Errorf("%s", strings.Join(violations, "; "))
-}
-
-func (b *toolBlockState) call(index int) (*toolCallState, bool) {
-	if b == nil {
-		return nil, false
-	}
-	if index < 0 || index >= len(b.calls) {
-		b.addViolation("call index %d outside block length %d", index, len(b.calls))
-		return nil, false
-	}
-	return &b.calls[index], true
-}
-
-func (b *toolBlockState) addViolation(format string, args ...any) {
-	if b == nil {
-		return
-	}
-	b.violations = append(b.violations, fmt.Sprintf(format, args...))
+	return nil
 }

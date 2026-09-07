@@ -396,7 +396,7 @@ func finalText(events []Event) string {
 	return ""
 }
 
-func BenchmarkToolBlockShadowLifecycle(b *testing.B) {
+func BenchmarkToolBlockTerminalLifecycle(b *testing.B) {
 	ids := []string{"a", "b", "c", "d", "e", "f", "g", "h"}
 	calls := make([]llm.ToolCall, len(ids))
 	for i, id := range ids {
@@ -404,11 +404,20 @@ func BenchmarkToolBlockShadowLifecycle(b *testing.B) {
 	}
 	b.ReportAllocs()
 	for i := 0; i < b.N; i++ {
-		state := newToolBlockState(calls)
+		state, err := newToolBlockState(calls)
+		if err != nil {
+			b.Fatal(err)
+		}
 		for ordinal := range calls {
 			state.markRunning(ordinal)
 			state.markAttemptReturned(ordinal, false)
-			state.markTerminal(ordinal, toolCallRunning, "handler_return")
+			result := projectToolResult(llm.NewToolMessage(calls[ordinal].ID, "tool", llm.TextContent("ok"), false), nil, "ok")
+			if _, err := state.acceptResults(ordinal, toolCallRunning, "handler_return", []toolResultProjection{result}); err != nil {
+				b.Fatal(err)
+			}
+			if _, err := state.takePublication(ordinal); err != nil {
+				b.Fatal(err)
+			}
 		}
 		if err := state.validateClosed(); err != nil {
 			b.Fatal(err)
