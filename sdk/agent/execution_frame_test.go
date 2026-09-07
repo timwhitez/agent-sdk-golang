@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"net"
 	"reflect"
 	"strings"
 	"testing"
@@ -68,14 +69,11 @@ func TestExecutionFrameOwnsRequestAndResolverSchemas(t *testing.T) {
 	}
 }
 
-func TestExecutionFrameResolutionCompatibilityAndSafeDiagnostics(t *testing.T) {
-	var warnings []string
+func TestExecutionFrameBindings(t *testing.T) {
 	a, err := New(Config{LLM: historyCloneModel{}, Tools: []tools.Tool{
-		{Name: "read_file", Description: "secret-schema-marker", Handler: func(context.Context, json.RawMessage, *tools.Container) (llm.Content, error) {
-			return llm.TextContent("one"), nil
-		}},
+		{Name: "read_file", Description: "private metadata"},
 		{Name: "ReadFile", Hidden: true},
-	}, Warningf: func(format string, args ...any) { warnings = append(warnings, fmt.Sprintf(format, args...)) }})
+	}})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -84,272 +82,321 @@ func TestExecutionFrameResolutionCompatibilityAndSafeDiagnostics(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	a.observeFrameAdvertisement(frame)
-	for i, name := range []string{"read_file", "read", " READ_FILE ", "ReadFile", "invalid", "unknown-secret-name"} {
-		tool, resolved, found, alias := a.resolveToolByName(name)
-		if !found {
-			var ok bool
-			tool, ok = a.toolMap["invalid"]
-			if !ok {
-				tool = autoInvalidTool()
-			}
-			resolved = "invalid"
+	if !frame.validBindings() {
+		t.Fatal("valid hidden/collision/alias binding rejected")
+	}
+	for _, name := range []string{"read_file", "read", " READ_FILE ", "ReadFile", "unknown", "invalid"} {
+		want, wn, wf, wa := resolveToolByName(name, a.toolMap, a.toolMapNormalized)
+		got, gn, gf, ga := resolveToolByName(name, frame.exact, frame.normalized)
+		if !reflect.DeepEqual(want.Definition(), got.Definition()) || wn != gn || wf != gf || wa != ga {
+			t.Errorf("resolution changed for %q", name)
 		}
-		a.observeFrameResolution(frame, i, name, tool, resolved, found, alias)
 	}
-	// A distinct closure is not comparable identity evidence. Equal metadata
-	// must not generate a false mismatch merely because Handler is non-nil.
-	actual := a.toolMap["read_file"]
-	actual.Handler = func(context.Context, json.RawMessage, *tools.Container) (llm.Content, error) {
-		return llm.TextContent("two"), nil
+	frame.request.Tools[0].Description = "different"
+	if frame.validBindings() {
+		t.Fatal("advertisement mismatch accepted")
 	}
-	a.observeFrameResolution(frame, 0, "read_file", actual, "read_file", true, false)
-	registeredFallback := autoInvalidTool()
-	registeredFallback.Description = "registered private fallback"
-	a.toolMap["invalid"] = registeredFallback
-	registeredFrame, err := newExecutionFrame(a.llm, request, a.toolMap, a.toolMapNormalized)
-	if err != nil {
-		t.Fatal(err)
-	}
-	a.observeFrameResolution(registeredFrame, 0, "unknown", registeredFallback, "invalid", false, false)
-	a.observeFrameResolution(registeredFrame, 0, "invalid", registeredFallback, "invalid", true, false)
-	if len(warnings) != 0 {
-		t.Fatalf("false warnings: %v", warnings)
-	}
-	actual.Description = "other-secret-marker"
-	a.observeFrameResolution(frame, 3, "read_file", actual, "read_file", true, false)
-	frame.request.Tools[0].Description = "private-prompt-marker"
-	a.observeFrameAdvertisement(frame)
-	want := []string{"warning: execution frame shadow mismatch: resolved_tool[3]", "warning: execution frame shadow mismatch: advertised_tool[0]"}
-	if !reflect.DeepEqual(warnings, want) {
-		t.Fatalf("unsafe/unexpected diagnostics: %v", warnings)
+	frame.request.Tools[0] = frame.exact["read_file"].Definition()
+	alias := frame.normalized["read"]
+	alias.Description = "different"
+	frame.normalized["read"] = alias
+	if frame.validBindings() {
+		t.Fatal("normalized binding mismatch accepted")
 	}
 }
 
-func TestExecutionFrameShadowFailureDoesNotTakeAuthority(t *testing.T) {
-	for _, cancelOnWarning := range []bool{false, true} {
-		t.Run(fmt.Sprint(cancelOnWarning), func(t *testing.T) {
-			ctx, cancel := context.WithCancel(context.Background())
-			defer cancel()
-			calls, handled := 0, 0
-			model := &frameScriptModel{invoke: func(req llm.InvokeRequest) (*llm.Completion, error) {
-				calls++
-				if len(req.Tools) != 1 || req.Tools[0].Name != "work" {
-					t.Error("shadow altered provider tools")
+func TestExecutionFrameFailureStopsBeforeAdmission(t *testing.T) {
+	for _, corrupt := range []string{"request", "registry", "advertisement", "normalized"} {
+		for _, cancelOnWarning := range []bool{false, true} {
+			t.Run(fmt.Sprintf("%s/cancel=%v", corrupt, cancelOnWarning), func(t *testing.T) {
+				ctx, cancel := context.WithCancel(context.Background())
+				defer cancel()
+				calls, handled, errorsSeen := 0, 0, 0
+				var warnings []string
+				model := &frameScriptModel{invoke: func(llm.InvokeRequest) (*llm.Completion, error) {
+					calls++
+					return &llm.Completion{Content: llm.TextContent("unexpected")}, nil
+				}}
+				a, err := New(Config{LLM: model, Tools: []tools.Tool{{Name: "work", Handler: func(context.Context, json.RawMessage, *tools.Container) (llm.Content, error) {
+					handled++
+					return llm.Content{}, nil
+				}}}, Warningf: func(format string, args ...any) {
+					warnings = append(warnings, fmt.Sprintf(format, args...))
+					if cancelOnWarning {
+						cancel()
+					}
+				}})
+				if err != nil {
+					t.Fatal(err)
 				}
-				return &llm.Completion{ToolCalls: []llm.ToolCall{{ID: "a", Function: llm.FunctionCall{Name: "work", Arguments: "{}"}}}}, nil
-			}}
-			var warnings []string
-			a, err := New(Config{LLM: model, Tools: []tools.Tool{{Name: "work", Handler: func(context.Context, json.RawMessage, *tools.Container) (llm.Content, error) {
-				handled++
-				return llm.Content{}, tools.TaskComplete("legacy result")
-			}}}, Warningf: func(format string, args ...any) {
-				warnings = append(warnings, fmt.Sprintf(format, args...))
-				if cancelOnWarning {
-					cancel()
+				switch corrupt {
+				case "request":
+					a.tools[0].Schema = map[string]any{"secret-marker": func() {}}
+				case "registry":
+					a.toolMap["hidden"] = tools.Tool{Name: "hidden", Hidden: true, Schema: map[string]any{"secret-marker": func() {}}}
+				case "advertisement":
+					a.tools[0].Description = "secret-marker"
+				case "normalized":
+					tool := a.toolMapNormalized["work"]
+					tool.Description = "secret-marker"
+					a.toolMapNormalized["work"] = tool
 				}
-			}})
-			if err != nil {
-				t.Fatal(err)
-			}
-			// Hidden runtime-only corruption cannot affect the old request clone.
-			a.toolMap["hidden"] = tools.Tool{Hidden: true, Schema: map[string]any{"private-marker": func() {}}}
-			for range a.QueryStream(ctx, llm.TextContent("private prompt")) {
-			}
-			wantCalls := 1
-			if cancelOnWarning {
-				wantCalls = 0
-			}
-			if calls != wantCalls || handled != wantCalls {
-				t.Fatalf("provider/handler=%d/%d want %d", calls, handled, wantCalls)
-			}
-			if !reflect.DeepEqual(warnings, []string{"warning: execution frame shadow snapshot unavailable"}) {
-				t.Fatalf("warnings=%v", warnings)
-			}
-		})
+				for envelope := range a.QueryStreamEnveloped(ctx, llm.TextContent("secret-marker")) {
+					switch event := envelope.Event.(type) {
+					case ErrorEvent:
+						errorsSeen++
+						want := "invalid_request"
+						if cancelOnWarning {
+							want = "canceled"
+						}
+						if event.Kind != want || envelope.Origin != EventOriginSDKDriver || strings.Contains(event.Message, "secret-marker") {
+							t.Errorf("unsafe error or provenance: %#v / %s", event, envelope.Origin)
+						}
+					case ToolCallEvent, ToolResultEvent, StepStartEvent, StepCompleteEvent:
+						t.Errorf("unexpected tool event %T", event)
+					}
+				}
+				if calls != 0 || handled != 0 || errorsSeen != 1 {
+					t.Fatalf("calls/handled/errors=%d/%d/%d", calls, handled, errorsSeen)
+				}
+				wantWarning := "warning: execution frame tool bindings inconsistent"
+				if corrupt == "request" || corrupt == "registry" {
+					wantWarning = "warning: execution frame snapshot unavailable"
+				}
+				if !reflect.DeepEqual(warnings, []string{wantWarning}) {
+					t.Fatalf("warnings=%v", warnings)
+				}
+			})
+		}
 	}
 }
 
-func TestExecutionFrameContinuationUsesFinalizingRequest(t *testing.T) {
+func TestExecutionFrameDispatchUsesCapturedHandlers(t *testing.T) {
+	for _, name := range []string{"work", " WORK ", "read", "hidden", "invalid", "unknown"} {
+		for _, canceled := range []bool{false, true} {
+			t.Run(fmt.Sprintf("%s/cancel=%v", name, canceled), func(t *testing.T) {
+				ctx, cancel := context.WithCancel(context.Background())
+				defer cancel()
+				var a *Agent
+				providerCalls, capturedCalls, replacementCalls := 0, 0, 0
+				captured := func(_ context.Context, args json.RawMessage, _ *tools.Container) (llm.Content, error) {
+					capturedCalls++
+					if name == "unknown" && !strings.Contains(string(args), "unknown") {
+						t.Error("fallback args not wrapped")
+					}
+					return llm.Content{}, tools.TaskComplete("captured result")
+				}
+				model := &frameScriptModel{invoke: func(llm.InvokeRequest) (*llm.Completion, error) {
+					providerCalls++
+					for key, tool := range a.toolMap {
+						tool.Description = "changed"
+						tool.Handler = func(context.Context, json.RawMessage, *tools.Container) (llm.Content, error) {
+							replacementCalls++
+							return llm.Content{}, tools.TaskComplete("replacement result")
+						}
+						a.toolMap[key] = tool
+					}
+					a.toolMapNormalized = buildNormalizedToolMap(a.toolMap, a.tools)
+					if canceled {
+						cancel()
+					}
+					return &llm.Completion{ToolCalls: []llm.ToolCall{{ID: "a", Function: llm.FunctionCall{Name: name, Arguments: "{}"}}}}, nil
+				}}
+				var err error
+				a, err = New(Config{LLM: model, Tools: []tools.Tool{
+					{Name: "work", Handler: captured}, {Name: "read_file", Handler: captured},
+					{Name: "hidden", Hidden: true, Handler: captured}, {Name: "invalid", Hidden: true, Handler: captured},
+				}})
+				if err != nil {
+					t.Fatal(err)
+				}
+				for range a.QueryStream(ctx, llm.TextContent("run")) {
+				}
+				wantCalls := 1
+				if canceled {
+					wantCalls = 0
+				}
+				if providerCalls != 1 || capturedCalls != wantCalls || replacementCalls != 0 {
+					t.Fatalf("provider/captured/replacement=%d/%d/%d", providerCalls, capturedCalls, replacementCalls)
+				}
+				results := 0
+				for _, message := range a.Messages() {
+					if message.Role != llm.RoleTool {
+						continue
+					}
+					results++
+					want := "captured result"
+					if canceled {
+						want = toolSkippedByCancellationText
+					}
+					if message.ToolCallID != "a" || !strings.Contains(message.Content.PlainText(), want) {
+						t.Error("wrong terminal result")
+					}
+				}
+				if results != wantCalls {
+					t.Fatalf("results=%d", results)
+				}
+			})
+		}
+	}
+}
+
+func TestExecutionFrameRetryOwnsLogicalRequest(t *testing.T) {
 	var a *Agent
-	var warnings []string
-	calls, handled := 0, 0
-	setDescription := func(description string, advertised bool) {
-		tool := a.toolMap["work"]
-		tool.Description = description
-		a.toolMap["work"] = tool
-		a.toolMapNormalized = buildNormalizedToolMap(a.toolMap, a.tools)
-		if advertised {
-			a.tools[0] = tool
-		}
-	}
+	calls, replacementCalls := 0, 0
+	replacement := &frameScriptModel{invoke: func(llm.InvokeRequest) (*llm.Completion, error) {
+		replacementCalls++
+		return &llm.Completion{}, nil
+	}}
 	model := &frameScriptModel{invoke: func(req llm.InvokeRequest) (*llm.Completion, error) {
 		calls++
+		if req.Tools[0].Parameters["value"] != int64(7) {
+			t.Error("logical request changed across attempts")
+		}
 		if calls == 1 {
-			setDescription("finalizing", true)
-			a.toolChoice = "required"
-			return &llm.Completion{StopReason: "max_tokens", ToolCalls: []llm.ToolCall{{ID: "a", Function: llm.FunctionCall{Name: "work", Arguments: `{"text":`}}}}, nil
+			a.tools[0].Schema["value"] = int64(99)
+			req.Tools[0].Parameters["value"] = int64(88)
+			a.llm = replacement
+			return nil, &net.DNSError{Err: "fixture timeout", IsTimeout: true}
 		}
-		if calls != 2 {
-			t.Error("unexpected extra admission")
-		}
-		if req.Tools[0].Description != "finalizing" || req.ToolChoice != "required" {
-			t.Error("finalizing request not refreshed")
-		}
-		// Restore the first frame's metadata. Only the finalizing frame can
-		// detect this drift; dispatch deliberately remains the legacy path.
-		setDescription("initial", false)
-		return &llm.Completion{StopReason: "tool_calls", ToolCalls: []llm.ToolCall{{ID: "a", Function: llm.FunctionCall{Name: "work", Arguments: `"ok"}`}}}}, nil
+		return &llm.Completion{Content: llm.TextContent("done")}, nil
 	}}
 	var err error
-	a, err = New(Config{LLM: model, ToolChoice: "auto", Tools: []tools.Tool{{Name: "work", Description: "initial", Handler: func(_ context.Context, args json.RawMessage, _ *tools.Container) (llm.Content, error) {
-		handled++
-		if !strings.Contains(string(args), "ok") {
-			t.Errorf("merged args=%s", args)
-		}
-		return llm.Content{}, tools.TaskComplete("legacy result")
-	}}}, Warningf: func(format string, args ...any) { warnings = append(warnings, fmt.Sprintf(format, args...)) }})
+	a, err = New(Config{LLM: model, InvokeRetryMaxAttempts: 2, Tools: []tools.Tool{{Name: "work", Schema: map[string]any{"value": int64(7)}}}})
 	if err != nil {
 		t.Fatal(err)
 	}
-	for range a.QueryStream(context.Background(), llm.TextContent("continue")) {
+	for range a.QueryStream(context.Background(), llm.TextContent("run")) {
 	}
-	if calls != 2 || handled != 1 {
-		t.Fatalf("calls/handled=%d/%d", calls, handled)
-	}
-	var frameWarnings []string
-	for _, warning := range warnings {
-		if strings.Contains(warning, "execution frame") {
-			frameWarnings = append(frameWarnings, warning)
-		}
-	}
-	if !reflect.DeepEqual(frameWarnings, []string{"warning: execution frame shadow mismatch: resolved_tool[0]"}) {
-		t.Fatalf("frame warnings=%v", frameWarnings)
-	}
-	if _, changed, _ := repairToolCallPairsDetailed(a.Messages()); changed {
-		t.Fatal("shadow changed tool pair topology")
+	if calls != 2 || replacementCalls != 0 {
+		t.Fatalf("calls/replacement=%d/%d", calls, replacementCalls)
 	}
 }
 
-func TestExecutionFrameResolutionDriftKeepsLegacyAuthorityAndCancellation(t *testing.T) {
-	for _, cancelOnWarning := range []bool{false, true} {
-		t.Run(fmt.Sprint(cancelOnWarning), func(t *testing.T) {
-			ctx, cancel := context.WithCancel(context.Background())
-			defer cancel()
+func TestExecutionFrameUnregisteredInvalidStaysInternal(t *testing.T) {
+	var a *Agent
+	calls, injected := 0, 0
+	model := &frameScriptModel{invoke: func(llm.InvokeRequest) (*llm.Completion, error) {
+		calls++
+		if calls == 1 {
+			a.toolMap["invalid"] = tools.Tool{Name: "invalid", Hidden: true, Handler: func(context.Context, json.RawMessage, *tools.Container) (llm.Content, error) {
+				injected++
+				return llm.Content{}, tools.TaskComplete("wrong fallback")
+			}}
+			return &llm.Completion{ToolCalls: []llm.ToolCall{{ID: "a", Function: llm.FunctionCall{Name: "unknown", Arguments: "{}"}}}}, nil
+		}
+		return &llm.Completion{Content: llm.TextContent("done")}, nil
+	}}
+	var err error
+	a, err = New(Config{LLM: model})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for range a.QueryStream(context.Background(), llm.TextContent("run")) {
+	}
+	if calls != 2 || injected != 0 {
+		t.Fatalf("provider/injected=%d/%d", calls, injected)
+	}
+	results := 0
+	for _, message := range a.Messages() {
+		if message.Role == llm.RoleTool {
+			results++
+			if message.ToolCallID != "a" || !message.IsError {
+				t.Error("internal fallback result changed")
+			}
+		}
+	}
+	if results != 1 {
+		t.Fatalf("results=%d", results)
+	}
+}
+
+func TestExecutionFrameContinuationFinalizingAuthority(t *testing.T) {
+	for _, failure := range []string{"none", "snapshot", "binding"} {
+		t.Run(failure, func(t *testing.T) {
 			var a *Agent
-			providerCalls, oldCalls, newCalls := 0, 0, 0
-			var warnings []string
-			model := &frameScriptModel{invoke: func(llm.InvokeRequest) (*llm.Completion, error) {
-				providerCalls++
-				changed := a.toolMap["work"]
-				changed.Description = "private changed definition"
-				changed.Handler = func(context.Context, json.RawMessage, *tools.Container) (llm.Content, error) {
-					newCalls++
-					return llm.Content{}, tools.TaskComplete("new legacy result")
+			calls, first, last, errorsSeen := 0, 0, 0, 0
+			model := &frameScriptModel{invoke: func(req llm.InvokeRequest) (*llm.Completion, error) {
+				calls++
+				if calls == 1 {
+					tool := a.toolMap["work"]
+					tool.Description = "finalizing"
+					tool.Handler = func(_ context.Context, args json.RawMessage, _ *tools.Container) (llm.Content, error) {
+						last++
+						if !strings.Contains(string(args), "ok") {
+							t.Error("merged args lost")
+						}
+						return llm.Content{}, tools.TaskComplete("finalizing")
+					}
+					a.tools[0] = tool
+					a.toolMap["work"] = tool
+					a.toolMapNormalized = buildNormalizedToolMap(a.toolMap, a.tools)
+					a.toolChoice = "required"
+					if failure == "snapshot" {
+						a.tools[0].Schema = map[string]any{"private": func() {}}
+					}
+					if failure == "binding" {
+						a.tools[0].Description = "private"
+					}
+					return &llm.Completion{Content: llm.TextContent("partial visible"), StopReason: "max_tokens", ToolCalls: []llm.ToolCall{{ID: "a", Function: llm.FunctionCall{Name: "work", Arguments: `{"text":`}}}}, nil
 				}
-				a.toolMap["work"] = changed
-				return &llm.Completion{ToolCalls: []llm.ToolCall{{ID: "a", Function: llm.FunctionCall{Name: "work", Arguments: "{}"}}}}, nil
+				if req.Tools[0].Description != "finalizing" || req.ToolChoice != "required" {
+					t.Error("wrong finalizing request")
+				}
+				tool := a.toolMap["work"]
+				tool.Handler = func(context.Context, json.RawMessage, *tools.Container) (llm.Content, error) {
+					first++
+					return llm.Content{}, tools.TaskComplete("wrong")
+				}
+				a.toolMap["work"] = tool
+				return &llm.Completion{ToolCalls: []llm.ToolCall{{ID: "a", Function: llm.FunctionCall{Name: "work", Arguments: `"ok"}`}}}}, nil
 			}}
 			var err error
 			a, err = New(Config{LLM: model, Tools: []tools.Tool{{Name: "work", Handler: func(context.Context, json.RawMessage, *tools.Container) (llm.Content, error) {
-				oldCalls++
-				return llm.Content{}, tools.TaskComplete("old shadow result")
-			}}}, Warningf: func(format string, args ...any) {
-				warnings = append(warnings, fmt.Sprintf(format, args...))
-				if cancelOnWarning {
-					cancel()
-				}
-			}})
+				first++
+				return llm.Content{}, nil
+			}}}})
 			if err != nil {
 				t.Fatal(err)
 			}
-			for range a.QueryStream(ctx, llm.TextContent("run")) {
-			}
-			wantNew := 1
-			if cancelOnWarning {
-				wantNew = 0
-			}
-			if providerCalls != 1 || oldCalls != 0 || newCalls != wantNew {
-				t.Fatalf("provider/old/new calls=%d/%d/%d", providerCalls, oldCalls, newCalls)
-			}
-			if !reflect.DeepEqual(warnings, []string{"warning: execution frame shadow mismatch: resolved_tool[0]"}) {
-				t.Fatalf("warnings=%v", warnings)
-			}
-			results := 0
-			for _, message := range a.Messages() {
-				if message.Role != llm.RoleTool {
-					continue
-				}
-				results++
-				if message.ToolCallID != "a" {
-					t.Error("tool identity changed")
-				}
-				if !cancelOnWarning && !strings.Contains(message.Content.PlainText(), "new legacy result") {
-					t.Error("shadow changed result")
-				}
-				if cancelOnWarning && message.Content.PlainText() != toolSkippedByCancellationText {
-					t.Error("unstarted call not closed as cancellation")
+			for event := range a.QueryStream(context.Background(), llm.TextContent("run")) {
+				if _, ok := event.(ErrorEvent); ok {
+					errorsSeen++
 				}
 			}
-			if results != 1 {
-				t.Fatalf("terminal results=%d", results)
-			}
-		})
-	}
-}
-
-func TestExecutionFrameRuntimeAdvertisementKeepsRequestAndLegacyAuthority(t *testing.T) {
-	for _, cancelOnWarning := range []bool{false, true} {
-		t.Run(fmt.Sprint(cancelOnWarning), func(t *testing.T) {
-			ctx, cancel := context.WithCancel(context.Background())
-			defer cancel()
-			providerCalls, handlerCalls := 0, 0
-			var warnings []string
-			model := &frameScriptModel{invoke: func(request llm.InvokeRequest) (*llm.Completion, error) {
-				providerCalls++
-				if len(request.Tools) != 1 || request.Tools[0].Description != "private advertised metadata" || request.ToolChoice != "required" {
-					t.Error("shadow altered provider request")
+			if failure == "none" {
+				if calls != 2 || first != 0 || last != 1 || errorsSeen != 0 {
+					t.Fatalf("calls/first/last/errors=%d/%d/%d/%d", calls, first, last, errorsSeen)
 				}
-				return &llm.Completion{ToolCalls: []llm.ToolCall{{ID: "a", Function: llm.FunctionCall{Name: "work", Arguments: "{}"}}}}, nil
-			}}
-			a, err := New(Config{LLM: model, ToolChoice: "required", Tools: []tools.Tool{{Name: "work", Description: "private advertised metadata", Handler: func(context.Context, json.RawMessage, *tools.Container) (llm.Content, error) {
-				handlerCalls++
-				return llm.Content{}, tools.TaskComplete("legacy result")
-			}}}, Warningf: func(format string, args ...any) {
-				warnings = append(warnings, fmt.Sprintf(format, args...))
-				if cancelOnWarning {
-					cancel()
+			} else {
+				if calls != 1 || first != 0 || last != 0 || errorsSeen != 1 {
+					t.Fatalf("calls/first/last/errors=%d/%d/%d/%d", calls, first, last, errorsSeen)
 				}
-			}})
-			if err != nil {
-				t.Fatal(err)
-			}
-			runtimeTool := a.toolMap["work"]
-			runtimeTool.Description = "private runtime metadata"
-			a.toolMap["work"] = runtimeTool
-			for range a.QueryStream(ctx, llm.TextContent("private prompt")) {
-			}
-			wantCalls := 1
-			if cancelOnWarning {
-				wantCalls = 0
-			}
-			if providerCalls != wantCalls || handlerCalls != wantCalls {
-				t.Fatalf("provider/handler=%d/%d want %d", providerCalls, handlerCalls, wantCalls)
-			}
-			if !reflect.DeepEqual(warnings, []string{"warning: execution frame shadow mismatch: advertised_tool[0]"}) {
-				t.Fatalf("warnings=%v", warnings)
-			}
-			results := 0
-			for _, message := range a.Messages() {
-				if message.Role == llm.RoleTool {
-					results++
-					if message.ToolCallID != "a" || !strings.Contains(message.Content.PlainText(), "legacy result") {
-						t.Error("shadow changed legacy result")
+				for _, m := range a.Messages() {
+					if len(m.ToolCalls) != 0 || m.Role == llm.RoleTool {
+						t.Fatal("unaccepted continuation survived failure")
 					}
 				}
 			}
-			if results != wantCalls {
-				t.Fatalf("terminal results=%d want %d", results, wantCalls)
+			if _, changed, _ := repairToolCallPairsDetailed(a.Messages()); changed {
+				t.Fatal("history requires repair")
+			}
+			if failure != "none" {
+				// Repair only the injected private registry corruption, not history.
+				a.tools[0] = a.toolMap["work"]
+				nextCalls := 0
+				a.llm = &frameScriptModel{invoke: func(llm.InvokeRequest) (*llm.Completion, error) {
+					nextCalls++
+					return &llm.Completion{Content: llm.TextContent("next")}, nil
+				}}
+				for event := range a.QueryStream(context.Background(), llm.TextContent("next")) {
+					if warning, ok := event.(WarnEvent); ok && warning.Kind == "tool_pairing_repaired" {
+						t.Error("next query needed history repair")
+					}
+				}
+				if nextCalls != 1 {
+					t.Fatalf("next provider calls=%d", nextCalls)
+				}
 			}
 		})
 	}
@@ -367,5 +414,33 @@ func BenchmarkExecutionFrameSnapshot(b *testing.B) {
 		if _, err := newExecutionFrame(a.llm, request, a.toolMap, a.toolMapNormalized); err != nil {
 			b.Fatal(err)
 		}
+	}
+}
+
+func BenchmarkExecutionFrameAdmissionScaling(b *testing.B) {
+	for _, size := range []struct{ tools, messages int }{{1, 1}, {32, 32}, {128, 256}} {
+		b.Run(fmt.Sprintf("tools%d/messages%d", size.tools, size.messages), func(b *testing.B) {
+			registry := make([]tools.Tool, size.tools)
+			request := llm.InvokeRequest{}
+			for i := range registry {
+				registry[i] = tools.Tool{Name: fmt.Sprintf("tool_%d", i), Schema: map[string]any{"type": "object", "properties": map[string]any{"value": map[string]any{"type": "string"}}}}
+				request.Tools = append(request.Tools, registry[i].Definition())
+			}
+			for i := 0; i < size.messages; i++ {
+				request.Messages = append(request.Messages, llm.NewUserMessage(strings.Repeat("fixture ", 128)))
+			}
+			a, err := New(Config{LLM: historyCloneModel{}, Tools: registry})
+			if err != nil {
+				b.Fatal(err)
+			}
+			b.ReportAllocs()
+			b.ResetTimer()
+			for i := 0; i < b.N; i++ {
+				frame, err := newExecutionFrame(a.llm, request, a.toolMap, a.toolMapNormalized)
+				if err != nil || !frame.validBindings() {
+					b.Fatal("invalid fixture frame")
+				}
+			}
+		})
 	}
 }
