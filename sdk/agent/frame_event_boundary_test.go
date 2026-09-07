@@ -13,7 +13,7 @@ import (
 	"github.com/timwhitez/agent-sdk-golang/sdk/tools"
 )
 
-// A transport retry is not another logical request; continuation and the next
+// An SDK invocation retry is not another logical request; continuation and the next
 // post-tool request are. Existing envelope sequence counts events, not attempts.
 // Freeze that distinction before adding Frame/attempt identity metadata.
 func TestFrameEventBoundaryRetryContinuationAndLegacyParity(t *testing.T) {
@@ -97,7 +97,11 @@ func TestFrameEventBoundaryRetryContinuationAndLegacyParity(t *testing.T) {
 		if len(requests) != 5 || handlers != 2 || warnings != 1 || ids != 1 {
 			t.Fatalf("enveloped=%v requests=%d handlers=%d warnings=%d ids=%d", enveloped, len(requests), handlers, warnings, ids)
 		}
-		if !reflect.DeepEqual(requests[0], requests[1]) || reflect.DeepEqual(requests[1], requests[2]) || reflect.DeepEqual(requests[2], requests[3]) || reflect.DeepEqual(requests[3], requests[4]) {
+		views := make(map[string]struct{})
+		for _, request := range requests {
+			views[string(request)] = struct{}{}
+		}
+		if !reflect.DeepEqual(requests[0], requests[1]) || len(views) != 4 {
 			t.Fatal("retry/logical-request boundaries changed")
 		}
 		if !enveloped {

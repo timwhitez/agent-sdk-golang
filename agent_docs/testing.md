@@ -21,12 +21,13 @@ This document summarizes recommended test commands and current coverage focus.
 
 ## Coverage Map (Representative)
 - `frame_event_boundary_test.go` freezes one cross-boundary identity fixture:
-  five Provider invocations across four distinct logical request views (one
+  five SDK ChatModel.Invoke calls across four distinct request views (one
   transient retry), continuation and two completed Tool Blocks reusing a Call
   ID, but one QueryID and fourteen events on the existing sequence. Legacy and
   enveloped execution retain identical requests/history, explicit event-kind
   and origin goldens, clean final Tool Pair topology and metadata-only privacy.
-  This characterization does not add or prove Frame/attempt identity yet.
+  This characterization does not add or prove Frame/attempt identity yet, nor
+  count HTTP attempts or retries hidden inside a model/provider wrapper.
 - `compaction_publication_test.go` checks combined source-checked checkpoint and
   history publication: pre-I/O stale/pending/admission/runtime rejection,
   callback ownership, acknowledged commit after cancellation, writer isolation,
