@@ -20,6 +20,13 @@ This document summarizes recommended test commands and current coverage focus.
 - Anthropic provider: `go test ./sdk/llm/anthropic`
 
 ## Coverage Map (Representative)
+- `tool_outcome_projection_test.go` joins execution knowledge, exactly one
+  history result, delivered ToolResultEvent/Accounting adjacency, original and
+  visible measurements, and Artifact disposition in one real Agent trajectory.
+  Ordinary success and TaskComplete each cover successful publication, sink
+  failure, and persisted-object/codec-budget failure. Projection failure is not
+  reclassified as an unstarted handler; this characterization does not enable
+  new terminal authority or change history-only synthetic tail delivery.
 - CachePlan request attachment: `sdk/llm/cache_request_test.go` proves nil/empty
   ownership and JSON exclusion; `cache_plan_wire_test.go` freezes buffered and
   streaming Chat/Responses/Anthropic wire payloads with legacy cache flags and
