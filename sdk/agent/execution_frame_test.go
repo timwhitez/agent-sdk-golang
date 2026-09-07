@@ -37,7 +37,7 @@ func TestExecutionFrameOwnsRequestAndResolverSchemas(t *testing.T) {
 	}}
 	exact := map[string]tools.Tool{tool.Name: tool}
 	normalized := buildNormalizedToolMap(exact, []tools.Tool{tool})
-	frame, err := newExecutionFrame(model, request, exact, normalized)
+	frame, err := newExecutionFrame("fixture", model, request, exact, normalized)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -80,7 +80,7 @@ func TestExecutionFrameBindings(t *testing.T) {
 		t.Fatal(err)
 	}
 	request := llm.InvokeRequest{Tools: []llm.ToolDefinition{a.tools[0].Definition()}}
-	frame, err := newExecutionFrame(a.llm, request, a.toolMap, a.toolMapNormalized)
+	frame, err := newExecutionFrame("fixture", a.llm, request, a.toolMap, a.toolMapNormalized)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -413,7 +413,7 @@ func BenchmarkExecutionFrameSnapshot(b *testing.B) {
 	b.ReportAllocs()
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		if _, err := newExecutionFrame(a.llm, request, a.toolMap, a.toolMapNormalized); err != nil {
+		if _, err := newExecutionFrame("fixture", a.llm, request, a.toolMap, a.toolMapNormalized); err != nil {
 			b.Fatal(err)
 		}
 	}
@@ -438,7 +438,7 @@ func BenchmarkExecutionFrameAdmissionScaling(b *testing.B) {
 			b.ReportAllocs()
 			b.ResetTimer()
 			for i := 0; i < b.N; i++ {
-				frame, err := newExecutionFrame(a.llm, request, a.toolMap, a.toolMapNormalized)
+				frame, err := newExecutionFrame("fixture", a.llm, request, a.toolMap, a.toolMapNormalized)
 				if err != nil || !frame.validBindings() {
 					b.Fatal("invalid fixture frame")
 				}

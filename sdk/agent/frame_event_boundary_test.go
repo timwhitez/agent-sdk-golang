@@ -3,6 +3,7 @@ package agent
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"net"
 	"reflect"
 	"strings"
@@ -22,6 +23,7 @@ func TestFrameEventBoundaryRetryContinuationAndLegacyParity(t *testing.T) {
 	var baselineKinds []EventKind
 	wantKinds := []EventKind{EventKindWarning, EventKindAutoContinue, EventKindStepStart, EventKindToolCall, EventKindToolResult, EventKindAccounting, EventKindStepComplete, EventKindStepStart, EventKindToolCall, EventKindToolResult, EventKindAccounting, EventKindStepComplete, EventKindText, EventKindFinalResponse}
 	wantOrigins := []EventOrigin{EventOriginSDKDriver, EventOriginSDKDriver, EventOriginToolRuntime, EventOriginToolRuntime, EventOriginToolRuntime, EventOriginSDKDriver, EventOriginToolRuntime, EventOriginToolRuntime, EventOriginToolRuntime, EventOriginToolRuntime, EventOriginSDKDriver, EventOriginToolRuntime, EventOriginModel, EventOriginSDKDriver}
+	wantFrames := []int{1, 1, 2, 2, 2, 2, 2, 3, 3, 3, 3, 3, 4, 4}
 	for _, enveloped := range []bool{false, true} {
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
@@ -74,6 +76,16 @@ func TestFrameEventBoundaryRetryContinuationAndLegacyParity(t *testing.T) {
 				}
 				if len(kinds) <= len(wantOrigins) && e.Origin != wantOrigins[len(kinds)-1] {
 					t.Errorf("origin golden at %d=%s", len(kinds), e.Origin)
+				}
+				if len(kinds) <= len(wantFrames) {
+					frame := wantFrames[len(kinds)-1]
+					attempt := uint64(1)
+					if frame == 1 {
+						attempt = 2
+					}
+					if e.FrameID != fmt.Sprintf("boundary-query/frame/%d", frame) || e.InvokeAttempt != attempt {
+						t.Errorf("correlation at event%d: frame=%s attempt=%d", len(kinds), e.FrameID, e.InvokeAttempt)
+					}
 				}
 				metadata := e
 				metadata.Event = nil

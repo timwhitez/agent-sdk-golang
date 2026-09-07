@@ -49,6 +49,12 @@ const (
 type EventEnvelope struct {
 	SchemaVersion int
 	QueryID       string
+	// FrameID identifies the explicitly correlated execution context, not the
+	// sole provenance of aggregated continuation content. Empty means unknown.
+	FrameID string `json:"FrameID,omitempty"`
+	// InvokeAttempt counts SDK ChatModel entries within that logical frame;
+	// zero means no invocation correlation. It does not count hidden HTTP retries.
+	InvokeAttempt uint64 `json:"InvokeAttempt,omitempty"`
 	Sequence      uint64
 	Origin        EventOrigin
 	Kind          EventKind

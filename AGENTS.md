@@ -117,6 +117,10 @@ agent_docs/          Detailed architecture/provider/tool/build/test documentatio
   concrete-model snapshotting or proof of mutable handler closure identity.
 
 ### Execution APIs
+- Envelope producer sites can attach opaque `FrameID` and `InvokeAttempt`.
+  Attempts count Agent calls to its captured model, not inner HTTP retries.
+  Unknown/unannotated contexts stay absent; this is not complete continuation
+  provenance, a failure attribution or a concrete-model snapshot contract.
 - `CommitCompactionHistory(ctx, expected, candidate, result)` publishes a
   host-computed compaction under one SDK admission/runtime boundary. Reuse the
   exact source snapshot used to compute the candidate; stale content/pending

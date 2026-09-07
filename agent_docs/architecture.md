@@ -634,6 +634,36 @@ candidate computation or recovery snapshot write. Source-content equality is
 not session/runtime revision binding, and external writers or legacy independent
 checkpoint-only calls remain outside the lease. No persistence schema changes.
 
+## Frame Correlation
+
+Each materialized Query Driver request owns an opaque, content-free Frame ID
+derived from the existing QueryID and logical-loop ordinal. It is not a hash of
+Prompt, tools, model names or results; consumers must treat the ID as opaque.
+The Frame's request/model/resolver snapshot is unchanged by correlation.
+
+EventEnvelope has optional FrameID/InvokeAttempt fields at explicit producer
+sites: model output/usage, accepted tool lifecycle and its accounting, known
+continuation/final/error paths. InvokeAttempt counts actual Agent entries into
+the captured ChatModel.Invoke/InvokeStream, not a model wrapper's inner calls,
+HTTP attempts or provider-reported retry counters. Retrying a logical request
+keeps its Frame ID; a new Driver iteration gets a new ID. Waiting/canceling
+between attempts has no current invocation association, while retained partial
+usage keeps the completed invocation's association.
+
+Correlation values are copied into the envelope at emission. No ambient
+current-frame state, replacement eventOutput, second event sequence, altered
+backpressure owner, Provider request field/header or session persistence field
+is introduced. Compaction, host steering and other unannotated producers remain
+uncorrelated rather than inheriting a guessed Frame. This is a finalizing/
+execution context, not proof that aggregated continuation content has only one
+source, nor a complete lineage graph, invocation trace or failure attribution.
+
+Compatibility: these are additive public EventEnvelope fields, omitted in JSON
+when unavailable. Existing required v1 fields and legacy typed Event payloads
+remain unchanged. External unkeyed Go struct literals must migrate to keyed
+literals; strict JSON decoders need to allow the new optional fields. This is
+not a claim that all public envelope wire representations are byte-identical.
+
 ## Runtime Compaction Configuration Updates
 
 `UpdateCompactionConfig` is non-blocking. If the current compaction runtime is in
