@@ -956,7 +956,7 @@ func (s *Service) protectedZoneStart(messages []llm.Message) int {
 	if latestUser := latestRealUserIndex(messages); latestUser >= 0 && latestUser < start {
 		start = latestUser
 	}
-	if openToolBlock := openToolBlockStart(messages); openToolBlock >= 0 && openToolBlock < start {
+	if openToolBlock := llm.OpenToolCallBlockStart(messages); openToolBlock >= 0 && openToolBlock < start {
 		start = openToolBlock
 	}
 	if tokenStart := s.protectedRecentTokenStart(messages); tokenStart >= 0 && tokenStart < start {
@@ -981,42 +981,6 @@ func (s *Service) protectedRecentTokenStart(messages []llm.Message) int {
 		}
 	}
 	return 0
-}
-
-func openToolBlockStart(messages []llm.Message) int {
-	openStart := -1
-	pending := map[string]int{}
-	for i, msg := range messages {
-		if msg.Role == llm.RoleAssistant && len(msg.ToolCalls) > 0 {
-			if openStart < 0 {
-				openStart = i
-			}
-			for callIndex, call := range msg.ToolCalls {
-				id := strings.TrimSpace(call.ID)
-				if id == "" {
-					id = fmt.Sprintf("__missing_tool_call_id_%d_%d", i, callIndex)
-				}
-				pending[id]++
-			}
-			continue
-		}
-		if msg.Role != llm.RoleTool || len(pending) == 0 {
-			continue
-		}
-		id := strings.TrimSpace(msg.ToolCallID)
-		if count := pending[id]; count > 1 {
-			pending[id] = count - 1
-		} else {
-			delete(pending, id)
-		}
-		if len(pending) == 0 {
-			openStart = -1
-		}
-	}
-	if len(pending) == 0 {
-		return -1
-	}
-	return openStart
 }
 
 func (s *Service) protectedRecentMessages() int {

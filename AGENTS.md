@@ -117,6 +117,11 @@ agent_docs/          Detailed architecture/provider/tool/build/test documentatio
   concrete-model snapshotting or proof of mutable handler closure identity.
 
 ### Execution APIs
+- `ReplaceHistoryChecked` / `ClearHistoryChecked` return
+  `ErrActiveHistoryMutation` when an active query's non-system messages or
+  protected tool/continuation tail would change. Legal system-context updates
+  affect the next request. Legacy void methods warn on rejection. History
+  publication owners should use checked methods and handle failure explicitly.
 - `Query(ctx, text)` for synchronous usage (`sdk/agent/agent.go:159`)
 - `QueryStream(ctx, input)` and `QueryStreamWithSteering(ctx, input, steeringCh)` for event streaming (`sdk/agent/agent.go:181`, `sdk/agent/agent.go:197`)
 - History and maintenance APIs: `Messages`, `ReplaceHistory`, `ClearHistory`, `NotifyTodoCompletion`, `CompactNow` (`sdk/agent/agent.go:120`, `sdk/agent/agent.go:153`, `sdk/agent/agent.go:137`, `sdk/agent/agent.go:144`, `sdk/agent/agent.go:874`)

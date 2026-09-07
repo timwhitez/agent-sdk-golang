@@ -20,6 +20,11 @@ This document summarizes recommended test commands and current coverage focus.
 - Anthropic provider: `go test ./sdk/llm/anthropic`
 
 ## Coverage Map (Representative)
+- `history_mutation_test.go` covers checked/legacy Clear and Replace during
+  provider-pending and handler-active phases, actual next-request System updates,
+  rejection without history/cleanup side effects, reused completed IDs,
+  complete Message/opaque-state JSON identity, nil/empty compatibility, forbidden
+  System gaps, and continuation insertion/removal after the old index capture.
 - `tool_terminal_authority_test.go` checks whole-batch atomicity, ordinal order,
   invalid role/identity/phase/knowledge, duplicate terminal/start/claim rejection,
   pending-payload release, unpublishable tails and idempotent abort. Real Driver
