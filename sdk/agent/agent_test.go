@@ -922,7 +922,7 @@ func TestMergeToolArgsWithDiagnosticsReportsShapeConflict(t *testing.T) {
 
 func TestToolCallContinuationMergeUsesStableCallIDOnly(t *testing.T) {
 	cont := toolCallContinuation{}
-	cont.addPartial(0, []llm.ToolCall{{
+	cont.addPartial([]llm.ToolCall{{
 		ID:   "call_1",
 		Type: "function",
 		Function: llm.FunctionCall{
@@ -964,7 +964,7 @@ func TestToolCallContinuationMergeUsesStableCallIDOnly(t *testing.T) {
 
 func TestToolCallContinuationPreservesMergeDiagnosticsByCallID(t *testing.T) {
 	cont := toolCallContinuation{}
-	cont.addPartial(0, []llm.ToolCall{{
+	cont.addPartial([]llm.ToolCall{{
 		ID:   "call_1",
 		Type: "function",
 		Function: llm.FunctionCall{
@@ -1010,7 +1010,7 @@ func TestToolCallContinuationClearsPartialAfterIndexShift(t *testing.T) {
 	}}
 
 	cont := toolCallContinuation{}
-	cont.addPartial(9, partial) // stale index after compaction
+	cont.addPartial(partial) // cleanup follows reminder ownership, not cached indexes
 
 	messages := []llm.Message{
 		{Role: llm.RoleSystem, Content: llm.TextContent("sys")},

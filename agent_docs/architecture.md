@@ -587,6 +587,23 @@ turn goroutine starts. An overlapping submission receives an
 or replace steering/cancellation state. Callers needing parallel turns must use
 separate `Agent` instances.
 
+Public history replacement is checked under the same history mutex as Driver
+writes. During a query, the complete non-system Message JSON sequence must stay
+unchanged; System updates may not alter an open tool/continuation tail or insert
+a gap into a completed call/result block. This permits legitimate next-request
+system updates, not destructive reset or user/tool-history rewriting while a
+provider or handler is active. `ReplaceHistoryChecked` / `ClearHistoryChecked`
+return the source-negative `ErrActiveHistoryMutation` on rejection; legacy void
+wrappers warn after unlocking and do not defer the operation. Rejection does not
+reset ephemeral tracking or clean result dumps. Idle behavior remains unchanged.
+
+Continuation updates locate the current assistant by complete JSON identity
+under that mutex, rather than an index captured before System prefix changes.
+`llm.OpenToolCallBlockStart` is shared with compaction protection and is a
+conservative locator, not a second full Tool Pair validator. These public-query
+mutation guarantees do not claim to serialize independent manual compaction or
+freeze mutable runtime dependency handles.
+
 ## Runtime Compaction Configuration Updates
 
 `UpdateCompactionConfig` is non-blocking. If the current compaction runtime is in

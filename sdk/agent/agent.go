@@ -505,22 +505,22 @@ func (a *Agent) Messages() []llm.Message {
 	return llm.CloneMessages(a.messages)
 }
 
+// ClearHistory is the compatibility wrapper for ClearHistoryChecked. A rejected
+// active-query mutation is reported through Warningf; it is not deferred.
 func (a *Agent) ClearHistory() {
-	a.mu.Lock()
-	a.messages = nil
-	a.resetEphemeralTrackingLocked()
-	a.mu.Unlock()
-	a.cleanupToolResultDumps(toolResultDumpNow(), true)
+	if err := a.ClearHistoryChecked(); err != nil {
+		a.warnf("warning: ClearHistory rejected during an active query; use ClearHistoryChecked or wait for query completion")
+	}
 }
 
 // ReplaceHistory replaces the current conversation history.
 // Callers should include the system prompt message if they want it preserved.
+// Rejected active-query changes are reported through Warningf. Publication
+// owners should use ReplaceHistoryChecked and propagate its error instead.
 func (a *Agent) ReplaceHistory(messages []llm.Message) {
-	a.mu.Lock()
-	a.messages = llm.CloneMessages(messages)
-	a.resetEphemeralTrackingLocked()
-	a.mu.Unlock()
-	a.cleanupToolResultDumps(toolResultDumpNow(), true)
+	if err := a.ReplaceHistoryChecked(messages); err != nil {
+		a.warnf("warning: ReplaceHistory rejected during an active query; use ReplaceHistoryChecked or preserve the active message structure")
+	}
 }
 
 func (a *Agent) Query(ctx context.Context, text string) (string, error) {
@@ -805,7 +805,7 @@ func (a *Agent) queryStreamWithSteering(ctx context.Context, input llm.Content, 
 			if frameFailure != "" {
 				a.warnf("warning: %s", frameFailure)
 				if cont.hasPending() {
-					a.discardContinuationToolCalls(&cont, -1)
+					a.discardContinuationToolCalls(&cont, nil)
 				}
 			}
 			// Preparation/Warningf can synchronously cancel the root turn.
@@ -894,7 +894,7 @@ func (a *Agent) queryStreamWithSteering(ctx context.Context, input llm.Content, 
 				// A failed continuation was never accepted for execution. Remove
 				// its staged tool topology before publishing the terminal error.
 				if cont.hasPending() {
-					a.discardContinuationToolCalls(&cont, -1)
+					a.discardContinuationToolCalls(&cont, nil)
 				}
 				// Save partial assistant message if any text was streamed,
 				// so the conversation history reflects what the user saw.
@@ -985,12 +985,12 @@ func (a *Agent) queryStreamWithSteering(ctx context.Context, input llm.Content, 
 
 			// Append assistant message.
 			a.mu.Lock()
-			a.messages = append(a.messages, llm.Message{
+			currentAssistant := llm.CloneMessage(llm.Message{
 				Role:      llm.RoleAssistant,
-				Content:   llm.CloneContent(comp.Content),
+				Content:   comp.Content,
 				ToolCalls: comp.ToolCalls,
 			})
-			msgIndex := len(a.messages) - 1
+			a.messages = append(a.messages, currentAssistant)
 			a.mu.Unlock()
 			postCompletionEstimate := 0
 			if a.hasCompactor && a.compactor != nil {
@@ -1030,7 +1030,10 @@ func (a *Agent) queryStreamWithSteering(ctx context.Context, input llm.Content, 
 					// The truncated tool_use blocks will never receive a
 					// tool_result, and a user reminder is appended next: strip
 					// them from history or every later request is invalid.
-					a.discardContinuationToolCalls(&cont, msgIndex)
+					if err := a.discardContinuationToolCalls(&cont, &currentAssistant); err != nil {
+						emitSDKErr(ErrorEvent{Kind: "invalid_tool_call_block", Message: err.Error()})
+						return
+					}
 					reminder := messageorigin.NewInternalUserMessage(messageorigin.KindToolCallContinuation, messageorigin.ToolCallContinuationLimitText)
 					if a.hasCompactor {
 						if err := a.checkAndCompactWithGrowth(ctx, comp, out, additionalSinceCompletion(), pendingMessageTokens(reminder)); err != nil {
@@ -1043,7 +1046,7 @@ func (a *Agent) queryStreamWithSteering(ctx context.Context, input llm.Content, 
 					a.mu.Unlock()
 					continue
 				}
-				cont.addPartial(msgIndex, comp.ToolCalls)
+				cont.addPartial(comp.ToolCalls)
 				a.emitEvent(out, WarnEvent{
 					Message: fmt.Sprintf("continuing truncated tool-call arguments (%d/%d)", turn, cont.maxTurns),
 					Kind:    "continuation",
@@ -1079,7 +1082,10 @@ func (a *Agent) queryStreamWithSteering(ctx context.Context, input llm.Content, 
 						// The merged tool_use blocks are being abandoned and a
 						// user reminder follows: strip them from history so no
 						// tool_use is left without a tool_result.
-						a.discardContinuationToolCalls(&cont, msgIndex)
+						if err := a.discardContinuationToolCalls(&cont, &currentAssistant); err != nil {
+							emitSDKErr(ErrorEvent{Kind: "invalid_tool_call_block", Message: err.Error()})
+							return
+						}
 						reminder := messageorigin.NewInternalUserMessage(messageorigin.KindToolCallContinuation, messageorigin.InvalidToolCallContinuationText)
 						if a.hasCompactor {
 							if err := a.checkAndCompactWithGrowth(ctx, comp, out, additionalSinceCompletion(), pendingMessageTokens(reminder)); err != nil {
@@ -1093,7 +1099,7 @@ func (a *Agent) queryStreamWithSteering(ctx context.Context, input llm.Content, 
 						continue
 					}
 					// Still invalid JSON — keep accumulating.
-					cont.setAccumulated(merged, msgIndex)
+					cont.setAccumulated(merged)
 					a.emitEvent(out, WarnEvent{
 						Message: fmt.Sprintf("tool-call merge remained invalid; requesting continuation (%d/%d)", turn, cont.maxTurns),
 						Kind:    "continuation",
@@ -1113,9 +1119,16 @@ func (a *Agent) queryStreamWithSteering(ctx context.Context, input llm.Content, 
 				}
 				// Valid merged tool calls — clean up partials and update.
 				a.mu.Lock()
+				msgIndex := assistantAnchorIndex(a.messages, currentAssistant)
+				if msgIndex < 0 {
+					a.mu.Unlock()
+					emitSDKErr(ErrorEvent{Kind: "invalid_tool_call_block", Message: errAssistantHistoryChanged.Error()})
+					return
+				}
 				cont.clearPartialToolCalls(a.messages, msgIndex)
 				comp.ToolCalls = merged
-				a.messages[msgIndex] = llm.Message{Role: llm.RoleAssistant, Content: comp.Content, ToolCalls: merged}
+				currentAssistant = llm.CloneMessage(llm.Message{Role: llm.RoleAssistant, Content: comp.Content, ToolCalls: merged})
+				a.messages[msgIndex] = currentAssistant
 				a.mu.Unlock()
 			}
 			if comp.HasToolCalls() {
@@ -1275,7 +1288,10 @@ func (a *Agent) queryStreamWithSteering(ctx context.Context, input llm.Content, 
 			if err != nil {
 				// No block was accepted. Defensively discard the staged assistant
 				// topology if IDs changed after the earlier admission check.
-				a.discardContinuationToolCalls(&cont, msgIndex)
+				if discardErr := a.discardContinuationToolCalls(&cont, &currentAssistant); discardErr != nil {
+					emitSDKErr(ErrorEvent{Kind: "invalid_tool_call_block", Message: discardErr.Error()})
+					return
+				}
 				failToolBlock(err)
 				return
 			}
@@ -5096,7 +5112,6 @@ func autoInvalidTool() tools.Tool {
 // toolCallContinuation tracks partial tool calls across auto-continue boundaries.
 type toolCallContinuation struct {
 	partialCalls     []llm.ToolCall
-	msgIndices       []int
 	mergeDiagnostics map[string][]string
 	turns            int
 	maxTurns         int
@@ -5157,7 +5172,6 @@ func (c *toolCallContinuation) reset() {
 		return
 	}
 	c.partialCalls = nil
-	c.msgIndices = nil
 	c.mergeDiagnostics = nil
 	c.turns = 0
 }
@@ -5185,8 +5199,16 @@ func (c *toolCallContinuation) discardPartialToolCalls(messages []llm.Message) {
 // The budget is marked exhausted rather than reset: otherwise the very next
 // truncated response would start a fresh continuation episode and append
 // another unpairable tool_use block, permanently malforming the history again.
-func (a *Agent) discardContinuationToolCalls(cont *toolCallContinuation, currentIndex int) {
+func (a *Agent) discardContinuationToolCalls(cont *toolCallContinuation, current *llm.Message) error {
 	a.mu.Lock()
+	currentIndex := -1
+	if current != nil {
+		currentIndex = assistantAnchorIndex(a.messages, *current)
+		if currentIndex < 0 {
+			a.mu.Unlock()
+			return errAssistantHistoryChanged
+		}
+	}
 	cont.discardPartialToolCalls(a.messages)
 	if currentIndex >= 0 && currentIndex < len(a.messages) && a.messages[currentIndex].Role == llm.RoleAssistant {
 		a.messages[currentIndex].ToolCalls = nil
@@ -5195,9 +5217,10 @@ func (a *Agent) discardContinuationToolCalls(cont *toolCallContinuation, current
 	a.mu.Unlock()
 	cont.reset()
 	cont.exhaust()
+	return nil
 }
 
-func (c *toolCallContinuation) addPartial(msgIndex int, calls []llm.ToolCall) {
+func (c *toolCallContinuation) addPartial(calls []llm.ToolCall) {
 	if len(c.partialCalls) == 0 {
 		c.partialCalls = cloneToolCalls(calls)
 	} else {
@@ -5218,12 +5241,10 @@ func (c *toolCallContinuation) addPartial(msgIndex int, calls []llm.ToolCall) {
 			}
 		}
 	}
-	c.msgIndices = append(c.msgIndices, msgIndex)
 }
 
-func (c *toolCallContinuation) setAccumulated(calls []llm.ToolCall, msgIndex int) {
+func (c *toolCallContinuation) setAccumulated(calls []llm.ToolCall) {
 	c.partialCalls = cloneToolCalls(calls)
-	c.msgIndices = append(c.msgIndices, msgIndex)
 }
 
 func (c *toolCallContinuation) mergeToolCalls(current []llm.ToolCall) []llm.ToolCall {
