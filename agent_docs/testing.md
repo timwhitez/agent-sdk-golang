@@ -20,6 +20,11 @@ This document summarizes recommended test commands and current coverage focus.
 - Anthropic provider: `go test ./sdk/llm/anthropic`
 
 ## Coverage Map (Representative)
+- `tool_result_projection_test.go` checks the shared result record's canonical
+  history/identity/flags, explicit event-view override, original/visible
+  measurements, opaque-state exclusion from visible text, and delivery-gated
+  Accounting on absent or abandoned output. Existing guard transcript goldens
+  preserve richer history text and delayed result publication.
 - `tool_outcome_projection_test.go` joins execution knowledge, exactly one
   history result, delivered ToolResultEvent/Accounting adjacency, original and
   visible measurements, and Artifact disposition in one real Agent trajectory.

@@ -1347,7 +1347,12 @@ func (a *Agent) queryStreamWithSteering(ctx context.Context, input llm.Content, 
 					a.observeRepeatedSignatureIntervention(legacyDecision, shadowDecision)
 					if blocked {
 						loopGuardStrikes++
-						closeToolResults(idx, toolCallAccepted, "loop_guard", loopGuardSkippedToolResults(tc, resolvedName)...)
+						// Accepted blocks have non-empty IDs, so this helper returns
+						// one history result. Keep its richer history-only suffix.
+						guardHistory := loopGuardSkippedToolResults(tc, resolvedName)
+						guardResult := projectToolResult(guardHistory[0], map[string]any{"loop_guard_suppressed": true}, "[ERROR] Tool call skipped by loop guard - Repeated identical tool call blocked before execution.")
+						guardResult.visible = guardResult.original
+						closeToolResults(idx, toolCallAccepted, "loop_guard", guardResult.history)
 						reminder := strings.TrimSpace(a.loopGuardUserMsg)
 						if repeatGuard.exhausted {
 							// The default reminder can mislead here ("reuse prior
@@ -1401,12 +1406,7 @@ func (a *Agent) queryStreamWithSteering(ctx context.Context, input llm.Content, 
 							Tool: resolvedName, Args: norm.Display, ArgsJSON: norm.Normalized,
 							ArgsMeta: norm.Meta, ToolCallID: tc.ID, DisplayName: resolvedName,
 						})
-						guardResult := ToolResultEvent{
-							Tool: resolvedName, ToolCallID: tc.ID, IsError: true,
-							Result:   "[ERROR] Tool call skipped by loop guard - Repeated identical tool call blocked before execution.",
-							Metadata: map[string]any{"loop_guard_suppressed": true},
-						}
-						a.emitToolResultWithAccounting(out, guardResult, guardResult.Result, 0)
+						a.emitToolResultWithAccounting(out, guardResult, 0)
 						a.emitEvent(out, StepCompleteEvent{StepID: tc.ID, Status: "error"})
 						continue
 					}
@@ -1428,15 +1428,12 @@ func (a *Agent) queryStreamWithSteering(ctx context.Context, input llm.Content, 
 					decision := progressLedger.preflight(evidenceReq, a.compactionGeneration.Load())
 					if decision.suppress {
 						content := llm.TextContent(decision.content)
-						closeToolResults(idx, toolCallAccepted, "evidence_suppressed", llm.Message{
+						suppressedResult := projectToolResult(llm.Message{
 							Role: llm.RoleTool, ToolCallID: tc.ID, ToolName: resolvedName,
 							Content: content, IsError: false, Ephemeral: tool.EphemeralKeep > 0,
-						})
-						suppressedResult := ToolResultEvent{
-							Tool: resolvedName, Result: content.PlainText(), ToolCallID: tc.ID,
-							IsError: false, Metadata: decision.metadata,
-						}
-						a.emitToolResultWithAccounting(out, suppressedResult, suppressedResult.Result, 0)
+						}, decision.metadata, content.PlainText())
+						closeToolResults(idx, toolCallAccepted, "evidence_suppressed", suppressedResult.history)
+						a.emitToolResultWithAccounting(out, suppressedResult, 0)
 						a.emitEvent(out, StepCompleteEvent{StepID: tc.ID, Status: "completed"})
 						if decision.recovery {
 							reminder := evidenceRecoveryMessage(evidenceReq)
@@ -1504,8 +1501,9 @@ func (a *Agent) queryStreamWithSteering(ctx context.Context, input llm.Content, 
 					originalResult := content.PlainText()
 					content, meta = a.applyToolResultTruncation(ctx, content, meta, resolvedName, tc.ID)
 					// append tool message and finish
-					closeToolResults(idx, toolCallRunning, "task_complete", llm.Message{Role: llm.RoleTool, ToolCallID: tc.ID, ToolName: resolvedName, Content: content, IsError: false, Ephemeral: ephemeral})
-					a.emitToolResultWithAccounting(out, ToolResultEvent{Tool: resolvedName, Result: content.PlainText(), ToolCallID: tc.ID, IsError: false, Metadata: meta}, originalResult, time.Since(start))
+					result := projectToolResult(llm.Message{Role: llm.RoleTool, ToolCallID: tc.ID, ToolName: resolvedName, Content: content, IsError: false, Ephemeral: ephemeral}, meta, originalResult)
+					closeToolResults(idx, toolCallRunning, "task_complete", result.history)
+					a.emitToolResultWithAccounting(out, result, time.Since(start))
 					a.emitEvent(out, StepCompleteEvent{StepID: tc.ID, Status: status, DurationMS: time.Since(start).Milliseconds()})
 					if err := ctx.Err(); err != nil {
 						closeToolResults(idx+1, toolCallAccepted, "root_cancel_after_task_complete", skippedToolResults(comp.ToolCalls[idx+1:], toolSkippedByCancellationText)...)
@@ -1547,9 +1545,10 @@ func (a *Agent) queryStreamWithSteering(ctx context.Context, input llm.Content, 
 				content, meta = a.applyToolResultTruncation(ctx, content, meta, resolvedName, tc.ID)
 
 				// append tool message
-				closeToolResults(idx, toolCallRunning, "handler_return", llm.Message{Role: llm.RoleTool, ToolCallID: tc.ID, ToolName: resolvedName, Content: content, IsError: isError, Ephemeral: ephemeral})
+				result := projectToolResult(llm.Message{Role: llm.RoleTool, ToolCallID: tc.ID, ToolName: resolvedName, Content: content, IsError: isError, Ephemeral: ephemeral}, meta, originalResult)
+				closeToolResults(idx, toolCallRunning, "handler_return", result.history)
 
-				a.emitToolResultWithAccounting(out, ToolResultEvent{Tool: resolvedName, Result: content.PlainText(), ToolCallID: tc.ID, IsError: isError, Metadata: meta}, originalResult, time.Since(start))
+				a.emitToolResultWithAccounting(out, result, time.Since(start))
 				a.emitEvent(out, StepCompleteEvent{StepID: tc.ID, Status: status, DurationMS: time.Since(start).Milliseconds()})
 				if rootCancelErr == nil {
 					rootCancelErr = ctx.Err()
@@ -2706,14 +2705,15 @@ func (a *Agent) emitUsageWithAccounting(out *eventOutput, usage llm.Usage, respo
 	})
 }
 
-func (a *Agent) emitToolResultWithAccounting(out *eventOutput, event ToolResultEvent, original string, duration time.Duration) {
+func (a *Agent) emitToolResultWithAccounting(out *eventOutput, result toolResultProjection, duration time.Duration) {
+	event := result.event()
 	if !a.emitEvent(out, event) {
 		return
 	}
 	a.emitAccounting(out, AccountingEvent{
 		Payload: sdkaccounting.ProjectToolResult(sdkaccounting.ToolResultInput{
 			Tool:     event.Tool,
-			Original: original,
+			Original: result.original,
 			Visible:  event.Result,
 			IsError:  event.IsError,
 			Metadata: event.Metadata,
