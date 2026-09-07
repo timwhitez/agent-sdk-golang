@@ -1273,6 +1273,9 @@ func (a *Agent) queryStreamWithSteering(ctx context.Context, input llm.Content, 
 			// once every tool_use in the block has a matching tool_result.
 			activeToolBlock, err = newToolBlockState(comp.ToolCalls)
 			if err != nil {
+				// No block was accepted. Defensively discard the staged assistant
+				// topology if IDs changed after the earlier admission check.
+				a.discardContinuationToolCalls(&cont, msgIndex)
 				failToolBlock(err)
 				return
 			}
