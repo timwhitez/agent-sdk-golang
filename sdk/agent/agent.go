@@ -765,18 +765,30 @@ func (a *Agent) queryStreamWithSteering(ctx context.Context, input llm.Content, 
 				DisableThinking: requireDoneRecoveryDisableThinkingActive,
 			}
 			frame, frameErr := newExecutionFrame(a.llm, request, a.toolMap, a.toolMapNormalized)
+			frameFailure := ""
 			if frameErr != nil {
 				// Clone errors may contain schema data. Keep diagnostics structural.
-				a.warnf("warning: execution frame shadow snapshot unavailable")
+				frameFailure = "execution frame snapshot unavailable"
+			} else if !frame.validBindings() {
+				frameFailure = "execution frame tool bindings inconsistent"
 			}
-			a.observeFrameAdvertisement(frame)
+			if frameFailure != "" {
+				a.warnf("warning: %s", frameFailure)
+				if cont.hasPending() {
+					a.discardContinuationToolCalls(&cont, -1)
+				}
+			}
 			// Preparation/Warningf can synchronously cancel the root turn.
 			// Keep the final gate immediately before actual provider admission.
 			if err := ctx.Err(); err != nil {
 				emitSDKErr(a.errEvent(err))
 				return
 			}
-			comp, streamedText, err := a.invokeCompletionWithRetryAndSteering(ctx, request, out, steeringCh)
+			if frameFailure != "" {
+				emitSDKErr(ErrorEvent{Kind: "invalid_request", Message: frameFailure + "; rebuild the Agent with consistent, cloneable tool definitions"})
+				return
+			}
+			comp, streamedText, err := a.invokeModelCompletionWithRetryAndSteering(ctx, frame.model, frame.request, out, steeringCh)
 			if err != nil {
 				// Check for steering interrupt - handle specially
 				var steerErr *llm.SteeringInterruptError
@@ -1236,7 +1248,7 @@ func (a *Agent) queryStreamWithSteering(ctx context.Context, input llm.Content, 
 				originalName := tc.Function.Name
 
 				// Resolve tool: exact match → normalized/alias match → fallback
-				tool, resolvedName, found, normalizedAlias := a.resolveToolByName(tc.Function.Name)
+				tool, resolvedName, found, normalizedAlias := resolveToolByName(tc.Function.Name, frame.exact, frame.normalized)
 				unknownToolFallback := false
 				execArgs := tc.Function.Arguments
 
@@ -1244,16 +1256,14 @@ func (a *Agent) queryStreamWithSteering(ctx context.Context, input llm.Content, 
 					unknownToolFallback = true
 					resolvedName = "invalid"
 					execArgs = wrapInvalidToolArgs(originalName, tc.Function.Arguments)
-					if inv, ok := a.toolMap["invalid"]; ok {
+					if inv, ok := frame.exact["invalid"]; ok {
 						tool = inv
 					} else {
 						tool = autoInvalidTool()
 					}
 				}
 
-				a.observeFrameResolution(frame, idx, originalName, tool, resolvedName, found, normalizedAlias)
 				if err := ctx.Err(); err != nil {
-					// Shadow diagnostics can cancel the root turn synchronously.
 					// Close every unstarted call before any handler can execute.
 					closeToolResults(idx, toolCallAccepted, "root_cancel_before_start", skippedToolResults(comp.ToolCalls[idx:], toolSkippedByCancellationText)...)
 					a.appendMessages(pendingBlockMessages)

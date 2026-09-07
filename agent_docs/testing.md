@@ -20,6 +20,14 @@ This document summarizes recommended test commands and current coverage focus.
 - Anthropic provider: `go test ./sdk/llm/anthropic`
 
 ## Coverage Map (Representative)
+- `execution_frame_test.go` validates actual captured-handler dispatch across
+  exact/alias/hidden/registered and internal fallback paths, request ownership
+  across retries, finalizing continuation authority, and fail-closed snapshot
+  or structural binding errors with source-negative SDK provenance. Root
+  cancellation takes priority and unaccepted calls create no Tool Results.
+  Scaling benchmarks measure constructor plus binding checks, not Provider or
+  task success; mutable model wrappers and handler closure state remain outside
+  the snapshot guarantee.
 - `agent_continuation_provider_failure_test.go` checks terminal invocation
   failure after an unaccepted max-token tool block: discard only abandoned
   ToolCalls/provider state, preserve visible text and earlier completed blocks

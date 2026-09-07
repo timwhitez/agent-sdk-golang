@@ -7,7 +7,7 @@ import (
 	"github.com/timwhitez/agent-sdk-golang/sdk/tools"
 )
 
-// executionFrame shadows one logical request, not the final provider payload.
+// executionFrame owns one logical request, not the final provider payload.
 // For continued tool calls it is the finalizing request's dispatch snapshot;
 // the merged arguments may originate from multiple earlier requests.
 // Model/Handler values retain runtime handles, not immutable closure state or
@@ -50,36 +50,21 @@ func newExecutionFrame(model llm.ChatModel, request llm.InvokeRequest, exact, no
 	return &executionFrame{model: model, request: owned, exact: ownedExact, normalized: ownedNormalized}, nil
 }
 
-func (a *Agent) observeFrameAdvertisement(frame *executionFrame) {
-	if frame == nil {
-		return
-	}
-	for index, definition := range frame.request.Tools {
+// validBindings checks structural agreement, not mutable closure identity.
+// Hidden tools and the dispatch-time internal invalid fallback remain legal.
+func (frame *executionFrame) validBindings() bool {
+	for _, definition := range frame.request.Tools {
 		tool, ok := frame.exact[definition.Name]
 		if !ok || tool.Hidden || !reflect.DeepEqual(definition, tool.Definition()) {
-			a.warnf("warning: execution frame shadow mismatch: advertised_tool[%d]", index)
+			return false
 		}
 	}
-}
-
-func (a *Agent) observeFrameResolution(frame *executionFrame, index int, name string, actual tools.Tool, resolved string, found, alias bool) {
-	if frame == nil {
-		return
-	}
-	expected, expectedName, expectedFound, expectedAlias := resolveToolByName(name, frame.exact, frame.normalized)
-	if !expectedFound {
-		expectedName = "invalid"
-		var ok bool
-		expected, ok = frame.exact["invalid"]
-		if !ok {
-			expected = autoInvalidTool()
+	for _, normalized := range frame.normalized {
+		exact, ok := frame.exact[normalized.Name]
+		if !ok || normalized.Hidden != exact.Hidden || normalized.EphemeralKeep != exact.EphemeralKeep ||
+			(normalized.Handler == nil) != (exact.Handler == nil) || !reflect.DeepEqual(normalized.Definition(), exact.Definition()) {
+			return false
 		}
 	}
-	// Functions cannot prove closure identity through comparison. Check only
-	// resolution and metadata; retain the captured Handler for later authority.
-	if expectedName != resolved || expectedFound != found || expectedAlias != alias ||
-		expected.Hidden != actual.Hidden || expected.EphemeralKeep != actual.EphemeralKeep ||
-		(expected.Handler == nil) != (actual.Handler == nil) || !reflect.DeepEqual(expected.Definition(), actual.Definition()) {
-		a.warnf("warning: execution frame shadow mismatch: resolved_tool[%d]", index)
-	}
+	return true
 }

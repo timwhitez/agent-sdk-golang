@@ -102,13 +102,13 @@ agent_docs/          Detailed architecture/provider/tool/build/test documentatio
 - Unknown tool dispatch uses a registered `invalid` tool when present, otherwise
   constructs the internal fallback at dispatch; `Agent.New` does not add it to
   the advertised tool list (`sdk/agent/agent.go`).
-- A private `executionFrame` shadows each logical request with owned request
-  and resolver schemas plus captured model/handler handles. Legacy invocation
-  and dispatch remain authoritative. Continued arguments can have multiple
-  request sources; the dispatch shadow belongs to the finalizing request.
-  Diagnostics use structural `Warningf` messages only, not a second event path
-  (`sdk/agent/execution_frame.go`). This is not concrete-model snapshotting or
-  proof of mutable handler closure identity.
+- A private `executionFrame` owns each logical request and resolver schemas,
+  with captured model/handler handles used by actual invocation and dispatch.
+  Snapshot or structural binding failure terminates before admission with a
+  source-negative SDK-origin error, discarding unaccepted continuation topology.
+  Continued arguments can have multiple request sources; dispatch uses the
+  finalizing request's frame (`sdk/agent/execution_frame.go`). This is not
+  concrete-model snapshotting or proof of mutable handler closure identity.
 
 ### Execution APIs
 - `Query(ctx, text)` for synchronous usage (`sdk/agent/agent.go:159`)

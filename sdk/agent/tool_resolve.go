@@ -104,10 +104,6 @@ func pickToolCandidate(candidates []string, toolMap map[string]tools.Tool, normM
 	return tools.Tool{}, false
 }
 
-func (a *Agent) resolveToolByName(name string) (tools.Tool, string, bool, bool) {
-	return resolveToolByName(name, a.toolMap, a.toolMapNormalized)
-}
-
 func resolveToolByName(name string, exact, normalized map[string]tools.Tool) (tools.Tool, string, bool, bool) {
 	raw := strings.TrimSpace(name)
 	if raw == "" {
