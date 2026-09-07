@@ -11,6 +11,7 @@ import (
 // safely copy without unsafe access.
 func CloneInvokeRequest(request InvokeRequest) (InvokeRequest, error) {
 	out := request
+	out.CachePlan = CloneCachePlan(request.CachePlan)
 	out.Messages = CloneMessages(request.Messages)
 	if request.Tools != nil {
 		out.Tools = make([]ToolDefinition, len(request.Tools))
