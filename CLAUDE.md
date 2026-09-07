@@ -84,6 +84,12 @@ agent_docs/          Detailed architecture/provider/tool/build/test documentatio
   concrete-model snapshotting or proof of mutable handler closure identity.
 
 ### Execution APIs
+- Public manual/preflight compaction shares query admission. Conflicting calls
+  return `ErrAgentBusy`; hosts must not run emergency fallback for this error.
+  Manual compaction rejects all external history replacement until checkpoint
+  publication completes. Callback reads and queued configuration updates remain
+  supported. Public checkpoint-only commit followed by host publication is still
+  a separate two-phase boundary, not covered by this manual-pipeline fence.
 - `ReplaceHistoryChecked` / `ClearHistoryChecked` return
   `ErrActiveHistoryMutation` when an active query's non-system messages or
   protected tool/continuation tail would change. Legal system-context updates

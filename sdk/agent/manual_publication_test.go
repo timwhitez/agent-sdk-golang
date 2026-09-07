@@ -129,6 +129,21 @@ func TestManualCompactionCannotEnterActiveQuery(t *testing.T) {
 	drainCompactionUpdateTurn(t, stream)
 }
 
+func TestManualCompactionClassifiesLingeringAutomaticWorkAsBusy(t *testing.T) {
+	ag := newCompactionUpdateAgent(t, &countingCompactionModel{}, 100000)
+	// A canceled turn can finish while a context-ignoring automatic summary
+	// still holds compactionInFlight. The host must not enter fallback.
+	ag.compactionInFlight.Store(true)
+	res, err := ag.CompactNow(context.Background())
+	if !errors.Is(err, ErrAgentBusy) || res.Compacted {
+		t.Fatalf("result=%v error=%v", res.Compacted, err)
+	}
+	ag.compactionInFlight.Store(false)
+	if err := ag.ClearHistoryChecked(); err != nil {
+		t.Fatalf("manual ownership leaked: %v", err)
+	}
+}
+
 func TestCanceledManualSummaryReleasesAdmission(t *testing.T) {
 	model := &blockingCompactionUpdateModel{started: make(chan struct{}), release: make(chan struct{})}
 	ag := newCompactionUpdateAgent(t, model, 100000)

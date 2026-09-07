@@ -512,7 +512,7 @@ func (a *Agent) Messages() []llm.Message {
 // active-query mutation is reported through Warningf; it is not deferred.
 func (a *Agent) ClearHistory() {
 	if err := a.ClearHistoryChecked(); err != nil {
-		a.warnf("warning: ClearHistory rejected during an active query; use ClearHistoryChecked or wait for query completion")
+		a.warnf("warning: ClearHistory rejected during an active query or manual compaction; use ClearHistoryChecked or wait for completion")
 	}
 }
 
@@ -522,7 +522,7 @@ func (a *Agent) ClearHistory() {
 // owners should use ReplaceHistoryChecked and propagate its error instead.
 func (a *Agent) ReplaceHistory(messages []llm.Message) {
 	if err := a.ReplaceHistoryChecked(messages); err != nil {
-		a.warnf("warning: ReplaceHistory rejected during an active query; use ReplaceHistoryChecked or preserve the active message structure")
+		a.warnf("warning: ReplaceHistory rejected during an active query or manual compaction; use ReplaceHistoryChecked and handle publication conflicts")
 	}
 }
 
@@ -4343,7 +4343,7 @@ func (a *Agent) CompactPipelineNow(ctx context.Context, req compaction.PipelineR
 	}
 	a.applyPendingCompaction(nil)
 	if !a.compactionInFlight.CompareAndSwap(false, true) {
-		return compaction.Result{Compacted: false}, fmt.Errorf("compaction already in progress")
+		return compaction.Result{Compacted: false}, fmt.Errorf("%w: compaction already in progress", ErrAgentBusy)
 	}
 	defer a.releaseCompactionInFlight()
 
