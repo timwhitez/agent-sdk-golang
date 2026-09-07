@@ -42,6 +42,8 @@ func TestExecutionFrameOwnsRequestAndResolverSchemas(t *testing.T) {
 		t.Fatal(err)
 	}
 	request.Messages[0].Content.Blocks[0].Text = "changed"
+	request.CachePlan.RequestFingerprint = "changed"
+	request.CachePlan.Directives[0].Target.MessageIndex = 999
 	request.Tools[1].Parameters["limit"] = int64(999)
 	tool.Schema["nested"].(map[string]any)["value"] = int64(999)
 	delete(exact, tool.Name)

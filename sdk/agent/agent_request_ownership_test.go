@@ -117,6 +117,8 @@ func (m *providerAdmissionModel) Invoke(_ context.Context, request llm.InvokeReq
 		m.onFirst()
 	}
 	if call == 1 && m.retryFirst {
+		request.CachePlan.RequestFingerprint = "mutated"
+		request.CachePlan.Directives[0].Target.MessageIndex = 999
 		request.Messages[0].Content.Blocks[0].Text = "mutated"
 		request.Tools[1].Parameters["limit"] = int64(99)
 		request.Tools[1].Parameters["items"].([]any)[0] = "mutated"
@@ -232,6 +234,11 @@ func providerAdmissionRequest() llm.InvokeRequest {
 		ToolChoice:      llm.ToolChoice("required"),
 		Temperature:     &temperature,
 		DisableThinking: true,
+		CachePlan: &llm.CachePlan{
+			SchemaVersion:      llm.CachePlanSchemaVersion,
+			RequestFingerprint: "fixture-request",
+			Directives:         []llm.CacheDirective{{Target: llm.CacheTarget{Kind: llm.CacheAfterMessage, MessageIndex: 0}, Policy: llm.CacheBestEffort}},
+		},
 		Responses: &llm.ResponsesOptions{
 			UseResponseItems:  &yes,
 			UseInstructions:   &no,

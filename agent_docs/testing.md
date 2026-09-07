@@ -20,6 +20,11 @@ This document summarizes recommended test commands and current coverage focus.
 - Anthropic provider: `go test ./sdk/llm/anthropic`
 
 ## Coverage Map (Representative)
+- CachePlan request attachment: `sdk/llm/cache_request_test.go` proves nil/empty
+  ownership and JSON exclusion; `cache_plan_wire_test.go` freezes buffered and
+  streaming Chat/Responses/Anthropic wire payloads with legacy cache flags and
+  injected HTTP failures. Existing Agent retry/Frame ownership fixtures include
+  CachePlan mutation isolation. No explicit cache policy enforcement is claimed.
 - `execution_frame_test.go` validates actual captured-handler dispatch across
   exact/alias/hidden/registered and internal fallback paths, request ownership
   across retries, finalizing continuation authority, and fail-closed snapshot
