@@ -38,9 +38,14 @@ and progressive disclosure through `agent_docs/`.
   kind/origin, and observational timestamp. Legacy `QueryStream` uses the same
   direct delivery/backpressure path without metadata; sequence gaps expose
   dropped events (`sdk/agent/event_envelope.go`, `sdk/agent/agent.go`).
-- The sequential Tool Loop mirrors accepted/running/terminal transitions into
-  a query-local, observe-only `toolBlockState`. Mismatches use `Warningf`; the
-  shadow does not construct history, events, Tool Results, or Provider payloads
+- The sequential Tool Loop uses query/block-local `toolBlockState` to accept
+  terminal batches atomically and in ordinal order before history commit.
+  Publishable results are claimed once from that authority; claim does not
+  imply delivery and Accounting remains delivery-gated. Internal rejection
+  closes remaining calls without re-execution, preserves observed execution,
+  marks uncertain results indeterminate, retains queued steering, and emits
+  one source-negative SDK error. History-only tails remain unpublishable.
+  This is not a concurrent scheduler or durable ledger
   (`sdk/agent/tool_block_state.go`, `sdk/agent/agent.go`).
 - Auto-continue on `max_tokens` (including partial tool-call merge) now emits metadata-only `AutoContinueEvent` instead of text markers (`sdk/agent/agent.go:259`, `sdk/agent/agent.go:275`, `sdk/agent/agent.go:298`, `sdk/agent/events.go:113`)
 - Tool resolution via exact + normalized + alias matching (`sdk/agent/tool_resolve.go:107`, `sdk/agent/tool_resolve.go:30`)

@@ -13,18 +13,18 @@ import (
 )
 
 func TestToolBlockStateTracksExecutedAndUnstartedClosure(t *testing.T) {
-	block := newToolBlockState([]llm.ToolCall{{ID: "run"}, {ID: "skip"}})
+	block := terminalFixture(t, "run", "skip")
 	block.markRunning(0)
 	block.markAttemptReturned(0, false)
-	block.markTerminal(0, toolCallRunning, "handler_return")
-	block.markTerminal(1, toolCallAccepted, "turn_end")
+	acceptHistoryTerminal(t, block, 0, toolCallRunning, "handler_return")
+	acceptHistoryTerminal(t, block, 1, toolCallAccepted, "turn_end")
 	if err := block.validateClosed(); err != nil {
 		t.Fatal(err)
 	}
 }
 
 func TestToolBlockStateExecutionKnowledgeTransitions(t *testing.T) {
-	block := newToolBlockState([]llm.ToolCall{{ID: "observed"}, {ID: "indeterminate"}, {ID: "unstarted"}})
+	block := terminalFixture(t, "observed", "indeterminate", "unstarted")
 	if got := block.calls[0].executionKnowledge; got != toolExecutionNotStarted {
 		t.Fatalf("accepted execution=%q want %q", got, toolExecutionNotStarted)
 	}
@@ -33,11 +33,11 @@ func TestToolBlockStateExecutionKnowledgeTransitions(t *testing.T) {
 		t.Fatalf("running execution=%q want %q", got, toolExecutionAttemptStarted)
 	}
 	block.markAttemptReturned(0, false)
-	block.markTerminal(0, toolCallRunning, "handler_return")
+	acceptHistoryTerminal(t, block, 0, toolCallRunning, "handler_return")
 	block.markRunning(1)
 	block.markAttemptReturned(1, true)
-	block.markTerminal(1, toolCallRunning, "handler_return")
-	block.markTerminal(2, toolCallAccepted, "root_cancel_after_handler")
+	acceptHistoryTerminal(t, block, 1, toolCallRunning, "handler_return")
+	acceptHistoryTerminal(t, block, 2, toolCallAccepted, "root_cancel_after_handler")
 
 	if got := block.calls[0].executionKnowledge; got != toolExecutionOutcomeObserved {
 		t.Fatalf("observed execution=%q want %q", got, toolExecutionOutcomeObserved)
@@ -114,51 +114,13 @@ func TestToolBlockStateObservesOrdinaryAttemptOutcomes(t *testing.T) {
 	}
 }
 
-func TestToolBlockStateReportsInvariantViolations(t *testing.T) {
-	tests := []struct {
-		name string
-		run  func(*toolBlockState)
-		want string
-	}{
-		{name: "missing terminal", run: func(*toolBlockState) {}, want: "remains phase=\"accepted\""},
-		{name: "duplicate terminal", run: func(block *toolBlockState) {
-			block.markTerminal(0, toolCallAccepted, "first")
-			block.markTerminal(0, toolCallTerminal, "second")
-		}, want: "2 terminal transitions"},
-		{name: "wrong phase", run: func(block *toolBlockState) {
-			block.markTerminal(0, toolCallRunning, "handler_return")
-		}, want: "want \"running\""},
-		{name: "running without returned outcome", run: func(block *toolBlockState) {
-			block.markRunning(0)
-			block.markTerminal(0, toolCallRunning, "handler_return")
-		}, want: "want terminal execution knowledge"},
-		{name: "terminal unknown execution", run: func(block *toolBlockState) {
-			block.markTerminal(0, toolCallAccepted, "turn_end")
-			block.calls[0].executionKnowledge = toolExecutionUnknown
-		}, want: "execution=\"unknown\""},
-		{name: "out of range", run: func(block *toolBlockState) {
-			block.markRunning(1)
-			block.markTerminal(0, toolCallAccepted, "turn_end")
-		}, want: "outside block length"},
-	}
-	for _, test := range tests {
-		t.Run(test.name, func(t *testing.T) {
-			block := newToolBlockState([]llm.ToolCall{{ID: "call-1"}})
-			test.run(block)
-			err := block.validateClosed()
-			if err == nil || !strings.Contains(err.Error(), test.want) {
-				t.Fatalf("error=%v want substring %q", err, test.want)
-			}
-		})
-	}
-}
-
 func TestToolBlockStateRejectsAmbiguousAcceptedIDs(t *testing.T) {
-	block := newToolBlockState([]llm.ToolCall{{ID: ""}, {ID: "same"}, {ID: "same"}})
-	block.markTerminalRange(0, toolCallAccepted, "closed")
-	err := block.validateClosed()
-	if err == nil || !strings.Contains(err.Error(), "empty id") || !strings.Contains(err.Error(), "duplicates the id") || strings.Contains(err.Error(), "same") {
-		t.Fatalf("error=%v", err)
+	for _, calls := range [][]llm.ToolCall{{{ID: ""}}, {{ID: "private-id"}, {ID: "private-id"}}} {
+		block, err := newToolBlockState(calls)
+		var typed *toolBlockTransitionError
+		if block != nil || !errors.As(err, &typed) || strings.Contains(err.Error(), "private-id") {
+			t.Fatalf("invalid block=%v err=%v", block, err)
+		}
 	}
 }
 

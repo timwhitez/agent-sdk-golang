@@ -20,6 +20,14 @@ This document summarizes recommended test commands and current coverage focus.
 - Anthropic provider: `go test ./sdk/llm/anthropic`
 
 ## Coverage Map (Representative)
+- `tool_terminal_authority_test.go` checks whole-batch atomicity, ordinal order,
+  invalid role/identity/phase/knowledge, duplicate terminal/start/claim rejection,
+  pending-payload release, unpublishable tails and idempotent abort. Real Driver
+  failure injection proves zero execution after rejected start, conservative
+  result closure after returned effects, preservation of prior terminals and
+  consumed steering, publication rejection, and next-query zero pairing repair.
+  `BenchmarkToolBlockTerminalLifecycle` measures the new sequential lifecycle;
+  it is not a matched comparison with the former shadow-only fixture.
 - `tool_result_projection_test.go` checks the shared result record's canonical
   history/identity/flags, explicit event-view override, original/visible
   measurements, opaque-state exclusion from visible text, and delivery-gated
@@ -30,8 +38,8 @@ This document summarizes recommended test commands and current coverage focus.
   visible measurements, and Artifact disposition in one real Agent trajectory.
   Ordinary success and TaskComplete each cover successful publication, sink
   failure, and persisted-object/codec-budget failure. Projection failure is not
-  reclassified as an unstarted handler; this characterization does not enable
-  new terminal authority or change history-only synthetic tail delivery.
+  reclassified as an unstarted handler; terminal authority is tested separately
+  above, and history-only synthetic tail delivery remains unchanged.
 - CachePlan request attachment: `sdk/llm/cache_request_test.go` proves nil/empty
   ownership and JSON exclusion; `cache_plan_wire_test.go` freezes buffered and
   streaming Chat/Responses/Anthropic wire payloads with legacy cache flags and
