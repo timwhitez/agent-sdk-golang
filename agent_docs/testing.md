@@ -20,6 +20,11 @@ This document summarizes recommended test commands and current coverage focus.
 - Anthropic provider: `go test ./sdk/llm/anthropic`
 
 ## Coverage Map (Representative)
+- `agent_continuation_provider_failure_test.go` checks terminal invocation
+  failure after an unaccepted max-token tool block: discard only abandoned
+  ToolCalls/provider state, preserve visible text and earlier completed blocks
+  with reused IDs, retain partial usage/error provenance, invent no tool
+  execution/results/accounting, and leave the next query with zero repairs.
 - `sdk/agent/agent_test.go` - max-token auto-continue metadata emission, overflow-triggered compaction checks, async compaction apply-on-next-turn behavior, structured compaction telemetry, compaction system-message deduplication, tool-call delta merge behavior, and truncation metadata/path persistence (`sdk/agent/agent_test.go:180`, `sdk/agent/agent_test.go:402`, `sdk/agent/agent_test.go:271`, `sdk/agent/agent_test.go:210`, `sdk/agent/agent_test.go:421`)
 - `sdk/accounting/projector_contract_test.go` and
   `sdk/agent/agent_accounting_contract_test.go` cover allowlisted bounded
