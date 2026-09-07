@@ -298,6 +298,63 @@ func TestExecutionFrameResolutionDriftKeepsLegacyAuthorityAndCancellation(t *tes
 	}
 }
 
+func TestExecutionFrameRuntimeAdvertisementKeepsRequestAndLegacyAuthority(t *testing.T) {
+	for _, cancelOnWarning := range []bool{false, true} {
+		t.Run(fmt.Sprint(cancelOnWarning), func(t *testing.T) {
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			providerCalls, handlerCalls := 0, 0
+			var warnings []string
+			model := &frameScriptModel{invoke: func(request llm.InvokeRequest) (*llm.Completion, error) {
+				providerCalls++
+				if len(request.Tools) != 1 || request.Tools[0].Description != "private advertised metadata" || request.ToolChoice != "required" {
+					t.Error("shadow altered provider request")
+				}
+				return &llm.Completion{ToolCalls: []llm.ToolCall{{ID: "a", Function: llm.FunctionCall{Name: "work", Arguments: "{}"}}}}, nil
+			}}
+			a, err := New(Config{LLM: model, ToolChoice: "required", Tools: []tools.Tool{{Name: "work", Description: "private advertised metadata", Handler: func(context.Context, json.RawMessage, *tools.Container) (llm.Content, error) {
+				handlerCalls++
+				return llm.Content{}, tools.TaskComplete("legacy result")
+			}}}, Warningf: func(format string, args ...any) {
+				warnings = append(warnings, fmt.Sprintf(format, args...))
+				if cancelOnWarning {
+					cancel()
+				}
+			}})
+			if err != nil {
+				t.Fatal(err)
+			}
+			runtimeTool := a.toolMap["work"]
+			runtimeTool.Description = "private runtime metadata"
+			a.toolMap["work"] = runtimeTool
+			for range a.QueryStream(ctx, llm.TextContent("private prompt")) {
+			}
+			wantCalls := 1
+			if cancelOnWarning {
+				wantCalls = 0
+			}
+			if providerCalls != wantCalls || handlerCalls != wantCalls {
+				t.Fatalf("provider/handler=%d/%d want %d", providerCalls, handlerCalls, wantCalls)
+			}
+			if !reflect.DeepEqual(warnings, []string{"warning: execution frame shadow mismatch: advertised_tool[0]"}) {
+				t.Fatalf("warnings=%v", warnings)
+			}
+			results := 0
+			for _, message := range a.Messages() {
+				if message.Role == llm.RoleTool {
+					results++
+					if message.ToolCallID != "a" || !strings.Contains(message.Content.PlainText(), "legacy result") {
+						t.Error("shadow changed legacy result")
+					}
+				}
+			}
+			if results != wantCalls {
+				t.Fatalf("terminal results=%d want %d", results, wantCalls)
+			}
+		})
+	}
+}
+
 func BenchmarkExecutionFrameSnapshot(b *testing.B) {
 	a, err := New(Config{LLM: historyCloneModel{}, Tools: []tools.Tool{{Name: "read", Schema: map[string]any{"type": "object"}}}})
 	if err != nil {
