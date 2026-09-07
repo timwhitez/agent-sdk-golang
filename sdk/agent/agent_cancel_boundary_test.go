@@ -422,6 +422,7 @@ func TestRootCancellationBeforeFirstToolClosesAcceptedBlock(t *testing.T) {
 	var runs atomic.Int32
 	dropped := make(chan struct{})
 	var sawDrop atomic.Bool
+	var droppedCanceled atomic.Int32
 	failShadow := failOnToolBlockShadowWarning(t)
 	ag, err := New(Config{
 		LLM:               cancelBeforeToolStartModel{},
@@ -431,6 +432,11 @@ func TestRootCancellationBeforeFirstToolClosesAcceptedBlock(t *testing.T) {
 		EventDropLogEvery: 1,
 		Warningf: func(format string, args ...any) {
 			failShadow(format, args...)
+			if strings.Contains(format, "dropping consistency-critical agent event") && len(args) > 0 {
+				if event, ok := args[0].(ErrorEvent); ok && event.Kind == "canceled" {
+					droppedCanceled.Add(1)
+				}
+			}
 			if strings.Contains(format, "dropping agent event") && sawDrop.CompareAndSwap(false, true) {
 				cancel()
 				close(dropped)
@@ -447,8 +453,10 @@ func TestRootCancellationBeforeFirstToolClosesAcceptedBlock(t *testing.T) {
 		t.Fatal("timeout waiting for controlled event drop")
 	}
 	got := collectCancelBoundaryTerminals(events)
-	if runs.Load() != 0 || got.canceled != 1 || got.finals != 0 {
-		t.Fatalf("runs=%d canceled=%d finals=%d; want 0/1/0", runs.Load(), got.canceled, got.finals)
+	// Cancellation can race with the consumer draining the occupied slot.
+	// Count the actual typed drop, not any missing terminal or arbitrary drop.
+	if runs.Load() != 0 || got.canceled+int(droppedCanceled.Load()) != 1 || got.finals != 0 || ag.criticalEventDropCount.Load() != uint64(droppedCanceled.Load()) {
+		t.Fatalf("runs=%d canceled=%d dropped_canceled=%d critical_drops=%d finals=%d", runs.Load(), got.canceled, droppedCanceled.Load(), ag.criticalEventDropCount.Load(), got.finals)
 	}
 	assertCanceledToolResult(t, ag.Messages(), "never-start")
 }
