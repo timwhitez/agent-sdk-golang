@@ -753,14 +753,7 @@ func (a *Agent) queryStreamWithSteering(ctx context.Context, input llm.Content, 
 					requestToolChoice = llm.ToolChoice("required")
 				}
 			}
-			// Steering delivery and request preparation above can synchronously
-			// unblock a host that cancels the root turn. Recheck at the actual
-			// provider-admission boundary, not only at iteration entry.
-			if err := ctx.Err(); err != nil {
-				emitSDKErr(a.errEvent(err))
-				return
-			}
-			comp, streamedText, err := a.invokeCompletionWithRetryAndSteering(ctx, llm.InvokeRequest{
+			request := llm.InvokeRequest{
 				Messages:   messages,
 				Tools:      toolDefs,
 				ToolChoice: requestToolChoice,
@@ -770,7 +763,20 @@ func (a *Agent) queryStreamWithSteering(ctx context.Context, input llm.Content, 
 				// work tool, its follow-up request must stay in the same thinking mode
 				// until done, steering, or turn termination closes the subloop.
 				DisableThinking: requireDoneRecoveryDisableThinkingActive,
-			}, out, steeringCh)
+			}
+			frame, frameErr := newExecutionFrame(a.llm, request, a.toolMap, a.toolMapNormalized)
+			if frameErr != nil {
+				// Clone errors may contain schema data. Keep diagnostics structural.
+				a.warnf("warning: execution frame shadow snapshot unavailable")
+			}
+			a.observeFrameAdvertisement(frame)
+			// Preparation/Warningf can synchronously cancel the root turn.
+			// Keep the final gate immediately before actual provider admission.
+			if err := ctx.Err(); err != nil {
+				emitSDKErr(a.errEvent(err))
+				return
+			}
+			comp, streamedText, err := a.invokeCompletionWithRetryAndSteering(ctx, request, out, steeringCh)
 			if err != nil {
 				// Check for steering interrupt - handle specially
 				var steerErr *llm.SteeringInterruptError
@@ -1221,15 +1227,6 @@ func (a *Agent) queryStreamWithSteering(ctx context.Context, input llm.Content, 
 			activeToolBlock = newToolBlockState(comp.ToolCalls)
 			var pendingBlockMessages []llm.Message
 			for idx, tc := range comp.ToolCalls {
-				if err := ctx.Err(); err != nil {
-					// Close every unstarted tool call before terminating so a later
-					// turn never inherits an unpaired assistant tool-call block.
-					closeToolResults(idx, toolCallAccepted, "root_cancel_before_start", skippedToolResults(comp.ToolCalls[idx:], toolSkippedByCancellationText)...)
-					a.appendMessages(pendingBlockMessages)
-					pendingBlockMessages = nil
-					emitSDKErr(a.errEvent(err))
-					return
-				}
 				step := idx + 1
 				originalName := tc.Function.Name
 
@@ -1249,6 +1246,16 @@ func (a *Agent) queryStreamWithSteering(ctx context.Context, input llm.Content, 
 					}
 				}
 
+				a.observeFrameResolution(frame, idx, originalName, tool, resolvedName, found, normalizedAlias)
+				if err := ctx.Err(); err != nil {
+					// Shadow diagnostics can cancel the root turn synchronously.
+					// Close every unstarted call before any handler can execute.
+					closeToolResults(idx, toolCallAccepted, "root_cancel_before_start", skippedToolResults(comp.ToolCalls[idx:], toolSkippedByCancellationText)...)
+					a.appendMessages(pendingBlockMessages)
+					pendingBlockMessages = nil
+					emitSDKErr(a.errEvent(err))
+					return
+				}
 				norm := tools.NormalizeToolArgs(resolvedName, execArgs, tool.Schema)
 				resolution := toolResolutionExact
 				if unknownToolFallback {
