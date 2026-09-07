@@ -117,6 +117,11 @@ agent_docs/          Detailed architecture/provider/tool/build/test documentatio
   concrete-model snapshotting or proof of mutable handler closure identity.
 
 ### Execution APIs
+- `CommitCompactionHistory(ctx, expected, candidate, result)` publishes a
+  host-computed compaction under one SDK admission/runtime boundary. Reuse the
+  exact source snapshot used to compute the candidate; stale content/pending
+  work rejects before persistence. Without a writer this is memory-only. The
+  checkpoint-only legacy API does not provide this publication boundary.
 - Public manual/preflight compaction shares query admission. Conflicting calls
   return `ErrAgentBusy`; hosts must not run emergency fallback for this error.
   Through checkpoint publication, manual compaction rejects checked history

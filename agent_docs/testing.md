@@ -20,6 +20,14 @@ This document summarizes recommended test commands and current coverage focus.
 - Anthropic provider: `go test ./sdk/llm/anthropic`
 
 ## Coverage Map (Representative)
+- `compaction_publication_test.go` checks combined source-checked checkpoint and
+  history publication: pre-I/O stale/pending/admission/runtime rejection,
+  callback ownership, acknowledged commit after cancellation, writer isolation,
+  ledger/write failure, no-op and memory-only behavior, and legacy successful
+  checkpoint/result parity. Benchmark measures owned-copy/content-comparison
+  publication cost without a writer, not Provider latency or a speedup. Live
+  legacy dump references survive successful/no-op/rejected publication and
+  remain removable by the existing TTL cleanup.
 - `manual_publication_test.go` covers independent manual-compaction ownership
   through checkpoint/apply, query and nested manual admission, checked mutation
   rejection, callback read/config-update safety and error/cancellation release.
