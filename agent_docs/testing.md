@@ -20,6 +20,11 @@ This document summarizes recommended test commands and current coverage focus.
 - Anthropic provider: `go test ./sdk/llm/anthropic`
 
 ## Coverage Map (Representative)
+- `manual_publication_test.go` covers independent manual-compaction ownership
+  through checkpoint/apply, query and nested manual admission, checked mutation
+  rejection, callback read/config-update safety and error/cancellation release.
+  Public checkpoint-only commits remain separate from host history publication;
+  this is not a new atomic host commit-and-publish API.
 - `history_mutation_test.go` covers checked/legacy Clear and Replace during
   provider-pending and handler-active phases, actual next-request System updates,
   rejection without history/cleanup side effects, reused completed IDs,

@@ -252,9 +252,12 @@ type Agent struct {
 	// whose caller has already gone away.
 	// turnActive is acquired synchronously before the turn goroutine starts,
 	// preventing overlapping submissions from mutating shared turn state.
-	turnActive      atomic.Bool
-	turnCancelMu    sync.Mutex
-	turnCancelByOut map[*eventOutput]*turnBackpressure
+	turnActive atomic.Bool
+	// manualCompactionActive is protected by mu. Manual compaction shares
+	// turnActive admission but rejects even System-only history replacement.
+	manualCompactionActive bool
+	turnCancelMu           sync.Mutex
+	turnCancelByOut        map[*eventOutput]*turnBackpressure
 }
 
 // turnBackpressure carries the per-turn state emitEvent needs on the slow path:
@@ -509,7 +512,7 @@ func (a *Agent) Messages() []llm.Message {
 // active-query mutation is reported through Warningf; it is not deferred.
 func (a *Agent) ClearHistory() {
 	if err := a.ClearHistoryChecked(); err != nil {
-		a.warnf("warning: ClearHistory rejected during an active query; use ClearHistoryChecked or wait for query completion")
+		a.warnf("warning: ClearHistory rejected during an active query or manual compaction; use ClearHistoryChecked or wait for completion")
 	}
 }
 
@@ -519,7 +522,7 @@ func (a *Agent) ClearHistory() {
 // owners should use ReplaceHistoryChecked and propagate its error instead.
 func (a *Agent) ReplaceHistory(messages []llm.Message) {
 	if err := a.ReplaceHistoryChecked(messages); err != nil {
-		a.warnf("warning: ReplaceHistory rejected during an active query; use ReplaceHistoryChecked or preserve the active message structure")
+		a.warnf("warning: ReplaceHistory rejected during an active query or manual compaction; use ReplaceHistoryChecked and handle publication conflicts")
 	}
 }
 
@@ -4310,7 +4313,26 @@ func (a *Agent) CompactNow(ctx context.Context) (compaction.Result, error) {
 // CompactPipelineNow applies the canonical compaction pipeline synchronously.
 // Hosts use this for preflight so they do not duplicate local-versus-summary
 // decisions outside the SDK.
+// It returns ErrAgentBusy instead of overlapping an active query or another
+// public compaction. Hosts must not turn this rejection into a local fallback.
 func (a *Agent) CompactPipelineNow(ctx context.Context, req compaction.PipelineRequest) (compaction.Result, error) {
+	if ctx != nil && ctx.Err() != nil {
+		return compaction.Result{}, ctx.Err()
+	}
+	a.mu.Lock()
+	if !a.turnActive.CompareAndSwap(false, true) {
+		a.mu.Unlock()
+		return compaction.Result{}, ErrAgentBusy
+	}
+	a.manualCompactionActive = true
+	a.mu.Unlock()
+	defer func() {
+		a.mu.Lock()
+		a.manualCompactionActive = false
+		a.turnActive.Store(false)
+		a.mu.Unlock()
+	}()
+
 	releaseCompactionRuntime, err := a.beginCompactionRuntimeUse(ctx)
 	if err != nil {
 		return compaction.Result{Compacted: false}, err
@@ -4321,7 +4343,7 @@ func (a *Agent) CompactPipelineNow(ctx context.Context, req compaction.PipelineR
 	}
 	a.applyPendingCompaction(nil)
 	if !a.compactionInFlight.CompareAndSwap(false, true) {
-		return compaction.Result{Compacted: false}, fmt.Errorf("compaction already in progress")
+		return compaction.Result{Compacted: false}, fmt.Errorf("%w: compaction already in progress", ErrAgentBusy)
 	}
 	defer a.releaseCompactionInFlight()
 

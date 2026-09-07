@@ -9,8 +9,9 @@ import (
 )
 
 // ErrActiveHistoryMutation means a replacement could invalidate the active
-// query's conversation or unfinished tool block. No mutation was applied.
-var ErrActiveHistoryMutation = errors.New("agent: history replacement would invalidate an active query")
+// query's conversation or an independent manual compaction publication.
+// No mutation was applied.
+var ErrActiveHistoryMutation = errors.New("agent: history replacement would invalidate an active query or manual compaction")
 
 var errAssistantHistoryChanged = errors.New("agent: current assistant history changed before continuation finalization")
 
@@ -18,10 +19,12 @@ var errAssistantHistoryChanged = errors.New("agent: current assistant history ch
 // system-context update during a query. Non-system messages must retain their
 // full JSON identity and any open tool/continuation tail must remain unchanged.
 // System updates affect the next logical request, not its captured predecessor.
+// An independent manual compaction rejects all replacements until publication
+// completes, including System-only updates and callback attempts.
 func (a *Agent) ReplaceHistoryChecked(messages []llm.Message) error {
 	a.mu.Lock()
 	owned := llm.CloneMessages(messages)
-	if a.turnActive.Load() && !activeHistoryReplacementSafe(a.messages, owned) {
+	if a.manualCompactionActive || (a.turnActive.Load() && !activeHistoryReplacementSafe(a.messages, owned)) {
 		a.mu.Unlock()
 		return ErrActiveHistoryMutation
 	}

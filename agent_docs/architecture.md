@@ -600,9 +600,16 @@ reset ephemeral tracking or clean result dumps. Idle behavior remains unchanged.
 Continuation updates locate the current assistant by complete JSON identity
 under that mutex, rather than an index captured before System prefix changes.
 `llm.OpenToolCallBlockStart` is shared with compaction protection and is a
-conservative locator, not a second full Tool Pair validator. These public-query
-mutation guarantees do not claim to serialize independent manual compaction or
-freeze mutable runtime dependency handles.
+conservative locator, not a second full Tool Pair validator. Public manual
+compaction now shares query admission: CompactPipelineNow owns the boundary
+through snapshot, calculation, checkpoint and publication. CompactNow and
+CompactLocalNow reuse it; conflicting queries/manual calls return ErrAgentBusy,
+and all external history replacements (including System updates) are rejected.
+No history mutex is held across model or host callbacks. Query-owned automatic
+compaction retains its existing private lifecycle. Hosts must not treat busy as
+permission for emergency fallback. Public checkpoint-only commit followed by
+host history replacement still has a separate publication boundary; this does
+not add an atomic host transaction or freeze mutable runtime dependency handles.
 
 ## Runtime Compaction Configuration Updates
 
