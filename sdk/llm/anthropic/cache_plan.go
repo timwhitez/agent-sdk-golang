@@ -9,6 +9,50 @@ import (
 type messageCacheLocation struct {
 	system, plain, eligible bool
 	message, block          int
+	blocks                  map[cacheSourceKey]messageCacheLocation
+}
+
+type cacheSourceKey struct {
+	source string
+	index  int
+}
+
+func newCacheLocations(request llm.InvokeRequest, targets []llm.CacheTarget) ([]messageCacheLocation, []llm.CacheTargetDescriptor) {
+	var locations []messageCacheLocation
+	needBlocks := false
+	for _, target := range targets {
+		if target.Kind != llm.CacheAfterMessage && target.Kind != llm.CacheAfterMessageBlock {
+			continue
+		}
+		if locations == nil {
+			locations = make([]messageCacheLocation, len(request.Messages))
+		}
+		if target.Kind == llm.CacheAfterMessageBlock && target.MessageIndex >= 0 && target.MessageIndex < len(locations) {
+			if locations[target.MessageIndex].blocks == nil {
+				locations[target.MessageIndex].blocks = make(map[cacheSourceKey]messageCacheLocation)
+			}
+			needBlocks = true
+		}
+	}
+	if needBlocks {
+		return locations, llm.CacheTargets(request)
+	}
+	return locations, nil
+}
+
+func cacheLocation(target llm.CacheTarget, locations []messageCacheLocation, descriptors []llm.CacheTargetDescriptor) messageCacheLocation {
+	if target.MessageIndex < 0 || target.MessageIndex >= len(locations) {
+		return messageCacheLocation{}
+	}
+	if target.Kind == llm.CacheAfterMessage {
+		return locations[target.MessageIndex]
+	}
+	for _, descriptor := range descriptors {
+		if descriptor.Target.Kind == llm.CacheAfterMessageBlock && descriptor.Target.MessageIndex == target.MessageIndex && descriptor.Target.BlockOrdinal == target.BlockOrdinal {
+			return locations[target.MessageIndex].blocks[cacheSourceKey{descriptor.Source, descriptor.SourceIndex}]
+		}
+	}
+	return messageCacheLocation{}
 }
 
 func cacheableContentBoundary(source llm.ContentBlock, wire contentBlockParam) bool {
@@ -27,13 +71,7 @@ func cacheableContentBoundary(source llm.ContentBlock, wire contentBlockParam) b
 // with warnings disabled. Tool-only plans do not need message serialization.
 func (c *Client) PromptCacheTargetEligibility(request llm.InvokeRequest, targets []llm.CacheTarget) []bool {
 	eligible := make([]bool, len(targets))
-	var locations []messageCacheLocation
-	for _, target := range targets {
-		if target.Kind == llm.CacheAfterMessage {
-			locations = make([]messageCacheLocation, len(request.Messages))
-			break
-		}
-	}
+	locations, descriptors := newCacheLocations(request, targets)
 	if locations != nil {
 		if _, _, err := serializeMessagesWithLocations(request.Messages, nil, locations); err != nil {
 			locations = nil
@@ -43,8 +81,8 @@ func (c *Client) PromptCacheTargetEligibility(request llm.InvokeRequest, targets
 		switch target.Kind {
 		case llm.CacheAfterToolDefinition:
 			eligible[i] = target.ToolIndex >= 0 && target.ToolIndex < len(request.Tools)
-		case llm.CacheAfterMessage:
-			eligible[i] = target.MessageIndex >= 0 && target.MessageIndex < len(locations) && locations[target.MessageIndex].eligible
+		case llm.CacheAfterMessage, llm.CacheAfterMessageBlock:
+			eligible[i] = cacheLocation(target, locations, descriptors).eligible
 		}
 	}
 	return eligible
@@ -53,7 +91,7 @@ func (c *Client) PromptCacheTargetEligibility(request llm.InvokeRequest, targets
 // applyCachePlan only touches newly serialized objects, after all destinations
 // pass validation. A collapsed system string can be wrapped whole, not split
 // to invent earlier source boundaries. Existing structured blocks keep shape.
-func applyCachePlan(plan *llm.CachePlan, system *any, messages []messageParam, tools []toolParam, locations []messageCacheLocation) error {
+func applyCachePlan(plan *llm.CachePlan, system *any, messages []messageParam, tools []toolParam, locations []messageCacheLocation, sources []llm.CacheTargetDescriptor) error {
 	if len(plan.Directives) > 4 {
 		return &llm.CachePlanValidationError{Reason: "breakpoint_limit", DirectiveIndex: -1}
 	}
@@ -68,9 +106,9 @@ func applyCachePlan(plan *llm.CachePlan, system *any, messages []messageParam, t
 			if target.ToolIndex >= 0 && target.ToolIndex < len(tools) {
 				destination = &tools[target.ToolIndex].CacheCtrl
 			}
-		case llm.CacheAfterMessage:
+		case llm.CacheAfterMessage, llm.CacheAfterMessageBlock:
 			if target.MessageIndex >= 0 && target.MessageIndex < len(locations) {
-				location := locations[target.MessageIndex]
+				location := cacheLocation(target, locations, sources)
 				if location.eligible {
 					if location.system {
 						if location.plain {

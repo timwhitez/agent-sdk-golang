@@ -27,7 +27,7 @@ func TestCachePlanAttachmentPreservesLegacyWireGolden(t *testing.T) {
 				var baseline []byte
 				for _, plan := range []*llm.CachePlan{nil, {Directives: []llm.CacheDirective{}}, {
 					SchemaVersion: llm.CachePlanSchemaVersion,
-					Directives:    []llm.CacheDirective{{Target: llm.CacheTarget{Kind: llm.CacheAfterMessageBlock}, Policy: llm.CacheBestEffort}},
+					Directives:    []llm.CacheDirective{{Target: llm.CacheTarget{Kind: llm.CacheAfterMessageBlock}, Policy: llm.CacheBestEffort, TTL: llm.CacheTTL1Hour}},
 				}} {
 					calls := 0
 					var payload []byte

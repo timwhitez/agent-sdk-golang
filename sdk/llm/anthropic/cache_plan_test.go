@@ -13,7 +13,7 @@ func TestToolCacheMappingGuardDoesNotPartiallyRewrite(t *testing.T) {
 		tools := []toolParam{{Name: "fixture", CacheCtrl: &cacheControl{Type: "ephemeral"}}}
 		before, _ := json.Marshal(tools)
 		var system any
-		err := applyCachePlan(&llm.CachePlan{Directives: []llm.CacheDirective{{Target: target}}}, &system, nil, tools, nil)
+		err := applyCachePlan(&llm.CachePlan{Directives: []llm.CacheDirective{{Target: target}}}, &system, nil, tools, nil, nil)
 		after, _ := json.Marshal(tools)
 		if err == nil || string(before) != string(after) {
 			t.Fatal("invalid mapping changed payload", err)
@@ -25,14 +25,14 @@ func TestToolCacheMappingGuardDoesNotPartiallyRewrite(t *testing.T) {
 	} {
 		tools := []toolParam{{CacheCtrl: &cacheControl{Type: "ephemeral"}}}
 		var system any
-		if err := applyCachePlan(plan, &system, nil, tools, nil); err == nil || tools[0].CacheCtrl == nil {
+		if err := applyCachePlan(plan, &system, nil, tools, nil, nil); err == nil || tools[0].CacheCtrl == nil {
 			t.Fatal("limit/TTL guard failed")
 		}
 	}
 }
 
 func BenchmarkToolCacheRequestBuilder(b *testing.B) {
-	for _, mode := range []string{"legacy", "explicit", "message"} {
+	for _, mode := range []string{"legacy", "explicit", "message", "block"} {
 		b.Run(mode, func(b *testing.B) {
 			client := &Client{ModelName: "fixture", MaxTokens: 64, MaxCachedToolDefinitions: 1}
 			request := llm.InvokeRequest{Messages: []llm.Message{{Role: llm.RoleSystem, Content: llm.TextContent(strings.Repeat("x", 1024)), Cache: true}, {Role: llm.RoleUser, Content: llm.TextContent("hello"), Cache: true}}, Tools: []llm.ToolDefinition{{Name: "first"}, {Name: "second"}}}
@@ -44,6 +44,9 @@ func BenchmarkToolCacheRequestBuilder(b *testing.B) {
 				target := llm.CacheTarget{Kind: llm.CacheAfterToolDefinition}
 				if mode == "message" {
 					target = llm.CacheTarget{Kind: llm.CacheAfterMessage, MessageIndex: 1}
+				}
+				if mode == "block" {
+					target = llm.CacheTarget{Kind: llm.CacheAfterMessageBlock, MessageIndex: 1}
 				}
 				request.CachePlan, err = view.Bind([]llm.CacheDirective{{Target: target, Policy: llm.CacheRequired, TTL: llm.CacheTTL5Minutes}})
 				if err != nil {
@@ -68,7 +71,7 @@ func TestMessageMappingGuardDoesNotPartiallyWrapSystem(t *testing.T) {
 		{Target: llm.CacheTarget{Kind: llm.CacheAfterToolDefinition, ToolIndex: 99}},
 	}}
 	locations := []messageCacheLocation{{system: true, plain: true, eligible: true}}
-	if err := applyCachePlan(plan, &system, nil, nil, locations); err == nil {
+	if err := applyCachePlan(plan, &system, nil, nil, locations, nil); err == nil {
 		t.Fatal("invalid second destination accepted")
 	}
 	if system != "original\n\ntext" {
