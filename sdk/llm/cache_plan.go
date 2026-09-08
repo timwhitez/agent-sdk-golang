@@ -81,8 +81,12 @@ type PromptCacheCapabilities struct {
 	ExplicitContentBlock    bool
 	ExplicitToolDefinition  bool
 	SupportedTTLs           []CacheTTL
-	MaxBreakpoints          int
-	UsageTelemetry          bool
+	// MaxBreakpoints bounds explicit logical directives; zero permits none.
+	// Provider-default TTL needs no SupportedTTLs entry. Explicit TTLs do.
+	MaxBreakpoints int
+	// UsageTelemetry means the client can normalize optional cache usage;
+	// it does not promise that a particular response contains it.
+	UsageTelemetry bool
 }
 
 // Clone returns an owned capability snapshot.

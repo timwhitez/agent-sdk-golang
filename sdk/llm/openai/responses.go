@@ -55,6 +55,12 @@ func (c *ResponsesClient) Provider() string { return openAIProviderLabel(c.Provi
 
 func (c *ResponsesClient) Model() string { return c.ModelName }
 
+// PromptCacheCapabilities does not promise implicit provider cache hits or
+// explicit CachePlan mapping; only optional usage normalization exists today.
+func (c *ResponsesClient) PromptCacheCapabilities() llm.PromptCacheCapabilities {
+	return llm.PromptCacheCapabilities{UsageTelemetry: true}
+}
+
 func (c *ResponsesClient) Invoke(ctx context.Context, req llm.InvokeRequest) (*llm.Completion, error) {
 	local := *c
 	local.Extra = cloneMap(c.Extra)
