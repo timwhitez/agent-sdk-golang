@@ -28,8 +28,8 @@ const (
 )
 
 // CacheTarget identifies an object in a normalized, already-materialized
-// request. Only fields selected by Kind are meaningful. Fingerprints bind the
-// intent without retaining Prompt, Tool Result, or Tool Definition text.
+// request. Only fields selected by Kind are meaningful. CacheTargetView defines
+// logical ordinals and binds by an owned request snapshot, not a wire index.
 type CacheTarget struct {
 	Kind CacheTargetKind
 
@@ -37,6 +37,8 @@ type CacheTarget struct {
 	BlockOrdinal int
 	ToolIndex    int
 
+	// Reserved experimental field. CacheTargetView.Validate requires it empty;
+	// it does not generate or trust caller-supplied content fingerprints.
 	ExpectedObjectFingerprint string
 }
 
@@ -51,7 +53,9 @@ type CacheDirective struct {
 // Provider adapters do not consume this type until explicit validation and
 // capability-gated mapping are added.
 type CachePlan struct {
-	SchemaVersion      int
+	SchemaVersion int
+	// Reserved experimental field; unused by providers. CacheTargetView uses
+	// its retained request snapshot instead and requires this field empty.
 	RequestFingerprint string
 	Directives         []CacheDirective
 }
