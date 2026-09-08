@@ -106,3 +106,12 @@ func (capabilities PromptCacheCapabilities) Clone() PromptCacheCapabilities {
 type PromptCacheCapabilityProvider interface {
 	PromptCacheCapabilities() PromptCacheCapabilities
 }
+
+// PromptCacheTargetEligibilityProvider optionally refines global capabilities
+// using the concrete serializer. Results correspond to targets in input order;
+// false means the exact boundary cannot be mapped. Decide supplies owned copies
+// and checks eligibility before reserving capacity. No network or diagnostics
+// should be emitted by this request-local preflight.
+type PromptCacheTargetEligibilityProvider interface {
+	PromptCacheTargetEligibility(InvokeRequest, []CacheTarget) []bool
+}

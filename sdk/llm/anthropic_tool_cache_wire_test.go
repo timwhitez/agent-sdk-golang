@@ -217,7 +217,7 @@ func TestCacheAdmissionMixedSummaryDoesNotMislabelAccepted(t *testing.T) {
 	var directives []llm.CacheDirective
 	for i := 0; i < 32; i++ {
 		request.Messages = append(request.Messages, llm.Message{Role: llm.RoleUser, Content: llm.TextContent("private-text")})
-		directives = append(directives, llm.CacheDirective{Target: llm.CacheTarget{Kind: llm.CacheAfterMessage, MessageIndex: i}, Policy: llm.CacheBestEffort})
+		directives = append(directives, llm.CacheDirective{Target: llm.CacheTarget{Kind: llm.CacheAfterMessageBlock, MessageIndex: i}, Policy: llm.CacheBestEffort})
 	}
 	directives = append(directives, toolDirective(0, llm.CacheRequired, ""))
 	bindToolCache(t, &request, directives)
