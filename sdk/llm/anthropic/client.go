@@ -73,6 +73,12 @@ func (c *Client) warnf(format string, args ...any) {
 
 func (c *Client) Provider() string { return "anthropic" }
 
+// PromptCacheCapabilities reports explicit CachePlan mapping, not legacy
+// Message.Cache/MaxCachedToolDefinitions. Those legacy controls remain separate.
+func (c *Client) PromptCacheCapabilities() llm.PromptCacheCapabilities {
+	return llm.PromptCacheCapabilities{UsageTelemetry: true}
+}
+
 func (c *Client) Model() string { return c.ModelName }
 
 func (c *Client) Invoke(ctx context.Context, req llm.InvokeRequest) (*llm.Completion, error) {
