@@ -6,13 +6,17 @@ stream normalization, and response metadata behavior.
 ## Shared LLM Contracts
 - `InvokeRequest.CachePlan` is experimental in-memory intent, owned by
   `CloneInvokeRequest` and the private execution frame, and excluded from JSON.
-  Built-in serializers still ignore it: fingerprint/target validation,
-  required/best-effort policy and capability-gated wire mapping are not enabled.
+  Bind nonempty plans with `CacheTargetView.Bind`. Built-in buffered/streaming
+  entrypoints clone and validate that original binding before network I/O:
+  stale/unbound/unsupported Required plans fail; Best-effort skips produce bounded
+  `Completion.Diagnostics` and warning-sink metadata. Explicit wire mapping is
+  still unavailable; nil/empty plans preserve the legacy path.
   Legacy `Message.Cache` behavior is unchanged; do not use the new field as a
   cache-control guarantee. No Agent Config or host plan generator is added.
-  Adding this exported field preserves keyed literals but external unkeyed
-  `InvokeRequest` literals must be updated. Message/Completion layouts and
-  session JSON are unchanged.
+  `CachePlan` now includes a private binding and `ResponsesClient` supports the
+  existing `WarningSinkSetter` pattern. External unkeyed literals need updating;
+  JSON cannot restore a valid binding. Message/Completion layouts and session
+  JSON remain unchanged. No content fingerprints or Git-hash gates are added.
 - Provider-neutral interfaces: `ChatModel`, `StreamingChatModel` (`sdk/llm/model.go:8`, `sdk/llm/model.go:17`)
 - Unified request envelope: `InvokeRequest` (messages, tools, tool choice, temperature, responses options) (`sdk/llm/model.go:82`)
 - Unified stream event union: text/thinking/tool-call deltas, usage, done, response metadata, errors (`sdk/llm/model.go:24`, `sdk/llm/model.go:28`, `sdk/llm/model.go:33`, `sdk/llm/model.go:39`, `sdk/llm/model.go:50`, `sdk/llm/model.go:55`, `sdk/llm/model.go:62`, `sdk/llm/model.go:70`)

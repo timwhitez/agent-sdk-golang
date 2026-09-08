@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log"
 	"net/http"
 	"strconv"
 	"strings"
@@ -49,6 +50,18 @@ type ResponsesClient struct {
 	// instead of the official array-of-content-parts form.
 	// Some OpenAI-compatible gateways (e.g. certain enterprise proxies) require this.
 	ForceStringInput bool
+
+	Warningf func(format string, args ...any)
+}
+
+func (c *ResponsesClient) SetWarningf(warnf func(string, ...any)) { c.Warningf = warnf }
+
+func (c *ResponsesClient) warnf(format string, args ...any) {
+	if c != nil && c.Warningf != nil {
+		c.Warningf(format, args...)
+		return
+	}
+	log.Printf(format, args...)
 }
 
 func (c *ResponsesClient) Provider() string { return openAIProviderLabel(c.ProviderLabel) }
@@ -62,6 +75,10 @@ func (c *ResponsesClient) PromptCacheCapabilities() llm.PromptCacheCapabilities 
 }
 
 func (c *ResponsesClient) Invoke(ctx context.Context, req llm.InvokeRequest) (*llm.Completion, error) {
+	req, cacheDiagnostics, err := llm.AdmitCachePlan(ctx, req, c, c.warnf)
+	if err != nil {
+		return nil, err
+	}
 	local := *c
 	local.Extra = cloneMap(c.Extra)
 	local.ExtraBody = cloneMap(c.ExtraBody)
@@ -72,7 +89,7 @@ func (c *ResponsesClient) Invoke(ctx context.Context, req llm.InvokeRequest) (*l
 	lastErr := error(nil)
 
 	retry := resolveRetryPolicy(local.MaxRetries, local.RetryBaseDelay, local.RetryMaxDelay)
-	diagnostics := []llm.Diagnostic{}
+	diagnostics := cacheDiagnostics
 
 	autoCompat := shouldAutoCompat(req)
 	compatStage := responsesCompatFull
@@ -386,6 +403,10 @@ func looksLikeResponsesInputUnsupported(msg string) bool {
 // InvokeStream implements true SSE streaming for OpenAI responses.
 // It emits text deltas and basic tool-call deltas (best-effort).
 func (c *ResponsesClient) InvokeStream(ctx context.Context, req llm.InvokeRequest) (<-chan llm.StreamEvent, error) {
+	req, _, err := llm.AdmitCachePlan(ctx, req, c, c.warnf)
+	if err != nil {
+		return nil, err
+	}
 	// Keep provider production separate from caller delivery. If a caller stops
 	// consuming, cancellation switches the forwarding goroutine to drain-and-drop
 	// mode so the producer can finish and close the response body.

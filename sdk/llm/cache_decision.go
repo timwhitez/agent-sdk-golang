@@ -25,7 +25,7 @@ type CachePlanDecision struct {
 // Decide validates against the retained view, queries the actual model's
 // optional capability interface once, and allocates logical breakpoints.
 // It never invokes the model, changes request/history, or guesses from names.
-// No production provider invokes this opt-in helper yet.
+// Built-in admission reuses this helper; it can also be called without sending.
 //
 // Invalid/stale plans fail for both policies. Required directives reserve
 // capacity first; remaining best-effort directives are kept in input order.

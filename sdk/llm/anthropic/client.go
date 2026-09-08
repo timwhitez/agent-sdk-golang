@@ -82,6 +82,10 @@ func (c *Client) PromptCacheCapabilities() llm.PromptCacheCapabilities {
 func (c *Client) Model() string { return c.ModelName }
 
 func (c *Client) Invoke(ctx context.Context, req llm.InvokeRequest) (*llm.Completion, error) {
+	req, cacheDiagnostics, err := llm.AdmitCachePlan(ctx, req, c, c.warnf)
+	if err != nil {
+		return nil, err
+	}
 	client := redirectSafeHTTPClient(c.httpClient())
 	baseURL := strings.TrimRight(c.baseURL(), "/")
 	endpoint := anthropicEndpoint(baseURL, "messages")
@@ -102,7 +106,7 @@ func (c *Client) Invoke(ctx context.Context, req llm.InvokeRequest) (*llm.Comple
 	localBeta := append([]string(nil), c.Beta...)
 	localThinking := c.configuredThinking()
 	usedFinalDowngradeRetry := false
-	diagnostics := []llm.Diagnostic{}
+	diagnostics := cacheDiagnostics
 
 	for attempt := 0; attempt < maxRetries+1; attempt++ {
 		if err := ctx.Err(); err != nil {
@@ -656,6 +660,10 @@ type requestPayload struct {
 // InvokeStream implements true SSE streaming for Anthropic messages.
 // It emits text deltas, thinking deltas, and basic tool_use deltas (best-effort).
 func (c *Client) InvokeStream(ctx context.Context, req llm.InvokeRequest) (<-chan llm.StreamEvent, error) {
+	req, _, err := llm.AdmitCachePlan(ctx, req, c, c.warnf)
+	if err != nil {
+		return nil, err
+	}
 	out := make(chan llm.StreamEvent, 128)
 	go func() {
 		defer close(out)

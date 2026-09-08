@@ -50,14 +50,16 @@ type CacheDirective struct {
 
 // CachePlan is request-local optimization intent. It must not be written into
 // conversation history or treated as proof that a Provider cache was hit.
-// Provider adapters do not consume this type until explicit validation and
-// capability-gated mapping are added.
+// Bind a nonempty plan with CacheTargetView.Bind before passing it to a built-in
+// client. Clients enforce admission, but explicit wire mapping is not available.
 type CachePlan struct {
 	SchemaVersion int
 	// Reserved experimental field; unused by providers. CacheTargetView uses
 	// its retained request snapshot instead and requires this field empty.
 	RequestFingerprint string
 	Directives         []CacheDirective
+	// Immutable request binding, shared safely by CloneCachePlan. Never serialized.
+	view *CacheTargetView
 }
 
 // CloneCachePlan returns an owned copy while preserving nil versus non-nil
