@@ -26,8 +26,8 @@ func TestCachePlanAttachmentPreservesLegacyWireGolden(t *testing.T) {
 			t.Run(fmt.Sprintf("%s/stream=%v", provider, stream), func(t *testing.T) {
 				var baseline []byte
 				for _, plan := range []*llm.CachePlan{nil, {Directives: []llm.CacheDirective{}}, {
-					SchemaVersion: -1, RequestFingerprint: "private-plan-marker",
-					Directives: []llm.CacheDirective{{Target: llm.CacheTarget{Kind: llm.CacheAfterMessageBlock, MessageIndex: -1, ExpectedObjectFingerprint: "private-plan-marker"}, Policy: llm.CacheRequired, TTL: "unsupported"}},
+					SchemaVersion: llm.CachePlanSchemaVersion,
+					Directives:    []llm.CacheDirective{{Target: llm.CacheTarget{Kind: llm.CacheAfterToolDefinition}, Policy: llm.CacheBestEffort}},
 				}} {
 					calls := 0
 					var payload []byte
@@ -53,6 +53,17 @@ func TestCachePlanAttachmentPreservesLegacyWireGolden(t *testing.T) {
 						Messages:  []llm.Message{{Role: llm.RoleSystem, Content: llm.TextContent("system"), Cache: true}, {Role: llm.RoleUser, Content: llm.TextContent("hello"), Cache: true}},
 						Tools:     []llm.ToolDefinition{{Name: "work", Description: "fixture", Parameters: map[string]any{"type": "object"}}},
 						CachePlan: plan,
+					}
+					if plan != nil && len(plan.Directives) != 0 {
+						view, err := llm.NewCacheTargetView(request)
+						if err != nil {
+							t.Fatal(err)
+						}
+						plan, err = view.Bind(plan.Directives)
+						if err != nil {
+							t.Fatal(err)
+						}
+						request.CachePlan = plan
 					}
 					before, err := json.Marshal(request.Messages)
 					if err != nil {
@@ -90,7 +101,7 @@ func TestCachePlanAttachmentPreservesLegacyWireGolden(t *testing.T) {
 					if baseline == nil {
 						baseline = payload
 					} else if !bytes.Equal(payload, baseline) {
-						t.Fatal("inert plan changed legacy payload")
+						t.Fatal("skipped best-effort plan changed legacy payload")
 					}
 				}
 				// Fixed local wire golden: no remote endpoint is contacted.

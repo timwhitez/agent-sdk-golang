@@ -130,9 +130,9 @@ type InvokeRequest struct {
 	// Responses options (OpenAI Responses API). Ignored by providers that don't use it.
 	Responses *ResponsesOptions
 
-	// CachePlan is experimental, in-memory request-local intent. It is cloned
-	// with the request but excluded from JSON and not consumed by providers yet;
-	// neither required nor best-effort policies are enforced at this stage.
-	// Do not rely on it for cache control until capability-gated mapping exists.
+	// CachePlan is in-memory request-local intent, cloned but excluded from JSON.
+	// Built-in clients require nonempty plans bound with CacheTargetView.Bind;
+	// they reject required unsupported/stale intent and diagnose best-effort skips.
+	// Explicit wire mapping is not implemented; nil/empty plans retain legacy behavior.
 	CachePlan *CachePlan `json:"-"`
 }

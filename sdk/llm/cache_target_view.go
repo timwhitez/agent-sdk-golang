@@ -135,11 +135,11 @@ func (view *CacheTargetView) Targets() []CacheTargetDescriptor {
 }
 
 // Validate checks a plan against this retained view and the current request.
-// This is an opt-in pure check, not Provider admission: no client invokes it yet.
+// This is a pure check; built-in admission reuses it through AdmitCachePlan.
 // Nil plans require no check. Fingerprint fields from the experimental API are
 // unsupported here; the retained owned snapshot supplies the binding instead.
 // Both policies require valid structure; capability/TTL support and best-effort
-// downgrade remain the responsibility of a future Provider admission layer.
+// downgrade are handled by Decide and the Provider admission layer.
 func (view *CacheTargetView) Validate(request InvokeRequest, plan *CachePlan) error {
 	if plan == nil {
 		return nil

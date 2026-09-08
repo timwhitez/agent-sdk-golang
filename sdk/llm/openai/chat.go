@@ -94,6 +94,10 @@ func (c *ChatClient) PromptCacheCapabilities() llm.PromptCacheCapabilities {
 }
 
 func (c *ChatClient) Invoke(ctx context.Context, req llm.InvokeRequest) (*llm.Completion, error) {
+	req, cacheDiagnostics, err := llm.AdmitCachePlan(ctx, req, c, c.warnf)
+	if err != nil {
+		return nil, err
+	}
 	local := *c
 	local.Extra = cloneMap(c.Extra)
 	local.ExtraBody = cloneMap(c.ExtraBody)
@@ -104,7 +108,7 @@ func (c *ChatClient) Invoke(ctx context.Context, req llm.InvokeRequest) (*llm.Co
 	lastErr := error(nil)
 
 	retry := resolveRetryPolicy(local.MaxRetries, local.RetryBaseDelay, local.RetryMaxDelay)
-	diagnostics := []llm.Diagnostic{}
+	diagnostics := cacheDiagnostics
 
 	for attempt := 0; attempt < retry.maxRetries; attempt++ {
 		if err := ctx.Err(); err != nil {
@@ -212,6 +216,10 @@ func (c *ChatClient) Invoke(ctx context.Context, req llm.InvokeRequest) (*llm.Co
 // InvokeStream implements true SSE streaming for OpenAI chat/completions.
 // It emits text deltas and tool_call deltas.
 func (c *ChatClient) InvokeStream(ctx context.Context, req llm.InvokeRequest) (<-chan llm.StreamEvent, error) {
+	req, _, err := llm.AdmitCachePlan(ctx, req, c, c.warnf)
+	if err != nil {
+		return nil, err
+	}
 	// Keep provider production separate from caller delivery. If a caller stops
 	// consuming, cancellation switches the forwarding goroutine to drain-and-drop
 	// mode so the producer can finish and close the response body.

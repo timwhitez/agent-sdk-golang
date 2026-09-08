@@ -78,10 +78,21 @@ func TestAnthropicLegacyCacheBoundaryWireGolden(t *testing.T) {
 			t.Run(fmt.Sprintf("%s/stream=%v", fixture.name, stream), func(t *testing.T) {
 				var baseline []byte
 				for _, plan := range []*llm.CachePlan{nil, {Directives: []llm.CacheDirective{}}, {
-					SchemaVersion: -1, RequestFingerprint: "private-plan-marker",
-					Directives: []llm.CacheDirective{{Target: llm.CacheTarget{Kind: llm.CacheAfterMessageBlock, MessageIndex: -1}, Policy: llm.CacheRequired}},
+					SchemaVersion: llm.CachePlanSchemaVersion,
+					Directives:    []llm.CacheDirective{{Target: llm.CacheTarget{Kind: llm.CacheAfterToolDefinition}, Policy: llm.CacheBestEffort}},
 				}} {
 					request := llm.InvokeRequest{Messages: llm.CloneMessages(fixture.messages), Tools: tools, CachePlan: plan}
+					if plan != nil && len(plan.Directives) != 0 {
+						view, err := llm.NewCacheTargetView(request)
+						if err != nil {
+							t.Fatal(err)
+						}
+						plan, err = view.Bind(plan.Directives)
+						if err != nil {
+							t.Fatal(err)
+						}
+						request.CachePlan = plan
+					}
 					before, err := llm.CloneInvokeRequest(request)
 					if err != nil {
 						t.Fatal(err)
@@ -125,7 +136,7 @@ func TestAnthropicLegacyCacheBoundaryWireGolden(t *testing.T) {
 						}
 					}
 					if baseline != nil && !bytes.Equal(baseline, payload) {
-						t.Fatal("inert plan changed wire payload")
+						t.Fatal("skipped best-effort plan changed wire payload")
 					}
 					baseline = payload
 				}
