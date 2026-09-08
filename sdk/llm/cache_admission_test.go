@@ -362,6 +362,12 @@ func BenchmarkCacheAdmission(b *testing.B) {
 }
 
 func TestResponsesCacheWarningSinkRemainsConstructionScoped(t *testing.T) {
+	// Agent.New scans its default dump directory. Isolate this fixture from
+	// unrelated processes creating/removing indexes in the shared system temp dir.
+	temporary := t.TempDir()
+	t.Setenv("TMPDIR", temporary)
+	t.Setenv("TMP", temporary)
+	t.Setenv("TEMP", temporary)
 	var configured, child atomic.Int32
 	model := admissionModel("responses", func(r *http.Request) (*http.Response, error) {
 		return &http.Response{StatusCode: 401, Header: make(http.Header), Body: io.NopCloser(strings.NewReader(`{"error":{"message":"fixture"}}`)), Request: r}, nil
@@ -384,6 +390,6 @@ func TestResponsesCacheWarningSinkRemainsConstructionScoped(t *testing.T) {
 	}
 	workers.Wait()
 	if configured.Load() != 80 || child.Load() != 0 {
-		t.Fatal("shared child construction replaced the fixed client diagnostic sink")
+		t.Fatalf("shared child construction sink: configured=%d child=%d", configured.Load(), child.Load())
 	}
 }
