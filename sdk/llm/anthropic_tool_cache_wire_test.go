@@ -138,7 +138,8 @@ func TestAnthropicToolCacheFailuresBeforeNetwork(t *testing.T) {
 				directives := []llm.CacheDirective{toolDirective(0, llm.CacheRequired, "")}
 				reason, index := "unsupported_ttl", 0
 				if failure == "ttl" {
-					directives[0].TTL = llm.CacheTTL1Hour
+					directives = append(directives, toolDirective(1, llm.CacheRequired, llm.CacheTTL1Hour))
+					reason, index = "ttl_order_conflict", 1
 				}
 				if failure == "overflow" {
 					for i := 1; i < 5; i++ {

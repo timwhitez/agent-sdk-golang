@@ -173,20 +173,25 @@ func TestCacheDecisionBuiltinCapabilitiesAreConservative(t *testing.T) {
 			want.ExplicitMessageBoundary = true
 			want.ExplicitContentBlock = true
 			want.ExplicitToolDefinition, want.MaxBreakpoints = true, 4
-			want.SupportedTTLs = []llm.CacheTTL{llm.CacheTTL5Minutes}
+			want.SupportedTTLs = []llm.CacheTTL{llm.CacheTTL5Minutes, llm.CacheTTL1Hour}
 		}
 		if !ok || !reflect.DeepEqual(provider.PromptCacheCapabilities(), want) {
 			t.Fatal("builtin claims unimplemented explicit control")
 		}
 		request, view, plan := cacheDecisionFixture(t)
 		for i := range plan.Directives {
+			request.Messages[i].Content.Blocks = []llm.ContentBlock{{Type: "document", Source: &llm.DocSrc{Data: "fixture", MediaType: "application/pdf"}}}
 			plan.Directives[i].Target.Kind = llm.CacheAfterMessageBlock
-			plan.Directives[i].TTL = llm.CacheTTL1Hour
+			plan.Directives[i].Target.BlockOrdinal = 1
 		}
-		_, err := view.Decide(request, plan, model)
+		view, err := llm.NewCacheTargetView(request)
+		if err != nil {
+			t.Fatal(err)
+		}
+		_, err = view.Decide(request, plan, model)
 		reason := "unsupported_target"
 		if _, ok := model.(*anthropic.Client); ok {
-			reason = "unsupported_ttl"
+			reason = "unmappable_target"
 		}
 		assertCacheViewError(t, err, reason, 2)
 		plan.Directives[2].Policy = llm.CacheBestEffort

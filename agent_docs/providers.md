@@ -10,7 +10,7 @@ stream normalization, and response metadata behavior.
   entrypoints clone and validate that original binding before network I/O:
   stale/unbound/unsupported Required plans fail; accepted/skipped decisions produce
   bounded `Completion.Diagnostics` and warning metadata. Anthropic maps exact
-  Tool Definition and eligible Message/ContentBlock boundaries with default/5m TTL and up to
+  Tool Definition and eligible Message/ContentBlock boundaries with default/5m/1h TTL and up to
   four breakpoints. Eligibility comes from the same serialization traversal,
   before capacity allocation: hidden/empty/placeholder endpoints are not targets.
   A collapsed System string exposes only its last emitted source endpoint and
@@ -19,7 +19,10 @@ stream normalization, and response metadata behavior.
   the shared `llm.CacheTargets` metadata projection, not a raw Blocks/wire index;
   hidden/opaque/empty sources are not ordinal targets, and document placeholders
   are unmappable. Tool Results expose only their outer result block. A collapsed
-  System string exposes only its final actual endpoint. 1h TTL remains unsupported.
+  System string exposes only its final actual endpoint. Mixed TTLs follow actual
+  tools/system/messages wire order: long TTLs must precede short/default TTLs.
+  Required conflicts reject before network; best-effort entries are selected in
+  original priority order only when compatible, without rewriting TTL or Prompt.
   An accepted plan overrides
   legacy cache markers without changing block shape/text/order. All-skipped,
   nil and empty plans preserve the legacy path. See the official

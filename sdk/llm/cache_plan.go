@@ -115,3 +115,10 @@ type PromptCacheCapabilityProvider interface {
 type PromptCacheTargetEligibilityProvider interface {
 	PromptCacheTargetEligibility(InvokeRequest, []CacheTarget) []bool
 }
+
+// PromptCacheTTLOrderProvider reports actual wire positions for clients that
+// require longer TTLs before shorter ones. Negative positions are unmappable;
+// equal positions identify the same breakpoint. Results follow target input order.
+type PromptCacheTTLOrderProvider interface {
+	PromptCacheTTLOrder(InvokeRequest, []CacheTarget) []int
+}
