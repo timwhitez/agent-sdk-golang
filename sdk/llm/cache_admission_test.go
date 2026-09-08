@@ -373,28 +373,32 @@ func TestResponsesCacheWarningSinkRemainsConstructionScoped(t *testing.T) {
 	t.Setenv("TMPDIR", temporary)
 	t.Setenv("TMP", temporary)
 	t.Setenv("TEMP", temporary)
-	var configured, child atomic.Int32
-	model := admissionModel("responses", func(r *http.Request) (*http.Response, error) {
-		return &http.Response{StatusCode: 401, Header: make(http.Header), Body: io.NopCloser(strings.NewReader(`{"error":{"message":"fixture"}}`)), Request: r}, nil
-	}, func(string, ...any) { configured.Add(1) })
-	request := admissionRequest(t, llm.CacheBestEffort)
-	var workers sync.WaitGroup
-	for i := 0; i < 8; i++ {
-		workers.Add(1)
-		go func() {
-			defer workers.Done()
-			for j := 0; j < 10; j++ {
-				if _, err := agent.New(agent.Config{LLM: model, Warningf: func(string, ...any) { child.Add(1) }}); err != nil {
-					t.Error(err)
-				}
-				if _, err := model.Invoke(context.Background(), request); err == nil {
-					t.Error("expected fixture rejection")
-				}
+	for _, provider := range []string{"anthropic", "chat", "responses"} {
+		t.Run(provider, func(t *testing.T) {
+			var configured, child atomic.Int32
+			model := admissionModel(provider, func(r *http.Request) (*http.Response, error) {
+				return &http.Response{StatusCode: 401, Header: make(http.Header), Body: io.NopCloser(strings.NewReader(`{"error":{"message":"fixture"}}`)), Request: r}, nil
+			}, func(string, ...any) { configured.Add(1) })
+			request := admissionRequest(t, llm.CacheBestEffort)
+			var workers sync.WaitGroup
+			for i := 0; i < 8; i++ {
+				workers.Add(1)
+				go func() {
+					defer workers.Done()
+					for j := 0; j < 10; j++ {
+						if _, err := agent.New(agent.Config{LLM: model, Warningf: func(string, ...any) { child.Add(1) }}); err != nil {
+							t.Error(err)
+						}
+						if _, err := model.Invoke(context.Background(), request); err == nil {
+							t.Error("expected fixture rejection")
+						}
+					}
+				}()
 			}
-		}()
-	}
-	workers.Wait()
-	if configured.Load() != 80 || child.Load() != 0 {
-		t.Fatalf("shared child construction sink: configured=%d child=%d", configured.Load(), child.Load())
+			workers.Wait()
+			if configured.Load() != 80 || child.Load() != 0 {
+				t.Fatalf("shared child construction sink: configured=%d child=%d", configured.Load(), child.Load())
+			}
+		})
 	}
 }
