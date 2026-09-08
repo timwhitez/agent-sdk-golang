@@ -133,6 +133,6 @@ type InvokeRequest struct {
 	// CachePlan is in-memory request-local intent, cloned but excluded from JSON.
 	// Built-in clients require nonempty plans bound with CacheTargetView.Bind;
 	// they reject required unsupported/stale intent and diagnose best-effort skips.
-	// Explicit wire mapping is not implemented; nil/empty plans retain legacy behavior.
+	// Concrete client capabilities define mapped targets; nil/empty retain legacy behavior.
 	CachePlan *CachePlan `json:"-"`
 }
