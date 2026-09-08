@@ -10,8 +10,9 @@ import (
 // executionFrame owns one logical request, not the final provider payload.
 // For continued tool calls it is the finalizing request's dispatch snapshot;
 // the merged arguments may originate from multiple earlier requests.
-// Model/Handler values retain runtime handles, not immutable closure state or
-// a dynamic model wrapper's concrete target. Only the opaque id is correlated
+// Handlers retain runtime handles, not immutable closure state. The driver
+// captures a model configuration only through explicit FrameModelBinder support;
+// unbound wrappers retain legacy behavior. Only the opaque id is correlated
 // in event metadata; request/model/resolver content is not emitted here.
 type executionFrame struct {
 	id         string
