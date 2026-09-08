@@ -53,15 +53,22 @@ func NewCacheTargetView(request InvokeRequest) (*CacheTargetView, error) {
 	if err != nil {
 		return nil, cachePlanError("uncloneable_request", -1)
 	}
-	view := &CacheTargetView{request: &owned}
-	for i, message := range owned.Messages {
+	return &CacheTargetView{request: &owned, targets: CacheTargets(owned)}, nil
+}
+
+// CacheTargets returns owned, content-free logical target metadata for a request.
+// It is the same projection used by CacheTargetView, not a new binding or proof
+// that a stale plan is valid. Callers must own inputs while this reads them.
+func CacheTargets(request InvokeRequest) []CacheTargetDescriptor {
+	var targets []CacheTargetDescriptor
+	for i, message := range request.Messages {
 		if message.Role != RoleSystem && message.Role != RoleUser && message.Role != RoleAssistant && message.Role != RoleTool {
 			continue
 		}
 		ordinal := 0
-		start := len(view.targets)
+		start := len(targets)
 		appendBlock := func(source string, index int) {
-			view.targets = append(view.targets, CacheTargetDescriptor{
+			targets = append(targets, CacheTargetDescriptor{
 				Target: CacheTarget{Kind: CacheAfterMessageBlock, MessageIndex: i, BlockOrdinal: ordinal},
 				Source: source, SourceIndex: index,
 			})
@@ -105,21 +112,21 @@ func NewCacheTargetView(request InvokeRequest) (*CacheTargetView, error) {
 				}
 			}
 		}
-		if len(view.targets) > start {
-			last := view.targets[len(view.targets)-1]
+		if len(targets) > start {
+			last := targets[len(targets)-1]
 			// This is a logical message boundary. Provider mapping must still
 			// reject unsupported/hidden trailing wire blocks instead of guessing.
 			last.Target = CacheTarget{Kind: CacheAfterMessage, MessageIndex: i}
-			view.targets = append(view.targets, last)
+			targets = append(targets, last)
 		}
 	}
-	for i := range owned.Tools {
-		view.targets = append(view.targets, CacheTargetDescriptor{
+	for i := range request.Tools {
+		targets = append(targets, CacheTargetDescriptor{
 			Target: CacheTarget{Kind: CacheAfterToolDefinition, ToolIndex: i},
 			Source: "tool_definition", SourceIndex: i,
 		})
 	}
-	return view, nil
+	return targets
 }
 
 // Targets returns an owned list. BlockOrdinal indexes visible logical blocks:

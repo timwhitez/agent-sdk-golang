@@ -171,6 +171,7 @@ func TestCacheDecisionBuiltinCapabilitiesAreConservative(t *testing.T) {
 		want := llm.PromptCacheCapabilities{UsageTelemetry: true}
 		if _, anthropicClient := model.(*anthropic.Client); anthropicClient {
 			want.ExplicitMessageBoundary = true
+			want.ExplicitContentBlock = true
 			want.ExplicitToolDefinition, want.MaxBreakpoints = true, 4
 			want.SupportedTTLs = []llm.CacheTTL{llm.CacheTTL5Minutes}
 		}
@@ -180,9 +181,14 @@ func TestCacheDecisionBuiltinCapabilitiesAreConservative(t *testing.T) {
 		request, view, plan := cacheDecisionFixture(t)
 		for i := range plan.Directives {
 			plan.Directives[i].Target.Kind = llm.CacheAfterMessageBlock
+			plan.Directives[i].TTL = llm.CacheTTL1Hour
 		}
 		_, err := view.Decide(request, plan, model)
-		assertCacheViewError(t, err, "unsupported_target", 2)
+		reason := "unsupported_target"
+		if _, ok := model.(*anthropic.Client); ok {
+			reason = "unsupported_ttl"
+		}
+		assertCacheViewError(t, err, reason, 2)
 		plan.Directives[2].Policy = llm.CacheBestEffort
 		result, err := view.Decide(request, plan, model)
 		if err != nil || len(result.Plan.Directives) != 0 || len(result.Directives) != 3 {

@@ -47,7 +47,7 @@ func admissionRequest(t *testing.T, policy llm.CacheDirectivePolicy) llm.InvokeR
 	if err != nil {
 		t.Fatal(err)
 	}
-	request.CachePlan, err = view.Bind([]llm.CacheDirective{{Target: llm.CacheTarget{Kind: llm.CacheAfterMessageBlock, MessageIndex: 1}, Policy: policy}})
+	request.CachePlan, err = view.Bind([]llm.CacheDirective{{Target: llm.CacheTarget{Kind: llm.CacheAfterMessageBlock, MessageIndex: 1}, Policy: policy, TTL: llm.CacheTTL1Hour}})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -84,6 +84,9 @@ func TestCacheAdmissionRejectsBeforeNetwork(t *testing.T) {
 				t.Run(fmt.Sprintf("%s/%v/%s", provider, stream, failure), func(t *testing.T) {
 					request := admissionRequest(t, llm.CacheRequired)
 					reason := "unsupported_target"
+					if provider == "anthropic" {
+						reason = "unsupported_ttl"
+					}
 					index := 0
 					switch failure {
 					case "view-overwrite", "view-overwrite-best-effort", "view-clear":
@@ -220,10 +223,14 @@ func TestCacheAdmissionBestEffortWireDiagnosticsAndIsolation(t *testing.T) {
 							t.Fatal("skip changed legacy wire")
 						}
 						if planned {
-							if !reflect.DeepEqual(warnings, []string{"cache_plan_skipped: directive 0: unsupported_target"}) {
+							reason := "unsupported_target"
+							if provider == "anthropic" {
+								reason = "unsupported_ttl"
+							}
+							if !reflect.DeepEqual(warnings, []string{"cache_plan_skipped: directive 0: " + reason}) {
 								t.Fatalf("warnings=%v", warnings)
 							}
-							if !stream && status == 200 && !reflect.DeepEqual(completion.Diagnostics, []llm.Diagnostic{{Kind: "cache_plan_skipped", Message: "directive 0: unsupported_target"}}) {
+							if !stream && status == 200 && !reflect.DeepEqual(completion.Diagnostics, []llm.Diagnostic{{Kind: "cache_plan_skipped", Message: "directive 0: " + reason}}) {
 								t.Fatal("missing typed completion diagnostic")
 							}
 						} else if len(warnings) != 0 {
