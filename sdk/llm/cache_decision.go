@@ -5,7 +5,8 @@ import "reflect"
 // CacheDirectiveDecision is bounded, content-free metadata for one original
 // directive. Accepted means eligible under reported capabilities, not mapped,
 // sent, or cached. Reason is accepted, unsupported_target, unsupported_ttl,
-// unmappable_target, or breakpoint_limit. No content, names, IDs, hashes or
+// unmappable_target, breakpoint_limit, ttl_order_conflict, or duplicate_boundary.
+// No content, names, IDs, hashes or
 // Provider strings are kept.
 type CacheDirectiveDecision struct {
 	DirectiveIndex int
@@ -29,7 +30,8 @@ type CachePlanDecision struct {
 // Built-in admission reuses this helper; it can also be called without sending.
 //
 // Invalid/stale plans fail for both policies. Required directives reserve
-// capacity first; remaining best-effort directives are kept in input order.
+// capacity first; remaining best-effort directives are kept in input order when
+// compatible with required/previously selected wire TTL boundaries.
 // Unsupported required directives or required overflow reject the entire plan
 // with a fixed CachePlanValidationError, never a partially accepted result.
 func (view *CacheTargetView) Decide(request InvokeRequest, plan *CachePlan, model ChatModel) (*CachePlanDecision, error) {
@@ -80,6 +82,28 @@ func (view *CacheTargetView) Decide(request InvokeRequest, plan *CachePlan, mode
 		}
 		eligible = append([]bool(nil), mapping...)
 	}
+	var order []int
+	for _, directive := range plan.Directives {
+		if directive.TTL != CacheTTL1Hour {
+			continue
+		}
+		if provider, ok := model.(PromptCacheTTLOrderProvider); ok {
+			copy, err := CloneInvokeRequest(*snapshot)
+			if err != nil {
+				return nil, cachePlanError("uncloneable_request", -1)
+			}
+			targets := make([]CacheTarget, len(plan.Directives))
+			for i, d := range plan.Directives {
+				targets[i] = d.Target
+			}
+			positions := provider.PromptCacheTTLOrder(copy, targets)
+			if len(positions) != len(targets) {
+				return nil, cachePlanError("invalid_capabilities", -1)
+			}
+			order = append([]int(nil), positions...)
+		}
+		break
+	}
 	result.Directives = make([]CacheDirectiveDecision, len(plan.Directives))
 	required := 0
 	for i, directive := range plan.Directives {
@@ -110,6 +134,9 @@ func (view *CacheTargetView) Decide(request InvokeRequest, plan *CachePlan, mode
 		if reason == "accepted" && eligible != nil && !eligible[i] {
 			reason = "unmappable_target"
 		}
+		if reason == "accepted" && order != nil && order[i] < 0 {
+			reason = "unmappable_target"
+		}
 		if directive.Policy == CacheRequired {
 			if reason != "accepted" {
 				return nil, cachePlanError(reason, i)
@@ -122,23 +149,59 @@ func (view *CacheTargetView) Decide(request InvokeRequest, plan *CachePlan, mode
 		result.Directives[i] = CacheDirectiveDecision{DirectiveIndex: i, Reason: reason}
 	}
 	remaining := caps.MaxBreakpoints - required
-	// Filter the owned slice, preserving nil/empty ownership and original order.
-	directives := result.Plan.Directives
-	result.Plan.Directives = result.Plan.Directives[:0]
-	for i, directive := range directives {
+	selected := make([]int, 0, required)
+	conflict := func(index int) string {
+		if order == nil {
+			return ""
+		}
+		for _, previous := range selected {
+			if order[index] == order[previous] {
+				return "duplicate_boundary"
+			}
+			long, previousLong := plan.Directives[index].TTL == CacheTTL1Hour, plan.Directives[previous].TTL == CacheTTL1Hour
+			if long != previousLong && ((long && order[index] > order[previous]) || (!long && order[index] < order[previous])) {
+				return "ttl_order_conflict"
+			}
+		}
+		return ""
+	}
+	for i, d := range plan.Directives {
+		if d.Policy != CacheRequired {
+			continue
+		}
+		if reason := conflict(i); reason != "" {
+			return nil, cachePlanError(reason, i)
+		}
+		selected = append(selected, i)
+	}
+	// Decide optional entries before compacting the slice: conflict lookup must
+	// keep the original directive indexes and TTLs throughout selection.
+	for i, d := range plan.Directives {
 		decision := &result.Directives[i]
 		if decision.Reason != "accepted" {
 			continue
 		}
-		if directive.Policy == CacheBestEffort {
+		if d.Policy == CacheBestEffort {
+			if reason := conflict(i); reason != "" {
+				decision.Reason = reason
+				continue
+			}
 			if remaining == 0 {
 				decision.Reason = "breakpoint_limit"
 				continue
 			}
 			remaining--
+			selected = append(selected, i)
 		}
 		decision.Accepted = true
-		result.Plan.Directives = append(result.Plan.Directives, directive)
+	}
+	// Filter the owned slice, preserving nil/empty ownership and original order.
+	directives := result.Plan.Directives
+	result.Plan.Directives = result.Plan.Directives[:0]
+	for i, directive := range directives {
+		if result.Directives[i].Accepted {
+			result.Plan.Directives = append(result.Plan.Directives, directive)
+		}
 	}
 	return result, nil
 }

@@ -21,7 +21,7 @@ func TestToolCacheMappingGuardDoesNotPartiallyRewrite(t *testing.T) {
 	}
 	for _, plan := range []*llm.CachePlan{
 		{Directives: make([]llm.CacheDirective, 5)},
-		{Directives: []llm.CacheDirective{{Target: llm.CacheTarget{Kind: llm.CacheAfterToolDefinition}, TTL: llm.CacheTTL1Hour}}},
+		{Directives: []llm.CacheDirective{{Target: llm.CacheTarget{Kind: llm.CacheAfterToolDefinition}, TTL: "invalid"}}},
 	} {
 		tools := []toolParam{{CacheCtrl: &cacheControl{Type: "ephemeral"}}}
 		var system any
@@ -76,5 +76,22 @@ func TestMessageMappingGuardDoesNotPartiallyWrapSystem(t *testing.T) {
 	}
 	if system != "original\n\ntext" {
 		t.Fatal("failed mapping partially rewrote system")
+	}
+}
+
+func TestMixedTTLBuilderGuardBeforeMutation(t *testing.T) {
+	var system any = "unchanged"
+	tools := []toolParam{{CacheCtrl: &cacheControl{Type: "ephemeral"}}, {CacheCtrl: &cacheControl{Type: "ephemeral"}}}
+	before, _ := json.Marshal(tools)
+	plan := &llm.CachePlan{Directives: []llm.CacheDirective{
+		{Target: llm.CacheTarget{Kind: llm.CacheAfterToolDefinition, ToolIndex: 1}, TTL: llm.CacheTTL1Hour},
+		{Target: llm.CacheTarget{Kind: llm.CacheAfterToolDefinition, ToolIndex: 0}},
+	}}
+	if err := applyCachePlan(plan, &system, nil, tools, nil, nil); err == nil {
+		t.Fatal("illegal wire order accepted")
+	}
+	after, _ := json.Marshal(tools)
+	if string(before) != string(after) || system != "unchanged" {
+		t.Fatal("TTL guard partially rewrote payload")
 	}
 }

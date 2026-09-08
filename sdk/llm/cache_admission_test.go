@@ -43,11 +43,12 @@ func admissionModel(provider string, transport cacheWireTransport, warning func(
 func admissionRequest(t *testing.T, policy llm.CacheDirectivePolicy) llm.InvokeRequest {
 	t.Helper()
 	request := llm.InvokeRequest{Messages: []llm.Message{{Role: llm.RoleSystem, Content: llm.TextContent("system"), Cache: true}, {Role: llm.RoleUser, Content: llm.TextContent("hello")}}}
+	request.Messages[1].Content.Blocks = []llm.ContentBlock{{Type: "document", Source: &llm.DocSrc{Data: "fixture-document", MediaType: "application/pdf"}}}
 	view, err := llm.NewCacheTargetView(request)
 	if err != nil {
 		t.Fatal(err)
 	}
-	request.CachePlan, err = view.Bind([]llm.CacheDirective{{Target: llm.CacheTarget{Kind: llm.CacheAfterMessageBlock, MessageIndex: 1}, Policy: policy, TTL: llm.CacheTTL1Hour}})
+	request.CachePlan, err = view.Bind([]llm.CacheDirective{{Target: llm.CacheTarget{Kind: llm.CacheAfterMessageBlock, MessageIndex: 1, BlockOrdinal: 1}, Policy: policy}})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -85,7 +86,7 @@ func TestCacheAdmissionRejectsBeforeNetwork(t *testing.T) {
 					request := admissionRequest(t, llm.CacheRequired)
 					reason := "unsupported_target"
 					if provider == "anthropic" {
-						reason = "unsupported_ttl"
+						reason = "unmappable_target"
 					}
 					index := 0
 					switch failure {
@@ -225,7 +226,7 @@ func TestCacheAdmissionBestEffortWireDiagnosticsAndIsolation(t *testing.T) {
 						if planned {
 							reason := "unsupported_target"
 							if provider == "anthropic" {
-								reason = "unsupported_ttl"
+								reason = "unmappable_target"
 							}
 							if !reflect.DeepEqual(warnings, []string{"cache_plan_skipped: directive 0: " + reason}) {
 								t.Fatalf("warnings=%v", warnings)

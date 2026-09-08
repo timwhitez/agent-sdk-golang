@@ -75,9 +75,9 @@ func (c *Client) Provider() string { return "anthropic" }
 
 // PromptCacheCapabilities reports implemented explicit mappings, not a promise
 // of endpoint/model acceptance or a cache hit. Request-local eligibility further
-// restricts message/block boundaries. 1h mapping remains unsupported.
+// restricts message/block boundaries; mixed TTLs follow actual wire order.
 func (c *Client) PromptCacheCapabilities() llm.PromptCacheCapabilities {
-	return llm.PromptCacheCapabilities{ExplicitMessageBoundary: true, ExplicitContentBlock: true, ExplicitToolDefinition: true, SupportedTTLs: []llm.CacheTTL{llm.CacheTTL5Minutes}, MaxBreakpoints: 4, UsageTelemetry: true}
+	return llm.PromptCacheCapabilities{ExplicitMessageBoundary: true, ExplicitContentBlock: true, ExplicitToolDefinition: true, SupportedTTLs: []llm.CacheTTL{llm.CacheTTL5Minutes, llm.CacheTTL1Hour}, MaxBreakpoints: 4, UsageTelemetry: true}
 }
 
 func (c *Client) Model() string { return c.ModelName }

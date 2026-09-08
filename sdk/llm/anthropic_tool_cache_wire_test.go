@@ -138,7 +138,8 @@ func TestAnthropicToolCacheFailuresBeforeNetwork(t *testing.T) {
 				directives := []llm.CacheDirective{toolDirective(0, llm.CacheRequired, "")}
 				reason, index := "unsupported_ttl", 0
 				if failure == "ttl" {
-					directives[0].TTL = llm.CacheTTL1Hour
+					directives = append(directives, toolDirective(1, llm.CacheRequired, llm.CacheTTL1Hour))
+					reason, index = "ttl_order_conflict", 1
 				}
 				if failure == "overflow" {
 					for i := 1; i < 5; i++ {
@@ -235,10 +236,19 @@ func TestCacheAdmissionMixedSummaryDoesNotMislabelAccepted(t *testing.T) {
 }
 
 func TestAnthropicExplicitToolCacheSurvivesBetaRetry(t *testing.T) {
-	for _, stream := range []bool{false, true} {
-		t.Run(fmt.Sprint(stream), func(t *testing.T) {
+	for _, test := range []struct {
+		stream bool
+		ttl    llm.CacheTTL
+		mixed  bool
+	}{{false, llm.CacheTTL5Minutes, false}, {true, llm.CacheTTL5Minutes, false}, {false, llm.CacheTTL1Hour, false}, {true, llm.CacheTTL1Hour, false}, {false, llm.CacheTTL1Hour, true}, {true, llm.CacheTTL1Hour, true}} {
+		stream := test.stream
+		t.Run(fmt.Sprintf("%v/%s/mixed=%v", stream, test.ttl, test.mixed), func(t *testing.T) {
 			request := toolCacheRequest()
-			bindToolCache(t, &request, []llm.CacheDirective{toolDirective(2, llm.CacheRequired, llm.CacheTTL5Minutes)})
+			directives := []llm.CacheDirective{toolDirective(2, llm.CacheRequired, test.ttl)}
+			if test.mixed {
+				directives = append(directives, toolDirective(4, llm.CacheRequired, llm.CacheTTL5Minutes))
+			}
+			bindToolCache(t, &request, directives)
 			before, err := llm.CloneInvokeRequest(request)
 			if err != nil {
 				t.Fatal(err)
@@ -267,8 +277,11 @@ func TestAnthropicExplicitToolCacheSurvivesBetaRetry(t *testing.T) {
 			client := model.(*anthropic.Client)
 			client.Beta = []string{"unsupported-beta"}
 			_, err = callAdmissionModel(context.Background(), model, request, stream)
-			if err != nil || len(payloads) != 2 || payloads[0] != payloads[1] || accepted.Load() != 1 {
+			if err != nil || len(payloads) != 2 || payloads[0] != payloads[1] || accepted.Load() != int32(len(directives)) {
 				t.Fatalf("retry count=%d accepted=%d err=%v", len(payloads), accepted.Load(), err)
+			}
+			if test.ttl == llm.CacheTTL1Hour && !strings.Contains(payloads[0], `"ttl":"1h"`) {
+				t.Fatal("long TTL fixture did not reach wire")
 			}
 			if !reflect.DeepEqual(request, before) || !reflect.DeepEqual(client.Beta, []string{"unsupported-beta"}) {
 				t.Fatal("compat retry mutated source")
