@@ -1,280 +1,50 @@
 # Testing
 
-This document summarizes recommended test commands and current coverage focus.
+## Local loop
 
-## Core Commands
-- Run all tests: `go test ./...`
-- Verbose run: `go test -v ./...`
-- Race detection: `go test -race ./...`
+```sh
+go test ./sdk/agent                 # choose the affected package
+go test ./...
+go vet ./...
+go build ./...
+```
 
-## Focused Commands by Area
-- Agent loop: `go test ./sdk/agent`
-- Accounting schema/projectors: `go test ./sdk/accounting`
-- Canonical artifact contract: `go test ./sdk/artifact`
-- Compaction service: `go test ./sdk/agent/compaction`
-- Message origin classifier: `go test ./sdk/agent/messageorigin`
-- Tools + args/schema/deps: `go test ./sdk/tools`
-- Sandbox tools: `go test ./sdk/tools/sandbox`
-- Process runner and canonical raw streams: `go test ./sdk/tools/execrunner`
-- OpenAI provider: `go test ./sdk/llm/openai`
-- Anthropic provider: `go test ./sdk/llm/anthropic`
+Format changed Go files with `gofmt`. For concurrent/stateful changes, run
+`go test -race` on the affected packages; widen the scope when behavior crosses
+package boundaries. Documentation-only changes need link/fact checks, not a
+fabricated runtime or performance claim.
 
-## Coverage Map (Representative)
-- `frame_event_boundary_test.go` freezes one cross-boundary identity fixture:
-  five SDK ChatModel.Invoke calls across four distinct request views (one
-  transient retry), continuation and two completed Tool Blocks reusing a Call
-  ID, but one QueryID and fourteen events on the existing sequence. Legacy and
-  enveloped execution retain identical requests/history, explicit event-kind
-  and origin goldens, clean final Tool Pair topology and metadata-only privacy.
-  It now also asserts the explicit Frame/SDK-invocation mapping without counting
-  HTTP attempts or retries hidden inside a model/provider wrapper.
-- `frame_correlation_test.go` covers streaming SDK retries versus provider retry
-  reports, pre-admission/backoff cancellation, retained usage's original attempt,
-  concurrent unscoped host/compaction events, terminal eviction/backpressure
-  ownership and absent-correlation JSON compatibility. The emission benchmark
-  measures metadata/channel overhead, not Frame construction or Provider cost.
-- `compaction_publication_test.go` checks combined source-checked checkpoint and
-  history publication: pre-I/O stale/pending/admission/runtime rejection,
-  callback ownership, acknowledged commit after cancellation, writer isolation,
-  ledger/write failure, no-op and memory-only behavior, and legacy successful
-  checkpoint/result parity. Benchmark measures owned-copy/content-comparison
-  publication cost without a writer, not Provider latency or a speedup. Live
-  legacy dump references survive successful/no-op/rejected publication and
-  remain removable by the existing TTL cleanup.
-- `manual_publication_test.go` covers independent manual-compaction ownership
-  through checkpoint/apply, query and nested manual admission, checked mutation
-  rejection, callback read/config-update safety and error/cancellation release.
-  Public checkpoint-only commits remain separate from host history publication;
-  this is not a new atomic host commit-and-publish API.
-- `history_mutation_test.go` covers checked/legacy Clear and Replace during
-  provider-pending and handler-active phases, actual next-request System updates,
-  rejection without history/cleanup side effects, reused completed IDs,
-  complete Message/opaque-state JSON identity, nil/empty compatibility, forbidden
-  System gaps, and continuation insertion/removal after the old index capture.
-- `tool_terminal_authority_test.go` checks whole-batch atomicity, ordinal order,
-  invalid role/identity/phase/knowledge, duplicate terminal/start/claim rejection,
-  pending-payload release, unpublishable tails and idempotent abort. Real Driver
-  failure injection proves zero execution after rejected start, conservative
-  result closure after returned effects, preservation of prior terminals and
-  consumed steering, publication rejection, and next-query zero pairing repair.
-  `BenchmarkToolBlockTerminalLifecycle` measures the new sequential lifecycle;
-  it is not a matched comparison with the former shadow-only fixture.
-- `tool_result_projection_test.go` checks the shared result record's canonical
-  history/identity/flags, explicit event-view override, original/visible
-  measurements, opaque-state exclusion from visible text, and delivery-gated
-  Accounting on absent or abandoned output. Existing guard transcript goldens
-  preserve richer history text and delayed result publication.
-- `tool_outcome_projection_test.go` joins execution knowledge, exactly one
-  history result, delivered ToolResultEvent/Accounting adjacency, original and
-  visible measurements, and Artifact disposition in one real Agent trajectory.
-  Ordinary success and TaskComplete each cover successful publication, sink
-  failure, and persisted-object/codec-budget failure. Projection failure is not
-  reclassified as an unstarted handler; terminal authority is tested separately
-  above, and history-only synthetic tail delivery remains unchanged.
-- CachePlan request attachment: `sdk/llm/cache_request_test.go` proves nil/empty
-  ownership and JSON exclusion; `cache_plan_wire_test.go` freezes buffered and
-  streaming Chat/Responses/Anthropic wire payloads with legacy cache flags and
-  injected HTTP failures. Existing Agent retry/Frame ownership fixtures include
-  CachePlan mutation isolation. No explicit cache policy enforcement is claimed.
-- `execution_frame_test.go` validates actual captured-handler dispatch across
-  exact/alias/hidden/registered and internal fallback paths, request ownership
-  across retries, finalizing continuation authority, and fail-closed snapshot
-  or structural binding errors with source-negative SDK provenance. Root
-  cancellation takes priority and unaccepted calls create no Tool Results.
-  Scaling benchmarks measure constructor plus binding checks, not Provider or
-  task success; mutable model wrappers and handler closure state remain outside
-  the snapshot guarantee.
-- `agent_continuation_provider_failure_test.go` checks terminal invocation
-  failure after an unaccepted max-token tool block: discard only abandoned
-  ToolCalls/provider state, preserve visible text and earlier completed blocks
-  with reused IDs, retain partial usage/error provenance, invent no tool
-  execution/results/accounting, and leave the next query with zero repairs.
-- `sdk/agent/agent_test.go` - max-token auto-continue metadata emission, overflow-triggered compaction checks, async compaction apply-on-next-turn behavior, structured compaction telemetry, compaction system-message deduplication, tool-call delta merge behavior, and truncation metadata/path persistence (`sdk/agent/agent_test.go:180`, `sdk/agent/agent_test.go:402`, `sdk/agent/agent_test.go:271`, `sdk/agent/agent_test.go:210`, `sdk/agent/agent_test.go:421`)
-- `sdk/accounting/projector_contract_test.go` and
-  `sdk/agent/agent_accounting_contract_test.go` cover allowlisted bounded
-  projection, independent scan/return disposition, secret/raw/path exclusion,
-  provider-usage unknown handling, compaction summary/path exclusion,
-  estimator failure, source-event adjacency, and monotonic sequence.
-- `sdk/agent/agent_artifact_boundary_test.go` - oversized canonical-envelope
-  re-encoding, byte/token budgets with CJK/emoji/no-newline fixtures, exact
-  sink-byte recovery, provider/body metadata identity, sink/capability failure
-  diagnostics without fabricated refs, invalid owner/hash/byte/recovery
-  manifest rejection, ordered raw-source to logical-result lineage for bounded
-  derived results, malformed/duplicate/owner-mismatched/ephemeral source
-  rejection, sink lineage-preservation enforcement, dynamic owner resolution
-  across session switches, provider failure, concurrent whole-owner snapshots, existing-envelope owner
-  revalidation above and below the result budget, and durable host-object survival across `ClearHistory`/
-  `ReplaceHistory`.
-- `sdk/artifact/contract_test.go` - schema/owner/lineage/measurement/retention
-  validation, explicit resolver registration, fixed recovery/continuation field
-  preservation, codec byte/token budgets, exact full-versus-truncated-prefix
-  view state, UTF-8 preview reduction, and clone
-  isolation.
-- `sdk/tools/execrunner/runner_canonical_test.go` - separate canonical
-  stdout/stderr ownership, 150 KiB tail recovery, exact stream byte/hash
-  manifests, no legacy combined duplicate in canonical mode, stream-aware
-  progress chunks, UTF-8-safe single-line CJK/emoji previews, and fail-closed
-  short-write diagnostics.
-- `sdk/agent/agent_compaction_local_test.go` - automatic Tier 1 local snip
-  compaction runs without invoking the summary model and applies through the
-  same pending-compaction boundary.
-- `sdk/agent/agent_compaction_canonical_test.go` - Agent construction and
-  compaction-config replacement retain one canonical owner/sink/resolver/
-  capability binding, while the default envelope codec alone leaves legacy
-  embedders in path-writer compatibility mode.
-- `sdk/agent/agent_stream_response_test.go` - stream response metadata is preserved into `Completion.ResponseID` and propagated into `UsageEvent` / `FinalResponseEvent` for stream consumers (`sdk/agent/agent_stream_response_test.go:31`, `sdk/agent/agent_stream_response_test.go:56`)
-- `sdk/agent/agent_steering_test.go` and
-  `sdk/agent/agent_steering_interrupt_test.go` cover steering channel ownership,
-  streaming interruption, active-tool stage cancellation without root-query
-  cancellation, partial history, continuation after steering, and the delayed
-  host-acknowledgement race where steering is already in history before the
-  current provider stage is canceled.
-- `sdk/agent/agent_cancel_boundary_test.go` proves that root-context
-  cancellation inside a tool handler stops before the next provider admission,
-  takes precedence over task-complete, closes but does not execute unstarted
-  sibling tool calls with cancellation-specific results (never false task-
-  completion text), and is rechecked after pre-provider steering delivery,
-  including with fake tools/models that intentionally ignore their context.
-- `sdk/agent/agent_max_iterations_test.go` covers max-iteration error/final
-  events plus require-done recovery: an empty/text-only post-tool stop forces
-  the next auto request to `tool_choice=required` with `DisableThinking` set (so
-  the forced choice stays legal under Anthropic extended thinking), and keeps
-  `DisableThinking` active across an ordinary recovery tool plus its follow-up
-  auto request until the done tool completes, while
-	  providers that keep answering in text are bounded by the safety valve, which
-	  returns the model's latest post-tool response with terminal status
-	  `partial` and reason `require_done_safety`. Anthropic
-	  request-shaping for this (`DisableThinking` suppresses manual/adaptive
-	  thinking; other forced `tool_choice` conflicts return an actionable error)
-	  is covered by `sdk/llm/anthropic/client_test.go`
-	  `TestBuildRequestToolChoiceUnderThinking`. Adaptive
-	  `thinking.type="adaptive"` plus `output_config.effort`, including downgrade
-	  retry behavior, is covered by the adjacent adaptive-thinking tests.
-- `sdk/agent/agent_streaming_error_test.go` - partial output persistence and streamed error metadata propagation (`sdk/agent/agent_streaming_error_test.go:36`, `sdk/agent/agent_streaming_error_test.go:94`)
-- `sdk/agent/agent_tool_resolve_test.go` - alias resolution, normalized collisions, unknown-tool fallback (`sdk/agent/agent_tool_resolve_test.go:117`, `sdk/agent/agent_tool_resolve_test.go:143`, `sdk/agent/agent_tool_resolve_test.go:229`)
-- `sdk/agent/agent_retry_loop_guard_test.go` - retry/backoff behavior and repeated-tool loop guard warnings, non-fatal loop-guard retreat (formerly doom-loop aborts), reminder injection, and synthetic skipped tool results that preserve contiguous assistant tool-call/tool-result history (`sdk/agent/agent_retry_loop_guard_test.go`)
-- `sdk/agent/agent_evidence_progress_test.go` - read alias normalization,
-  separate line/absolute-byte range units, byte-subrange coverage across
-  `read`/`read_file`, repeat suppression, mixed-batch continuity, conservative
-  invalidation after arbitrary successful non-evidence tools, target-state
-  changes, and one post-compaction revalidation.
-- `sdk/agent/agent_message_origin_test.go` plus the continuation, idle,
-  loop-guard, require-done, early-stop, and evidence-progress tests verify that
-  framework-authored user-role history carries stable `sdk_internal_*` names.
-- `sdk/agent/agent_usage_test.go` - zero-prompt provider usage falls back to effective estimates, retains raw provider values, emits one warning per query, and does not invent usage when the provider omits the usage object.
-- `sdk/agent/agent_ephemeral_test.go` - ephemeral retention behavior across turns (`sdk/agent/agent_ephemeral_test.go:56`)
-- `sdk/agent/agent_todo_prompt_test.go` - hidden todo reminder injection when work remains (`sdk/agent/agent_todo_prompt_test.go:30`)
-- `sdk/agent/agent_compaction_error_test.go` - compaction-path provider failure
-  logging, retry-once behavior, below-threshold short-circuiting,
-  disabled-compactor cache behavior, and the Tier 4 guarantee that a failed
-  overflow compaction stops before the next provider request.
-- `sdk/agent/compaction/service_test.go` - summary prefix/tagging,
-  overflow-limit checks (`context_window - reserve_output_tokens`), real-user
-  retention that excludes named and narrowly detected legacy internal messages,
-  similar legitimate user-text preservation, strict last-match summary
-  extraction, timeout-bounded compaction, telemetry, tool-context gating,
-  provider-valid tool topology repair, first/latest real-user anchors,
-  newest-24 key-event selection, unverified assistant-claim labeling, and
-  UNKNOWN/warning behavior for host checkpoint provider failure. Watermark
-  anchors cover the shared usable prompt window, exhausted-budget behavior, and
-  the 70%/80%/85%/100% decision matrix. Quality-gate anchors cover system/data
-  role separation, untrusted boundaries, protected JSON anchor-envelope
-  retention, required-section rejection,
-  credential-like task material acceptance, and history/ledger atomicity on
-  rejected summaries. The same suite drives real framed `Compact` requests to
-  verify latest-user and verified-checkpoint coverage plus malformed-frame and
-  malformed-envelope rejection. Full and incremental regressions include
-  headings, fences, quotes, JSON fragments, newlines, and frame markers inside
-  first/latest user text.
-- `sdk/agent/compaction/ledger_test.go` - compaction ledger schema validation,
-  replacement hash checks, duplicate replacement rejection, stable message-key
-  normalization, canonical-manifest durability and provider-stub checks,
-  canonical/legacy slot mutual exclusion, and `LedgerStore` interface compile
-  coverage.
-- `sdk/agent/compaction/local_reduce_test.go` - tool-result snip replacements,
-  stable ledger reuse, generated-marker parsing, repeated-pass fixed-point
-  idempotency, same-text no-op handling, complete-current-turn/open-tool-block/
-  recent-token protected zones, protected-tool skips, artifact-write warnings,
-  latest-real-user microcompact protection, and provider-valid history.
-- `sdk/agent/compaction/local_reduce_canonical_test.go` - full resolver
-  validation for canonical envelopes and plain-source writes, immutable
-  manifest identity, owner/hash/byte/retention/sink failure preservation,
-  legacy in-place migration only while exact source bytes remain, snip-to-prune
-  ref reuse, mismatched prune-parent rejection, and ledger/checkpoint round-trip
-  recovery of the same object.
-- Compaction truncation anchors
-  (`TestCompactionTruncationPreservesValidUTF8`,
-  `TestSummaryDeltaTruncationPreservesChinesePath`,
-  `TestCompactionMaterialUsesTokenBudget`, `TestTruncationMarkerIsExplicit`,
-  `TestASCIIAndCJKBudgetsRemainBounded`, and
-  `TestAssistantPreviewUsesSharedTokenTruncator`) verify UTF-8 validity,
-  injected-estimator budgets, explicit omission markers, and preserved exact
-  identifiers across full and incremental summary material.
-- `sdk/agent/messageorigin/origin_test.go` - stable constructor names, reserved
-  origin recognition, destroyed-user exclusion, and preservation of unknown
-  named real users.
-- `sdk/agent/compaction/prune_test.go` - prune watermark behavior, monotonic
-  tool-result replacement upgrades, fixed-point tool/assistant idempotency,
-  assistant-text compaction, assistant tool-call preservation, and user-message
-  preservation.
-- `sdk/agent/compaction/pipeline_test.go` - ordered tier execution and merged
-  telemetry, including the contract that provider trigger usage stays in
-  `Result.Usage` while `OriginalTokens`/`NewTokens` share one estimator and
-  declare `TokenCountSourceEstimate`, plus deferred local ledger mutation when a
-  runtime checkpoint writer is configured and transaction retention when a
-  failed summary falls back to successful local reduction.
-- `sdk/agent/compaction/incremental_summary_test.go` - ledger-backed summary
-  metadata, hash/coverage mismatch full rebuild, stable covered-end checkpoint
-  identity, source-snapshot truthfulness, second-pass previous-summary-plus-
-  delta prompt construction, and summary extraction failure atomicity.
-- `sdk/agent/compaction/runtime_checkpoint_test.go` and
-  `sdk/agent/agent_compaction_checkpoint_test.go` cover deterministic checkpoint
-  IDs, tamper rejection, persist-before-apply ordering, manual failure
-  atomicity, deferred summary-ledger commit, ledger rollback after checkpoint
-  failure, visible ledger-commit/rollback failures, overflow local-fallback
-  commit, stale-ledger refresh after a successful full rebuild, and retryable
-  automatic checkpoint failure.
-- `sdk/agent/compaction/models_test.go` - compaction prompt contract checks,
-  including exact parity between the prompt's canonical `##` section headings
-  and the validator, plus summary-prompt resolver behavior for model-aware and
-  fallback paths.
-- `sdk/agent/compaction/validation.go` is covered by
-  `TestCompactionQualityGateRejectsMissingRequiredSections`,
-  `TestCompactionQualityGateAllowsCredentialLikeSecurityMaterial`, and
-  `TestRejectedSummaryDoesNotMutateHistoryOrLedger`, plus framed-material
-  fact-coverage and malformed-frame integration tests in `service_test.go`.
-- `sdk/agent/compaction/checkpoint.go` is covered through service and Goode
-  adapter tests: it applies per-type entry limits and a final token bound to the
-  portable host checkpoint schema without importing repository packages.
-- `sdk/tools/args_normalize_test.go` - arg normalization/repair pipeline, metadata tagging, and tool-specific offset/line alias handling (`sdk/tools/args_normalize_test.go:12`, `sdk/tools/args_normalize_test.go:154`, `sdk/tools/args_normalize_test.go:277`)
-- `sdk/tools/schema_test.go` - schema alias repair and tool execute decode behavior (`sdk/tools/schema_test.go:74`, `sdk/tools/schema_test.go:113`)
-- `sdk/tools/deps_test.go` - dependency container concurrency memoization and non-caching of errors (`sdk/tools/deps_test.go:12`, `sdk/tools/deps_test.go:72`)
-- `sdk/tools/sandbox/sandbox_test.go` - path safety, allowlist behavior, confirmer gating, edit/apply_patch/read/webfetch/glob/grep guardrails, webfetch read-error surfacing, `ls`/`grep` malformed-glob rejection, glob stat-failure warning/metadata surfacing, and grep scan-failure diagnostics for open/read/seek/walk paths (`sdk/tools/sandbox/sandbox_test.go:58`, `sdk/tools/sandbox/sandbox_test.go:89`, `sdk/tools/sandbox/sandbox_test.go:189`, `sdk/tools/sandbox/sandbox_test.go:353`, `sdk/tools/sandbox/sandbox_test.go:429`, `sdk/tools/sandbox/sandbox_test.go:468`, `sdk/tools/sandbox/sandbox_test.go:868`, `sdk/tools/sandbox/sandbox_test.go:980`)
-- `sdk/llm/usage_test.go`, `sdk/llm/openai/chat_test.go`, `sdk/llm/openai/responses_parse_test.go`, and `sdk/llm/anthropic/client_test.go` cover the versioned prompt-token contract, legacy quality labeling, cached/image breakdowns without double counting, and Anthropic streaming/non-streaming parity.
-- `sdk/llm/openai/responses_stream_test.go` - responses streaming error event behavior (`sdk/llm/openai/responses_stream_test.go:13`)
-- `sdk/llm/openai/responses_root_shape_test.go` - buffered parser and HTTP
-  invocation reject null, array, and scalar response roots while preserving
-  valid object responses.
-- `sdk/llm/openai/responses_agent_history_test.go` drives strict buffered and
-  streaming two-request Agent/tool fixtures that reject continuations unless
-  reasoning and function-call output items are replayed faithfully, including
-  a max-token partial tool-call boundary.
-- `sdk/llm/openai/responses_state_test.go` covers opaque parsing, non-rendering,
-  bounded restore validation, input-item injection rejection, the official
-  `conversation` wire key, stateful option conflicts, `[DONE]` fallback, and
-  streamed/terminal item-conflict rejection. Buffered and streaming fixtures
-  also preserve and replay official `program_output` and `tool_search_output`
-  variants without weakening the explicit input-only rejection matrix.
-- `sdk/llm/openai/responses_terminal_test.go` - buffered and streaming Responses terminal-state, usage/ID ordering, refusal visibility, and typed-error coverage
-- `sdk/llm/anthropic/client_test.go` - usage/response-id mapping, downgrade retries, stream error behavior, retryable error classification, jitter entropy bounds, and tool-ID normalization warning payloads (`sdk/llm/anthropic/client_test.go:47`, `sdk/llm/anthropic/client_test.go:84`, `sdk/llm/anthropic/client_test.go:146`, `sdk/llm/anthropic/client_test.go:654`, `sdk/llm/anthropic/client_test.go:670`)
-- `sdk/llm/anthropic/client_agent_history_test.go` uses a strict two-request
-  HTTP/SSE fixture to prove that streamed thinking text plus
-  `signature_delta` is retained in assistant history and replayed before the
-  prior `tool_use` block on the next Anthropic request. Adjacent client tests
-  cover the same signed block in non-streaming responses and raw stream events.
-- `sdk/tokens/cost_test.go` - initialization concurrency, cached-token clamping, warning surfacing for pricing-init/cache-read/cache-stat/cache-parse/cost-calc failures, cache-write warning behavior, and alias/family pricing lookup fallback (`sdk/tokens/cost_test.go:20`, `sdk/tokens/cost_test.go:65`, `sdk/tokens/cost_test.go:133`, `sdk/tokens/cost_test.go:223`, `sdk/tokens/cost_test.go:258`, `sdk/tokens/cost_test.go:316`)
+Use the existing fixture closest to the behavior. Tests and public API comments
+are the source of current contract details; this page is not a copy of every test.
 
-## Practical Test Strategy
-- Run area-focused tests first when editing a subsystem.
-- Run `go test ./...` before finalizing cross-cutting changes.
-- Use `-race` for changes involving tool dependency container concurrency (`sdk/tools/deps.go:198`).
+## Find relevant coverage
+
+| Change | Useful starting points |
+|---|---|
+| Frame/request ownership and events | [execution_frame_test.go](../sdk/agent/execution_frame_test.go), [frame_correlation_test.go](../sdk/agent/frame_correlation_test.go), [frame_event_boundary_test.go](../sdk/agent/frame_event_boundary_test.go), `event_envelope*_test.go` |
+| Tool outcomes, topology and publication | [tool_terminal_authority_test.go](../sdk/agent/tool_terminal_authority_test.go), [tool_outcome_projection_test.go](../sdk/agent/tool_outcome_projection_test.go), [history_mutation_test.go](../sdk/agent/history_mutation_test.go) |
+| Compaction/ledger/history | [compaction_publication_test.go](../sdk/agent/compaction_publication_test.go), [manual_publication_test.go](../sdk/agent/manual_publication_test.go), `agent_compaction*_test.go`, [compaction package](../sdk/agent/compaction) |
+| Provider wire/cache behavior | [llm tests](../sdk/llm), [cache_plan_wire_test.go](../sdk/llm/cache_plan_wire_test.go), [cache_request_test.go](../sdk/llm/cache_request_test.go), provider HTTP/SSE fixtures |
+| Artifact, accounting and sandbox safety | [artifact](../sdk/artifact), [accounting](../sdk/accounting), [tools](../sdk/tools), [agent_artifact_boundary_test.go](../sdk/agent/agent_artifact_boundary_test.go) |
+
+For a specific contract, search the implementation and tests:
+
+```sh
+rg -n '^func (Test|Benchmark)' sdk/agent
+rg -n 'CommitCompactionHistory' sdk
+```
+
+## Evidence that matters
+
+- Assert the observable contract, including failure/cancellation and forbidden
+  effects where relevant. Green counters alone do not prove publication or delivery.
+- Keep golden/compatibility fixtures for serialization changes. Use failure
+  injection for state/artifact writes and source/ownership conflicts.
+- Check SDK versus host responsibility before duplicating an adapter or test.
+  Cross-repo changes need the actual selected SDK module, not an assumed checkout.
+- Benchmarks must name the measured operation and comparable setup. SDK invocation
+  counts are not HTTP attempts; harness overhead is not model-quality evidence.
+
+Local fixtures should establish deterministic behavior without credentials.
+Use a targeted live-provider probe only for behavior local fixtures cannot
+establish, and report unavailable/not-run coverage honestly.
