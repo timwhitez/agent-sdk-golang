@@ -13,8 +13,10 @@ stream normalization, and response metadata behavior.
   still unavailable; nil/empty plans preserve the legacy path.
   Legacy `Message.Cache` behavior is unchanged; do not use the new field as a
   cache-control guarantee. No Agent Config or host plan generator is added.
-  `CachePlan` now includes a private binding and `ResponsesClient` supports the
-  existing `WarningSinkSetter` pattern. External unkeyed literals need updating;
+  `CachePlan` now includes a private binding. Responses diagnostics use its
+  construction-time `Warningf` (or the default logger), not automatic shared
+  `WarningSinkSetter` mutation during child Agent creation. Configure it before
+  concurrent use. External unkeyed literals need updating;
   JSON cannot restore a valid binding. Message/Completion layouts and session
   JSON remain unchanged. No content fingerprints or Git-hash gates are added.
 - Provider-neutral interfaces: `ChatModel`, `StreamingChatModel` (`sdk/llm/model.go:8`, `sdk/llm/model.go:17`)

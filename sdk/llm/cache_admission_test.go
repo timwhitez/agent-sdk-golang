@@ -10,10 +10,12 @@ import (
 	"net/http"
 	"reflect"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
 
+	"github.com/timwhitez/agent-sdk-golang/sdk/agent"
 	"github.com/timwhitez/agent-sdk-golang/sdk/llm"
 	"github.com/timwhitez/agent-sdk-golang/sdk/llm/anthropic"
 	"github.com/timwhitez/agent-sdk-golang/sdk/llm/openai"
@@ -28,11 +30,13 @@ func admissionModel(provider string, transport cacheWireTransport, warning func(
 	case "chat":
 		model = &openai.ChatClient{HTTPClient: client, BaseURL: "https://fixture.invalid", APIKey: "private-key", ModelName: "fixture", MaxRetries: 1}
 	case "responses":
-		model = &openai.ResponsesClient{HTTPClient: client, BaseURL: "https://fixture.invalid", APIKey: "private-key", ModelName: "fixture", MaxRetries: 1}
+		model = &openai.ResponsesClient{HTTPClient: client, BaseURL: "https://fixture.invalid", APIKey: "private-key", ModelName: "fixture", MaxRetries: 1, Warningf: warning}
 	default:
 		panic("unknown fixture provider")
 	}
-	model.(llm.WarningSinkSetter).SetWarningf(warning)
+	if setter, ok := model.(llm.WarningSinkSetter); ok {
+		setter.SetWarningf(warning)
+	}
 	return model
 }
 
@@ -76,13 +80,16 @@ func callAdmissionModel(ctx context.Context, model llm.StreamingChatModel, reque
 func TestCacheAdmissionRejectsBeforeNetwork(t *testing.T) {
 	for _, provider := range []string{"anthropic", "chat", "responses"} {
 		for _, stream := range []bool{false, true} {
-			for _, failure := range []string{"required", "unbound", "stale", "stale-best-effort", "clone-stale", "uncloneable", "view-overwrite", "view-clear", "schema", "canceled"} {
+			for _, failure := range []string{"required", "unbound", "stale", "stale-best-effort", "clone-stale", "uncloneable", "view-overwrite", "view-overwrite-best-effort", "view-clear", "schema", "canceled"} {
 				t.Run(fmt.Sprintf("%s/%v/%s", provider, stream, failure), func(t *testing.T) {
 					request := admissionRequest(t, llm.CacheRequired)
 					reason := "unsupported_target"
 					index := 0
 					switch failure {
-					case "view-overwrite", "view-clear":
+					case "view-overwrite", "view-overwrite-best-effort", "view-clear":
+						if failure == "view-overwrite-best-effort" {
+							request.CachePlan.Directives[0].Policy = llm.CacheBestEffort
+						}
 						view, err := llm.NewCacheTargetView(request)
 						if err != nil {
 							t.Fatal(err)
@@ -91,7 +98,7 @@ func TestCacheAdmissionRejectsBeforeNetwork(t *testing.T) {
 						if err != nil {
 							t.Fatal(err)
 						}
-						if failure == "view-overwrite" {
+						if failure != "view-clear" {
 							request.Messages[1].Content.Text = "private-rebound"
 							fresh, err := llm.NewCacheTargetView(request)
 							if err != nil {
@@ -351,5 +358,32 @@ func BenchmarkCacheAdmission(b *testing.B) {
 		if _, _, err := llm.AdmitCachePlan(context.Background(), request, model, nil); err != nil {
 			b.Fatal(err)
 		}
+	}
+}
+
+func TestResponsesCacheWarningSinkRemainsConstructionScoped(t *testing.T) {
+	var configured, child atomic.Int32
+	model := admissionModel("responses", func(r *http.Request) (*http.Response, error) {
+		return &http.Response{StatusCode: 401, Header: make(http.Header), Body: io.NopCloser(strings.NewReader(`{"error":{"message":"fixture"}}`)), Request: r}, nil
+	}, func(string, ...any) { configured.Add(1) })
+	request := admissionRequest(t, llm.CacheBestEffort)
+	var workers sync.WaitGroup
+	for i := 0; i < 8; i++ {
+		workers.Add(1)
+		go func() {
+			defer workers.Done()
+			for j := 0; j < 10; j++ {
+				if _, err := agent.New(agent.Config{LLM: model, Warningf: func(string, ...any) { child.Add(1) }}); err != nil {
+					t.Error(err)
+				}
+				if _, err := model.Invoke(context.Background(), request); err == nil {
+					t.Error("expected fixture rejection")
+				}
+			}
+		}()
+	}
+	workers.Wait()
+	if configured.Load() != 80 || child.Load() != 0 {
+		t.Fatal("shared child construction replaced the fixed client diagnostic sink")
 	}
 }

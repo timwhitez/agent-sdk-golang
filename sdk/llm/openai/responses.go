@@ -51,10 +51,10 @@ type ResponsesClient struct {
 	// Some OpenAI-compatible gateways (e.g. certain enterprise proxies) require this.
 	ForceStringInput bool
 
+	// Configure before concurrent use. Deliberately not a WarningSinkSetter:
+	// shared child Agents must not overwrite this client's sink in Agent.New.
 	Warningf func(format string, args ...any)
 }
-
-func (c *ResponsesClient) SetWarningf(warnf func(string, ...any)) { c.Warningf = warnf }
 
 func (c *ResponsesClient) warnf(format string, args ...any) {
 	if c != nil && c.Warningf != nil {
