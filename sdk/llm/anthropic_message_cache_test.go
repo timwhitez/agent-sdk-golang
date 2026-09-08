@@ -235,3 +235,54 @@ func TestAnthropicMessageCacheImageRoleEligibility(t *testing.T) {
 		}
 	}
 }
+
+func TestAnthropicMessageCacheEachMergedResult(t *testing.T) {
+	for _, stream := range []bool{false, true} {
+		for _, reorder := range []bool{false, true} {
+			for _, selected := range [][]int{{3}, {4}, {3, 4}} {
+				t.Run(fmt.Sprintf("%v/reorder=%v/selected=%v", stream, reorder, selected), func(t *testing.T) {
+					request := toolCacheRequest()
+					if reorder {
+						request.Messages[3], request.Messages[4] = request.Messages[4], request.Messages[3]
+					}
+					var directives []llm.CacheDirective
+					for _, index := range selected {
+						directives = append(directives, messageDirective(index, llm.CacheRequired))
+					}
+					bindToolCache(t, &request, directives)
+					var calls atomic.Int32
+					model := admissionModel("anthropic", func(r *http.Request) (*http.Response, error) {
+						calls.Add(1)
+						data, _ := io.ReadAll(r.Body)
+						var payload map[string]any
+						if err := json.Unmarshal(data, &payload); err != nil {
+							return nil, err
+						}
+						results := payload["messages"].([]any)[2].(map[string]any)["content"].([]any)
+						if len(results) != 2 {
+							t.Error("tool result group changed")
+							return nil, fmt.Errorf("fixture group mismatch")
+						}
+						for offset, raw := range results {
+							block := raw.(map[string]any)
+							wantCache := false
+							for _, index := range selected {
+								if index == 3+offset {
+									wantCache = true
+								}
+							}
+							if block["tool_use_id"] != request.Messages[3+offset].ToolCallID || (block["cache_control"] != nil) != wantCache {
+								t.Errorf("source %d cache/id mismatch: %#v", 3+offset, block)
+							}
+						}
+						return &http.Response{StatusCode: 401, Header: make(http.Header), Body: io.NopCloser(strings.NewReader(`{"error":{"message":"fixture"}}`)), Request: r}, nil
+					}, func(string, ...any) {})
+					_, _ = callAdmissionModel(context.Background(), model, request, stream)
+					if calls.Load() != 1 {
+						t.Fatal("mapped request not sent")
+					}
+				})
+			}
+		}
+	}
+}
