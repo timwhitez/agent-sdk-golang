@@ -73,10 +73,11 @@ func (c *Client) warnf(format string, args ...any) {
 
 func (c *Client) Provider() string { return "anthropic" }
 
-// PromptCacheCapabilities reports explicit CachePlan mapping, not legacy
-// Message.Cache/MaxCachedToolDefinitions. Those legacy controls remain separate.
+// PromptCacheCapabilities reports implemented explicit mappings, not a promise
+// of endpoint/model acceptance or a cache hit. Message/block and 1h TTL mapping
+// are deliberately not advertised by this first tool-definition slice.
 func (c *Client) PromptCacheCapabilities() llm.PromptCacheCapabilities {
-	return llm.PromptCacheCapabilities{UsageTelemetry: true}
+	return llm.PromptCacheCapabilities{ExplicitToolDefinition: true, SupportedTTLs: []llm.CacheTTL{llm.CacheTTL5Minutes}, MaxBreakpoints: 4, UsageTelemetry: true}
 }
 
 func (c *Client) Model() string { return c.ModelName }
@@ -544,7 +545,8 @@ func isClientTimeoutErr(err error) bool {
 // ---- request/response mapping ----
 
 type cacheControl struct {
-	Type string `json:"type"`
+	Type string       `json:"type"`
+	TTL  llm.CacheTTL `json:"ttl,omitempty"`
 }
 
 type toolParam struct {
@@ -1168,6 +1170,11 @@ func (c *Client) buildRequestWithThinking(req llm.InvokeRequest, thinkingConfig 
 	tools := []toolParam(nil)
 	if len(req.Tools) > 0 {
 		tools = serializeTools(req.Tools, c.MaxCachedToolDefinitions)
+	}
+	if req.CachePlan != nil && len(req.CachePlan.Directives) > 0 {
+		if err := applyToolCachePlan(req.CachePlan, sys, msgs, tools); err != nil {
+			return nil, err
+		}
 	}
 
 	// Effective extended thinking for this call. A per-call DisableThinking wins

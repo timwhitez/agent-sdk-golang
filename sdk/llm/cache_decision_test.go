@@ -168,7 +168,12 @@ func TestCacheDecisionFailuresAndNoCapabilityGuessing(t *testing.T) {
 func TestCacheDecisionBuiltinCapabilitiesAreConservative(t *testing.T) {
 	for _, model := range []llm.ChatModel{&anthropic.Client{}, &openai.ChatClient{}, &openai.ResponsesClient{}} {
 		provider, ok := model.(llm.PromptCacheCapabilityProvider)
-		if !ok || !reflect.DeepEqual(provider.PromptCacheCapabilities(), llm.PromptCacheCapabilities{UsageTelemetry: true}) {
+		want := llm.PromptCacheCapabilities{UsageTelemetry: true}
+		if _, anthropicClient := model.(*anthropic.Client); anthropicClient {
+			want.ExplicitToolDefinition, want.MaxBreakpoints = true, 4
+			want.SupportedTTLs = []llm.CacheTTL{llm.CacheTTL5Minutes}
+		}
+		if !ok || !reflect.DeepEqual(provider.PromptCacheCapabilities(), want) {
 			t.Fatal("builtin claims unimplemented explicit control")
 		}
 		request, view, plan := cacheDecisionFixture(t)

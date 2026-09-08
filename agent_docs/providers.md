@@ -8,9 +8,14 @@ stream normalization, and response metadata behavior.
   `CloneInvokeRequest` and the private execution frame, and excluded from JSON.
   Bind nonempty plans with `CacheTargetView.Bind`. Built-in buffered/streaming
   entrypoints clone and validate that original binding before network I/O:
-  stale/unbound/unsupported Required plans fail; Best-effort skips produce bounded
-  `Completion.Diagnostics` and warning-sink metadata. Explicit wire mapping is
-  still unavailable; nil/empty plans preserve the legacy path.
+  stale/unbound/unsupported Required plans fail; accepted/skipped decisions produce
+  bounded `Completion.Diagnostics` and warning metadata. Anthropic maps exact
+  Tool Definition indexes with default/5m TTL and up to four breakpoints; other
+  explicit targets and 1h TTL are not advertised yet. An accepted plan overrides
+  legacy cache markers without changing block shape/text/order. All-skipped,
+  nil and empty plans preserve the legacy path. See the official
+  [cache constraints](https://platform.claude.com/docs/en/build-with-claude/prompt-caching)
+  and [tool-definition API](https://platform.claude.com/docs/en/agents-and-tools/tool-use/tool-use-with-prompt-caching).
   Legacy `Message.Cache` behavior is unchanged; do not use the new field as a
   cache-control guarantee. No Agent Config or host plan generator is added.
   `CachePlan` now includes a private binding. Responses diagnostics use its

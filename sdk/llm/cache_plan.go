@@ -51,7 +51,7 @@ type CacheDirective struct {
 // CachePlan is request-local optimization intent. It must not be written into
 // conversation history or treated as proof that a Provider cache was hit.
 // Bind a nonempty plan with CacheTargetView.Bind before passing it to a built-in
-// client. Clients enforce admission, but explicit wire mapping is not available.
+// client. Clients enforce admission and report only implemented wire mappings.
 type CachePlan struct {
 	SchemaVersion int
 	// Reserved experimental field; unused by providers. CacheTargetView uses

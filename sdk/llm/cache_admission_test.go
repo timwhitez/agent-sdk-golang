@@ -313,7 +313,12 @@ func TestCacheAdmissionPartialStreamCancellation(t *testing.T) {
 				calls.Add(1)
 				return &http.Response{StatusCode: 200, Header: make(http.Header), Body: body, Request: r}, nil
 			}, func(string, ...any) {})
-			events, err := model.InvokeStream(ctx, admissionRequest(t, llm.CacheBestEffort))
+			request := admissionRequest(t, llm.CacheBestEffort)
+			if provider == "anthropic" {
+				request = toolCacheRequest()
+				bindToolCache(t, &request, []llm.CacheDirective{toolDirective(2, llm.CacheRequired, llm.CacheTTLProviderDefault)})
+			}
+			events, err := model.InvokeStream(ctx, request)
 			if err != nil {
 				t.Fatal(err)
 			}

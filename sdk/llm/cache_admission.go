@@ -29,10 +29,10 @@ func (view *CacheTargetView) Bind(directives []CacheDirective) (*CachePlan, erro
 // The returned request is isolated from caller mutation before asynchronous
 // streaming or retry. Callers must exclusively own input graphs during this call.
 //
-// Current clients have no explicit mapper: required intent fails, best-effort
-// intent is skipped with bounded diagnostics while legacy cache flags remain.
-// An accepted directive fails as unmapped rather than silently reaching a client
-// whose serializer cannot implement it. Future mappers must extend this boundary.
+// Accepted directives remain on the owned request for the concrete client's
+// serializer. Capability reports must describe actual implemented mappings.
+// Unsupported best-effort intent is skipped; when none is accepted the legacy
+// path remains. An accepted explicit plan takes precedence over legacy hints.
 // Warning callbacks see fixed metadata only; buffered clients also return these
 // diagnostics in Completion.Diagnostics. No new event or invocation path is used.
 func AdmitCachePlan(ctx context.Context, request InvokeRequest, model ChatModel, warnf func(string, ...any)) (InvokeRequest, []Diagnostic, error) {
@@ -56,9 +56,6 @@ func AdmitCachePlan(ctx context.Context, request InvokeRequest, model ChatModel,
 	if err != nil {
 		return InvokeRequest{}, nil, err
 	}
-	if len(decision.Plan.Directives) != 0 {
-		return InvokeRequest{}, nil, cachePlanError("unmapped_plan", -1)
-	}
 	const diagnosticLimit = 32
 	count := len(decision.Directives)
 	if count > diagnosticLimit {
@@ -66,12 +63,29 @@ func AdmitCachePlan(ctx context.Context, request InvokeRequest, model ChatModel,
 	}
 	diagnostics := make([]Diagnostic, 0, count+1)
 	for _, d := range decision.Directives[:count] {
-		diagnostics = append(diagnostics, Diagnostic{Kind: "cache_plan_skipped", Message: fmt.Sprintf("directive %d: %s", d.DirectiveIndex, d.Reason)})
+		kind, reason := "cache_plan_skipped", d.Reason
+		if d.Accepted {
+			kind, reason = "cache_plan_accepted", "explicit plan takes precedence over legacy cache hints"
+		}
+		diagnostics = append(diagnostics, Diagnostic{Kind: kind, Message: fmt.Sprintf("directive %d: %s", d.DirectiveIndex, reason)})
 	}
 	if count < len(decision.Directives) {
-		diagnostics = append(diagnostics, Diagnostic{Kind: "cache_plan_skipped_summary", Message: fmt.Sprintf("%d additional directives skipped", len(decision.Directives)-count)})
+		accepted := 0
+		for _, d := range decision.Directives[count:] {
+			if d.Accepted {
+				accepted++
+			}
+		}
+		if accepted == 0 {
+			diagnostics = append(diagnostics, Diagnostic{Kind: "cache_plan_skipped_summary", Message: fmt.Sprintf("%d additional directives skipped", len(decision.Directives)-count)})
+		} else {
+			diagnostics = append(diagnostics, Diagnostic{Kind: "cache_plan_summary", Message: fmt.Sprintf("%d additional directives: %d accepted, %d skipped", len(decision.Directives)-count, accepted, len(decision.Directives)-count-accepted)})
+		}
 	}
 	owned.CachePlan = nil
+	if len(decision.Plan.Directives) > 0 {
+		owned.CachePlan = decision.Plan
+	}
 	if warnf != nil {
 		for _, d := range diagnostics {
 			warnf("%s: %s", d.Kind, d.Message)
