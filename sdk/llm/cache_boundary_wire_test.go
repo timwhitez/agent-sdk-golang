@@ -79,7 +79,7 @@ func TestAnthropicLegacyCacheBoundaryWireGolden(t *testing.T) {
 				var baseline []byte
 				for _, plan := range []*llm.CachePlan{nil, {Directives: []llm.CacheDirective{}}, {
 					SchemaVersion: llm.CachePlanSchemaVersion,
-					Directives:    []llm.CacheDirective{{Target: llm.CacheTarget{Kind: llm.CacheAfterMessage}, Policy: llm.CacheBestEffort}},
+					Directives:    []llm.CacheDirective{{Target: llm.CacheTarget{Kind: llm.CacheAfterMessageBlock}, Policy: llm.CacheBestEffort}},
 				}} {
 					request := llm.InvokeRequest{Messages: llm.CloneMessages(fixture.messages), Tools: tools, CachePlan: plan}
 					if plan != nil && len(plan.Directives) != 0 {

@@ -4,8 +4,9 @@ import "reflect"
 
 // CacheDirectiveDecision is bounded, content-free metadata for one original
 // directive. Accepted means eligible under reported capabilities, not mapped,
-// sent, or cached. Reason is accepted, unsupported_target, unsupported_ttl, or
-// breakpoint_limit. No content, names, IDs, hashes or Provider strings are kept.
+// sent, or cached. Reason is accepted, unsupported_target, unsupported_ttl,
+// unmappable_target, or breakpoint_limit. No content, names, IDs, hashes or
+// Provider strings are kept.
 type CacheDirectiveDecision struct {
 	DirectiveIndex int
 	Accepted       bool
@@ -45,6 +46,7 @@ func (view *CacheTargetView) Decide(request InvokeRequest, plan *CachePlan, mode
 	if len(plan.Directives) == 0 {
 		return result, nil
 	}
+	snapshot := view.request
 	value := reflect.ValueOf(model)
 	if !value.IsValid() || (value.Kind() == reflect.Pointer && value.IsNil()) {
 		return nil, cachePlanError("missing_model", -1)
@@ -60,6 +62,23 @@ func (view *CacheTargetView) Decide(request InvokeRequest, plan *CachePlan, mode
 		if ttl != CacheTTLProviderDefault && ttl != CacheTTL5Minutes && ttl != CacheTTL1Hour {
 			return nil, cachePlanError("invalid_capabilities", -1)
 		}
+	}
+	var eligible []bool
+	if mapper, ok := model.(PromptCacheTargetEligibilityProvider); ok {
+		// Do not expose the retained snapshot or caller graph to a provider hook.
+		mappingRequest, err := CloneInvokeRequest(*snapshot)
+		if err != nil {
+			return nil, cachePlanError("uncloneable_request", -1)
+		}
+		targets := make([]CacheTarget, len(plan.Directives))
+		for i, directive := range plan.Directives {
+			targets[i] = directive.Target
+		}
+		mapping := mapper.PromptCacheTargetEligibility(mappingRequest, targets)
+		if len(mapping) != len(plan.Directives) {
+			return nil, cachePlanError("invalid_capabilities", -1)
+		}
+		eligible = append([]bool(nil), mapping...)
 	}
 	result.Directives = make([]CacheDirectiveDecision, len(plan.Directives))
 	required := 0
@@ -87,6 +106,9 @@ func (view *CacheTargetView) Decide(request InvokeRequest, plan *CachePlan, mode
 			if !ttlSupported {
 				reason = "unsupported_ttl"
 			}
+		}
+		if reason == "accepted" && eligible != nil && !eligible[i] {
+			reason = "unmappable_target"
 		}
 		if directive.Policy == CacheRequired {
 			if reason != "accepted" {

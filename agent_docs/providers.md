@@ -10,8 +10,13 @@ stream normalization, and response metadata behavior.
   entrypoints clone and validate that original binding before network I/O:
   stale/unbound/unsupported Required plans fail; accepted/skipped decisions produce
   bounded `Completion.Diagnostics` and warning metadata. Anthropic maps exact
-  Tool Definition indexes with default/5m TTL and up to four breakpoints; other
-  explicit targets and 1h TTL are not advertised yet. An accepted plan overrides
+  Tool Definition and eligible Message boundaries with default/5m TTL and up to
+  four breakpoints. Eligibility comes from the same serialization traversal,
+  before capacity allocation: hidden/empty/placeholder endpoints are not targets.
+  A collapsed System string exposes only its last emitted source endpoint and
+  is wrapped whole, never split to invent earlier boundaries. Structured System
+  and merged Tool Results retain per-source locations. Content-block targets and
+  1h TTL are not advertised yet. An accepted plan overrides
   legacy cache markers without changing block shape/text/order. All-skipped,
   nil and empty plans preserve the legacy path. See the official
   [cache constraints](https://platform.claude.com/docs/en/build-with-claude/prompt-caching)

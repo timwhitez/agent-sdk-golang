@@ -74,10 +74,10 @@ func (c *Client) warnf(format string, args ...any) {
 func (c *Client) Provider() string { return "anthropic" }
 
 // PromptCacheCapabilities reports implemented explicit mappings, not a promise
-// of endpoint/model acceptance or a cache hit. Message/block and 1h TTL mapping
-// are deliberately not advertised by this first tool-definition slice.
+// of endpoint/model acceptance or a cache hit. Request-local eligibility further
+// restricts message boundaries. Content-block and 1h mapping remain unsupported.
 func (c *Client) PromptCacheCapabilities() llm.PromptCacheCapabilities {
-	return llm.PromptCacheCapabilities{ExplicitToolDefinition: true, SupportedTTLs: []llm.CacheTTL{llm.CacheTTL5Minutes}, MaxBreakpoints: 4, UsageTelemetry: true}
+	return llm.PromptCacheCapabilities{ExplicitMessageBoundary: true, ExplicitToolDefinition: true, SupportedTTLs: []llm.CacheTTL{llm.CacheTTL5Minutes}, MaxBreakpoints: 4, UsageTelemetry: true}
 }
 
 func (c *Client) Model() string { return c.ModelName }
@@ -1162,7 +1162,16 @@ func (c *Client) buildRequestWithThinking(req llm.InvokeRequest, thinkingConfig 
 		maxTokens = 8192
 	}
 
-	sys, msgs, err := serializeMessagesWithWarning(req.Messages, c.warnf)
+	var locations []messageCacheLocation
+	if req.CachePlan != nil {
+		for _, d := range req.CachePlan.Directives {
+			if d.Target.Kind == llm.CacheAfterMessage {
+				locations = make([]messageCacheLocation, len(req.Messages))
+				break
+			}
+		}
+	}
+	sys, msgs, err := serializeMessagesWithLocations(req.Messages, c.warnf, locations)
 	if err != nil {
 		return nil, err
 	}
@@ -1172,7 +1181,7 @@ func (c *Client) buildRequestWithThinking(req llm.InvokeRequest, thinkingConfig 
 		tools = serializeTools(req.Tools, c.MaxCachedToolDefinitions)
 	}
 	if req.CachePlan != nil && len(req.CachePlan.Directives) > 0 {
-		if err := applyToolCachePlan(req.CachePlan, sys, msgs, tools); err != nil {
+		if err := applyCachePlan(req.CachePlan, &sys, msgs, tools, locations); err != nil {
 			return nil, err
 		}
 	}
@@ -1293,28 +1302,45 @@ func serializeMessages(in []llm.Message) (system any, out []messageParam, err er
 }
 
 func serializeMessagesWithWarning(in []llm.Message, warnf func(string, ...any)) (system any, out []messageParam, err error) {
+	return serializeMessagesWithLocations(in, warnf, nil)
+}
+
+func serializeMessagesWithLocations(in []llm.Message, warnf func(string, ...any), locations []messageCacheLocation) (system any, out []messageParam, err error) {
 	if err := validateAnthropicToolHistory(in); err != nil {
 		return nil, nil, err
 	}
 
 	var sysBlocks []contentBlockParam
+	record := func(index int, location messageCacheLocation) {
+		if locations != nil {
+			locations[index] = location
+		}
+	}
 
 	for i := 0; i < len(in); i++ {
 		m := in[i]
 		switch m.Role {
 		case llm.RoleSystem:
+			start := len(sysBlocks)
+			cacheable := false
 			if strings.TrimSpace(m.Content.Text) != "" {
 				blk := contentBlockParam{Type: "text", Text: m.Content.Text}
 				if m.Cache {
 					blk.CacheCtrl = &cacheControl{Type: "ephemeral"}
 				}
 				sysBlocks = append(sysBlocks, blk)
+				cacheable = true
 			}
 			for _, b := range m.Content.Blocks {
 				if llm.IsProviderStateBlock(b) {
 					continue
 				}
-				sysBlocks = append(sysBlocks, toAnthropicBlock(b, m.Cache))
+				block := toAnthropicBlock(b, m.Cache)
+				sysBlocks = append(sysBlocks, block)
+				cacheable = cacheableContentBoundary(b, block) && block.Type == "text"
+			}
+			if len(sysBlocks) > start {
+				record(i, messageCacheLocation{system: true, block: len(sysBlocks) - 1, eligible: cacheable})
 			}
 		case llm.RoleTool:
 			// Anthropic requires every tool_result for one assistant turn to be
@@ -1324,16 +1350,18 @@ func serializeMessagesWithWarning(in []llm.Message, warnf func(string, ...any)) 
 			j := i
 			for j < len(in) && in[j].Role == llm.RoleTool {
 				results = append(results, toAnthropicToolResultBlock(in[j], warnf))
+				record(j, messageCacheLocation{message: len(out), block: len(results) - 1, eligible: true})
 				j++
 			}
 			i = j - 1
 			out = append(out, messageParam{Role: "user", Content: results})
 		default:
-			mp, e := toAnthropicMessageWithWarning(m, warnf)
+			mp, cacheable, e := toAnthropicMessageForCache(m, warnf)
 			if e != nil {
 				return nil, nil, e
 			}
 			if mp != nil {
+				record(i, messageCacheLocation{message: len(out), block: len(mp.Content) - 1, eligible: cacheable})
 				out = append(out, *mp)
 			}
 		}
@@ -1342,6 +1370,14 @@ func serializeMessagesWithWarning(in []llm.Message, warnf func(string, ...any)) 
 	if len(sysBlocks) > 0 {
 		if text, ok := joinPlainSystemText(sysBlocks); ok {
 			system = text
+			// A collapsed string has one provable endpoint. Do not split or
+			// reconstruct earlier message boundaries just to insert cache markers.
+			for i := range locations {
+				if locations[i].system {
+					locations[i].eligible = locations[i].eligible && locations[i].block == len(sysBlocks)-1
+					locations[i].plain, locations[i].block = true, 0
+				}
+			}
 		} else {
 			// Use structured system blocks when we need cache_control or non-text blocks.
 			system = sysBlocks
@@ -1430,25 +1466,34 @@ func toAnthropicMessage(m llm.Message) (*messageParam, error) {
 }
 
 func toAnthropicMessageWithWarning(m llm.Message, warnf func(string, ...any)) (*messageParam, error) {
+	message, _, err := toAnthropicMessageForCache(m, warnf)
+	return message, err
+}
+
+func toAnthropicMessageForCache(m llm.Message, warnf func(string, ...any)) (*messageParam, bool, error) {
 	if m.Role == llm.RoleTool {
 		// Anthropic expects tool results as role=user with tool_result blocks.
-		return &messageParam{Role: "user", Content: []contentBlockParam{toAnthropicToolResultBlock(m, warnf)}}, nil
+		return &messageParam{Role: "user", Content: []contentBlockParam{toAnthropicToolResultBlock(m, warnf)}}, true, nil
 	}
 
 	role := string(m.Role)
 	if role != "user" && role != "assistant" {
-		return nil, nil
+		return nil, false, nil
 	}
 
 	blocks := []contentBlockParam{}
+	cacheable := false
 	if strings.TrimSpace(m.Content.Text) != "" {
 		blocks = append(blocks, contentBlockParam{Type: "text", Text: m.Content.Text})
+		cacheable = true
 	}
 	for _, b := range m.Content.Blocks {
 		if llm.IsProviderStateBlock(b) {
 			continue
 		}
-		blocks = append(blocks, toAnthropicBlock(b, false))
+		block := toAnthropicBlock(b, false)
+		blocks = append(blocks, block)
+		cacheable = cacheableContentBoundary(b, block) && (block.Type != "image" || m.Role == llm.RoleUser)
 	}
 
 	if m.Role == llm.RoleAssistant && len(m.ToolCalls) > 0 {
@@ -1472,12 +1517,13 @@ func toAnthropicMessageWithWarning(m llm.Message, warnf func(string, ...any)) (*
 				Name:  tc.Function.Name,
 				Input: input,
 			})
+			cacheable = true
 		}
 	}
 
 	if len(blocks) == 0 {
 		// Anthropic rejects empty messages; omit them.
-		return nil, nil
+		return nil, false, nil
 	}
 	if m.Cache {
 		// cache_control is a block-level breakpoint: mark only the final block
@@ -1485,7 +1531,7 @@ func toAnthropicMessageWithWarning(m llm.Message, warnf func(string, ...any)) (*
 		// turns whose last block is a tool_use still advance the prefix.
 		blocks[len(blocks)-1].CacheCtrl = &cacheControl{Type: "ephemeral"}
 	}
-	return &messageParam{Role: role, Content: blocks}, nil
+	return &messageParam{Role: role, Content: blocks}, cacheable, nil
 }
 
 // toAnthropicToolResultBlock maps a tool message onto a single tool_result

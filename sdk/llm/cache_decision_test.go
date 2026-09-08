@@ -170,6 +170,7 @@ func TestCacheDecisionBuiltinCapabilitiesAreConservative(t *testing.T) {
 		provider, ok := model.(llm.PromptCacheCapabilityProvider)
 		want := llm.PromptCacheCapabilities{UsageTelemetry: true}
 		if _, anthropicClient := model.(*anthropic.Client); anthropicClient {
+			want.ExplicitMessageBoundary = true
 			want.ExplicitToolDefinition, want.MaxBreakpoints = true, 4
 			want.SupportedTTLs = []llm.CacheTTL{llm.CacheTTL5Minutes}
 		}
@@ -177,6 +178,9 @@ func TestCacheDecisionBuiltinCapabilitiesAreConservative(t *testing.T) {
 			t.Fatal("builtin claims unimplemented explicit control")
 		}
 		request, view, plan := cacheDecisionFixture(t)
+		for i := range plan.Directives {
+			plan.Directives[i].Target.Kind = llm.CacheAfterMessageBlock
+		}
 		_, err := view.Decide(request, plan, model)
 		assertCacheViewError(t, err, "unsupported_target", 2)
 		plan.Directives[2].Policy = llm.CacheBestEffort
@@ -222,5 +226,76 @@ func BenchmarkCacheDecision(b *testing.B) {
 		if _, err := view.Decide(request, plan, model); err != nil {
 			b.Fatal(err)
 		}
+	}
+}
+
+type cacheEligibilityModel struct {
+	cacheDecisionModel
+	hook func(llm.InvokeRequest, []llm.CacheTarget) []bool
+}
+
+func (m *cacheEligibilityModel) PromptCacheTargetEligibility(request llm.InvokeRequest, targets []llm.CacheTarget) []bool {
+	return m.hook(request, targets)
+}
+
+func TestCacheEligibilitySnapshotOwnershipAndPreallocation(t *testing.T) {
+	request, view, plan := cacheDecisionFixture(t)
+	before, err := llm.CloneInvokeRequest(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	mask := []bool{false, true, true}
+	model := &cacheEligibilityModel{cacheDecisionModel: cacheDecisionModel{caps: llm.PromptCacheCapabilities{ExplicitMessageBoundary: true, MaxBreakpoints: 2}}}
+	model.hook = func(copy llm.InvokeRequest, targets []llm.CacheTarget) []bool {
+		if !reflect.DeepEqual(copy, before) {
+			t.Error("eligibility did not receive validated original snapshot")
+		}
+		copy.Messages[0].Content.Text = "private-mutated"
+		copy.Tools[0].Name = "private-mutated"
+		targets[1].MessageIndex = 99
+		return mask
+	}
+	result, err := view.Decide(request, plan, model)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Directives[0].Reason != "unmappable_target" || len(result.Plan.Directives) != 2 || result.Plan.Directives[0].Target.MessageIndex != 1 || result.Plan.Directives[1].Target.MessageIndex != 2 {
+		t.Fatal("eligibility was applied after capacity or exposed target aliases")
+	}
+	mask[1] = false
+	if !result.Directives[1].Accepted || !reflect.DeepEqual(request, before) {
+		t.Fatal("eligibility exposed caller or result aliases")
+	}
+	if err := view.Validate(request, plan); err != nil {
+		t.Fatal("provider mutated retained snapshot", err)
+	}
+	changed, _ := llm.CloneInvokeRequest(request)
+	changed.Messages[0].Content.Text = "new-view"
+	fresh, err := llm.NewCacheTargetView(changed)
+	if err != nil {
+		t.Fatal(err)
+	}
+	model.onRead = func() { *view = *fresh }
+	mask[1] = true
+	if _, err := view.Decide(request, plan, model); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestCacheEligibilityMalformedAndStale(t *testing.T) {
+	request, view, plan := cacheDecisionFixture(t)
+	model := &cacheEligibilityModel{cacheDecisionModel: cacheDecisionModel{caps: llm.PromptCacheCapabilities{ExplicitMessageBoundary: true, MaxBreakpoints: 4}}}
+	var calls int
+	model.hook = func(llm.InvokeRequest, []llm.CacheTarget) []bool { calls++; return []bool{true} }
+	result, err := view.Decide(request, plan, model)
+	assertCacheViewError(t, err, "invalid_capabilities", -1)
+	if result != nil || calls != 1 {
+		t.Fatal("malformed hook produced partial result")
+	}
+	request.Messages[0].Content.Text = "changed"
+	_, err = view.Decide(request, plan, model)
+	assertCacheViewError(t, err, "stale_request", -1)
+	if calls != 1 {
+		t.Fatal("stale request reached mapper")
 	}
 }

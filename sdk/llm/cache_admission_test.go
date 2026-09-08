@@ -47,7 +47,7 @@ func admissionRequest(t *testing.T, policy llm.CacheDirectivePolicy) llm.InvokeR
 	if err != nil {
 		t.Fatal(err)
 	}
-	request.CachePlan, err = view.Bind([]llm.CacheDirective{{Target: llm.CacheTarget{Kind: llm.CacheAfterMessage, MessageIndex: 1}, Policy: policy}})
+	request.CachePlan, err = view.Bind([]llm.CacheDirective{{Target: llm.CacheTarget{Kind: llm.CacheAfterMessageBlock, MessageIndex: 1}, Policy: policy}})
 	if err != nil {
 		t.Fatal(err)
 	}
