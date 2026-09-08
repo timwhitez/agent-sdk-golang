@@ -803,6 +803,15 @@ func (a *Agent) queryStreamWithSteering(ctx context.Context, input llm.Content, 
 			} else if !frame.validBindings() {
 				frameFailure = "execution frame tool bindings inconsistent"
 			}
+			if frameFailure == "" {
+				bound, known, bindErr := llm.BindFrameModel(ctx, frame.model)
+				if bindErr != nil {
+					// A plugin error may contain configuration or credentials.
+					frameFailure = "execution frame model binding unavailable"
+				} else {
+					frame.model, frame.modelBound = bound, known
+				}
+			}
 			if frameFailure != "" {
 				a.warnf("warning: %s", frameFailure)
 				if cont.hasPending() {
@@ -919,7 +928,7 @@ func (a *Agent) queryStreamWithSteering(ctx context.Context, input llm.Content, 
 				if ctx.Err() != nil {
 					origin = EventOriginSDKDriver
 				}
-				emitErr(a.errEvent(err), origin, correlation)
+				emitErr(errEventForModel(err, frame.model), origin, correlation)
 				return
 			}
 			streamIdleRecoveries = 0
@@ -970,7 +979,7 @@ func (a *Agent) queryStreamWithSteering(ctx context.Context, input llm.Content, 
 					a.mu.Unlock()
 				}
 				emitErr(ErrorEvent{
-					Provider: a.llm.Provider(),
+					Provider: frame.model.Provider(),
 					Kind:     "invalid_tool_call_block",
 					Message:  fmt.Sprintf("provider returned duplicate tool_call_id values at positions %d and %d; no tools were executed", first+1, second+1),
 				}, EventOriginSDKDriver, correlation)
@@ -4981,9 +4990,17 @@ func classifyGenericErrorKind(err error) string {
 }
 
 func (a *Agent) errEvent(err error) ErrorEvent {
+	var model llm.ChatModel
+	if a != nil {
+		model = a.llm
+	}
+	return errEventForModel(err, model)
+}
+
+func errEventForModel(err error, model llm.ChatModel) ErrorEvent {
 	prov := ""
-	if a != nil && a.llm != nil {
-		prov = strings.TrimSpace(a.llm.Provider())
+	if model != nil {
+		prov = strings.TrimSpace(model.Provider())
 	}
 	if err == nil {
 		return ErrorEvent{Provider: prov, Message: "<nil>", Kind: "unknown"}

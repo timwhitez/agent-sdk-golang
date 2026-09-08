@@ -27,9 +27,11 @@ Key implementation: [agent.go](../sdk/agent/agent.go),
 [execution_frame.go](../sdk/agent/execution_frame.go),
 [tool_block_state.go](../sdk/agent/tool_block_state.go).
 
-- A Frame owns a cloned logical request and resolver definitions. Model/handler
-  references are handles, not immutable closure state or a dynamic wrapper's
-  concrete model snapshot. Provider serialization may transform the outgoing copy.
+- A Frame owns a cloned logical request and resolver definitions. It calls an
+  explicit `llm.FrameModelBinder` once before invocation; all SDK retries reuse
+  that configuration binding. Unknown/unsupported wrappers retain legacy handles.
+  Handler closure state and transport handles are not frozen. Provider
+  serialization may still transform the outgoing copy.
 - Partial continuation calls are not accepted Tool Blocks. Finalized calls use
   the finalizing Frame's dispatch context; their content can have multiple sources.
 - Provider Call IDs may repeat across blocks. The sequential block authority uses

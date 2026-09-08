@@ -4,6 +4,18 @@ This document explains provider implementations, compatibility fallbacks,
 stream normalization, and response metadata behavior.
 
 ## Shared LLM Contracts
+- `FrameModelBinder` is an optional configuration-binding contract, not an
+  endpoint/model acceptance guarantee. The query driver captures it once per
+  logical Frame and preserves SDK retry/attempt numbering. Errors fail before
+  invocation with fixed diagnostics; unsupported/false results stay legacy.
+  A binding must retain streaming support and its outer concrete wrapper type;
+  different wrapper types are treated as unknown so embedded-client method
+  promotion cannot strip a host wrapper. No reflection-based unwrapping occurs.
+  Anthropic currently provides an owned copy of scalar/pointer/Beta/retry-map
+  configuration. HTTPClient and Warningf remain runtime handles; configure input
+  before binding, never mutate it concurrently. OpenAI clients and current Goode
+  wrappers have not adopted this contract. Compaction/whole-Run publication and
+  full host identity remain separate work; no new Manifest or content hash.
 - `InvokeRequest.CachePlan` is experimental in-memory intent, owned by
   `CloneInvokeRequest` and the private execution frame, and excluded from JSON.
   Bind nonempty plans with `CacheTargetView.Bind`. Built-in buffered/streaming
