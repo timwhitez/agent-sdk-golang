@@ -46,6 +46,9 @@ func TestAnthropicLegacyCacheBoundaryWireGolden(t *testing.T) {
 	resultB := `{"type":"tool_result","tool_use_id":"call_b","content":"(no output)"}`
 	reordered := llm.CloneMessages(toolMessages)
 	reordered[1], reordered[2] = reordered[2], reordered[1]
+	textResults := llm.CloneMessages(toolMessages)
+	textResults[1].Content = withState(llm.Content{Text: "primary", Blocks: []llm.ContentBlock{{Type: "text", Text: "not-appended"}}})
+	textResults[2].Content = withState(llm.Content{Blocks: []llm.ContentBlock{{Type: "text", Text: "one"}, {Type: "text"}, {Type: "text", Text: "two"}}})
 	for _, fixture := range []struct {
 		name     string
 		messages []llm.Message
@@ -66,6 +69,10 @@ func TestAnthropicLegacyCacheBoundaryWireGolden(t *testing.T) {
 			golden: `{"messages":[` + assistant + `,{"role":"user","content":[` + resultA + `,` + resultB + `]}]}`},
 		{name: "reordered-results-retain-own-boundary", messages: reordered,
 			golden: `{"messages":[` + assistant + `,{"role":"user","content":[` + resultB + `,` + resultA + `]}]}`},
+		// Text-only results use PlainText: Text wins over Blocks; blocks-only
+		// results join nonempty text with newlines, not separate wire blocks.
+		{name: "text-result-flattening", messages: textResults,
+			golden: `{"messages":[` + assistant + `,{"role":"user","content":[{"type":"tool_result","tool_use_id":"call_a","content":"primary","is_error":true,"cache_control":{"type":"ephemeral"}},{"type":"tool_result","tool_use_id":"call_b","content":"one\ntwo"}]}]}`},
 	} {
 		for _, stream := range []bool{false, true} {
 			t.Run(fmt.Sprintf("%s/stream=%v", fixture.name, stream), func(t *testing.T) {
