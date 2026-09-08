@@ -94,13 +94,14 @@ func (c *ChatClient) PromptCacheCapabilities() llm.PromptCacheCapabilities {
 }
 
 func (c *ChatClient) Invoke(ctx context.Context, req llm.InvokeRequest) (*llm.Completion, error) {
-	req, cacheDiagnostics, err := llm.AdmitCachePlan(ctx, req, c, c.warnf)
+	local := *c
+	local.Warningf = llm.WarningSink(ctx, c.Warningf)
+	local.Extra = cloneMap(c.Extra)
+	local.ExtraBody = cloneMap(c.ExtraBody)
+	req, cacheDiagnostics, err := llm.AdmitCachePlan(ctx, req, &local, local.warnf)
 	if err != nil {
 		return nil, err
 	}
-	local := *c
-	local.Extra = cloneMap(c.Extra)
-	local.ExtraBody = cloneMap(c.ExtraBody)
 
 	client := local.httpClient()
 	baseURL := strings.TrimRight(local.baseURL(), "/")
@@ -216,7 +217,11 @@ func (c *ChatClient) Invoke(ctx context.Context, req llm.InvokeRequest) (*llm.Co
 // InvokeStream implements true SSE streaming for OpenAI chat/completions.
 // It emits text deltas and tool_call deltas.
 func (c *ChatClient) InvokeStream(ctx context.Context, req llm.InvokeRequest) (<-chan llm.StreamEvent, error) {
-	req, _, err := llm.AdmitCachePlan(ctx, req, c, c.warnf)
+	local := *c
+	local.Warningf = llm.WarningSink(ctx, c.Warningf)
+	local.Extra = cloneMap(c.Extra)
+	local.ExtraBody = cloneMap(c.ExtraBody)
+	req, _, err := llm.AdmitCachePlan(ctx, req, &local, local.warnf)
 	if err != nil {
 		return nil, err
 	}
@@ -226,9 +231,6 @@ func (c *ChatClient) InvokeStream(ctx context.Context, req llm.InvokeRequest) (<
 	out := make(chan llm.StreamEvent, 128)
 	forwarded := make(chan llm.StreamEvent, 128)
 	go forwardOpenAIStreamEvents(ctx, forwarded, out)
-	local := *c
-	local.Extra = cloneMap(c.Extra)
-	local.ExtraBody = cloneMap(c.ExtraBody)
 	go func() {
 		defer close(out)
 

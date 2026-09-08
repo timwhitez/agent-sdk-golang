@@ -83,6 +83,9 @@ func (c *Client) PromptCacheCapabilities() llm.PromptCacheCapabilities {
 func (c *Client) Model() string { return c.ModelName }
 
 func (c *Client) Invoke(ctx context.Context, req llm.InvokeRequest) (*llm.Completion, error) {
+	local := *c
+	local.Warningf = llm.WarningSink(ctx, c.Warningf)
+	c = &local
 	req, cacheDiagnostics, err := llm.AdmitCachePlan(ctx, req, c, c.warnf)
 	if err != nil {
 		return nil, err
@@ -662,6 +665,9 @@ type requestPayload struct {
 // InvokeStream implements true SSE streaming for Anthropic messages.
 // It emits text deltas, thinking deltas, and basic tool_use deltas (best-effort).
 func (c *Client) InvokeStream(ctx context.Context, req llm.InvokeRequest) (<-chan llm.StreamEvent, error) {
+	local := *c
+	local.Warningf = llm.WarningSink(ctx, c.Warningf)
+	c = &local
 	req, _, err := llm.AdmitCachePlan(ctx, req, c, c.warnf)
 	if err != nil {
 		return nil, err

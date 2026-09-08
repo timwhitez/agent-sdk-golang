@@ -394,9 +394,6 @@ func New(cfg Config) (*Agent, error) {
 	if cfg.Deps == nil {
 		cfg.Deps = tools.NewContainer()
 	}
-	if setter, ok := cfg.LLM.(llm.WarningSinkSetter); ok {
-		setter.SetWarningf(cfg.Warningf)
-	}
 
 	ownedTools := make([]tools.Tool, len(cfg.Tools))
 	toolMap := map[string]tools.Tool{}
@@ -2165,6 +2162,7 @@ func (a *Agent) invokeModelCompletionWithSteering(ctx context.Context, model llm
 	if ctx == nil {
 		ctx = context.Background()
 	}
+	ctx = llm.WithWarningSink(ctx, a.warnf)
 	// Last line of defense for the tool_use/tool_result pairing invariant. Any
 	// loop-level defect that leaves a tool_use without its result (or an orphan
 	// result) would otherwise become an unrecoverable provider 400 that replays

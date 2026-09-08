@@ -360,6 +360,7 @@ func (s *Service) compactSummary(ctx context.Context, model llm.ChatModel, messa
 		defer cancel()
 	}
 
+	invokeCtx = llm.WithWarningSink(invokeCtx, s.warningf)
 	comp, err := model.Invoke(invokeCtx, llm.InvokeRequest{Messages: prepared})
 	if err != nil {
 		return messages, Result{Compacted: false, Warnings: append(append([]string(nil), ledgerWarnings...), checkpointWarnings...)}, err

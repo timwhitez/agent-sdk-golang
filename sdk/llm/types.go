@@ -174,8 +174,10 @@ type Completion struct {
 	Raw         json.RawMessage `json:"-"`
 }
 
-// WarningSinkSetter lets runtime hosts route provider diagnostics without
-// allowing a client to write directly to a TUI or protocol stdout/stderr.
+// WarningSinkSetter is a configuration-time API. Call it before sharing a
+// client; it does not promise synchronization or per-Agent ownership. Agent.New
+// does not call it. Providers should read WarningSink(ctx, configuredFallback)
+// to support invocation-local routing without mutating shared model state.
 type WarningSinkSetter interface {
 	SetWarningf(func(format string, args ...any))
 }
