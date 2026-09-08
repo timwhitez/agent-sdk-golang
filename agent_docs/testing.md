@@ -26,8 +26,13 @@ This document summarizes recommended test commands and current coverage focus.
   ID, but one QueryID and fourteen events on the existing sequence. Legacy and
   enveloped execution retain identical requests/history, explicit event-kind
   and origin goldens, clean final Tool Pair topology and metadata-only privacy.
-  This characterization does not add or prove Frame/attempt identity yet, nor
-  count HTTP attempts or retries hidden inside a model/provider wrapper.
+  It now also asserts the explicit Frame/SDK-invocation mapping without counting
+  HTTP attempts or retries hidden inside a model/provider wrapper.
+- `frame_correlation_test.go` covers streaming SDK retries versus provider retry
+  reports, pre-admission/backoff cancellation, retained usage's original attempt,
+  concurrent unscoped host/compaction events, terminal eviction/backpressure
+  ownership and absent-correlation JSON compatibility. The emission benchmark
+  measures metadata/channel overhead, not Frame construction or Provider cost.
 - `compaction_publication_test.go` checks combined source-checked checkpoint and
   history publication: pre-I/O stale/pending/admission/runtime rejection,
   callback ownership, acknowledged commit after cancellation, writer isolation,

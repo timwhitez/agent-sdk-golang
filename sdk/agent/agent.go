@@ -651,7 +651,7 @@ func (a *Agent) queryStreamWithSteering(ctx context.Context, input llm.Content, 
 		criticalDroppedThisTurn := func() uint64 {
 			return dropsSince(a.criticalEventDropCount.Load(), out.criticalDropStart)
 		}
-		emitFinal := func(content, responseID string) {
+		emitFinal := func(content, responseID string, correlations ...eventCorrelation) {
 			a.emitEvent(out, FinalResponseEvent{
 				Content:               content,
 				ResponseID:            responseID,
@@ -659,9 +659,9 @@ func (a *Agent) queryStreamWithSteering(ctx context.Context, input llm.Content, 
 				StallRecoveries:       streamIdleRecoveryTotal,
 				DroppedEvents:         droppedThisTurn(),
 				DroppedCriticalEvents: criticalDroppedThisTurn(),
-			})
+			}, correlations...)
 		}
-		emitPartialFinal := func(content, responseID, reason string) {
+		emitPartialFinal := func(content, responseID, reason string, correlations ...eventCorrelation) {
 			a.emitEvent(out, FinalResponseEvent{
 				Content:               content,
 				ResponseID:            responseID,
@@ -670,14 +670,14 @@ func (a *Agent) queryStreamWithSteering(ctx context.Context, input llm.Content, 
 				StallRecoveries:       streamIdleRecoveryTotal,
 				DroppedEvents:         droppedThisTurn(),
 				DroppedCriticalEvents: criticalDroppedThisTurn(),
-			})
+			}, correlations...)
 		}
-		emitErr := func(e ErrorEvent, origin EventOrigin) {
+		emitErr := func(e ErrorEvent, origin EventOrigin, correlations ...eventCorrelation) {
 			e.StallRecoveries = streamIdleRecoveryTotal
-			a.emitEventFrom(out, e, origin)
+			a.emitEventFrom(out, e, origin, correlations...)
 		}
-		emitSDKErr := func(e ErrorEvent) {
-			emitErr(e, EventOriginSDKDriver)
+		emitSDKErr := func(e ErrorEvent, correlations ...eventCorrelation) {
+			emitErr(e, EventOriginSDKDriver, correlations...)
 		}
 		emitCompactionErr := func(e ErrorEvent) {
 			origin := EventOriginCompaction
@@ -687,6 +687,7 @@ func (a *Agent) queryStreamWithSteering(ctx context.Context, input llm.Content, 
 			emitErr(e, origin)
 		}
 		var activeToolBlock *toolBlockState
+		var activeToolBlockCorrelation eventCorrelation
 		var pendingBlockMessages []llm.Message
 		blockFailed := false
 		commitToolHistory := func(messages []llm.Message) { a.appendMessages(messages) }
@@ -701,7 +702,7 @@ func (a *Agent) queryStreamWithSteering(ctx context.Context, input llm.Content, 
 				if errors.As(err, &transition) {
 					message += ": " + transition.Error()
 				}
-				emitSDKErr(ErrorEvent{Kind: "invalid_tool_call_block", Message: message})
+				emitSDKErr(ErrorEvent{Kind: "invalid_tool_call_block", Message: message}, activeToolBlockCorrelation)
 			}
 			return false
 		}
@@ -720,7 +721,7 @@ func (a *Agent) queryStreamWithSteering(ctx context.Context, input llm.Content, 
 			if err != nil {
 				return failToolBlock(err)
 			}
-			a.emitToolResultWithAccounting(out, result, duration)
+			a.emitToolResultWithAccounting(out, result, duration, activeToolBlockCorrelation)
 			return true
 		}
 		finishToolBlock := func() bool {
@@ -797,7 +798,7 @@ func (a *Agent) queryStreamWithSteering(ctx context.Context, input llm.Content, 
 				// until done, steering, or turn termination closes the subloop.
 				DisableThinking: requireDoneRecoveryDisableThinkingActive,
 			}
-			frame, frameErr := newExecutionFrame(a.llm, request, a.toolMap, a.toolMapNormalized)
+			frame, frameErr := newExecutionFrame(fmt.Sprintf("%s/frame/%d", out.queryID, iter+1), a.llm, request, a.toolMap, a.toolMapNormalized)
 			frameFailure := ""
 			if frameErr != nil {
 				// Clone errors may contain schema data. Keep diagnostics structural.
@@ -821,7 +822,9 @@ func (a *Agent) queryStreamWithSteering(ctx context.Context, input llm.Content, 
 				emitSDKErr(ErrorEvent{Kind: "invalid_request", Message: frameFailure + "; rebuild the Agent with consistent, cloneable tool definitions"})
 				return
 			}
-			comp, streamedText, err := a.invokeModelCompletionWithRetryAndSteering(ctx, frame.model, frame.request, out, steeringCh)
+			invocation := &frameInvocation{frameID: frame.id}
+			comp, streamedText, err := a.invokeModelCompletionWithRetryAndSteering(ctx, frame.model, frame.request, out, steeringCh, invocation)
+			correlation := invocation.correlation()
 			if err != nil {
 				// Check for steering interrupt - handle specially
 				var steerErr *llm.SteeringInterruptError
@@ -845,7 +848,7 @@ func (a *Agent) queryStreamWithSteering(ctx context.Context, input llm.Content, 
 					// The provider already billed what it produced before the
 					// interrupt. This path continues the loop instead of ending
 					// the turn, so the tokens are only recorded here.
-					a.emitPartialUsage(out, comp)
+					a.emitPartialUsage(out, comp, invocation.completionCorrelation())
 					if msg := strings.TrimSpace(steerErr.Message); msg != "" {
 						a.mu.Lock()
 						a.messages = append(a.messages, llm.NewUserMessage(msg))
@@ -880,7 +883,7 @@ func (a *Agent) queryStreamWithSteering(ctx context.Context, input llm.Content, 
 						// Same as the steering path: the stalled response was
 						// already billed, and the recovery continues the loop
 						// rather than ending the turn, so emit it here.
-						a.emitPartialUsage(out, comp)
+						a.emitPartialUsage(out, comp, invocation.completionCorrelation())
 						a.mu.Lock()
 						a.messages = append(a.messages, messageorigin.NewInternalUserMessage(messageorigin.KindStreamIdleRecovery, streamIdleRecoveryText))
 						a.mu.Unlock()
@@ -914,12 +917,12 @@ func (a *Agent) queryStreamWithSteering(ctx context.Context, input llm.Content, 
 				// error, and the partial completion carries that usage. Emit it
 				// before the terminal error or the tokens never reach the
 				// accounting journal, which silently under-counts the ledger.
-				a.emitPartialUsage(out, comp)
+				a.emitPartialUsage(out, comp, invocation.completionCorrelation())
 				origin := EventOriginProvider
 				if ctx.Err() != nil {
 					origin = EventOriginSDKDriver
 				}
-				emitErr(a.errEvent(err), origin)
+				emitErr(a.errEvent(err), origin, correlation)
 				return
 			}
 			streamIdleRecoveries = 0
@@ -961,7 +964,7 @@ func (a *Agent) queryStreamWithSteering(ctx context.Context, input llm.Content, 
 			}
 
 			if comp.Usage != nil {
-				a.emitUsageWithAccounting(out, *comp.Usage, responseID)
+				a.emitUsageWithAccounting(out, *comp.Usage, responseID, correlation)
 			}
 			if first, second, duplicate := duplicateToolCallIDPositions(comp.ToolCalls); duplicate {
 				if cont.hasPending() {
@@ -973,16 +976,16 @@ func (a *Agent) queryStreamWithSteering(ctx context.Context, input llm.Content, 
 					Provider: a.llm.Provider(),
 					Kind:     "invalid_tool_call_block",
 					Message:  fmt.Sprintf("provider returned duplicate tool_call_id values at positions %d and %d; no tools were executed", first+1, second+1),
-				}, EventOriginSDKDriver)
+				}, EventOriginSDKDriver, correlation)
 				return
 			}
 
 			if comp.Thinking != "" {
-				a.emitEvent(out, ThinkingEvent{Content: comp.Thinking})
+				a.emitEvent(out, ThinkingEvent{Content: comp.Thinking}, correlation)
 			}
 			if !streamedText {
 				if txt := comp.PlainText(); txt != "" {
-					a.emitEvent(out, TextEvent{Content: txt})
+					a.emitEvent(out, TextEvent{Content: txt}, correlation)
 				}
 			}
 
@@ -1053,7 +1056,7 @@ func (a *Agent) queryStreamWithSteering(ctx context.Context, input llm.Content, 
 				a.emitEvent(out, WarnEvent{
 					Message: fmt.Sprintf("continuing truncated tool-call arguments (%d/%d)", turn, cont.maxTurns),
 					Kind:    "continuation",
-				})
+				}, correlation)
 				reminder := messageorigin.NewInternalUserMessage(messageorigin.KindToolCallContinuation, messageorigin.ResponseTruncatedContinuationText)
 				if a.hasCompactor {
 					if err := a.checkAndCompactWithGrowth(ctx, comp, out, additionalSinceCompletion(), pendingMessageTokens(reminder)); err != nil {
@@ -1064,7 +1067,7 @@ func (a *Agent) queryStreamWithSteering(ctx context.Context, input llm.Content, 
 				a.mu.Lock()
 				a.messages = append(a.messages, reminder)
 				a.mu.Unlock()
-				a.emitAutoContinue(out, "max_tokens", responseID)
+				a.emitAutoContinue(out, "max_tokens", responseID, correlation)
 				continue
 			}
 
@@ -1106,7 +1109,7 @@ func (a *Agent) queryStreamWithSteering(ctx context.Context, input llm.Content, 
 					a.emitEvent(out, WarnEvent{
 						Message: fmt.Sprintf("tool-call merge remained invalid; requesting continuation (%d/%d)", turn, cont.maxTurns),
 						Kind:    "continuation",
-					})
+					}, correlation)
 					reminder := messageorigin.NewInternalUserMessage(messageorigin.KindToolCallContinuation, messageorigin.ResponseTruncatedContinuationText)
 					if a.hasCompactor {
 						if err := a.checkAndCompactWithGrowth(ctx, comp, out, additionalSinceCompletion(), pendingMessageTokens(reminder)); err != nil {
@@ -1117,7 +1120,7 @@ func (a *Agent) queryStreamWithSteering(ctx context.Context, input llm.Content, 
 					a.mu.Lock()
 					a.messages = append(a.messages, reminder)
 					a.mu.Unlock()
-					a.emitAutoContinue(out, "max_tokens", responseID)
+					a.emitAutoContinue(out, "max_tokens", responseID, correlation)
 					continue
 				}
 				// Valid merged tool calls — clean up partials and update.
@@ -1177,7 +1180,7 @@ func (a *Agent) queryStreamWithSteering(ctx context.Context, input llm.Content, 
 					a.mu.Lock()
 					a.messages = append(a.messages, reminder)
 					a.mu.Unlock()
-					a.emitAutoContinue(out, "max_tokens", responseID)
+					a.emitAutoContinue(out, "max_tokens", responseID, correlation)
 					continue
 				}
 				if !a.requireDone {
@@ -1206,7 +1209,7 @@ func (a *Agent) queryStreamWithSteering(ctx context.Context, input llm.Content, 
 						_ = a.checkAndCompact(ctx, comp, out)
 					}
 					clearPendingTextContinuation()
-					emitFinal(combinedText, responseID)
+					emitFinal(combinedText, responseID, correlation)
 					return
 				}
 				// require done tool: only enforce when tools have actually been
@@ -1219,7 +1222,7 @@ func (a *Agent) queryStreamWithSteering(ctx context.Context, input llm.Content, 
 							_ = a.checkAndCompact(ctx, comp, out)
 						}
 						clearPendingTextContinuation()
-						emitFinal(combinedText, responseID)
+						emitFinal(combinedText, responseID, correlation)
 						return
 					}
 					// Tools were used earlier; enforce done-tool completion.
@@ -1258,7 +1261,7 @@ func (a *Agent) queryStreamWithSteering(ctx context.Context, input llm.Content, 
 						}
 						clearPendingTextContinuation()
 						requireDoneRecoveryDisableThinkingActive = false
-						emitPartialFinal(finalContent, finalResponseID, "require_done_safety")
+						emitPartialFinal(finalContent, finalResponseID, "require_done_safety", correlation)
 						return
 					}
 					forceRequireDoneToolChoice = true
@@ -1287,6 +1290,7 @@ func (a *Agent) queryStreamWithSteering(ctx context.Context, input llm.Content, 
 			// interleaved with user text, and the malformed history would stay
 			// in place and fail every later turn — so these are only appended
 			// once every tool_use in the block has a matching tool_result.
+			activeToolBlockCorrelation = correlation
 			activeToolBlock, err = newToolBlockState(comp.ToolCalls)
 			if err != nil {
 				// No block was accepted. Defensively discard the staged assistant
@@ -1464,19 +1468,19 @@ func (a *Agent) queryStreamWithSteering(ctx context.Context, input llm.Content, 
 							})
 							repeatGuard.exhausted = true
 						}
-						a.emitEvent(out, StepStartEvent{StepID: tc.ID, Title: resolvedName, StepNumber: step})
+						a.emitEvent(out, StepStartEvent{StepID: tc.ID, Title: resolvedName, StepNumber: step}, correlation)
 						a.emitEvent(out, ToolCallEvent{
 							Tool: resolvedName, Args: norm.Display, ArgsJSON: norm.Normalized,
 							ArgsMeta: norm.Meta, ToolCallID: tc.ID, DisplayName: resolvedName,
-						})
+						}, correlation)
 						if !publishToolResult(idx, 0) {
 							return
 						}
-						a.emitEvent(out, StepCompleteEvent{StepID: tc.ID, Status: "error"})
+						a.emitEvent(out, StepCompleteEvent{StepID: tc.ID, Status: "error"}, correlation)
 						continue
 					}
 				}
-				a.emitEvent(out, StepStartEvent{StepID: tc.ID, Title: resolvedName, StepNumber: step})
+				a.emitEvent(out, StepStartEvent{StepID: tc.ID, Title: resolvedName, StepNumber: step}, correlation)
 				argsMap := norm.Display
 				if argsMap == nil {
 					argsMap = map[string]any{"__raw": execArgs}
@@ -1488,7 +1492,7 @@ func (a *Agent) queryStreamWithSteering(ctx context.Context, input llm.Content, 
 					ArgsMeta:    norm.Meta,
 					ToolCallID:  tc.ID,
 					DisplayName: resolvedName,
-				})
+				}, correlation)
 				if evidenceTool {
 					decision := progressLedger.preflight(evidenceReq, a.compactionGeneration.Load())
 					if decision.suppress {
@@ -1503,7 +1507,7 @@ func (a *Agent) queryStreamWithSteering(ctx context.Context, input llm.Content, 
 						if !publishToolResult(idx, 0) {
 							return
 						}
-						a.emitEvent(out, StepCompleteEvent{StepID: tc.ID, Status: "completed"})
+						a.emitEvent(out, StepCompleteEvent{StepID: tc.ID, Status: "completed"}, correlation)
 						if decision.recovery {
 							reminder := evidenceRecoveryMessage(evidenceReq)
 							// Deferred until the tool-call block is closed; see
@@ -1584,7 +1588,7 @@ func (a *Agent) queryStreamWithSteering(ctx context.Context, input llm.Content, 
 					if !publishToolResult(idx, time.Since(start)) {
 						return
 					}
-					a.emitEvent(out, StepCompleteEvent{StepID: tc.ID, Status: status, DurationMS: time.Since(start).Milliseconds()})
+					a.emitEvent(out, StepCompleteEvent{StepID: tc.ID, Status: status, DurationMS: time.Since(start).Milliseconds()}, correlation)
 					if err := ctx.Err(); err != nil {
 						if !closeToolResults(idx+1, toolCallAccepted, "root_cancel_after_task_complete", historyOnlyResults(skippedToolResults(comp.ToolCalls[idx+1:], toolSkippedByCancellationText))...) {
 							return
@@ -1618,7 +1622,7 @@ func (a *Agent) queryStreamWithSteering(ctx context.Context, input llm.Content, 
 					if !finishToolBlock() {
 						return
 					}
-					emitFinal(finalContent, finalResponseID)
+					emitFinal(finalContent, finalResponseID, correlation)
 					return
 				}
 
@@ -1639,7 +1643,7 @@ func (a *Agent) queryStreamWithSteering(ctx context.Context, input llm.Content, 
 				if !publishToolResult(idx, time.Since(start)) {
 					return
 				}
-				a.emitEvent(out, StepCompleteEvent{StepID: tc.ID, Status: status, DurationMS: time.Since(start).Milliseconds()})
+				a.emitEvent(out, StepCompleteEvent{StepID: tc.ID, Status: status, DurationMS: time.Since(start).Milliseconds()}, correlation)
 				if rootCancelErr == nil {
 					rootCancelErr = ctx.Err()
 				}
@@ -2144,7 +2148,12 @@ func (a *Agent) invokeCompletionWithSteering(ctx context.Context, req llm.Invoke
 	return a.invokeModelCompletionWithSteering(ctx, a.llm, req, out, steeringCh)
 }
 
-func (a *Agent) invokeModelCompletionWithSteering(ctx context.Context, model llm.ChatModel, req llm.InvokeRequest, out *eventOutput, steeringCh <-chan SteeringMsg) (*llm.Completion, bool, error) {
+func (a *Agent) invokeModelCompletionWithSteering(ctx context.Context, model llm.ChatModel, req llm.InvokeRequest, out *eventOutput, steeringCh <-chan SteeringMsg, scopes ...*frameInvocation) (*llm.Completion, bool, error) {
+	var scope *frameInvocation
+	if len(scopes) == 1 {
+		scope = scopes[0]
+	}
+	scope.resetAttempt()
 	if model == nil {
 		return nil, false, fmt.Errorf("agent: nil llm")
 	}
@@ -2197,6 +2206,7 @@ func (a *Agent) invokeModelCompletionWithSteering(ctx context.Context, model llm
 			}
 			return comp, streamedText, fallbackErr
 		}
+		correlation := scope.enter()
 		ch, err := sm.InvokeStream(invokeCtx, req)
 		if err != nil {
 			return finishProviderStage(nil, false, err)
@@ -2266,20 +2276,20 @@ func (a *Agent) invokeModelCompletionWithSteering(ctx context.Context, model llm
 				if strings.TrimSpace(e.Delta) != "" || e.Delta == "\n" {
 					text.WriteString(e.Delta)
 					streamedText = true
-					a.emitEvent(out, TextDeltaEvent{Delta: e.Delta})
+					a.emitEvent(out, TextDeltaEvent{Delta: e.Delta}, correlation)
 				} else {
 					// preserve whitespace as-is
 					text.WriteString(e.Delta)
 					if e.Delta != "" {
 						streamedText = true
-						a.emitEvent(out, TextDeltaEvent{Delta: e.Delta})
+						a.emitEvent(out, TextDeltaEvent{Delta: e.Delta}, correlation)
 					}
 				}
 			case llm.StreamThinkingDeltaEvent:
 				thinkingBlocks.apply(e)
 				if e.Delta != "" {
 					thinking.WriteString(e.Delta)
-					a.emitEvent(out, ThinkingDeltaEvent{Delta: e.Delta})
+					a.emitEvent(out, ThinkingDeltaEvent{Delta: e.Delta}, correlation)
 				}
 			case llm.StreamToolCallDeltaEvent:
 				acc.apply(e)
@@ -2307,7 +2317,7 @@ func (a *Agent) invokeModelCompletionWithSteering(ctx context.Context, model llm
 				if e.RetryAfter > 0 {
 					msg = fmt.Sprintf("%s in %s", msg, e.RetryAfter.Round(time.Second))
 				}
-				a.emitEvent(out, WarnEvent{Kind: "rate_limit_retry", Message: msg})
+				a.emitEvent(out, WarnEvent{Kind: "rate_limit_retry", Message: msg}, correlation)
 			case llm.StreamErrorEvent:
 				return e.AsError()
 			case llm.StreamDoneEvent:
@@ -2402,6 +2412,7 @@ func (a *Agent) invokeModelCompletionWithSteering(ctx context.Context, model llm
 		finishStage()
 		return nil, false, err
 	}
+	scope.enter()
 	comp, err := model.Invoke(invokeCtx, req)
 	stageInterruptedForSteering := finishStage()
 	if ctx.Err() == nil && stageInterruptedForSteering {
@@ -2430,13 +2441,13 @@ func (a *Agent) invokeCompletionWithRetryAndSteering(ctx context.Context, req ll
 	return a.invokeModelCompletionWithRetryAndSteering(ctx, a.llm, req, out, steeringCh)
 }
 
-func (a *Agent) invokeModelCompletionWithRetryAndSteering(ctx context.Context, model llm.ChatModel, req llm.InvokeRequest, out *eventOutput, steeringCh <-chan SteeringMsg) (*llm.Completion, bool, error) {
+func (a *Agent) invokeModelCompletionWithRetryAndSteering(ctx context.Context, model llm.ChatModel, req llm.InvokeRequest, out *eventOutput, steeringCh <-chan SteeringMsg, scopes ...*frameInvocation) (*llm.Completion, bool, error) {
 	maxAttempts := defaultInvokeRetryMax
 	if a != nil && a.invokeRetryMax > 0 {
 		maxAttempts = a.invokeRetryMax
 	}
 	if maxAttempts <= 1 {
-		return a.invokeModelCompletionWithSteering(ctx, model, req, out, steeringCh)
+		return a.invokeModelCompletionWithSteering(ctx, model, req, out, steeringCh, scopes...)
 	}
 
 	var lastComp *llm.Completion
@@ -2446,7 +2457,7 @@ func (a *Agent) invokeModelCompletionWithRetryAndSteering(ctx context.Context, m
 		if err := ctx.Err(); err != nil {
 			return lastComp, lastStreamed, err
 		}
-		comp, streamedText, err := a.invokeModelCompletionWithSteering(ctx, model, req, out, steeringCh)
+		comp, streamedText, err := a.invokeModelCompletionWithSteering(ctx, model, req, out, steeringCh, scopes...)
 		if err == nil {
 			return comp, streamedText, nil
 		}
@@ -2470,6 +2481,11 @@ func (a *Agent) invokeModelCompletionWithRetryAndSteering(ctx context.Context, m
 		delay, retry := a.transientInvokeRetryDelay(err, comp, streamedText, attempt)
 		if !retry {
 			break
+		}
+		// A cancellation while waiting for another retry is not a failure
+		// inside the preceding, already completed model invocation.
+		if len(scopes) == 1 {
+			scopes[0].resetAttempt()
 		}
 		if delay > 0 {
 			a.warnf("agent invoke transient failure (attempt %d/%d): %v; retrying in %s", attempt, maxAttempts, err, delay)
@@ -2781,7 +2797,7 @@ func (a *Agent) executeToolSafely(ctx context.Context, tool tools.Tool, raw stri
 // normal success path (terminal stream error, steering interrupt, idle-timeout
 // recovery, context cancellation). The provider already billed the tokens it
 // produced, so skipping this leaves the accounting journal under-counted.
-func (a *Agent) emitPartialUsage(out *eventOutput, comp *llm.Completion) {
+func (a *Agent) emitPartialUsage(out *eventOutput, comp *llm.Completion, correlations ...eventCorrelation) {
 	if comp == nil || comp.Usage == nil {
 		return
 	}
@@ -2789,23 +2805,23 @@ func (a *Agent) emitPartialUsage(out *eventOutput, comp *llm.Completion) {
 	if usage == nil {
 		return
 	}
-	a.emitUsageWithAccounting(out, *usage, strings.TrimSpace(comp.ResponseID))
+	a.emitUsageWithAccounting(out, *usage, strings.TrimSpace(comp.ResponseID), correlations...)
 }
 
-func (a *Agent) emitUsageWithAccounting(out *eventOutput, usage llm.Usage, responseID string) {
-	if !a.emitEvent(out, UsageEvent{Usage: usage, ResponseID: responseID}) {
+func (a *Agent) emitUsageWithAccounting(out *eventOutput, usage llm.Usage, responseID string, correlations ...eventCorrelation) {
+	if !a.emitEvent(out, UsageEvent{Usage: usage, ResponseID: responseID}, correlations...) {
 		return
 	}
 	a.emitAccounting(out, AccountingEvent{
 		Payload:         sdkaccounting.ProjectUsage(usage, a.accountingEstimator),
 		CorrelationKind: "response",
 		ResponseID:      strings.TrimSpace(responseID),
-	})
+	}, correlations...)
 }
 
-func (a *Agent) emitToolResultWithAccounting(out *eventOutput, result toolResultProjection, duration time.Duration) {
+func (a *Agent) emitToolResultWithAccounting(out *eventOutput, result toolResultProjection, duration time.Duration, correlations ...eventCorrelation) {
 	event := result.event()
-	if !a.emitEvent(out, event) {
+	if !a.emitEvent(out, event, correlations...) {
 		return
 	}
 	a.emitAccounting(out, AccountingEvent{
@@ -2819,7 +2835,7 @@ func (a *Agent) emitToolResultWithAccounting(out *eventOutput, result toolResult
 		CorrelationKind: "tool_call",
 		ToolCallID:      strings.TrimSpace(event.ToolCallID),
 		DurationMS:      duration.Milliseconds(),
-	})
+	}, correlations...)
 }
 
 func (a *Agent) emitCompactionWithAccounting(out *eventOutput, event CompactionEvent) {
@@ -2832,23 +2848,31 @@ func (a *Agent) emitCompactionWithAccounting(out *eventOutput, event CompactionE
 	})
 }
 
-func (a *Agent) emitAccounting(out *eventOutput, event AccountingEvent) {
+func (a *Agent) emitAccounting(out *eventOutput, event AccountingEvent, correlations ...eventCorrelation) {
 	event.Sequence = a.accountingSequence.Add(1)
-	a.emitEvent(out, event)
+	a.emitEvent(out, event, correlations...)
 }
 
-func (a *Agent) emitEvent(out *eventOutput, ev Event) bool {
+func (a *Agent) emitEvent(out *eventOutput, ev Event, correlations ...eventCorrelation) bool {
 	if out == nil {
 		return false
 	}
-	return a.emitEnvelope(out, ev, out.next(ev))
+	envelope := out.next(ev)
+	if len(correlations) == 1 && correlations[0].frameID != "" {
+		envelope.FrameID, envelope.InvokeAttempt = correlations[0].frameID, correlations[0].attempt
+	}
+	return a.emitEnvelope(out, ev, envelope)
 }
 
-func (a *Agent) emitEventFrom(out *eventOutput, ev Event, origin EventOrigin) bool {
+func (a *Agent) emitEventFrom(out *eventOutput, ev Event, origin EventOrigin, correlations ...eventCorrelation) bool {
 	if out == nil {
 		return false
 	}
-	return a.emitEnvelope(out, ev, out.nextFrom(ev, origin))
+	envelope := out.nextFrom(ev, origin)
+	if len(correlations) == 1 && correlations[0].frameID != "" {
+		envelope.FrameID, envelope.InvokeAttempt = correlations[0].frameID, correlations[0].attempt
+	}
+	return a.emitEnvelope(out, ev, envelope)
 }
 
 func (a *Agent) emitEnvelope(out *eventOutput, ev Event, envelope EventEnvelope) bool {
@@ -3190,8 +3214,8 @@ func (a *Agent) logDroppedEvent(ev Event, reason string) {
 	}
 }
 
-func (a *Agent) emitAutoContinue(out *eventOutput, reason string, responseID string) {
-	a.emitEvent(out, AutoContinueEvent{Reason: reason, ResponseID: strings.TrimSpace(responseID)})
+func (a *Agent) emitAutoContinue(out *eventOutput, reason string, responseID string, correlations ...eventCorrelation) {
+	a.emitEvent(out, AutoContinueEvent{Reason: reason, ResponseID: strings.TrimSpace(responseID)}, correlations...)
 }
 
 // lastResultForSignatureIsRecycled reports whether the most recent tool result
