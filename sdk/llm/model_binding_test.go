@@ -40,6 +40,11 @@ func TestBindFrameModelCapabilityAndFailureBoundaries(t *testing.T) {
 	}
 	target := &bindingModel{}
 	var nilTarget *bindingModel
+	for _, missing := range []ChatModel{nil, nilTarget} {
+		if _, _, err := BindFrameModel(context.Background(), missing); err == nil {
+			t.Fatal("nil source model accepted")
+		}
+	}
 	sentinel := errors.New("private binding failure")
 	for _, tc := range []struct {
 		name    string

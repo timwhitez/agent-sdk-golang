@@ -17,7 +17,6 @@ import (
 type executionFrame struct {
 	id         string
 	model      llm.ChatModel
-	modelBound bool
 	request    llm.InvokeRequest
 	exact      map[string]tools.Tool
 	normalized map[string]tools.Tool

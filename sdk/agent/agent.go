@@ -797,6 +797,7 @@ func (a *Agent) queryStreamWithSteering(ctx context.Context, input llm.Content, 
 			}
 			frame, frameErr := newExecutionFrame(fmt.Sprintf("%s/frame/%d", out.queryID, iter+1), a.llm, request, a.toolMap, a.toolMapNormalized)
 			frameFailure := ""
+			frameFailureHint := "rebuild the Agent with consistent, cloneable tool definitions"
 			if frameErr != nil {
 				// Clone errors may contain schema data. Keep diagnostics structural.
 				frameFailure = "execution frame snapshot unavailable"
@@ -804,12 +805,13 @@ func (a *Agent) queryStreamWithSteering(ctx context.Context, input llm.Content, 
 				frameFailure = "execution frame tool bindings inconsistent"
 			}
 			if frameFailure == "" {
-				bound, known, bindErr := llm.BindFrameModel(ctx, frame.model)
+				bound, _, bindErr := llm.BindFrameModel(ctx, frame.model)
 				if bindErr != nil {
 					// A plugin error may contain configuration or credentials.
 					frameFailure = "execution frame model binding unavailable"
+					frameFailureHint = "check the model's FrameModelBinder implementation"
 				} else {
-					frame.model, frame.modelBound = bound, known
+					frame.model = bound
 				}
 			}
 			if frameFailure != "" {
@@ -825,7 +827,7 @@ func (a *Agent) queryStreamWithSteering(ctx context.Context, input llm.Content, 
 				return
 			}
 			if frameFailure != "" {
-				emitSDKErr(ErrorEvent{Kind: "invalid_request", Message: frameFailure + "; rebuild the Agent with consistent, cloneable tool definitions"})
+				emitSDKErr(ErrorEvent{Kind: "invalid_request", Message: frameFailure + "; " + frameFailureHint})
 				return
 			}
 			invocation := &frameInvocation{frameID: frame.id}
