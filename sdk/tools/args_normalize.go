@@ -1,11 +1,78 @@
 package tools
 
 import (
+	"bytes"
+	"context"
+	"encoding"
 	"encoding/json"
 	"errors"
 	"io"
+	"reflect"
 	"strings"
 )
+
+// Original spelling is needed only if a later typed decode repairs arguments.
+// Keeping it in context avoids publishing args_raw metadata on untouched calls.
+type originalToolArgsKey struct{}
+
+// DecodeTypedToolArgs preserves an already valid input. After an unknown-field
+// decode error, plain argument types may receive one schema-key repair and fresh
+// decode before business execution. Types with custom JSON/Text decoders are
+// never decoded twice: their accepted keys and effects cannot be inferred from
+// the schema. This helper never invokes a business handler.
+func DecodeTypedToolArgs[Args any](ctx context.Context, name string, schema map[string]any, raw json.RawMessage) (Args, error) {
+	decode := func(raw json.RawMessage) (Args, error) {
+		var args Args
+		dec := json.NewDecoder(bytes.NewReader(raw))
+		dec.DisallowUnknownFields()
+		err := dec.Decode(&args)
+		return args, err
+	}
+	args, err := decode(raw)
+	if err == nil || !strings.Contains(err.Error(), "unknown field") || hasCustomArgumentDecoder(reflect.TypeOf((*Args)(nil)).Elem(), make(map[reflect.Type]bool)) {
+		return args, err
+	}
+	meta := ToolResultMetadataSnapshot(ctx)
+	if original, ok := ctx.Value(originalToolArgsKey{}).(string); ok {
+		meta = ensureArgsRaw(meta, original)
+	}
+	if repaired, repairedMeta, ok := repairToolArgsBySchema(name, schema, raw, meta); ok {
+		if repairedArgs, repairedErr := decode(repaired); repairedErr == nil {
+			UpsertToolResultMetadata(ctx, repairedMeta)
+			return repairedArgs, nil
+		}
+	}
+	return args, err
+}
+
+func hasCustomArgumentDecoder(typ reflect.Type, seen map[reflect.Type]bool) bool {
+	if seen[typ] {
+		return false
+	}
+	seen[typ] = true
+	decoder := reflect.TypeOf((*json.Unmarshaler)(nil)).Elem()
+	textDecoder := reflect.TypeOf((*encoding.TextUnmarshaler)(nil)).Elem()
+	if typ.Implements(decoder) || reflect.PointerTo(typ).Implements(decoder) || typ.Implements(textDecoder) || reflect.PointerTo(typ).Implements(textDecoder) {
+		return true
+	}
+	switch typ.Kind() {
+	case reflect.Pointer, reflect.Slice, reflect.Array:
+		return hasCustomArgumentDecoder(typ.Elem(), seen)
+	case reflect.Map:
+		return hasCustomArgumentDecoder(typ.Key(), seen) || hasCustomArgumentDecoder(typ.Elem(), seen)
+	case reflect.Struct:
+		for i := 0; i < typ.NumField(); i++ {
+			field := typ.Field(i)
+			if (field.PkgPath != "" && !field.Anonymous) || strings.Split(field.Tag.Get("json"), ",")[0] == "-" {
+				continue
+			}
+			if hasCustomArgumentDecoder(field.Type, seen) {
+				return true
+			}
+		}
+	}
+	return false
+}
 
 // ToolArgsNormalization captures normalized tool arguments and metadata.
 type ToolArgsNormalization struct {

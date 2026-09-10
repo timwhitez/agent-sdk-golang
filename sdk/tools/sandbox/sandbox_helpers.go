@@ -1,7 +1,6 @@
 package sandbox
 
 import (
-	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -315,10 +314,8 @@ func toolWithArgs[Args any](name, description string, fn func(ctx context.Contex
 		Description: description,
 		Schema:      schema,
 		Handler: func(ctx context.Context, raw json.RawMessage, deps *tools.Container) (llm.Content, error) {
-			var a Args
-			dec := json.NewDecoder(bytes.NewReader(raw))
-			dec.DisallowUnknownFields()
-			if err := dec.Decode(&a); err != nil {
+			a, err := tools.DecodeTypedToolArgs[Args](ctx, name, schema, raw)
+			if err != nil {
 				msg := formatErrorDiagnosticFromErr("tool arguments are invalid", err, "Fix tool arguments and retry.")
 				return llm.TextContent(msg), err
 			}

@@ -4,6 +4,15 @@ This document explains the tool subsystem and how it interacts with the agent lo
 provider-facing schemas, metadata propagation, and sandbox safety gates.
 
 ## Tool Core Model
+
+`Tool.Execute` invokes an arbitrary Handler at most once. Error strings do not
+prove that an effect did not happen and never authorize automatic replay.
+`Func` and the sandbox typed adapter use `DecodeTypedToolArgs`: valid inputs
+are unchanged; plain unknown-field decode failures may receive schema repair
+and a fresh decode before business execution. Custom JSON/Text decoders are
+never reentered; their own adapter is responsible for aliases. Business handlers
+are never retried, and the original execution error/result is preserved.
+
 - `Tool` is the runtime unit: name, description, schema, handler, visibility (`Hidden`), and retention (`EphemeralKeep`) (`sdk/tools/tool.go:15`)
 - `Definition()` converts internal tools to strict provider tool definitions (`sdk/tools/tool.go:31`)
 - `Execute()` is the single execution path used by the agent (`sdk/tools/tool.go:40`)
@@ -22,9 +31,9 @@ provider-facing schemas, metadata propagation, and sandbox safety gates.
    - Loose-object repair is now schema-aware: repaired payloads are accepted only when their shape/types remain compatible with the tool schema.
    - References: `sdk/tools/args_normalize.go:64`, `sdk/tools/tool.go:398`
 
-3. **Strict decode and second-chance schema repair**
-   - `Tool.Execute` retries when decode fails due to unknown/misaligned keys.
-   - Schema-key repair now recurses through nested objects, strips unknown fields on retry, and applies tool-specific alias mappings for ambiguous keys (for example `line` -> `offset` only for read-style tools).
+3. **Typed decoding and schema repair before execution**
+   - `DecodeTypedToolArgs` can repair unknown keys after a plain strict decode fails, before the business handler runs. `Tool.Execute` never retries a Handler; custom JSON/Text decoders are never reentered.
+   - Schema-key repair recurses through nested objects, strips unknown fields, and applies existing tool-specific alias mappings (for example `line` -> `offset` only for read-style tools).
    - References: `sdk/tools/tool.go:58`, `sdk/tools/tool.go:67`, `sdk/tools/tool.go:96`, `sdk/tools/tool.go:105`, `sdk/tools/tool.go:363`
 
 4. **Empty-output fallback**
