@@ -1,7 +1,6 @@
 package tools
 
 import (
-	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -61,25 +60,15 @@ func (t Tool) Execute(ctx context.Context, argsJSON string, deps *Container) (ll
 		return llm.TextContent(formatToolErrorDiagnostic("Invalid tool arguments", parseErr, toolDiagnosticInvalidArgsAction)), parseErr
 	}
 
-	call := func(raw json.RawMessage, meta map[string]any) (llm.Content, error, map[string]any) {
-		content, err := t.Handler(ctx, raw, deps)
-		if err == nil {
-			return content, nil, meta
-		}
-		// Second-chance: some models/proxies emit slightly-wrong keys (e.g. "content content")
-		// that fail strict decoding. Try to normalize keys to the schema and retry.
-		if looksLikeUnknownFieldErr(err) {
-			meta = ensureArgsRaw(meta, argsJSON)
-			if repaired, meta2, ok := repairToolArgsBySchema(t.Name, t.Schema, raw, meta); ok {
-				if content2, err2 := t.Handler(ctx, repaired, deps); err2 == nil {
-					return content2, nil, meta2
-				}
-			}
-		}
-		return content, err, meta
+	if argsRepaired(norm.Meta) {
+		UpsertToolResultMetadata(ctx, norm.Meta)
 	}
-
-	content, err, meta := call(norm.Normalized, norm.Meta)
+	// A handler error cannot prove that no side effect happened. Never replay
+	// execution based on its error text; typed adapters prepare before decoding.
+	if ctx != nil {
+		ctx = context.WithValue(ctx, originalToolArgsKey{}, argsJSON)
+	}
+	content, err := t.Handler(ctx, norm.Normalized, deps)
 	if err != nil && content.IsEmpty() {
 		content = llm.TextContent(formatToolErrorDiagnostic("Tool execution failed", err, toolDiagnosticDefaultAction))
 	}
@@ -87,19 +76,7 @@ func (t Tool) Execute(ctx context.Context, argsJSON string, deps *Container) (ll
 		content = llm.TextContent("Warning: tool returned no output.")
 		UpsertToolResultMetadata(ctx, map[string]any{"tool_warning": "handler returned empty content"})
 	}
-	if argsRepaired(meta) {
-		UpsertToolResultMetadata(ctx, meta)
-	}
 	return content, err
-}
-
-func looksLikeUnknownFieldErr(err error) bool {
-	if err == nil {
-		return false
-	}
-	// json.Decoder with DisallowUnknownFields() returns errors like:
-	//   json: unknown field "foo"
-	return strings.Contains(err.Error(), "unknown field")
 }
 
 func formatToolErrorDiagnostic(summary string, err error, action string) string {
@@ -772,6 +749,8 @@ func jsonValueType(value any) string {
 
 // Func creates a tool from an Args struct and a handler.
 // Args should be a struct type with json tags.
+// Plain unknown-field decode errors may receive schema key repair before business
+// execution. Custom decoders and business handlers are never retried.
 func Func[Args any](name, description string, fn func(ctx context.Context, args Args, deps *Container) (any, error)) Tool {
 	schema := SchemaFor[Args]()
 	return Tool{
@@ -780,10 +759,8 @@ func Func[Args any](name, description string, fn func(ctx context.Context, args 
 		EphemeralKeep: 0,
 		Schema:        schema,
 		Handler: func(ctx context.Context, raw json.RawMessage, deps *Container) (llm.Content, error) {
-			var a Args
-			dec := json.NewDecoder(bytes.NewReader(raw))
-			dec.DisallowUnknownFields()
-			if err := dec.Decode(&a); err != nil {
+			a, err := DecodeTypedToolArgs[Args](ctx, name, schema, raw)
+			if err != nil {
 				return llm.TextContent(formatToolErrorDiagnostic("Invalid tool arguments", err, toolDiagnosticInvalidArgsAction)), err
 			}
 			res, err := fn(ctx, a, deps)
