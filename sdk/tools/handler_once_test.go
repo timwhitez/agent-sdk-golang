@@ -127,6 +127,42 @@ func TestTypedRepairPreservesOriginalSpellingMetadata(t *testing.T) {
 	}
 }
 
+func TestNestedExecuteRepairOwnsItsOriginalArgs(t *testing.T) {
+	type args struct {
+		Value string `json:"value"`
+	}
+	child := Func[args]("child", "fixture", func(_ context.Context, a args, _ *Container) (any, error) { return a.Value, nil })
+	childRaw := `{"value":"child","extra":true}`
+	var childMeta map[string]any
+	parent := Tool{Name: "parent", Handler: func(ctx context.Context, _ json.RawMessage, deps *Container) (llm.Content, error) {
+		ctx = WithToolResultMetadata(ctx)
+		out, err := child.Execute(ctx, childRaw, deps)
+		childMeta = ToolResultMetadataSnapshot(ctx)
+		return out, err
+	}}
+	if _, err := parent.Execute(WithToolResultMetadata(context.Background()), `  {"parent":"private"}  `, NewContainer()); err != nil {
+		t.Fatal(err)
+	}
+	if childMeta["args_raw"] != childRaw {
+		t.Fatal("child inherited parent raw", childMeta)
+	}
+}
+
+func TestTypedDecodeNilContextDoesNotPanic(t *testing.T) {
+	type args struct {
+		Value string `json:"value"`
+	}
+	tool := Func[args]("fixture", "fixture", func(ctx context.Context, a args, _ *Container) (any, error) {
+		if ctx != nil {
+			t.Fatal("nil context changed")
+		}
+		return a.Value, nil
+	})
+	if out, err := tool.Execute(nil, `{"value":"ok","extra":true}`, NewContainer()); err != nil || out.PlainText() != "ok" {
+		t.Fatal(out, err)
+	}
+}
+
 type onceDecodedArgs struct {
 	Value string `json:"value"`
 }

@@ -33,8 +33,10 @@ func DecodeTypedToolArgs[Args any](ctx context.Context, name string, schema map[
 		return args, err
 	}
 	meta := ToolResultMetadataSnapshot(ctx)
-	if original, ok := ctx.Value(originalToolArgsKey{}).(string); ok {
-		meta = ensureArgsRaw(meta, original)
+	if ctx != nil {
+		if original, ok := ctx.Value(originalToolArgsKey{}).(string); ok {
+			meta = ensureArgsRaw(meta, original)
+		}
 	}
 	if repaired, repairedMeta, ok := repairToolArgsBySchema(name, schema, raw, meta); ok {
 		if repairedArgs, repairedErr := decode(repaired); repairedErr == nil {

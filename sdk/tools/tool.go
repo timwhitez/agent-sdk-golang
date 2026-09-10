@@ -65,7 +65,7 @@ func (t Tool) Execute(ctx context.Context, argsJSON string, deps *Container) (ll
 	}
 	// A handler error cannot prove that no side effect happened. Never replay
 	// execution based on its error text; typed adapters prepare before decoding.
-	if argsJSON != string(norm.Normalized) {
+	if ctx != nil {
 		ctx = context.WithValue(ctx, originalToolArgsKey{}, argsJSON)
 	}
 	content, err := t.Handler(ctx, norm.Normalized, deps)
