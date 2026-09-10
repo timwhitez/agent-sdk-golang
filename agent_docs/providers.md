@@ -13,8 +13,13 @@ stream normalization, and response metadata behavior.
   promotion cannot strip a host wrapper. No reflection-based unwrapping occurs.
   Anthropic currently provides an owned copy of scalar/pointer/Beta/retry-map
   configuration. HTTPClient and Warningf remain runtime handles; configure input
-  before binding, never mutate it concurrently. OpenAI clients and current Goode
-  wrappers have not adopted this contract. Compaction/whole-Run publication and
+  before binding, never mutate it concurrently. OpenAI Chat/Responses also bind
+  their configuration, including nested Extra/ExtraBody through the existing
+  clone walker. The strict binding variant rejects custom JSON/text marshalers
+  (except copied RawMessage), hidden mutable state and excessive traversal;
+  failure does not return a partial binding or emit source contents. Goode's
+  Switchable/Retry/Debug chain adopts the contract when its leaf supports it.
+  Compaction/whole-Run publication and
   full host identity remain separate work; no new Manifest or content hash.
 - `InvokeRequest.CachePlan` is experimental in-memory intent, owned by
   `CloneInvokeRequest` and the private execution frame, and excluded from JSON.
