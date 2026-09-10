@@ -1,6 +1,8 @@
 package llm
 
 import (
+	"encoding"
+	"encoding/json"
 	"fmt"
 	"reflect"
 )
@@ -85,10 +87,29 @@ func cloneBool(value *bool) *bool {
 }
 
 func cloneJSONMap(value map[string]any) (map[string]any, error) {
+	return cloneJSONMapMode(value, false)
+}
+
+// CloneStaticJSONMap owns nested configuration without executing custom JSON
+// or text marshalers. Such methods can observe hidden/global state, so a copy
+// alone cannot establish a stable configuration. Existing request cloning keeps
+// its compatibility behavior; this stricter variant is for model bindings.
+// RawMessage is copied as bytes. Traversal is limited to 100000 visited values
+// and 128 nesting levels, with container size checked before allocation.
+func CloneStaticJSONMap(value map[string]any) (map[string]any, error) {
+	return cloneJSONMapMode(value, true)
+}
+
+func cloneJSONMapMode(value map[string]any, static bool) (map[string]any, error) {
 	if value == nil {
 		return nil, nil
 	}
-	cloned, err := cloneJSONValue(reflect.ValueOf(value), 0)
+	var budget *int
+	if static {
+		remaining := 100000
+		budget = &remaining
+	}
+	cloned, err := cloneJSONValueMode(reflect.ValueOf(value), 0, budget)
 	if err != nil {
 		return nil, err
 	}
@@ -99,19 +120,44 @@ func cloneJSONMap(value map[string]any) (map[string]any, error) {
 	return out, nil
 }
 
-func cloneJSONValue(value reflect.Value, depth int) (reflect.Value, error) {
+func cloneJSONValueMode(value reflect.Value, depth int, budget *int) (reflect.Value, error) {
 	if !value.IsValid() {
 		return value, nil
 	}
 	if depth > 128 {
 		return reflect.Value{}, fmt.Errorf("JSON value nesting exceeds 128 levels")
 	}
+	if budget != nil {
+		*budget--
+		if *budget < 0 {
+			return reflect.Value{}, fmt.Errorf("static JSON configuration exceeds node budget")
+		}
+		// RawMessage has deterministic byte serialization; other custom methods
+		// may read external state even when their receiver contains only scalars.
+		rawType := reflect.TypeOf(json.RawMessage(nil))
+		typ := value.Type()
+		if typ != rawType && typ != reflect.PointerTo(rawType) {
+			jsonType := reflect.TypeOf((*json.Marshaler)(nil)).Elem()
+			textType := reflect.TypeOf((*encoding.TextMarshaler)(nil)).Elem()
+			if typ.Implements(jsonType) || typ.Implements(textType) || reflect.PointerTo(typ).Implements(jsonType) || reflect.PointerTo(typ).Implements(textType) {
+				return reflect.Value{}, fmt.Errorf("custom serialization cannot be statically bound")
+			}
+		}
+		// Reject large containers before allocating their copy, not only while
+		// descending into their elements.
+		switch value.Kind() {
+		case reflect.Map, reflect.Slice, reflect.Array:
+			if value.Len() > *budget {
+				return reflect.Value{}, fmt.Errorf("static JSON configuration exceeds node budget")
+			}
+		}
+	}
 	switch value.Kind() {
 	case reflect.Interface:
 		if value.IsNil() {
 			return reflect.Zero(value.Type()), nil
 		}
-		item, err := cloneJSONValue(value.Elem(), depth+1)
+		item, err := cloneJSONValueMode(value.Elem(), depth+1, budget)
 		if err != nil {
 			return reflect.Value{}, err
 		}
@@ -122,7 +168,7 @@ func cloneJSONValue(value reflect.Value, depth int) (reflect.Value, error) {
 		if value.IsNil() {
 			return reflect.Zero(value.Type()), nil
 		}
-		item, err := cloneJSONValue(value.Elem(), depth+1)
+		item, err := cloneJSONValueMode(value.Elem(), depth+1, budget)
 		if err != nil {
 			return reflect.Value{}, err
 		}
@@ -136,11 +182,11 @@ func cloneJSONValue(value reflect.Value, depth int) (reflect.Value, error) {
 		out := reflect.MakeMapWithSize(value.Type(), value.Len())
 		iter := value.MapRange()
 		for iter.Next() {
-			key, err := cloneJSONValue(iter.Key(), depth+1)
+			key, err := cloneJSONValueMode(iter.Key(), depth+1, budget)
 			if err != nil {
 				return reflect.Value{}, err
 			}
-			item, err := cloneJSONValue(iter.Value(), depth+1)
+			item, err := cloneJSONValueMode(iter.Value(), depth+1, budget)
 			if err != nil {
 				return reflect.Value{}, err
 			}
@@ -153,7 +199,7 @@ func cloneJSONValue(value reflect.Value, depth int) (reflect.Value, error) {
 		}
 		out := reflect.MakeSlice(value.Type(), value.Len(), value.Len())
 		for i := 0; i < value.Len(); i++ {
-			item, err := cloneJSONValue(value.Index(i), depth+1)
+			item, err := cloneJSONValueMode(value.Index(i), depth+1, budget)
 			if err != nil {
 				return reflect.Value{}, err
 			}
@@ -163,7 +209,7 @@ func cloneJSONValue(value reflect.Value, depth int) (reflect.Value, error) {
 	case reflect.Array:
 		out := reflect.New(value.Type()).Elem()
 		for i := 0; i < value.Len(); i++ {
-			item, err := cloneJSONValue(value.Index(i), depth+1)
+			item, err := cloneJSONValueMode(value.Index(i), depth+1, budget)
 			if err != nil {
 				return reflect.Value{}, err
 			}
@@ -181,7 +227,7 @@ func cloneJSONValue(value reflect.Value, depth int) (reflect.Value, error) {
 				}
 				continue
 			}
-			item, err := cloneJSONValue(value.Field(i), depth+1)
+			item, err := cloneJSONValueMode(value.Field(i), depth+1, budget)
 			if err != nil {
 				return reflect.Value{}, err
 			}
