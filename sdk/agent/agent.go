@@ -168,7 +168,6 @@ type Agent struct {
 	hasCompactor               bool
 
 	compactionAdmissionObserved func()
-	compactionShadowObserved    func()
 	toolBlockStateObserved      func(*toolBlockState)
 	toolBlockTestHook           func(*toolBlockState) // private failure-injection hook
 
@@ -3403,27 +3402,11 @@ func (a *Agent) checkAndCompactWithGrowth(ctx context.Context, last *llm.Complet
 	}
 	a.applyPendingCompaction(out)
 	decisionUsage := a.effectiveCompactionUsageWithGrowth(last.Usage, currentHistoryGrowth, pendingHistoryGrowth)
-	trigger, watermark := a.compactionTriggerAndWatermarkForUsage(decisionUsage)
-	overflow := watermark == "overflow"
-	ordinaryAdmission := false
-	if !overflow {
-		ordinaryAdmission = a.shouldAttemptCompactionUsage(ctx, decisionUsage)
-	}
-	legacyDecision := compactionDecision{
-		run:             overflow || ordinaryAdmission,
-		trigger:         trigger,
-		targetWatermark: watermark,
-	}
-	a.observeAutomaticCompactionDecision(legacyDecision, shadowAutomaticCompactionDecision(automaticCompactionObservation{
-		overflow:          overflow,
-		ordinaryAdmission: ordinaryAdmission,
-		trigger:           trigger,
-		targetWatermark:   watermark,
-	}))
-	if legacyDecision.targetWatermark == "overflow" {
+	decision := a.automaticCompactionDecision(ctx, decisionUsage)
+	if decision.targetWatermark == "overflow" {
 		return a.compactSyncOverflow(ctx, last, decisionUsage, out)
 	}
-	if !legacyDecision.run {
+	if !decision.run {
 		return nil
 	}
 	if !a.compactionInFlight.CompareAndSwap(false, true) {
@@ -3441,7 +3424,7 @@ func (a *Agent) checkAndCompactWithGrowth(ctx context.Context, last *llm.Complet
 	releaseCompactionRuntime := a.retainCompactionRuntimeUse()
 	go func() {
 		defer releaseCompactionRuntime()
-		a.runCompactionAsync(ctx, messages, snapshotLen, decisionUsage, triggerUsage, trigger, watermark)
+		a.runCompactionAsync(ctx, messages, snapshotLen, decisionUsage, triggerUsage, decision)
 	}()
 	return nil
 }
@@ -3478,15 +3461,15 @@ func (a *Agent) emitCompactionDecisionProvenance(out *eventOutput, decisionUsage
 	})
 }
 
-func (a *Agent) runCompactionAsync(ctx context.Context, snapshot []llm.Message, snapshotLen int, decisionUsage *llm.Usage, triggerUsage *llm.Usage, trigger string, watermark string) {
+func (a *Agent) runCompactionAsync(ctx context.Context, snapshot []llm.Message, snapshotLen int, decisionUsage *llm.Usage, triggerUsage *llm.Usage, decision compactionDecision) {
 	defer a.releaseCompactionInFlight()
 
 	compactCtx, cancelCompact := asyncCompactionContext(ctx)
 	defer cancelCompact()
 	newMsgs, res, err := a.compactWithRetry(compactCtx, snapshot, compaction.PipelineRequest{
-		Trigger:         trigger,
+		Trigger:         decision.trigger,
 		Usage:           decisionUsage,
-		TargetWatermark: watermark,
+		TargetWatermark: decision.targetWatermark,
 		AllowSummary:    a.compactionSummaryAllowed(),
 	})
 	if err != nil {
@@ -3498,7 +3481,7 @@ func (a *Agent) runCompactionAsync(ctx context.Context, snapshot []llm.Message, 
 		a.noteCompactionFailure()
 		return
 	}
-	switch strings.TrimSpace(trigger) {
+	switch strings.TrimSpace(decision.trigger) {
 	case "todo_checkpoint":
 		a.todoCompactionPending.Store(false)
 	case "retry_checkpoint":
@@ -3515,7 +3498,7 @@ func (a *Agent) runCompactionAsync(ctx context.Context, snapshot []llm.Message, 
 	a.pendingCompaction = &pendingCompaction{
 		messages:     newMsgs,
 		snapshotLen:  snapshotLen,
-		result:       a.withCompactionTelemetry(res, trigger, watermark, triggerUsage),
+		result:       a.withCompactionTelemetry(res, decision.trigger, decision.targetWatermark, triggerUsage),
 		triggerUsage: triggerUsage,
 	}
 	a.pendingCompactionMu.Unlock()
