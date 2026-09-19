@@ -11,6 +11,10 @@ import (
 
 const EventEnvelopeSchemaVersion = 1
 
+// RequestControlRequireDoneDisableThinking identifies only the SDK recovery
+// control that disabled thinking, not full request/content parentage.
+const RequestControlRequireDoneDisableThinking = "require_done_disable_thinking"
+
 type EventKind string
 
 const (
@@ -47,8 +51,13 @@ const (
 // EventEnvelope adds query-wide ordering metadata without replacing the typed
 // Event payload. Sequence, not Timestamp, defines logical order.
 type EventEnvelope struct {
-	SchemaVersion int
-	QueryID       string
+	// Optional, producer-captured control provenance for this logical request.
+	// Empty is unreported, not proof that the request has no other sources.
+	// Compaction, steering and merged continuation content remain independent.
+	RequestControlRelation      string `json:"RequestControlRelation,omitempty"`
+	RequestControlSourceFrameID string `json:"RequestControlSourceFrameID,omitempty"`
+	SchemaVersion               int
+	QueryID                     string
 	// FrameID identifies the explicitly correlated execution context, not the
 	// sole provenance of aggregated continuation content. Empty means unknown.
 	FrameID string `json:"FrameID,omitempty"`

@@ -625,6 +625,7 @@ func (a *Agent) queryStreamWithSteering(ctx context.Context, input llm.Content, 
 		requireDoneReminders := 0
 		forceRequireDoneToolChoice := false
 		requireDoneRecoveryDisableThinkingActive := false
+		requireDoneControlSource := ""
 		seenToolCallHistory := false
 		lastResponseID := ""
 		pendingTextContinuation := ""
@@ -740,6 +741,7 @@ func (a *Agent) queryStreamWithSteering(ctx context.Context, input llm.Content, 
 				requireDoneReminders = 0
 				forceRequireDoneToolChoice = false
 				requireDoneRecoveryDisableThinkingActive = false
+				requireDoneControlSource = ""
 				pendingRequireDoneFinalText = ""
 				pendingRequireDoneFinalResponseID = ""
 			}
@@ -775,6 +777,11 @@ func (a *Agent) queryStreamWithSteering(ctx context.Context, input llm.Content, 
 				DisableThinking: requireDoneRecoveryDisableThinkingActive,
 			}
 			frame, frameErr := newExecutionFrame(fmt.Sprintf("%s/frame/%d", out.queryID, iter+1), a.llm, request, a.toolMap, a.toolMapNormalized)
+			// Capture only this request's disable-thinking control provenance.
+			// Later resets never relabel events from an already-created Frame.
+			if frameErr == nil && frame.request.DisableThinking {
+				frame.controlSource = requireDoneControlSource
+			}
 			frameFailure := ""
 			frameFailureHint := "rebuild the Agent with consistent, cloneable tool definitions"
 			if frameErr != nil {
@@ -809,7 +816,7 @@ func (a *Agent) queryStreamWithSteering(ctx context.Context, input llm.Content, 
 				emitSDKErr(ErrorEvent{Kind: "invalid_request", Message: frameFailure + "; " + frameFailureHint})
 				return
 			}
-			invocation := &frameInvocation{frameID: frame.id}
+			invocation := &frameInvocation{frameID: frame.id, controlSource: frame.controlSource}
 			comp, streamedText, err := a.invokeModelCompletionWithRetryAndSteering(ctx, frame.model, frame.request, out, steeringCh, invocation)
 			correlation := invocation.correlation()
 			if err != nil {
@@ -819,6 +826,7 @@ func (a *Agent) queryStreamWithSteering(ctx context.Context, input llm.Content, 
 					requireDoneReminders = 0
 					forceRequireDoneToolChoice = false
 					requireDoneRecoveryDisableThinkingActive = false
+					requireDoneControlSource = ""
 					pendingTextContinuation = ""
 					pendingRequireDoneFinalText = ""
 					pendingRequireDoneFinalResponseID = ""
@@ -1248,6 +1256,7 @@ func (a *Agent) queryStreamWithSteering(ctx context.Context, input llm.Content, 
 						}
 						clearPendingTextContinuation()
 						requireDoneRecoveryDisableThinkingActive = false
+						requireDoneControlSource = ""
 						emitPartialFinal(finalContent, finalResponseID, "require_done_safety", correlation)
 						return
 					}
@@ -1263,6 +1272,9 @@ func (a *Agent) queryStreamWithSteering(ctx context.Context, input llm.Content, 
 					a.mu.Lock()
 					a.messages = append(a.messages, reminder)
 					a.mu.Unlock()
+					// This producer succeeded; retain its actual completion's
+					// Frame, not an ambient most-recent event identity.
+					requireDoneControlSource = frame.id
 					continue
 				}
 				continue
@@ -1580,12 +1592,14 @@ func (a *Agent) queryStreamWithSteering(ctx context.Context, input llm.Content, 
 					}
 					if strings.EqualFold(strings.TrimSpace(resolvedName), "done") {
 						requireDoneRecoveryDisableThinkingActive = false
+						requireDoneControlSource = ""
 					}
 					steeringMessages := a.collectSteering(steeringCh, out)
 					if len(steeringMessages) > 0 || outcome.Interrupted {
 						requireDoneReminders = 0
 						forceRequireDoneToolChoice = false
 						requireDoneRecoveryDisableThinkingActive = false
+						requireDoneControlSource = ""
 						pendingRequireDoneFinalText = ""
 						pendingRequireDoneFinalResponseID = ""
 						pendingBlockMessages = append(pendingBlockMessages, steeringMessages...)
@@ -1620,6 +1634,7 @@ func (a *Agent) queryStreamWithSteering(ctx context.Context, input llm.Content, 
 					}
 				}
 				requireDoneRecoveryDisableThinkingActive = false
+				requireDoneControlSource = ""
 				if !finishToolBlock() {
 					return
 				}
@@ -2798,6 +2813,10 @@ func (a *Agent) emitEvent(out *eventOutput, ev Event, correlations ...eventCorre
 	envelope := out.next(ev)
 	if len(correlations) == 1 && correlations[0].frameID != "" {
 		envelope.FrameID, envelope.InvokeAttempt = correlations[0].frameID, correlations[0].attempt
+		if correlations[0].controlSource != "" {
+			envelope.RequestControlRelation = RequestControlRequireDoneDisableThinking
+			envelope.RequestControlSourceFrameID = correlations[0].controlSource
+		}
 		envelope.ToolBlockID, envelope.ToolCallOrdinal, envelope.ToolBlockCallCount = correlations[0].toolBlockID, correlations[0].toolCallOrdinal, correlations[0].blockCallCount
 	}
 	return a.emitEnvelope(out, ev, envelope)
@@ -2810,6 +2829,10 @@ func (a *Agent) emitEventFrom(out *eventOutput, ev Event, origin EventOrigin, co
 	envelope := out.nextFrom(ev, origin)
 	if len(correlations) == 1 && correlations[0].frameID != "" {
 		envelope.FrameID, envelope.InvokeAttempt = correlations[0].frameID, correlations[0].attempt
+		if correlations[0].controlSource != "" {
+			envelope.RequestControlRelation = RequestControlRequireDoneDisableThinking
+			envelope.RequestControlSourceFrameID = correlations[0].controlSource
+		}
 		envelope.ToolBlockID, envelope.ToolCallOrdinal, envelope.ToolBlockCallCount = correlations[0].toolBlockID, correlations[0].toolCallOrdinal, correlations[0].blockCallCount
 	}
 	return a.emitEnvelope(out, ev, envelope)
