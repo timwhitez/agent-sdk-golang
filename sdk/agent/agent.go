@@ -715,7 +715,7 @@ func (a *Agent) queryStreamWithSteering(ctx context.Context, input llm.Content, 
 			if err != nil {
 				return failToolBlock(err)
 			}
-			a.emitToolResultWithAccounting(out, result, duration, activeToolBlockCorrelation)
+			a.emitToolResultWithAccounting(out, result, duration, activeToolBlock.eventCorrelation(activeToolBlockCorrelation, index))
 			return true
 		}
 		finishToolBlock := func() bool {
@@ -1312,6 +1312,7 @@ func (a *Agent) queryStreamWithSteering(ctx context.Context, input llm.Content, 
 				a.toolBlockTestHook(activeToolBlock)
 			}
 			for idx, tc := range comp.ToolCalls {
+				toolCorrelation := activeToolBlock.eventCorrelation(correlation, idx)
 				step := idx + 1
 				originalName := tc.Function.Name
 
@@ -1449,19 +1450,19 @@ func (a *Agent) queryStreamWithSteering(ctx context.Context, input llm.Content, 
 							})
 							repeatGuard.exhausted = true
 						}
-						a.emitEvent(out, StepStartEvent{StepID: tc.ID, Title: resolvedName, StepNumber: step}, correlation)
+						a.emitEvent(out, StepStartEvent{StepID: tc.ID, Title: resolvedName, StepNumber: step}, toolCorrelation)
 						a.emitEvent(out, ToolCallEvent{
 							Tool: resolvedName, Args: norm.Display, ArgsJSON: norm.Normalized,
 							ArgsMeta: norm.Meta, ToolCallID: tc.ID, DisplayName: resolvedName,
-						}, correlation)
+						}, toolCorrelation)
 						if !publishToolResult(idx, 0) {
 							return
 						}
-						a.emitEvent(out, StepCompleteEvent{StepID: tc.ID, Status: "error"}, correlation)
+						a.emitEvent(out, StepCompleteEvent{StepID: tc.ID, Status: "error"}, toolCorrelation)
 						continue
 					}
 				}
-				a.emitEvent(out, StepStartEvent{StepID: tc.ID, Title: resolvedName, StepNumber: step}, correlation)
+				a.emitEvent(out, StepStartEvent{StepID: tc.ID, Title: resolvedName, StepNumber: step}, toolCorrelation)
 				argsMap := norm.Display
 				if argsMap == nil {
 					argsMap = map[string]any{"__raw": execArgs}
@@ -1473,7 +1474,7 @@ func (a *Agent) queryStreamWithSteering(ctx context.Context, input llm.Content, 
 					ArgsMeta:    norm.Meta,
 					ToolCallID:  tc.ID,
 					DisplayName: resolvedName,
-				}, correlation)
+				}, toolCorrelation)
 				if evidenceTool {
 					decision := progressLedger.preflight(evidenceReq, a.compactionGeneration.Load())
 					if decision.suppress {
@@ -1488,7 +1489,7 @@ func (a *Agent) queryStreamWithSteering(ctx context.Context, input llm.Content, 
 						if !publishToolResult(idx, 0) {
 							return
 						}
-						a.emitEvent(out, StepCompleteEvent{StepID: tc.ID, Status: "completed"}, correlation)
+						a.emitEvent(out, StepCompleteEvent{StepID: tc.ID, Status: "completed"}, toolCorrelation)
 						if decision.recovery {
 							reminder := evidenceRecoveryMessage(evidenceReq)
 							// Deferred until the tool-call block is closed; see
@@ -1569,7 +1570,7 @@ func (a *Agent) queryStreamWithSteering(ctx context.Context, input llm.Content, 
 					if !publishToolResult(idx, time.Since(start)) {
 						return
 					}
-					a.emitEvent(out, StepCompleteEvent{StepID: tc.ID, Status: status, DurationMS: time.Since(start).Milliseconds()}, correlation)
+					a.emitEvent(out, StepCompleteEvent{StepID: tc.ID, Status: status, DurationMS: time.Since(start).Milliseconds()}, toolCorrelation)
 					if err := ctx.Err(); err != nil {
 						if !closeToolResults(idx+1, toolCallAccepted, "root_cancel_after_task_complete", historyOnlyResults(skippedToolResults(comp.ToolCalls[idx+1:], toolSkippedByCancellationText))...) {
 							return
@@ -1624,7 +1625,7 @@ func (a *Agent) queryStreamWithSteering(ctx context.Context, input llm.Content, 
 				if !publishToolResult(idx, time.Since(start)) {
 					return
 				}
-				a.emitEvent(out, StepCompleteEvent{StepID: tc.ID, Status: status, DurationMS: time.Since(start).Milliseconds()}, correlation)
+				a.emitEvent(out, StepCompleteEvent{StepID: tc.ID, Status: status, DurationMS: time.Since(start).Milliseconds()}, toolCorrelation)
 				if rootCancelErr == nil {
 					rootCancelErr = ctx.Err()
 				}
@@ -2850,6 +2851,7 @@ func (a *Agent) emitEvent(out *eventOutput, ev Event, correlations ...eventCorre
 	envelope := out.next(ev)
 	if len(correlations) == 1 && correlations[0].frameID != "" {
 		envelope.FrameID, envelope.InvokeAttempt = correlations[0].frameID, correlations[0].attempt
+		envelope.ToolBlockID, envelope.ToolCallOrdinal, envelope.ToolBlockCallCount = correlations[0].toolBlockID, correlations[0].toolCallOrdinal, correlations[0].blockCallCount
 	}
 	return a.emitEnvelope(out, ev, envelope)
 }
@@ -2861,6 +2863,7 @@ func (a *Agent) emitEventFrom(out *eventOutput, ev Event, origin EventOrigin, co
 	envelope := out.nextFrom(ev, origin)
 	if len(correlations) == 1 && correlations[0].frameID != "" {
 		envelope.FrameID, envelope.InvokeAttempt = correlations[0].frameID, correlations[0].attempt
+		envelope.ToolBlockID, envelope.ToolCallOrdinal, envelope.ToolBlockCallCount = correlations[0].toolBlockID, correlations[0].toolCallOrdinal, correlations[0].blockCallCount
 	}
 	return a.emitEnvelope(out, ev, envelope)
 }

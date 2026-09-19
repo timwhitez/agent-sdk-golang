@@ -55,11 +55,18 @@ type EventEnvelope struct {
 	// InvokeAttempt counts SDK ChatModel entries within that logical frame;
 	// zero means no invocation correlation. It does not count hidden HTTP retries.
 	InvokeAttempt uint64 `json:"InvokeAttempt,omitempty"`
-	Sequence      uint64
-	Origin        EventOrigin
-	Kind          EventKind
-	Timestamp     time.Time
-	Event         Event
+	// ToolBlockID names the accepted block of the finalizing Frame, not a
+	// provider ToolCallID or proof of execution/delivery. Empty means unknown.
+	ToolBlockID string `json:"ToolBlockID,omitempty"`
+	// ToolCallOrdinal is one-based within that block; ToolBlockCallCount includes
+	// accepted history-only tails that may produce no envelope. Zero is unknown.
+	ToolCallOrdinal    uint64 `json:"ToolCallOrdinal,omitempty"`
+	ToolBlockCallCount uint64 `json:"ToolBlockCallCount,omitempty"`
+	Sequence           uint64
+	Origin             EventOrigin
+	Kind               EventKind
+	Timestamp          time.Time
+	Event              Event
 }
 
 type eventOutput struct {

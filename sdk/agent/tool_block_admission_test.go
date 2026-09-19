@@ -43,6 +43,9 @@ func TestToolBlockConstructorFailureDiscardsUnacceptedHistory(t *testing.T) {
 	}
 	errorsSeen := 0
 	for envelope := range ag.QueryStreamEnveloped(context.Background(), llm.TextContent("run")) {
+		if envelope.ToolBlockID != "" || envelope.ToolCallOrdinal != 0 || envelope.ToolBlockCallCount != 0 {
+			t.Error("rejected block acquired tool identity")
+		}
 		switch e := envelope.Event.(type) {
 		case ErrorEvent:
 			errorsSeen++
