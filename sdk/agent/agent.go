@@ -859,11 +859,11 @@ func (a *Agent) queryStreamWithSteering(ctx context.Context, input llm.Content, 
 					if streamIdleRecoveries < maxRecov {
 						streamIdleRecoveries++
 						streamIdleRecoveryTotal++
-						if comp != nil && !comp.Content.IsEmpty() {
+						if comp != nil && (!comp.Content.IsEmpty() || llm.HasProviderState(comp.Content)) {
 							a.mu.Lock()
 							a.messages = append(a.messages, llm.Message{
 								Role:    llm.RoleAssistant,
-								Content: comp.Content,
+								Content: llm.CloneContent(comp.Content),
 							})
 							a.mu.Unlock()
 						}
