@@ -1308,6 +1308,14 @@ func (a *Agent) queryStreamWithSteering(ctx context.Context, input llm.Content, 
 				return
 			}
 			pendingBlockMessages = nil
+			closeUnstartedOnRootCancel := func(start int, err error) {
+				if !closeToolResults(start, toolCallAccepted, "root_cancel_before_start", historyOnlyResults(skippedToolResults(comp.ToolCalls[start:], toolSkippedByCancellationText))...) {
+					return
+				}
+				a.appendMessages(pendingBlockMessages)
+				pendingBlockMessages = nil
+				emitSDKErr(a.errEvent(err))
+			}
 			if a.toolBlockTestHook != nil {
 				a.toolBlockTestHook(activeToolBlock)
 			}
@@ -1333,13 +1341,7 @@ func (a *Agent) queryStreamWithSteering(ctx context.Context, input llm.Content, 
 				}
 
 				if err := ctx.Err(); err != nil {
-					// Close every unstarted call before any handler can execute.
-					if !closeToolResults(idx, toolCallAccepted, "root_cancel_before_start", historyOnlyResults(skippedToolResults(comp.ToolCalls[idx:], toolSkippedByCancellationText))...) {
-						return
-					}
-					a.appendMessages(pendingBlockMessages)
-					pendingBlockMessages = nil
-					emitSDKErr(a.errEvent(err))
+					closeUnstartedOnRootCancel(idx, err)
 					return
 				}
 				prepared, norm := tool.PrepareCall(execArgs)
@@ -1516,6 +1518,14 @@ func (a *Agent) queryStreamWithSteering(ctx context.Context, input llm.Content, 
 				ctxToolBase := tools.WithToolCallID(ctx, tc.ID)
 				ctxToolBase = tools.WithToolResultMetadata(ctxToolBase)
 				ctxTool, finishToolStage := a.beginSteeringInterruptibleStage(ctxToolBase)
+				// Event publication/Warningf can synchronously cancel the root
+				// after the early gate. Recheck at actual handler admission;
+				// steering's child context is not root cancellation authority.
+				if err := ctx.Err(); err != nil {
+					finishToolStage()
+					closeUnstartedOnRootCancel(idx, err)
+					return
+				}
 				if err := activeToolBlock.markRunning(idx); err != nil {
 					finishToolStage()
 					failToolBlock(err)
