@@ -6,6 +6,7 @@ import (
 	"errors"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/timwhitez/agent-sdk-golang/sdk/llm"
 	"github.com/timwhitez/agent-sdk-golang/sdk/tools"
@@ -109,4 +110,62 @@ func TestToolArgumentAdmissionViews(t *testing.T) {
 			assertContiguousToolResults(t, ag.Messages())
 		})
 	}
+}
+
+func TestToolArgumentEventMutationCannotChangeExecution(t *testing.T) {
+	type args struct {
+		Nested struct {
+			Values []string `json:"values"`
+		} `json:"nested"`
+	}
+	const raw = "```json\n{\"nested\":{\"values\":[\"safe\"]}}\n```"
+	mutated := make(chan struct{})
+	calls := 0
+	tool := tools.Func[args]("admission", "fixture", func(_ context.Context, a args, _ *tools.Container) (any, error) {
+		calls++
+		if len(a.Nested.Values) != 1 || a.Nested.Values[0] != "safe" {
+			t.Errorf("business args=%+v", a)
+		}
+		return "ok", nil
+	})
+	original := tool.Handler
+	tool.Handler = func(ctx context.Context, args json.RawMessage, deps *tools.Container) (llm.Content, error) {
+		select {
+		case <-mutated:
+		case <-ctx.Done():
+			return llm.Content{}, ctx.Err()
+		}
+		return original(ctx, args, deps)
+	}
+	model := &toolPlanScriptModel{toolCalls: []llm.ToolCall{{ID: "args-call", Type: "function", Function: llm.FunctionCall{Name: "admission", Arguments: raw}}}}
+	ag, err := New(Config{LLM: model, Tools: []tools.Tool{tool}, Warningf: func(string, ...any) {}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	results := 0
+	for event := range ag.QueryStream(ctx, llm.TextContent("run")) {
+		switch event := event.(type) {
+		case ToolCallEvent:
+			copy(event.ArgsJSON, []byte(strings.ReplaceAll(string(event.ArgsJSON), "safe", "evil")))
+			event.Args["nested"].(map[string]any)["values"].([]any)[0] = "evil"
+			event.ArgsMeta["args_raw"] = "evil"
+			close(mutated)
+		case ToolResultEvent:
+			results++
+			if event.IsError || event.Metadata["args_raw"] != raw {
+				t.Errorf("result=%+v", event)
+			}
+		}
+	}
+	if calls != 1 || results != 1 || model.calls != 2 {
+		t.Fatalf("business/results/provider=%d/%d/%d", calls, results, model.calls)
+	}
+	for _, message := range ag.Messages() {
+		if len(message.ToolCalls) != 0 && message.ToolCalls[0].Function.Arguments != raw {
+			t.Fatal("history changed provider arguments")
+		}
+	}
+	assertContiguousToolResults(t, ag.Messages())
 }
