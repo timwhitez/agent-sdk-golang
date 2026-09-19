@@ -1686,6 +1686,14 @@ func (a *Agent) queryStreamWithSteering(ctx context.Context, input llm.Content, 
 	return out
 }
 
+// UsesDefaultQueryIDGenerator reports whether this Agent always uses SDK-owned
+// query ID generation. A custom generator remains untrusted even if it returns
+// default-looking IDs or falls back after returning an empty string. This does
+// not authenticate arbitrary envelopes; hosts must consume this Agent's stream.
+func (a *Agent) UsesDefaultQueryIDGenerator() bool {
+	return a != nil && a.queryIDGenerator == nil
+}
+
 func (a *Agent) newQueryID() string {
 	if a != nil && a.queryIDGenerator != nil {
 		if id := strings.TrimSpace(a.queryIDGenerator()); id != "" {
