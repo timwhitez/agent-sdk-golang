@@ -1,9 +1,11 @@
 package tools
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
+	"maps"
 	"math"
 	"strings"
 
@@ -41,34 +43,69 @@ func (t Tool) Definition() llm.ToolDefinition {
 	}
 }
 
+// PreparedCall owns first-pass argument normalization and the complete Handler
+// captured when prepared. It does not predecode typed arguments, freeze closure
+// state, authorize effects, or promise replay safety. The caller owns execution.
+type PreparedCall struct {
+	tool       Tool
+	original   string
+	normalized json.RawMessage
+	meta       map[string]any
+	err        error
+}
+
+// PrepareCall normalizes once without invoking the Handler or resolving deps.
+// The returned observation is independent of the bytes and metadata executed by
+// the prepared call. Typed repair and wrapper-specific argument changes remain
+// inside the captured Handler; this observation is not final business authority.
+func (t Tool) PrepareCall(argsJSON string) (PreparedCall, ToolArgsNormalization) {
+	norm := NormalizeToolArgs(t.Name, argsJSON, t.Schema)
+	return PreparedCall{
+		tool: t, original: argsJSON, normalized: bytes.Clone(norm.Normalized),
+		// Normalization metadata consists only of bool/string scalars. Display
+		// may be nested, but is owned solely by the returned observation.
+		meta: maps.Clone(norm.Meta), err: norm.Err,
+	}, norm
+}
+
 func (t Tool) Execute(ctx context.Context, argsJSON string, deps *Container) (llm.Content, error) {
+	// Preserve the direct API's missing-handler error before normalization.
 	if t.Handler == nil {
 		return llm.Content{}, fmt.Errorf("tool %q missing handler", t.Name)
 	}
-	norm := NormalizeToolArgs(t.Name, argsJSON, t.Schema)
-	if norm.Err != nil {
-		if argsRepaired(norm.Meta) {
-			UpsertToolResultMetadata(ctx, norm.Meta)
-		}
-		return llm.TextContent(formatToolErrorDiagnostic("Invalid tool arguments", norm.Err, toolDiagnosticInvalidArgsAction)), norm.Err
+	prepared, _ := t.PrepareCall(argsJSON)
+	return prepared.Execute(ctx, deps)
+}
+
+// Execute invokes the complete captured Handler, retaining legacy typed decode,
+// wrapper, result, and error behavior. Each invocation owns its handler bytes.
+func (p PreparedCall) Execute(ctx context.Context, deps *Container) (llm.Content, error) {
+	if p.tool.Handler == nil {
+		return llm.Content{}, fmt.Errorf("tool %q missing handler", p.tool.Name)
 	}
-	if norm.Normalized == nil {
-		parseErr := norm.Err
+	if p.err != nil {
+		if argsRepaired(p.meta) {
+			UpsertToolResultMetadata(ctx, p.meta)
+		}
+		return llm.TextContent(formatToolErrorDiagnostic("Invalid tool arguments", p.err, toolDiagnosticInvalidArgsAction)), p.err
+	}
+	if p.normalized == nil {
+		parseErr := p.err
 		if parseErr == nil {
 			parseErr = fmt.Errorf("invalid tool args")
 		}
 		return llm.TextContent(formatToolErrorDiagnostic("Invalid tool arguments", parseErr, toolDiagnosticInvalidArgsAction)), parseErr
 	}
 
-	if argsRepaired(norm.Meta) {
-		UpsertToolResultMetadata(ctx, norm.Meta)
+	if argsRepaired(p.meta) {
+		UpsertToolResultMetadata(ctx, p.meta)
 	}
 	// A handler error cannot prove that no side effect happened. Never replay
 	// execution based on its error text; typed adapters prepare before decoding.
 	if ctx != nil {
-		ctx = context.WithValue(ctx, originalToolArgsKey{}, argsJSON)
+		ctx = context.WithValue(ctx, originalToolArgsKey{}, p.original)
 	}
-	content, err := t.Handler(ctx, norm.Normalized, deps)
+	content, err := p.tool.Handler(ctx, bytes.Clone(p.normalized), deps)
 	if err != nil && content.IsEmpty() {
 		content = llm.TextContent(formatToolErrorDiagnostic("Tool execution failed", err, toolDiagnosticDefaultAction))
 	}

@@ -1341,7 +1341,7 @@ func (a *Agent) queryStreamWithSteering(ctx context.Context, input llm.Content, 
 					emitSDKErr(a.errEvent(err))
 					return
 				}
-				norm := tools.NormalizeToolArgs(resolvedName, execArgs, tool.Schema)
+				prepared, norm := tool.PrepareCall(execArgs)
 				resolution := toolResolutionExact
 				if unknownToolFallback {
 					resolution = toolResolutionUnknownFallback
@@ -1520,7 +1520,7 @@ func (a *Agent) queryStreamWithSteering(ctx context.Context, input llm.Content, 
 					failToolBlock(err)
 					return
 				}
-				content, toolErr := a.executeToolSafely(ctxTool, tool, execArgs)
+				content, toolErr := a.executeToolSafely(ctxTool, tool, prepared)
 				stageInterruptedForSteering := finishToolStage()
 				rootCancelErr := ctx.Err()
 				if err := activeToolBlock.markAttemptReturned(idx, rootCancelErr != nil); err != nil {
@@ -2758,7 +2758,7 @@ func mergeToolResultMetadata(base, extra map[string]any) map[string]any {
 	return base
 }
 
-func (a *Agent) executeToolSafely(ctx context.Context, tool tools.Tool, raw string) (content llm.Content, err error) {
+func (a *Agent) executeToolSafely(ctx context.Context, tool tools.Tool, prepared tools.PreparedCall) (content llm.Content, err error) {
 	defer func() {
 		if recovered := recover(); recovered != nil {
 			panicMsg := fmt.Sprintf("tool %q panicked: %v", tool.Name, recovered)
@@ -2772,7 +2772,7 @@ func (a *Agent) executeToolSafely(ctx context.Context, tool tools.Tool, raw stri
 			err = fmt.Errorf("%s", panicMsg)
 		}
 	}()
-	return tool.Execute(ctx, raw, a.deps)
+	return prepared.Execute(ctx, a.deps)
 }
 
 // emitPartialUsage records the usage of a completion that did not reach the
