@@ -129,3 +129,15 @@ Diagnostics and accounting should describe bounded outcomes without copying
 secrets, full prompts/source/results or hidden reasoning. A Frame or model name
 alone is not evidence of model failure. [Testing guidance](testing.md) maps the
 relevant contract suites; historical receipts do not prove current behavior.
+
+### RequireDone thinking-control provenance
+
+The optional Envelope `RequestControlRelation=require_done_disable_thinking`
+and `RequestControlSourceFrameID` identify only the successful reminder producer
+that enabled the logical request's DisableThinking recovery mode. The source is
+captured after the reminder enters history and copied into each actual Frame;
+retries reuse it. Ordinary work can reset forced tool choice while retaining this
+thinking mode. Steering and done/safety resets clear future control state, without
+relabeling events from an already-created Frame. A new Query starts without it.
+Absent fields are unreported, not proof of a complete request/content lineage.
+Compaction, steering and multi-source continuation content retain separate scope.
