@@ -25,7 +25,17 @@ captured Provider request in place.
 
 Key implementation: [agent.go](../sdk/agent/agent.go),
 [execution_frame.go](../sdk/agent/execution_frame.go),
-[tool_block_state.go](../sdk/agent/tool_block_state.go).
+[tool_block_state.go](../sdk/agent/tool_block_state.go), and
+[sequential_block.go](../sdk/agent/sequential_block.go).
+
+Native and opt-in host child blocks share the sequential executor and the same
+block-state implementation. The executor invokes complete PreparedCalls and owns
+start/return/terminal/commit/publication order. Adapters retain policy and output
+projection; child scoped records are not automatically written to parent history.
+A synchronous child scope rejects concurrent, nested or expired admission and
+waits for accepted children before its parent completes. No lock is held across
+a Handler. All managed calls are Exclusive, not a promise about arbitrary host
+goroutines or a concurrent effect classifier.
 
 - A Frame owns a cloned logical request and resolver definitions. It calls an
   explicit `llm.FrameModelBinder` once before invocation; all SDK retries reuse

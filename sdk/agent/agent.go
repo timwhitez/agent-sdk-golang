@@ -700,24 +700,6 @@ func (a *Agent) queryStreamWithSteering(ctx context.Context, input llm.Content, 
 			}
 			return false
 		}
-		// One acceptance authority precedes the one history writer. Publication
-		// is claimed separately at the existing event boundary, at most once.
-		closeToolResults := func(start int, expected toolCallPhase, reason string, results ...toolResultProjection) bool {
-			messages, err := activeToolBlock.acceptResults(start, expected, reason, results)
-			if err != nil {
-				return failToolBlock(err)
-			}
-			commitToolHistory(messages)
-			return true
-		}
-		publishToolResult := func(index int, duration time.Duration) bool {
-			result, err := activeToolBlock.takePublication(index)
-			if err != nil {
-				return failToolBlock(err)
-			}
-			a.emitToolResultWithAccounting(out, result, duration, activeToolBlock.eventCorrelation(activeToolBlockCorrelation, index))
-			return true
-		}
 		finishToolBlock := func() bool {
 			block := activeToolBlock
 			if block == nil {
@@ -1308,371 +1290,343 @@ func (a *Agent) queryStreamWithSteering(ctx context.Context, input llm.Content, 
 				return
 			}
 			pendingBlockMessages = nil
-			closeUnstartedOnRootCancel := func(start int, err error) {
-				if !closeToolResults(start, toolCallAccepted, "root_cancel_before_start", historyOnlyResults(skippedToolResults(comp.ToolCalls[start:], toolSkippedByCancellationText))...) {
-					return
-				}
-				a.appendMessages(pendingBlockMessages)
-				pendingBlockMessages = nil
-				emitSDKErr(a.errEvent(err))
-			}
 			if a.toolBlockTestHook != nil {
 				a.toolBlockTestHook(activeToolBlock)
 			}
-			for idx, tc := range comp.ToolCalls {
-				toolCorrelation := activeToolBlock.eventCorrelation(correlation, idx)
-				step := idx + 1
-				originalName := tc.Function.Name
+			var tool tools.Tool
+			var originalName, resolvedName string
+			var unknownToolFallback, evidenceTool, taskComplete bool
+			var evidenceReq evidenceRequest
+			var completedMessage string
+			var postCommit, postPublish func()
+			var callStarted time.Time
+			adapter := SequentialBlockAdapter{
+				Admit: func(root context.Context, idx int) (BlockAdmission, error) {
+					tc := comp.ToolCalls[idx]
+					postCommit, postPublish, taskComplete = nil, nil, false
+					callStarted = time.Time{}
 
-				// Resolve tool: exact match → normalized/alias match → fallback
-				tool, resolvedName, found, normalizedAlias := resolveToolByName(tc.Function.Name, frame.exact, frame.normalized)
-				unknownToolFallback := false
-				execArgs := tc.Function.Arguments
+					toolCorrelation := activeToolBlock.eventCorrelation(correlation, idx)
+					step := idx + 1
+					originalName = tc.Function.Name
 
-				if !found {
-					unknownToolFallback = true
-					resolvedName = "invalid"
-					execArgs = wrapInvalidToolArgs(originalName, tc.Function.Arguments)
-					if inv, ok := frame.exact["invalid"]; ok {
-						tool = inv
-					} else {
-						tool = autoInvalidTool()
-					}
-				}
+					// Resolve tool: exact match → normalized/alias match → fallback
+					var found, normalizedAlias bool
+					tool, resolvedName, found, normalizedAlias = resolveToolByName(tc.Function.Name, frame.exact, frame.normalized)
+					unknownToolFallback = false
+					execArgs := tc.Function.Arguments
 
-				if err := ctx.Err(); err != nil {
-					closeUnstartedOnRootCancel(idx, err)
-					return
-				}
-				prepared, norm := tool.PrepareCall(execArgs)
-				resolution := toolResolutionExact
-				if unknownToolFallback {
-					resolution = toolResolutionUnknownFallback
-				} else if normalizedAlias {
-					resolution = toolResolutionNormalizedAlias
-				}
-				argsState := toolArgsNormalized
-				if norm.Err != nil {
-					argsState = toolArgsInvalid
-				}
-				planningObservation := toolPlanningObservation{ordinal: idx, resolution: resolution, args: argsState}
-				legacyPlan := toolCallPlan{ordinal: idx, class: toolPlanExclusive}
-				shadowPlan := shadowToolCallPlan(planningObservation)
-				if a.toolPlanShadowEvaluator != nil {
-					shadowPlan = a.toolPlanShadowEvaluator(planningObservation)
-				}
-				a.observeToolCallPlan(legacyPlan, shadowPlan)
-				evidenceReq, evidenceTool := newEvidenceRequest(resolvedName, norm.Normalized, execArgs, a.deps)
-				if !strings.EqualFold(strings.TrimSpace(resolvedName), "done") {
-					pendingRequireDoneFinalText = ""
-					pendingRequireDoneFinalResponseID = ""
-				}
-				if mergeWarnings := continuationMergeDiagnostics[tc.ID]; len(mergeWarnings) > 0 {
-					norm.Meta = appendToolArgMergeDiagnostics(norm.Meta, mergeWarnings)
-					for _, warning := range mergeWarnings {
-						a.warnf("warning: tool-call argument merge conflict for call %q: %s", tc.ID, warning)
-					}
-				}
-				if repeatGuard != nil && !evidenceTool {
-					signature := normalizeToolSignature(resolvedName, norm.Normalized, execArgs)
-					seen, blocked := repeatGuard.observe(signature)
-					lastResultRecycled := false
-					if blocked && repeatGuard.exhausted {
-						if a.repeatResultRecycled != nil {
-							lastResultRecycled = a.repeatResultRecycled(signature)
+					if !found {
+						unknownToolFallback = true
+						resolvedName = "invalid"
+						execArgs = wrapInvalidToolArgs(originalName, tc.Function.Arguments)
+						if inv, ok := frame.exact["invalid"]; ok {
+							tool = inv
 						} else {
-							lastResultRecycled = a.lastResultForSignatureIsRecycled(signature)
+							tool = autoInvalidTool()
 						}
 					}
-					observation := repeatedSignatureObservation{
-						count:              seen,
-						threshold:          repeatGuard.threshold,
-						exhausted:          repeatGuard.exhausted,
-						lastResultRecycled: lastResultRecycled,
-						reminderConfigured: strings.TrimSpace(a.loopGuardUserMsg) != "",
-						nextStrike:         loopGuardStrikes + 1,
-						strikeLimit:        a.loopGuardStrikeMax,
-					}
-					decision := decideRepeatedSignatureIntervention(observation)
-					if decision.action == interventionActionSuppressTool {
-						loopGuardStrikes++
-						// Accepted blocks have non-empty IDs, so this helper returns
-						// one history result. Keep its richer history-only suffix.
-						guardHistory := loopGuardSkippedToolResults(tc, resolvedName)
-						guardResult := projectToolResult(guardHistory[0], map[string]any{"loop_guard_suppressed": true}, "[ERROR] Tool call skipped by loop guard - Repeated identical tool call blocked before execution.")
-						guardResult.visible = guardResult.original
-						if !closeToolResults(idx, toolCallAccepted, "loop_guard", guardResult) {
-							return
-						}
-						reminder := strings.TrimSpace(a.loopGuardUserMsg)
-						if repeatGuard.exhausted {
-							// The default reminder can mislead here ("reuse prior
-							// results"), because the prior result was recycled and
-							// cannot be reused. Inject a diagnostic that matches
-							// reality and is aligned with the placeholder wording.
-							reminder = messageorigin.RecycledToolResultRecoveryText
-						}
-						if decision.queueReminder {
-							// Buffered, not appended: this is a user-role
-							// message and the assistant tool-call block is not
-							// closed yet. Appending here would interleave user
-							// text between two tool results of the same block
-							// and permanently invalidate the history.
-							pendingBlockMessages = append(pendingBlockMessages, messageorigin.NewInternalUserMessage(messageorigin.KindLoopGuard, reminder))
-							a.emitEvent(out, HiddenUserMessageEvent{Content: reminder})
-						}
-						a.emitEvent(out, WarnEvent{
-							Message: fmt.Sprintf(
-								"detected repeated tool-call signature (%d/%d within %d calls); strike %d/%d; injected loop-break reminder and skipping execution",
-								seen,
-								repeatGuard.threshold,
-								repeatGuard.window,
-								loopGuardStrikes,
-								a.loopGuardStrikeMax,
-							),
-							Kind: "loop_guard",
-						})
-						repeatGuard.reset()
-						if decision.downgradeGuard {
-							// Repeat protection budget is spent. Rather than
-							// aborting the run (which kills legitimate work — e.g. a
-							// long research turn that re-reads a file after context
-							// compaction evicted the earlier result) or fully
-							// disabling the guard (which nurtured 60-minute spins in
-							// the self-bootstrap case), downgrade it: normal repeats
-							// are allowed through, but the pathological subclass
-							// (re-reading a recycled placeholder) is still
-							// intercepted so the run stays bounded.
-							a.emitEvent(out, WarnEvent{
-								Message: fmt.Sprintf(
-									"repeated tool-call loop protection budget spent after %d strike(s); downgrading guard: normal repeats allowed, recycled-placeholder re-reads still blocked",
-									loopGuardStrikes,
-								),
-								Kind: "loop_guard",
-							})
-							repeatGuard.exhausted = true
-						}
-						a.emitEvent(out, StepStartEvent{StepID: tc.ID, Title: resolvedName, StepNumber: step}, toolCorrelation)
-						a.emitEvent(out, ToolCallEvent{
-							Tool: resolvedName, Args: norm.Display, ArgsJSON: norm.Normalized,
-							ArgsMeta: norm.Meta, ToolCallID: tc.ID, DisplayName: resolvedName,
-						}, toolCorrelation)
-						if !publishToolResult(idx, 0) {
-							return
-						}
-						a.emitEvent(out, StepCompleteEvent{StepID: tc.ID, Status: "error"}, toolCorrelation)
-						continue
-					}
-				}
-				a.emitEvent(out, StepStartEvent{StepID: tc.ID, Title: resolvedName, StepNumber: step}, toolCorrelation)
-				argsMap := norm.Display
-				if argsMap == nil {
-					argsMap = map[string]any{"__raw": execArgs}
-				}
-				a.emitEvent(out, ToolCallEvent{
-					Tool:        resolvedName,
-					Args:        argsMap,
-					ArgsJSON:    norm.Normalized,
-					ArgsMeta:    norm.Meta,
-					ToolCallID:  tc.ID,
-					DisplayName: resolvedName,
-				}, toolCorrelation)
-				if evidenceTool {
-					decision := progressLedger.preflight(evidenceReq, a.compactionGeneration.Load())
-					if decision.suppress {
-						content := llm.TextContent(decision.content)
-						suppressedResult := projectToolResult(llm.Message{
-							Role: llm.RoleTool, ToolCallID: tc.ID, ToolName: resolvedName,
-							Content: content, IsError: false, Ephemeral: tool.EphemeralKeep > 0,
-						}, decision.metadata, content.PlainText())
-						if !closeToolResults(idx, toolCallAccepted, "evidence_suppressed", suppressedResult) {
-							return
-						}
-						if !publishToolResult(idx, 0) {
-							return
-						}
-						a.emitEvent(out, StepCompleteEvent{StepID: tc.ID, Status: "completed"}, toolCorrelation)
-						if decision.recovery {
-							reminder := evidenceRecoveryMessage(evidenceReq)
-							// Deferred until the tool-call block is closed; see
-							// the loop-guard reminder above.
-							pendingBlockMessages = append(pendingBlockMessages, messageorigin.NewInternalUserMessage(messageorigin.KindEvidenceRecovery, reminder))
-							a.emitEvent(out, HiddenUserMessageEvent{Content: reminder})
-							a.emitEvent(out, WarnEvent{
-								Kind:     "no_progress_recovery",
-								Metadata: decision.metadata,
-								Message: fmt.Sprintf(
-									"suppressed repeated %s evidence call after %d execution(s); target=%s fingerprint=%s action=change_target_range_or_action",
-									evidenceReq.family,
-									decision.metadata["evidence_executed"],
-									evidenceReq.target,
-									evidenceReq.fingerprint,
-								),
-							})
-						}
-						continue
-					}
-				}
 
-				start := time.Now()
-				ctxToolBase := tools.WithToolCallID(ctx, tc.ID)
-				ctxToolBase = tools.WithToolResultMetadata(ctxToolBase)
-				ctxTool, finishToolStage := a.beginSteeringInterruptibleStage(ctxToolBase)
-				// Event publication/Warningf can synchronously cancel the root
-				// after the early gate. Recheck at actual handler admission;
-				// steering's child context is not root cancellation authority.
-				if err := ctx.Err(); err != nil {
-					finishToolStage()
-					closeUnstartedOnRootCancel(idx, err)
-					return
-				}
-				if err := activeToolBlock.markRunning(idx); err != nil {
-					finishToolStage()
-					failToolBlock(err)
-					return
-				}
-				content, toolErr := a.executeToolSafely(ctxTool, tool, prepared)
-				stageInterruptedForSteering := finishToolStage()
-				rootCancelErr := ctx.Err()
-				if err := activeToolBlock.markAttemptReturned(idx, rootCancelErr != nil); err != nil {
-					failToolBlock(err)
-					return
-				}
-				if rootCancelErr != nil {
-					// Root cancellation outranks a tool's ordinary or task-complete
-					// return. Keep a contiguous result for this call, then terminate.
-					toolErr = rootCancelErr
-					content = llm.TextContent("Tool execution canceled before turn continuation: " + rootCancelErr.Error())
-				}
-				isError := toolErr != nil
-				if unknownToolFallback {
-					isError = true
-				}
-				status := "completed"
-				if isError {
-					status = "error"
-				}
-				meta := tools.TakeToolResultMetadataSnapshot(ctxTool)
-				if unknownToolFallback {
-					if meta == nil {
-						meta = map[string]any{}
+					prepared, norm := tool.PrepareCall(execArgs)
+					resolution := toolResolutionExact
+					if unknownToolFallback {
+						resolution = toolResolutionUnknownFallback
+					} else if normalizedAlias {
+						resolution = toolResolutionNormalizedAlias
 					}
-					meta["error_kind"] = "tool_not_found"
-					meta["tool"] = originalName
-				}
+					argsState := toolArgsNormalized
+					if norm.Err != nil {
+						argsState = toolArgsInvalid
+					}
+					planningObservation := toolPlanningObservation{ordinal: idx, resolution: resolution, args: argsState}
+					legacyPlan := toolCallPlan{ordinal: idx, class: toolPlanExclusive}
+					shadowPlan := shadowToolCallPlan(planningObservation)
+					if a.toolPlanShadowEvaluator != nil {
+						shadowPlan = a.toolPlanShadowEvaluator(planningObservation)
+					}
+					a.observeToolCallPlan(legacyPlan, shadowPlan)
+					evidenceReq, evidenceTool = newEvidenceRequest(resolvedName, norm.Normalized, execArgs, a.deps)
+					if !strings.EqualFold(strings.TrimSpace(resolvedName), "done") {
+						pendingRequireDoneFinalText = ""
+						pendingRequireDoneFinalResponseID = ""
+					}
+					if mergeWarnings := continuationMergeDiagnostics[tc.ID]; len(mergeWarnings) > 0 {
+						norm.Meta = appendToolArgMergeDiagnostics(norm.Meta, mergeWarnings)
+						for _, warning := range mergeWarnings {
+							a.warnf("warning: tool-call argument merge conflict for call %q: %s", tc.ID, warning)
+						}
+					}
+					if repeatGuard != nil && !evidenceTool {
+						signature := normalizeToolSignature(resolvedName, norm.Normalized, execArgs)
+						seen, blocked := repeatGuard.observe(signature)
+						lastResultRecycled := false
+						if blocked && repeatGuard.exhausted {
+							if a.repeatResultRecycled != nil {
+								lastResultRecycled = a.repeatResultRecycled(signature)
+							} else {
+								lastResultRecycled = a.lastResultForSignatureIsRecycled(signature)
+							}
+						}
+						observation := repeatedSignatureObservation{
+							count:              seen,
+							threshold:          repeatGuard.threshold,
+							exhausted:          repeatGuard.exhausted,
+							lastResultRecycled: lastResultRecycled,
+							reminderConfigured: strings.TrimSpace(a.loopGuardUserMsg) != "",
+							nextStrike:         loopGuardStrikes + 1,
+							strikeLimit:        a.loopGuardStrikeMax,
+						}
+						decision := decideRepeatedSignatureIntervention(observation)
+						if decision.action == interventionActionSuppressTool {
+							loopGuardStrikes++
+							// Accepted blocks have non-empty IDs, so this helper returns
+							// one history result. Keep its richer history-only suffix.
+							guardHistory := loopGuardSkippedToolResults(tc, resolvedName)
+							guardResult := projectToolResult(guardHistory[0], map[string]any{"loop_guard_suppressed": true}, "[ERROR] Tool call skipped by loop guard - Repeated identical tool call blocked before execution.")
+							guardResult.visible = guardResult.original
+							postCommit = func() {
+								reminder := strings.TrimSpace(a.loopGuardUserMsg)
+								if repeatGuard.exhausted {
+									// The default reminder can mislead here ("reuse prior
+									// results"), because the prior result was recycled and
+									// cannot be reused. Inject a diagnostic that matches
+									// reality and is aligned with the placeholder wording.
+									reminder = messageorigin.RecycledToolResultRecoveryText
+								}
+								if decision.queueReminder {
+									// Buffered, not appended: this is a user-role
+									// message and the assistant tool-call block is not
+									// closed yet. Appending here would interleave user
+									// text between two tool results of the same block
+									// and permanently invalidate the history.
+									pendingBlockMessages = append(pendingBlockMessages, messageorigin.NewInternalUserMessage(messageorigin.KindLoopGuard, reminder))
+									a.emitEvent(out, HiddenUserMessageEvent{Content: reminder})
+								}
+								a.emitEvent(out, WarnEvent{
+									Message: fmt.Sprintf(
+										"detected repeated tool-call signature (%d/%d within %d calls); strike %d/%d; injected loop-break reminder and skipping execution",
+										seen,
+										repeatGuard.threshold,
+										repeatGuard.window,
+										loopGuardStrikes,
+										a.loopGuardStrikeMax,
+									),
+									Kind: "loop_guard",
+								})
+								repeatGuard.reset()
+								if decision.downgradeGuard {
+									// Repeat protection budget is spent. Rather than
+									// aborting the run (which kills legitimate work — e.g. a
+									// long research turn that re-reads a file after context
+									// compaction evicted the earlier result) or fully
+									// disabling the guard (which nurtured 60-minute spins in
+									// the self-bootstrap case), downgrade it: normal repeats
+									// are allowed through, but the pathological subclass
+									// (re-reading a recycled placeholder) is still
+									// intercepted so the run stays bounded.
+									a.emitEvent(out, WarnEvent{
+										Message: fmt.Sprintf(
+											"repeated tool-call loop protection budget spent after %d strike(s); downgrading guard: normal repeats allowed, recycled-placeholder re-reads still blocked",
+											loopGuardStrikes,
+										),
+										Kind: "loop_guard",
+									})
+									repeatGuard.exhausted = true
+								}
+								a.emitEvent(out, StepStartEvent{StepID: tc.ID, Title: resolvedName, StepNumber: step}, toolCorrelation)
+								a.emitEvent(out, ToolCallEvent{
+									Tool: resolvedName, Args: norm.Display, ArgsJSON: norm.Normalized,
+									ArgsMeta: norm.Meta, ToolCallID: tc.ID, DisplayName: resolvedName,
+								}, toolCorrelation)
+							}
+							terminal := blockTerminal(guardResult, "loop_guard")
+							return BlockAdmission{Skipped: &terminal}, nil
+						}
+					}
+					a.emitEvent(out, StepStartEvent{StepID: tc.ID, Title: resolvedName, StepNumber: step}, toolCorrelation)
+					argsMap := norm.Display
+					if argsMap == nil {
+						argsMap = map[string]any{"__raw": execArgs}
+					}
+					a.emitEvent(out, ToolCallEvent{
+						Tool:        resolvedName,
+						Args:        argsMap,
+						ArgsJSON:    norm.Normalized,
+						ArgsMeta:    norm.Meta,
+						ToolCallID:  tc.ID,
+						DisplayName: resolvedName,
+					}, toolCorrelation)
+					if evidenceTool {
+						decision := progressLedger.preflight(evidenceReq, a.compactionGeneration.Load())
+						if decision.suppress {
+							content := llm.TextContent(decision.content)
+							suppressedResult := projectToolResult(llm.Message{
+								Role: llm.RoleTool, ToolCallID: tc.ID, ToolName: resolvedName,
+								Content: content, IsError: false, Ephemeral: tool.EphemeralKeep > 0,
+							}, decision.metadata, content.PlainText())
+							postPublish = func() {
+								if decision.recovery {
+									reminder := evidenceRecoveryMessage(evidenceReq)
+									// Deferred until the tool-call block is closed; see
+									// the loop-guard reminder above.
+									pendingBlockMessages = append(pendingBlockMessages, messageorigin.NewInternalUserMessage(messageorigin.KindEvidenceRecovery, reminder))
+									a.emitEvent(out, HiddenUserMessageEvent{Content: reminder})
+									a.emitEvent(out, WarnEvent{
+										Kind:     "no_progress_recovery",
+										Metadata: decision.metadata,
+										Message: fmt.Sprintf(
+											"suppressed repeated %s evidence call after %d execution(s); target=%s fingerprint=%s action=change_target_range_or_action",
+											evidenceReq.family,
+											decision.metadata["evidence_executed"],
+											evidenceReq.target,
+											evidenceReq.fingerprint,
+										),
+									})
+								}
+							}
+							terminal := blockTerminal(suppressedResult, "evidence_suppressed")
+							return BlockAdmission{Skipped: &terminal}, nil
+						}
+					}
 
-				// If tool is configured ephemeral, mark tool message accordingly.
-				ephemeral := tool.EphemeralKeep > 0
-
-				// Tool completion special-case.
-				var tce *tools.TaskCompleteError
-				if rootCancelErr == nil && errors.As(toolErr, &tce) {
-					isError = false
-					status = "completed"
-					content = llm.TextContent("Task completed: " + tce.Message)
-					originalResult := content.PlainText()
+					callStarted = time.Now()
+					ctxTool := tools.WithToolResultMetadata(tools.WithToolCallID(root, tc.ID))
+					ctxTool, finish := a.beginSteeringInterruptibleStage(ctxTool)
+					return BlockAdmission{Call: &prepared, Context: ctxTool, Deps: a.deps, Finish: finish}, nil
+				},
+				OnPanic: func(_ int, ctx context.Context, recovered any) (llm.Content, error) {
+					panicMsg := fmt.Sprintf("tool %q panicked: %v", tool.Name, recovered)
+					a.warnf("error: recovered panic from tool %q: %v", tool.Name, recovered)
+					tools.UpsertToolResultMetadata(ctx, map[string]any{"panic": true, "panic_message": panicMsg, "tool": tool.Name})
+					return llm.TextContent("Error: " + panicMsg), fmt.Errorf("%s", panicMsg)
+				},
+				Project: func(idx int, outcome BlockOutcome) (BlockTerminal, error) {
+					tc := comp.ToolCalls[idx]
+					if outcome.NotStarted != BlockContinue {
+						text := toolSkippedByCancellationText
+						if outcome.NotStarted == BlockDone {
+							text = toolSkippedByTurnEndText
+						}
+						if outcome.NotStarted == BlockSteering {
+							text = toolSkippedBySteeringText
+						}
+						return blockTerminal(historyOnlyResults(skippedToolResults([]llm.ToolCall{tc}, text))[0], string(outcome.NotStarted)), nil
+					}
+					content, toolErr, meta := outcome.Content, outcome.Err, outcome.Metadata
+					if outcome.RootError != nil {
+						toolErr = outcome.RootError
+						content = llm.TextContent("Tool execution canceled before turn continuation: " + outcome.RootError.Error())
+					}
+					isError := toolErr != nil || unknownToolFallback
+					if unknownToolFallback {
+						if meta == nil {
+							meta = map[string]any{}
+						}
+						meta["error_kind"], meta["tool"] = "tool_not_found", originalName
+					}
+					reason := "handler_return"
+					var tce *tools.TaskCompleteError
+					if outcome.RootError == nil && errors.As(toolErr, &tce) {
+						taskComplete = true
+						completedMessage = tce.Message
+						reason = "task_complete"
+						isError = false
+						content = llm.TextContent("Task completed: " + tce.Message)
+					} else {
+						if evidenceTool {
+							meta = mergeToolResultMetadata(meta, progressLedger.observe(evidenceReq, content.PlainText(), isError))
+						}
+						progressLedger.invalidateAfter(resolvedName, isError)
+					}
+					original := content.PlainText()
 					content, meta = a.applyToolResultTruncation(ctx, content, meta, resolvedName, tc.ID)
-					// append tool message and finish
-					result := projectToolResult(llm.Message{Role: llm.RoleTool, ToolCallID: tc.ID, ToolName: resolvedName, Content: content, IsError: false, Ephemeral: ephemeral}, meta, originalResult)
-					if !closeToolResults(idx, toolCallRunning, "task_complete", result) {
-						return
+					return blockTerminal(projectToolResult(llm.Message{Role: llm.RoleTool, ToolCallID: tc.ID, ToolName: resolvedName, Content: content, IsError: isError, Ephemeral: tool.EphemeralKeep > 0}, meta, original), reason), nil
+				},
+				Commit: func(terminals []BlockTerminal) error {
+					rows := make([]llm.Message, len(terminals))
+					for i, t := range terminals {
+						rows[i] = t.History
 					}
-					if !publishToolResult(idx, time.Since(start)) {
-						return
+					commitToolHistory(rows)
+					if len(terminals) == 1 && terminals[0].Reason == "loop_guard" && postCommit != nil {
+						postCommit()
 					}
-					a.emitEvent(out, StepCompleteEvent{StepID: tc.ID, Status: status, DurationMS: time.Since(start).Milliseconds()}, toolCorrelation)
-					if err := ctx.Err(); err != nil {
-						if !closeToolResults(idx+1, toolCallAccepted, "root_cancel_after_task_complete", historyOnlyResults(skippedToolResults(comp.ToolCalls[idx+1:], toolSkippedByCancellationText))...) {
-							return
-						}
-						a.appendMessages(pendingBlockMessages)
-						pendingBlockMessages = nil
-						emitSDKErr(a.errEvent(err))
-						return
+					return nil
+				},
+				Publish: func(idx int, t BlockTerminal, duration time.Duration) {
+					tc := comp.ToolCalls[idx]
+					toolCorrelation := activeToolBlock.eventCorrelation(correlation, idx)
+					// Preserve legacy wall time: stage setup, projection and commit
+					// are included, with StepComplete sampled after publication.
+					if !callStarted.IsZero() {
+						duration = time.Since(callStarted)
 					}
-					// The turn ends here, but the assistant tool-call block must
-					// still be closed: a parallel `done` that is not the last
-					// call would otherwise leave tool_use blocks with no result,
-					// making the *next* turn's first provider request invalid.
-					if !closeToolResults(idx+1, toolCallAccepted, "task_complete_tail", historyOnlyResults(skippedToolResults(comp.ToolCalls[idx+1:], toolSkippedByTurnEndText))...) {
-						return
+					a.emitToolResultWithAccounting(out, t.projection(), duration, toolCorrelation)
+					status := "completed"
+					if t.History.IsError {
+						status = "error"
 					}
-					a.appendMessages(pendingBlockMessages)
-					pendingBlockMessages = nil
-					if a.hasCompactor {
-						_ = a.checkAndCompact(ctx, comp, out, additionalSinceCompletion())
+					if !callStarted.IsZero() {
+						duration = time.Since(callStarted)
 					}
-					finalContent := strings.TrimSpace(tce.Message)
-					finalResponseID := responseID
-					if preserved := strings.TrimSpace(pendingRequireDoneFinalText); preserved != "" {
-						finalContent = preserved
-						if preservedResponseID := strings.TrimSpace(pendingRequireDoneFinalResponseID); preservedResponseID != "" {
-							finalResponseID = preservedResponseID
-						}
+					a.emitEvent(out, StepCompleteEvent{StepID: tc.ID, Status: status, DurationMS: duration.Milliseconds()}, toolCorrelation)
+					if t.Reason == "evidence_suppressed" && postPublish != nil {
+						postPublish()
 					}
-					requireDoneRecoveryDisableThinkingActive = false
-					if !finishToolBlock() {
-						return
+				},
+				Boundary: func(_ int, outcome BlockOutcome) BlockStop {
+					if taskComplete {
+						return BlockDone
 					}
-					emitFinal(finalContent, finalResponseID, correlation)
-					return
-				}
-
-				if evidenceTool {
-					evidenceMeta := progressLedger.observe(evidenceReq, content.PlainText(), isError)
-					meta = mergeToolResultMetadata(meta, evidenceMeta)
-				}
-				progressLedger.invalidateAfter(resolvedName, isError)
-				originalResult := content.PlainText()
-				content, meta = a.applyToolResultTruncation(ctx, content, meta, resolvedName, tc.ID)
-
-				// append tool message
-				result := projectToolResult(llm.Message{Role: llm.RoleTool, ToolCallID: tc.ID, ToolName: resolvedName, Content: content, IsError: isError, Ephemeral: ephemeral}, meta, originalResult)
-				if !closeToolResults(idx, toolCallRunning, "handler_return", result) {
-					return
-				}
-
-				if !publishToolResult(idx, time.Since(start)) {
-					return
-				}
-				a.emitEvent(out, StepCompleteEvent{StepID: tc.ID, Status: status, DurationMS: time.Since(start).Milliseconds()}, toolCorrelation)
-				if rootCancelErr == nil {
-					rootCancelErr = ctx.Err()
-				}
-				if rootCancelErr != nil {
-					if !closeToolResults(idx+1, toolCallAccepted, "root_cancel_after_handler", historyOnlyResults(skippedToolResults(comp.ToolCalls[idx+1:], toolSkippedByCancellationText))...) {
-						return
+					if strings.EqualFold(strings.TrimSpace(resolvedName), "done") {
+						requireDoneRecoveryDisableThinkingActive = false
 					}
-					a.appendMessages(pendingBlockMessages)
-					pendingBlockMessages = nil
-					emitSDKErr(a.errEvent(rootCancelErr))
-					return
-				}
-				if strings.EqualFold(strings.TrimSpace(resolvedName), "done") {
-					requireDoneRecoveryDisableThinkingActive = false
-				}
-
-				// *** Boundary-aware steering: check for new user messages after each tool execution ***
-				steeringMessages := a.collectSteering(steeringCh, out)
-				if len(steeringMessages) > 0 || stageInterruptedForSteering {
-					requireDoneReminders = 0
-					forceRequireDoneToolChoice = false
-					requireDoneRecoveryDisableThinkingActive = false
-					pendingRequireDoneFinalText = ""
-					pendingRequireDoneFinalResponseID = ""
-					// Close the tool_result block for every remaining call
-					// *before* the steering text enters history. A user message
-					// between two tool results of the same assistant block makes
-					// the whole conversation permanently unsendable.
-					// Queue consumed input before terminal acceptance so failure
-					// recovery can retain it after closing the remaining calls.
-					pendingBlockMessages = append(pendingBlockMessages, steeringMessages...)
-					if !closeToolResults(idx+1, toolCallAccepted, "steering", historyOnlyResults(skippedToolResults(comp.ToolCalls[idx+1:], toolSkippedBySteeringText))...) {
-						return
+					steeringMessages := a.collectSteering(steeringCh, out)
+					if len(steeringMessages) > 0 || outcome.Interrupted {
+						requireDoneReminders = 0
+						forceRequireDoneToolChoice = false
+						requireDoneRecoveryDisableThinkingActive = false
+						pendingRequireDoneFinalText = ""
+						pendingRequireDoneFinalResponseID = ""
+						pendingBlockMessages = append(pendingBlockMessages, steeringMessages...)
+						return BlockSteering
 					}
-					break
-				}
+					return BlockContinue
+				},
 			}
+			stop, blockErr := runSequentialBlock(ctx, activeToolBlock, comp.ToolCalls, adapter, false)
+			if blockErr != nil {
+				failToolBlock(blockErr)
+				return
+			}
+			if stop == BlockRootBeforeStart || stop == BlockRootAfterHandler || stop == BlockRootAfterDone {
+				a.appendMessages(pendingBlockMessages)
+				pendingBlockMessages = nil
+				emitSDKErr(a.errEvent(ctx.Err()))
+				return
+			}
+			if stop == BlockDone {
+				a.appendMessages(pendingBlockMessages)
+				pendingBlockMessages = nil
+				if a.hasCompactor {
+					_ = a.checkAndCompact(ctx, comp, out, additionalSinceCompletion())
+				}
+				finalContent := strings.TrimSpace(completedMessage)
+				finalResponseID := responseID
+				if preserved := strings.TrimSpace(pendingRequireDoneFinalText); preserved != "" {
+					finalContent = preserved
+					if preservedResponseID := strings.TrimSpace(pendingRequireDoneFinalResponseID); preservedResponseID != "" {
+						finalResponseID = preservedResponseID
+					}
+				}
+				requireDoneRecoveryDisableThinkingActive = false
+				if !finishToolBlock() {
+					return
+				}
+				emitFinal(finalContent, finalResponseID, correlation)
+				return
+			}
+
 			// The assistant tool-call block is now closed: every tool_use has a
 			// tool_result. Only here may user-role messages enter history.
 			if !finishToolBlock() {
@@ -2775,23 +2729,6 @@ func mergeToolResultMetadata(base, extra map[string]any) map[string]any {
 		base[key] = value
 	}
 	return base
-}
-
-func (a *Agent) executeToolSafely(ctx context.Context, tool tools.Tool, prepared tools.PreparedCall) (content llm.Content, err error) {
-	defer func() {
-		if recovered := recover(); recovered != nil {
-			panicMsg := fmt.Sprintf("tool %q panicked: %v", tool.Name, recovered)
-			a.warnf("error: recovered panic from tool %q: %v", tool.Name, recovered)
-			tools.UpsertToolResultMetadata(ctx, map[string]any{
-				"panic":         true,
-				"panic_message": panicMsg,
-				"tool":          tool.Name,
-			})
-			content = llm.TextContent("Error: " + panicMsg)
-			err = fmt.Errorf("%s", panicMsg)
-		}
-	}()
-	return prepared.Execute(ctx, a.deps)
 }
 
 // emitPartialUsage records the usage of a completion that did not reach the
