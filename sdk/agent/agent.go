@@ -171,10 +171,8 @@ type Agent struct {
 	toolBlockStateObserved      func(*toolBlockState)
 	toolBlockTestHook           func(*toolBlockState) // private failure-injection hook
 
-	repeatInterventionShadowObserved  func(interventionDecision, interventionDecision)
-	repeatInterventionShadowEvaluator func(repeatedSignatureObservation) interventionDecision
-	repeatResultRecycled              func(string) bool
-	toolPlanShadowEvaluator           func(toolPlanningObservation) toolCallPlan
+	repeatResultRecycled    func(string) bool
+	toolPlanShadowEvaluator func(toolPlanningObservation) toolCallPlan
 
 	tools             []tools.Tool
 	toolMap           map[string]tools.Tool
@@ -1375,7 +1373,6 @@ func (a *Agent) queryStreamWithSteering(ctx context.Context, input llm.Content, 
 				if repeatGuard != nil && !evidenceTool {
 					signature := normalizeToolSignature(resolvedName, norm.Normalized, execArgs)
 					seen, blocked := repeatGuard.observe(signature)
-					detected := blocked
 					lastResultRecycled := false
 					if blocked && repeatGuard.exhausted {
 						if a.repeatResultRecycled != nil {
@@ -1384,40 +1381,17 @@ func (a *Agent) queryStreamWithSteering(ctx context.Context, input llm.Content, 
 							lastResultRecycled = a.lastResultForSignatureIsRecycled(signature)
 						}
 					}
-					if blocked && repeatGuard.exhausted && !lastResultRecycled {
-						// In downgraded mode the guard only keeps intercepting the
-						// pathological subclass (re-issuing a call whose previous
-						// result is a known recycled placeholder — which can never
-						// make progress). All other repeats, e.g. legitimate
-						// re-reads after compaction, are allowed through.
-						blocked = false
-					}
-					reminderConfigured := blocked && strings.TrimSpace(a.loopGuardUserMsg) != ""
-					legacyAction := interventionActionProceed
-					if blocked {
-						legacyAction = interventionActionSuppressTool
-					}
-					legacyDecision := interventionDecision{
-						detection:      interventionDetection{kind: interventionKindRepeatedSignature, active: detected},
-						action:         legacyAction,
-						queueReminder:  blocked && (repeatGuard.exhausted || reminderConfigured),
-						downgradeGuard: blocked && !repeatGuard.exhausted && a.loopGuardStrikeMax > 0 && loopGuardStrikes+1 >= a.loopGuardStrikeMax,
-					}
 					observation := repeatedSignatureObservation{
 						count:              seen,
 						threshold:          repeatGuard.threshold,
 						exhausted:          repeatGuard.exhausted,
 						lastResultRecycled: lastResultRecycled,
-						reminderConfigured: reminderConfigured,
+						reminderConfigured: strings.TrimSpace(a.loopGuardUserMsg) != "",
 						nextStrike:         loopGuardStrikes + 1,
 						strikeLimit:        a.loopGuardStrikeMax,
 					}
-					shadowDecision := shadowRepeatedSignatureIntervention(observation)
-					if a.repeatInterventionShadowEvaluator != nil {
-						shadowDecision = a.repeatInterventionShadowEvaluator(observation)
-					}
-					a.observeRepeatedSignatureIntervention(legacyDecision, shadowDecision)
-					if blocked {
+					decision := decideRepeatedSignatureIntervention(observation)
+					if decision.action == interventionActionSuppressTool {
 						loopGuardStrikes++
 						// Accepted blocks have non-empty IDs, so this helper returns
 						// one history result. Keep its richer history-only suffix.
@@ -1435,7 +1409,7 @@ func (a *Agent) queryStreamWithSteering(ctx context.Context, input llm.Content, 
 							// reality and is aligned with the placeholder wording.
 							reminder = messageorigin.RecycledToolResultRecoveryText
 						}
-						if reminder != "" {
+						if decision.queueReminder {
 							// Buffered, not appended: this is a user-role
 							// message and the assistant tool-call block is not
 							// closed yet. Appending here would interleave user
@@ -1456,7 +1430,7 @@ func (a *Agent) queryStreamWithSteering(ctx context.Context, input llm.Content, 
 							Kind: "loop_guard",
 						})
 						repeatGuard.reset()
-						if !repeatGuard.exhausted && a.loopGuardStrikeMax > 0 && loopGuardStrikes >= a.loopGuardStrikeMax {
+						if decision.downgradeGuard {
 							// Repeat protection budget is spent. Rather than
 							// aborting the run (which kills legitimate work — e.g. a
 							// long research turn that re-reads a file after context
