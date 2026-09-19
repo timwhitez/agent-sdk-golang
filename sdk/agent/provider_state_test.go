@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/timwhitez/agent-sdk-golang/sdk/agent/messageorigin"
 	"github.com/timwhitez/agent-sdk-golang/sdk/llm"
@@ -15,6 +16,7 @@ type steeringProviderStateModel struct {
 	calls          int
 	stateDelivered chan struct{}
 	secondErr      error
+	firstUsage     *llm.Usage
 }
 
 func (m *steeringProviderStateModel) Provider() string { return "test-responses" }
@@ -30,6 +32,9 @@ func (m *steeringProviderStateModel) InvokeStream(ctx context.Context, req llm.I
 	if call == 1 {
 		go func() {
 			defer close(stream)
+			if m.firstUsage != nil {
+				stream <- llm.StreamUsageEvent{Usage: *m.firstUsage}
+			}
 			stream <- llm.StreamProviderStateEvent{State: []llm.ProviderState{{
 				Provider: "openai-responses",
 				Kind:     "response.output_item.v1",
@@ -156,5 +161,52 @@ func TestSteeringBetweenProviderStateAndDonePersistsStateForNextRequest(t *testi
 	}
 	if model.calls != 2 || final != "steered" {
 		t.Fatalf("calls/final = %d/%q", model.calls, final)
+	}
+}
+
+func TestIdleRecoveryBetweenProviderStateAndDonePersistsStateForNextRequest(t *testing.T) {
+	model := &steeringProviderStateModel{stateDelivered: make(chan struct{}), firstUsage: llm.NewProviderUsage(10, 2, 12)}
+	ag, err := New(Config{LLM: model, MaxIterations: 3, InvokeRetryMaxAttempts: 1, StreamIdleTimeout: 20 * time.Millisecond, StreamIdleMaxRecoveries: 1, Warningf: func(string, ...any) {}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	usage, accounting, finals := 0, 0, 0
+	for event := range ag.QueryStream(ctx, llm.TextContent("start")) {
+		switch event := event.(type) {
+		case ErrorEvent:
+			t.Fatalf("query error: %#v", event)
+		case UsageEvent:
+			usage++
+			if event.Usage.PromptTokens != 10 || event.Usage.CompletionTokens != 2 {
+				t.Fatalf("partial usage changed: %+v", event.Usage)
+			}
+		case AccountingEvent:
+			accounting++
+		case FinalResponseEvent:
+			finals++
+			if event.Content != "steered" || event.StallRecoveries != 1 {
+				t.Fatalf("unexpected final: %+v", event)
+			}
+		}
+	}
+	if model.secondErr != nil {
+		t.Fatal(model.secondErr)
+	}
+	if model.calls != 2 || finals != 1 || usage != 1 || accounting != 1 {
+		t.Fatalf("calls/finals/usage/accounting=%d/%d/%d/%d", model.calls, finals, usage, accounting)
+	}
+	states := 0
+	for _, message := range ag.Messages() {
+		if llm.HasProviderState(message.Content) {
+			states++
+			if message.Role != llm.RoleAssistant || message.PlainText() != "" {
+				t.Fatal("opaque provider state became visible text")
+			}
+		}
+	}
+	if states != 1 {
+		t.Fatalf("provider-state messages=%d", states)
 	}
 }
