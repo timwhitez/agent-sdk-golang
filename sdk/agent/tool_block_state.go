@@ -240,3 +240,19 @@ func (b *toolBlockState) validateClosed() error {
 	}
 	return nil
 }
+
+// Each driver iteration creates a Frame and accepts at most one final block.
+// Continuations advance to a new Frame before admission; retries stay within
+// the same Frame. Derive identity only from that accepted block, never CallID.
+func (b *toolBlockState) eventCorrelation(frame eventCorrelation, index int) eventCorrelation {
+	if frame.frameID == "" {
+		return frame
+	}
+	if _, err := b.call(index); err != nil {
+		return frame
+	}
+	frame.toolBlockID = frame.frameID + "/tool-block"
+	frame.toolCallOrdinal = uint64(index + 1)
+	frame.blockCallCount = uint64(len(b.calls))
+	return frame
+}

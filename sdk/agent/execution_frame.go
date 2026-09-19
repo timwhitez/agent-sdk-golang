@@ -56,8 +56,11 @@ func newExecutionFrame(id string, model llm.ChatModel, request llm.InvokeRequest
 // eventCorrelation is copied at the producer, never read from ambient output
 // state. The original eventOutput remains the sequence/backpressure owner.
 type eventCorrelation struct {
-	frameID string
-	attempt uint64
+	toolBlockID     string
+	toolCallOrdinal uint64
+	blockCallCount  uint64
+	frameID         string
+	attempt         uint64
 }
 
 // frameInvocation is query-driver-local bookkeeping, separate from immutable

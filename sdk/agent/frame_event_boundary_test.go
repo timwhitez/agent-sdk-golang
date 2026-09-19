@@ -87,6 +87,14 @@ func TestFrameEventBoundaryRetryContinuationAndLegacyParity(t *testing.T) {
 						t.Errorf("correlation at event%d: frame=%s attempt=%d", len(kinds), e.FrameID, e.InvokeAttempt)
 					}
 				}
+				toolEvent := e.Kind == EventKindStepStart || e.Kind == EventKindToolCall || e.Kind == EventKindToolResult || e.Kind == EventKindStepComplete || e.Kind == EventKindAccounting
+				if toolEvent {
+					if e.ToolBlockID != e.FrameID+"/tool-block" || e.ToolCallOrdinal != 1 || e.ToolBlockCallCount != 1 {
+						t.Errorf("accepted tool correlation=%+v", e)
+					}
+				} else if e.ToolBlockID != "" || e.ToolCallOrdinal != 0 || e.ToolBlockCallCount != 0 {
+					t.Errorf("unaccepted/model event acquired tool identity: %+v", e)
+				}
 				metadata := e
 				metadata.Event = nil
 				encoded, err := json.Marshal(metadata)

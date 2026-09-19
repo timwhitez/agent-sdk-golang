@@ -55,6 +55,22 @@ Invoke/InvokeStream, not inner wrapper calls or HTTP retries. Retried requests
 reuse a Frame; new logical iterations get new IDs. Retained partial usage keeps
 its completed invocation association even when cancellation occurs in backoff.
 
+Accepted native tool dispatch adds optional `ToolBlockID`, one-based
+`ToolCallOrdinal`, and `ToolBlockCallCount` on explicitly associated Step,
+ToolCall, ToolResult, and tool-result Accounting envelopes. The count includes
+accepted tails closed only in history; this adds no events for those tails.
+Zero/empty remains unknown. Provider ToolCallID reuse across completed blocks
+does not reuse this block identity.
+
+The driver creates one Frame per logical iteration and accepts at most one
+final tool block in it, after continuation/admission checks. The block ID is
+that finalizing `FrameID + "/tool-block"`; retries remain within the Frame and
+unfinished continuations advance without acquiring a block identity. No new
+sequence, allocator, planner, or history writer is introduced. This identifies
+the accepted native dispatch block, not all argument provenance, delivery,
+external exactly-once effects, or full child/delegation lineage. Suppressed
+calls may still have this identity without executing a handler.
+
 Unannotated host/compaction contexts remain absent. Correlation identifies
 execution/finalizing context, not complete lineage or failure causation.
 Additional public fields require keyed Go literals and compatible strict JSON
