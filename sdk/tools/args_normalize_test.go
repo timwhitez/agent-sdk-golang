@@ -3,6 +3,7 @@ package tools
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"strings"
 	"testing"
 
@@ -325,26 +326,19 @@ func TestToolExecuteArgsRepairMetadata(t *testing.T) {
 	})
 }
 
-func TestRepairJSONKeysBySchemaPrefersConservativeMatch(t *testing.T) {
+// "user user_id" reaches user_user_id through delimiter normalization and
+// user_id through candidate-token normalization. Rule order must not pick a
+// winner between different properties (#153), so the repair is rejected.
+func TestRepairJSONKeysBySchemaRejectsRuleOrderAmbiguity(t *testing.T) {
 	type args struct {
 		UserID     string `json:"user_id"`
 		UserUserID string `json:"user_user_id"`
 	}
 	schema := SchemaFor[args]()
 	raw := json.RawMessage(`{"user user_id":"abc"}`)
-	repaired, ok := repairJSONKeysBySchema(schema, raw)
-	if !ok {
-		t.Fatalf("expected repair to succeed")
-	}
-	var m map[string]any
-	if err := json.Unmarshal(repaired, &m); err != nil {
-		t.Fatalf("unmarshal: %v", err)
-	}
-	if v, ok := m["user_user_id"].(string); !ok || v != "abc" {
-		t.Fatalf("expected user_user_id=abc, got %v", m["user_user_id"])
-	}
-	if _, ok := m["user_id"]; ok {
-		t.Fatalf("expected user_id to remain unset")
+	repaired, ok, err := repairJSONKeysBySchemaWithOptions(schema, raw, schemaRepairOptions{})
+	if !errors.Is(err, errAmbiguousToolArguments) || ok || repaired != nil {
+		t.Fatalf("repair = %s ok=%v err=%v, want ambiguity rejection", repaired, ok, err)
 	}
 }
 
@@ -391,7 +385,7 @@ func TestRepairJSONKeysBySchemaStripsUnknownKeysRecursivelyWhenEnabled(t *testin
 	}
 	raw := json.RawMessage(`{"payload":{"filePath":"notes.txt","extra":"drop"},"extra_top":"drop"}`)
 
-	repaired, ok := repairJSONKeysBySchemaWithOptions(schema, raw, schemaRepairOptions{StripUnknown: true, ToolName: "read"})
+	repaired, ok, _ := repairJSONKeysBySchemaWithOptions(schema, raw, schemaRepairOptions{StripUnknown: true, ToolName: "read"})
 	if !ok {
 		t.Fatalf("expected recursive schema repair to run")
 	}
@@ -423,7 +417,7 @@ func TestRepairJSONKeysBySchemaKeepsUnknownKeysWhenStripUnknownDisabled(t *testi
 	schema := SchemaFor[args]()
 	raw := json.RawMessage(`{"filePath":"notes.txt","extra":"keep"}`)
 
-	repaired, ok := repairJSONKeysBySchemaWithOptions(schema, raw, schemaRepairOptions{StripUnknown: false, ToolName: "read"})
+	repaired, ok, _ := repairJSONKeysBySchemaWithOptions(schema, raw, schemaRepairOptions{StripUnknown: false, ToolName: "read"})
 	if !ok {
 		t.Fatalf("expected key repair to run")
 	}
@@ -448,7 +442,7 @@ func TestRepairJSONKeysBySchemaOffsetLineAliasIsToolSpecific(t *testing.T) {
 	schema := SchemaFor[args]()
 	raw := json.RawMessage(`{"line":12}`)
 
-	readRepaired, ok := repairJSONKeysBySchemaWithOptions(schema, raw, schemaRepairOptions{StripUnknown: true, ToolName: "read"})
+	readRepaired, ok, _ := repairJSONKeysBySchemaWithOptions(schema, raw, schemaRepairOptions{StripUnknown: true, ToolName: "read"})
 	if !ok {
 		t.Fatalf("expected read tool alias repair")
 	}
@@ -460,7 +454,7 @@ func TestRepairJSONKeysBySchemaOffsetLineAliasIsToolSpecific(t *testing.T) {
 		t.Fatalf("expected offset=12 for read alias repair, got %#v", readMap["offset"])
 	}
 
-	readPrefixedRepaired, ok := repairJSONKeysBySchemaWithOptions(schema, raw, schemaRepairOptions{StripUnknown: true, ToolName: "tools.function.read"})
+	readPrefixedRepaired, ok, _ := repairJSONKeysBySchemaWithOptions(schema, raw, schemaRepairOptions{StripUnknown: true, ToolName: "tools.function.read"})
 	if !ok {
 		t.Fatalf("expected prefixed read tool alias repair")
 	}
@@ -472,7 +466,7 @@ func TestRepairJSONKeysBySchemaOffsetLineAliasIsToolSpecific(t *testing.T) {
 		t.Fatalf("expected offset=12 for prefixed read alias repair, got %#v", readPrefixedMap["offset"])
 	}
 
-	otherRepaired, ok := repairJSONKeysBySchemaWithOptions(schema, raw, schemaRepairOptions{StripUnknown: true, ToolName: "custom_tool"})
+	otherRepaired, ok, _ := repairJSONKeysBySchemaWithOptions(schema, raw, schemaRepairOptions{StripUnknown: true, ToolName: "custom_tool"})
 	if !ok {
 		t.Fatalf("expected custom tool payload to be normalized")
 	}
