@@ -38,7 +38,7 @@ func TestAutomaticCompactionAsyncPreservesSampledDescriptor(t *testing.T) {
 				admissions++
 				ag.todoCompactionPending.Store(!initialTodo)
 			}
-			if err := ag.checkAndCompactWithGrowth(context.Background(), &llm.Completion{Usage: llm.WithPromptEstimate(nil, 70)}, nil, 0, 0); err != nil {
+			if err := ag.checkAndCompactWithGrowth(context.Background(), "", &llm.Completion{Usage: llm.WithPromptEstimate(nil, 70)}, nil, 0, 0); err != nil {
 				t.Fatal(err)
 			}
 			waitFor(t, time.Second, func() bool { return !ag.compactionInFlight.Load() }, "async descriptor completion")
@@ -126,7 +126,7 @@ func TestAutomaticCompactionDriverAdmissionBoundaries(t *testing.T) {
 			if test.canceled {
 				cancel()
 			}
-			err = ag.checkAndCompactWithGrowth(ctx, &llm.Completion{Usage: llm.WithPromptEstimate(nil, test.tokens)}, nil, 0, 0)
+			err = ag.checkAndCompactWithGrowth(ctx, "", &llm.Completion{Usage: llm.WithPromptEstimate(nil, test.tokens)}, nil, 0, 0)
 			if (err != nil) != test.wantError || admissions != test.wantAdmissions {
 				t.Fatalf("err=%v admissions=%d; want error=%v admissions=%d", err, admissions, test.wantError, test.wantAdmissions)
 			}

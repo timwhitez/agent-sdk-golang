@@ -15,6 +15,12 @@ const EventEnvelopeSchemaVersion = 1
 // control that disabled thinking, not full request/content parentage.
 const RequestControlRequireDoneDisableThinking = "require_done_disable_thinking"
 
+// RequestHistoryCompactionApplied reports that an automatic compaction,
+// triggered by the usage of RequestHistorySourceFrameID, was published into
+// history before this Frame's request was built. It names that one producer,
+// not the sole source of the request's content.
+const RequestHistoryCompactionApplied = "compaction_applied"
+
 type EventKind string
 
 const (
@@ -56,6 +62,12 @@ type EventEnvelope struct {
 	// Compaction, steering and merged continuation content remain independent.
 	RequestControlRelation      string `json:"RequestControlRelation,omitempty"`
 	RequestControlSourceFrameID string `json:"RequestControlSourceFrameID,omitempty"`
+	// Optional, producer-captured history provenance for this logical request:
+	// an automatic compaction published since the previous Frame. It is set
+	// only on the first Frame built after publication (retries reuse it) and
+	// empty means unreported, not that history was unchanged.
+	RequestHistoryRelation      string `json:"RequestHistoryRelation,omitempty"`
+	RequestHistorySourceFrameID string `json:"RequestHistorySourceFrameID,omitempty"`
 	SchemaVersion               int
 	QueryID                     string
 	// FrameID identifies the explicitly correlated execution context, not the

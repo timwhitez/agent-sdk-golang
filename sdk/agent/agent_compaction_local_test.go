@@ -76,7 +76,7 @@ func TestCheckAndCompactUsesLocalSnipWithoutModelInvoke(t *testing.T) {
 		llm.NewUserMessage("latest"),
 	})
 
-	ag.checkAndCompact(context.Background(), &llm.Completion{Usage: &llm.Usage{PromptTokens: 70, TotalTokens: 70}}, nil)
+	ag.checkAndCompact(context.Background(), "", &llm.Completion{Usage: &llm.Usage{PromptTokens: 70, TotalTokens: 70}}, nil)
 	waitFor(t, time.Second, func() bool {
 		return !ag.compactionInFlight.Load() && ag.hasPendingCompaction()
 	}, "local snip pending compaction")
@@ -121,7 +121,7 @@ func TestOverflowStillCompactsSynchronouslyBeforeProviderCall(t *testing.T) {
 		llm.NewUserMessage("latest"),
 	})
 
-	ag.checkAndCompact(context.Background(), &llm.Completion{Usage: &llm.Usage{PromptTokens: 100, TotalTokens: 100}}, nil)
+	ag.checkAndCompact(context.Background(), "", &llm.Completion{Usage: &llm.Usage{PromptTokens: 100, TotalTokens: 100}}, nil)
 	if got := model.calls.Load(); got != 0 {
 		t.Fatalf("compaction model calls = %d, want 0 when synchronous local reduction resolves overflow", got)
 	}
@@ -163,7 +163,7 @@ func TestCheckAndCompactCountsPostCompletionToolGrowth(t *testing.T) {
 
 	// 90 is below Tier 1 for the 150-token usable prompt window (105), but
 	// 20 tokens appended after the completion move the next request to 110.
-	ag.checkAndCompact(context.Background(), &llm.Completion{Usage: llm.NewProviderUsage(85, 5, 90)}, nil, 20)
+	ag.checkAndCompact(context.Background(), "", &llm.Completion{Usage: llm.NewProviderUsage(85, 5, 90)}, nil, 20)
 	waitFor(t, time.Second, func() bool {
 		return !ag.compactionInFlight.Load() && ag.hasPendingCompaction()
 	}, "post-completion growth compaction")
@@ -221,7 +221,7 @@ func TestNoOpAsyncCompactionDoesNotQueueSuccess(t *testing.T) {
 	}
 	ag.ReplaceHistory([]llm.Message{llm.NewUserMessage("latest protected request")})
 
-	ag.checkAndCompact(context.Background(), &llm.Completion{Usage: &llm.Usage{PromptTokens: 70, TotalTokens: 70}}, nil)
+	ag.checkAndCompact(context.Background(), "", &llm.Completion{Usage: &llm.Usage{PromptTokens: 70, TotalTokens: 70}}, nil)
 	waitFor(t, time.Second, func() bool { return !ag.compactionInFlight.Load() }, "no-op local compaction")
 	if ag.hasPendingCompaction() {
 		t.Fatal("no-op compaction must not queue a success event or history replacement")
@@ -277,7 +277,7 @@ func TestTodoCompletionBelowMinimumThresholdDoesNotInvokeSummaryModel(t *testing
 	ag.ReplaceHistory([]llm.Message{llm.NewUserMessage("keep the current task state")})
 	ag.NotifyTodoCompletion()
 
-	ag.checkAndCompact(context.Background(), &llm.Completion{Usage: &llm.Usage{
+	ag.checkAndCompact(context.Background(), "", &llm.Completion{Usage: &llm.Usage{
 		PromptTokens: 40_000,
 		TotalTokens:  40_000,
 	}}, nil)
@@ -322,7 +322,7 @@ func TestTodoCheckpointAtEligibleWatermarkUsesNormalPipeline(t *testing.T) {
 	})
 	ag.NotifyTodoCompletion()
 
-	ag.checkAndCompact(context.Background(), &llm.Completion{Usage: &llm.Usage{PromptTokens: 70, TotalTokens: 70}}, nil)
+	ag.checkAndCompact(context.Background(), "", &llm.Completion{Usage: &llm.Usage{PromptTokens: 70, TotalTokens: 70}}, nil)
 	waitFor(t, time.Second, func() bool {
 		return !ag.compactionInFlight.Load() && ag.hasPendingCompaction()
 	}, "todo checkpoint local compaction")
@@ -362,7 +362,7 @@ func TestPlaceholderPressureUsesLocalDeterministicCleanup(t *testing.T) {
 	}
 	ag.ReplaceHistory(destroyedPlaceholderHistory(defaultDestroyedToolCompactThreshold))
 
-	ag.checkAndCompact(context.Background(), &llm.Completion{Usage: &llm.Usage{
+	ag.checkAndCompact(context.Background(), "", &llm.Completion{Usage: &llm.Usage{
 		PromptTokens: 40_000,
 		TotalTokens:  40_000,
 	}}, nil)
@@ -414,7 +414,7 @@ func TestPlaceholderPressureWithEstimatedUsageRemainsEligible(t *testing.T) {
 	if !ag.shouldAttemptCompaction(context.Background(), last) {
 		t.Fatal("estimated prompt usage should keep placeholder cleanup eligible")
 	}
-	ag.checkAndCompact(context.Background(), last, nil)
+	ag.checkAndCompact(context.Background(), "", last, nil)
 	waitFor(t, time.Second, func() bool {
 		return !ag.compactionInFlight.Load() && ag.hasPendingCompaction()
 	}, "estimated placeholder cleanup")
@@ -485,7 +485,7 @@ func TestCheckAndCompactOverflowWaitsForInFlightThenSummarizes(t *testing.T) {
 		ag.compactionInFlight.Store(false)
 	}()
 
-	ag.checkAndCompact(context.Background(), &llm.Completion{Usage: &llm.Usage{PromptTokens: 100, TotalTokens: 100}}, nil)
+	ag.checkAndCompact(context.Background(), "", &llm.Completion{Usage: &llm.Usage{PromptTokens: 100, TotalTokens: 100}}, nil)
 	if got := model.calls.Load(); got != 1 {
 		t.Fatalf("compaction model calls = %d, want 1 after waiting for in-flight compaction", got)
 	}

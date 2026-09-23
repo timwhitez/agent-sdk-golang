@@ -209,7 +209,7 @@ func TestCheckAndCompactLogsError(t *testing.T) {
 		},
 	}
 
-	ag.checkAndCompact(context.Background(), comp, nil)
+	ag.checkAndCompact(context.Background(), "", comp, nil)
 	waitFor(t, time.Second, func() bool {
 		return strings.Contains(buf.String(), "compaction failed")
 	}, "compaction failure log")
@@ -241,7 +241,7 @@ func TestCheckAndCompactUsesConfiguredWarningSink(t *testing.T) {
 		},
 	}
 
-	ag.checkAndCompact(context.Background(), comp, nil)
+	ag.checkAndCompact(context.Background(), "", comp, nil)
 	waitFor(t, time.Second, func() bool {
 		return strings.Contains(warnings.String(), "compaction failed")
 	}, "compaction failure warning")
@@ -281,7 +281,7 @@ func TestCheckAndCompactCancelsAsyncCompactionWithTurn(t *testing.T) {
 
 	ctx, cancel := context.WithCancel(context.Background())
 	comp := &llm.Completion{Usage: &llm.Usage{TotalTokens: 100, PromptTokens: 80}}
-	ag.checkAndCompact(ctx, comp, nil)
+	ag.checkAndCompact(ctx, "", comp, nil)
 	select {
 	case <-model.entered:
 	case <-time.After(time.Second):
@@ -319,7 +319,7 @@ func TestCheckAndCompactRetriesOnceByDefault(t *testing.T) {
 	ag.ReplaceHistory([]llm.Message{llm.NewUserMessage("hello")})
 
 	comp := &llm.Completion{Usage: &llm.Usage{TotalTokens: 100, PromptTokens: 80}}
-	ag.checkAndCompact(context.Background(), comp, nil)
+	ag.checkAndCompact(context.Background(), "", comp, nil)
 	waitFor(t, time.Second, func() bool {
 		return model.Calls() == 2 && ag.hasPendingCompaction()
 	}, "async compaction retry completion")
@@ -376,7 +376,7 @@ func TestCheckAndCompactSkipsInvokeWhenBelowThreshold(t *testing.T) {
 	ag.ReplaceHistory([]llm.Message{llm.NewUserMessage("hello")})
 
 	comp := &llm.Completion{Usage: &llm.Usage{TotalTokens: 10, PromptTokens: 10}}
-	ag.checkAndCompact(context.Background(), comp, nil)
+	ag.checkAndCompact(context.Background(), "", comp, nil)
 
 	if got := model.Calls(); got != 0 {
 		t.Fatalf("expected no compaction invoke below threshold, got %d", got)
@@ -403,7 +403,7 @@ func TestCheckAndCompactSkipsInvokeWhenContextCanceled(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 	comp := &llm.Completion{Usage: &llm.Usage{TotalTokens: 120, PromptTokens: 99}}
-	ag.checkAndCompact(ctx, comp, nil)
+	ag.checkAndCompact(ctx, "", comp, nil)
 
 	if got := model.Calls(); got != 0 {
 		t.Fatalf("expected canceled context to skip compaction invoke, got %d", got)
@@ -570,7 +570,7 @@ func TestCheckAndCompactAsyncSurvivesCallerCancelAfterStart(t *testing.T) {
 
 	ctx, cancel := context.WithCancel(context.Background())
 	comp := &llm.Completion{Usage: &llm.Usage{TotalTokens: 120, PromptTokens: 99}}
-	ag.checkAndCompact(ctx, comp, nil)
+	ag.checkAndCompact(ctx, "", comp, nil)
 
 	select {
 	case <-model.entered:
@@ -608,7 +608,7 @@ func TestNewCachesDisabledCompactorState(t *testing.T) {
 
 	ag.ReplaceHistory([]llm.Message{llm.NewUserMessage("hello")})
 	comp := &llm.Completion{Usage: &llm.Usage{TotalTokens: 1000, PromptTokens: 1000}}
-	ag.checkAndCompact(context.Background(), comp, nil)
+	ag.checkAndCompact(context.Background(), "", comp, nil)
 	if got := model.Calls(); got != 0 {
 		t.Fatalf("expected disabled compaction to skip model invoke, got %d", got)
 	}
