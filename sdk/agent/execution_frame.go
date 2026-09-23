@@ -16,6 +16,9 @@ import (
 // in event metadata; request/model/resolver content is not emitted here.
 type executionFrame struct {
 	controlSource string
+	// historySource is the Frame whose usage triggered an automatic
+	// compaction published into this request's history; empty is unknown.
+	historySource string
 	id            string
 	model         llm.ChatModel
 	request       llm.InvokeRequest
@@ -61,6 +64,7 @@ type eventCorrelation struct {
 	intervention       string
 	interventionResult string
 	interventionStrike uint64
+	historySource      string
 	controlSource      string
 	toolBlockID        string
 	toolCallOrdinal    uint64
@@ -72,6 +76,7 @@ type eventCorrelation struct {
 // frameInvocation is query-driver-local bookkeeping, separate from immutable
 // executionFrame state. Only actual ChatModel entries advance the counter.
 type frameInvocation struct {
+	historySource string
 	controlSource string
 	frameID       string
 	entries       uint64
@@ -95,7 +100,7 @@ func (s *frameInvocation) correlation() eventCorrelation {
 	if s == nil || s.frameID == "" {
 		return eventCorrelation{}
 	}
-	return eventCorrelation{frameID: s.frameID, attempt: s.current, controlSource: s.controlSource}
+	return eventCorrelation{frameID: s.frameID, attempt: s.current, controlSource: s.controlSource, historySource: s.historySource}
 }
 
 // A completion retained across retry backoff belongs to the last actual model
@@ -105,7 +110,7 @@ func (s *frameInvocation) completionCorrelation() eventCorrelation {
 	if s == nil || s.frameID == "" {
 		return eventCorrelation{}
 	}
-	return eventCorrelation{frameID: s.frameID, attempt: s.entries, controlSource: s.controlSource}
+	return eventCorrelation{frameID: s.frameID, attempt: s.entries, controlSource: s.controlSource, historySource: s.historySource}
 }
 
 // validBindings checks structural agreement, not mutable closure identity.
