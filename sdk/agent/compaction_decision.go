@@ -29,6 +29,8 @@ type compactionDecision struct {
 	// allowSummary is the summary-tier admission sampled with the decision.
 	allowSummary bool
 	entry        compactionEntry
+	// inputEpoch is the user-input epoch the decision was made in.
+	inputEpoch uint64
 	// request is the explicit host request of a manual entry.
 	request compaction.PipelineRequest
 }
@@ -36,12 +38,17 @@ type compactionDecision struct {
 func (a *Agent) automaticCompactionDecision(ctx context.Context, usage *llm.Usage) compactionDecision {
 	trigger, watermark := a.compactionTriggerAndWatermarkForUsage(usage)
 	run := watermark == "overflow" || a.shouldAttemptCompactionUsage(ctx, usage)
+	// Sampled on every decision, run or not, so a decision below the summary
+	// threshold clears the suppression.
+	epoch := a.userInputEpoch.Load()
+	suppressed := a.automaticSummarySuppressed(epoch, usage)
 	return compactionDecision{
 		run:             run,
 		trigger:         trigger,
 		targetWatermark: watermark,
-		allowSummary:    run && a.compactionSummaryAllowed(),
+		allowSummary:    run && a.compactionSummaryAllowed() && !suppressed,
 		entry:           compactionEntryAutomatic,
+		inputEpoch:      epoch,
 	}
 }
 
