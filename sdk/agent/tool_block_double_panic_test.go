@@ -24,7 +24,7 @@ func TestToolBlockDoublePanicStillReleasesStage(t *testing.T) {
 			}
 			a.OnPanic = func(int, context.Context, any) (llm.Content, error) { panic("on-panic boom") }
 			if parallel {
-				a.parallel = &blockParallelism{maxWorkers: 2, eligible: allEligible}
+				a.Parallel = &BlockParallelism{MaxWorkers: 2, Plan: planFrom(allEligible)}
 			}
 			state, _ := newToolBlockState(calls)
 			func() {

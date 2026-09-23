@@ -34,8 +34,15 @@ start/return/terminal/commit/publication order. Adapters retain policy and outpu
 projection; child scoped records are not automatically written to parent history.
 A synchronous child scope rejects concurrent, nested or expired admission and
 waits for accepted children before its parent completes. No lock is held across
-a Handler. All managed calls are Exclusive, not a promise about arbitrary host
-goroutines or a concurrent effect classifier.
+a Handler. Calls are Exclusive unless the adapter sets `Parallel`: then the
+host's `Plan` may declare a call Concurrent (with opaque Resource keys), and
+consecutive Concurrent calls without shared keys run in one bounded wave
+(`MaxWorkers`, hard-capped at `MaxBlockWorkers`). Workers only execute the
+owned PreparedCall; the owner still admits, projects, commits and publishes in
+model order, so out-of-order completion keeps one terminal per call. A missing,
+false or panicking plan is Exclusive. The native Agent loop sets no `Parallel`
+today; this is not a concurrent effect classifier or a promise about arbitrary
+host goroutines.
 
 - A Frame owns a cloned logical request and resolver definitions. It calls an
   explicit `llm.FrameModelBinder` once before invocation; all SDK retries reuse

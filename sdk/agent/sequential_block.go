@@ -80,23 +80,39 @@ type SequentialBlockAdapter struct {
 	Boundary func(int, BlockOutcome) BlockStop
 	OnPanic  func(int, context.Context, any) (llm.Content, error)
 
-	// parallel is an in-package opt-in for bounded waves. No production
-	// adapter sets it yet: nil keeps every call Exclusive and sequential.
-	parallel *blockParallelism
+	// Parallel opts the block into bounded waves. Nil (the default) keeps
+	// every call Exclusive and sequential, and no goroutine is created.
+	Parallel *BlockParallelism
 }
 
-// blockParallelism lets consecutive eligible calls run in one bounded wave.
-// Workers only execute an owned PreparedCall and return its outcome; the
-// single owner keeps per-ordinal result slots and runs the existing
-// terminal/projection/commit/publication path strictly in model order.
-type blockParallelism struct {
-	// maxWorkers bounds concurrently running handlers and the wave's result
-	// slots; values below 2 disable waves.
-	maxWorkers int
-	// eligible reports, before admission, whether call i may share a wave.
-	// It must come from a trusted capability; false keeps the call Exclusive
-	// and ends the wave, acting as a barrier.
-	eligible func(int) bool
+// MaxBlockWorkers is the hard ceiling on concurrently running handlers of one
+// block, whatever BlockParallelism.MaxWorkers asks for.
+const MaxBlockWorkers = 16
+
+// BlockParallelism lets consecutive calls that the host's trusted capability
+// declares Concurrent run in one bounded wave. Workers only execute the owned
+// PreparedCall returned by Admit and hand back its outcome; the single owner
+// keeps per-ordinal result slots and runs the existing terminal, projection,
+// commit and publication path strictly in model order. Admit, Project,
+// Commit, Publish, Boundary and OnPanic are still called only by the owner,
+// never concurrently.
+type BlockParallelism struct {
+	// MaxWorkers bounds concurrently running handlers and a wave's result
+	// slots (capped at MaxBlockWorkers); values below 2 disable waves.
+	MaxWorkers int
+	// Plan classifies call i before it is admitted. It must be pure (no
+	// effects, I/O or confirmation) and must read the same accepted arguments
+	// that Admit will execute. A missing Plan, a panic, Concurrent=false or a
+	// Resources overlap with an earlier call of the wave makes the call
+	// Exclusive: it ends the wave and runs alone.
+	Plan func(index int) BlockCallPlan
+}
+
+// BlockCallPlan is a host's capability decision for one call. Resources are
+// opaque keys; two calls sharing a key never run in the same wave.
+type BlockCallPlan struct {
+	Concurrent bool
+	Resources  []string
 }
 
 type sequentialScopeKey struct{}
@@ -116,8 +132,10 @@ func (s *sequentialScope) finish() {
 	}
 }
 
-// RunSequentialBlock runs a whole accepted block, with all calls Exclusive.
-// It creates no goroutines and cannot be used to escape an active child scope.
+// RunSequentialBlock runs a whole accepted block. Without adapter.Parallel
+// every call is Exclusive and no goroutine is created; with it, planned
+// Concurrent calls may run in bounded waves while results still commit in
+// model order. It cannot be used to escape an active child scope.
 func RunSequentialBlock(ctx context.Context, calls []llm.ToolCall, adapter SequentialBlockAdapter) (BlockStop, error) {
 	if ctx == nil {
 		ctx = context.Background()
@@ -331,13 +349,45 @@ func runSequentialBlock(root context.Context, state *toolBlockState, calls []llm
 		}
 		return BlockContinue
 	}
+	// waveSize is how many calls starting at i run in one wave; 1 means the
+	// call runs Exclusive. Planning never admits, executes or confirms.
 	waveSize := func(i int) int {
-		p := a.parallel
-		if p == nil || p.maxWorkers < 2 || p.eligible == nil {
+		p := a.Parallel
+		if p == nil || p.MaxWorkers < 2 || p.Plan == nil {
 			return 1
 		}
+		limit := p.MaxWorkers
+		if limit > MaxBlockWorkers {
+			limit = MaxBlockWorkers
+		}
+		plan := func(j int) (out BlockCallPlan, ok bool) {
+			defer func() {
+				if recover() != nil {
+					out, ok = BlockCallPlan{}, false
+				}
+			}()
+			return p.Plan(j), true
+		}
+		held := map[string]bool{}
 		n := 0
-		for i+n < len(calls) && n < p.maxWorkers && p.eligible(i+n) {
+		for i+n < len(calls) && n < limit {
+			decision, ok := plan(i + n)
+			if !ok || !decision.Concurrent {
+				break
+			}
+			conflict := false
+			for _, r := range decision.Resources {
+				if held[r] {
+					conflict = true
+					break
+				}
+			}
+			if conflict {
+				break
+			}
+			for _, r := range decision.Resources {
+				held[r] = true
+			}
 			n++
 		}
 		if n < 2 {
