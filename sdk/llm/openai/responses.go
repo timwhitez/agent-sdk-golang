@@ -17,6 +17,9 @@ import (
 
 // ResponsesClient implements the OpenAI Responses API (/v1/responses).
 // This is best-effort and focuses on tool calling + text output.
+// ResponsesClient streams over HTTP SSE through InvokeStream.
+var _ llm.StreamingChatModel = (*ResponsesClient)(nil)
+
 type ResponsesClient struct {
 	HTTPClient *http.Client
 	BaseURL    string
