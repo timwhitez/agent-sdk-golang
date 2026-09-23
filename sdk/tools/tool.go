@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"maps"
 	"math"
@@ -169,44 +170,97 @@ type schemaRepairOptions struct {
 }
 
 func repairJSONKeysBySchema(schema map[string]any, raw []byte) ([]byte, bool) {
-	return repairJSONKeysBySchemaWithOptions(schema, raw, schemaRepairOptions{})
-}
-
-func repairJSONKeysBySchemaWithOptions(schema map[string]any, raw []byte, opts schemaRepairOptions) ([]byte, bool) {
-	if len(raw) == 0 || schema == nil {
-		return nil, false
-	}
-	var v any
-	if err := json.Unmarshal(raw, &v); err != nil {
-		return nil, false
-	}
-	m, ok := v.(map[string]any)
-	if !ok {
-		return nil, false
-	}
-
-	repaired, changed := repairObjectBySchema(m, schema, opts)
-	if !changed {
-		return nil, false
-	}
-	b, err := json.Marshal(repaired)
+	repaired, ok, err := repairJSONKeysBySchemaWithOptions(schema, raw, schemaRepairOptions{})
 	if err != nil {
 		return nil, false
 	}
-	return b, true
+	return repaired, ok
 }
 
+// Fixed reasons for rejected schema-key repairs. They never include argument
+// values, key names or schema text.
+const (
+	ambiguousArgsReasonTarget  = "ambiguous_target"
+	ambiguousArgsReasonSources = "multiple_sources"
+)
+
+// errAmbiguousToolArguments marks a schema-key repair that had more than one
+// possible interpretation. Such input is rejected instead of guessing.
+var errAmbiguousToolArguments = errors.New("ambiguous tool arguments")
+
+type ambiguousToolArgumentsError struct {
+	Reason string
+}
+
+func (e *ambiguousToolArgumentsError) Error() string {
+	return "ambiguous tool arguments (reason=" + e.Reason + "): a non-exact argument name matches more than one schema field or several aliases target the same field; resend using the exact schema field names"
+}
+
+func (e *ambiguousToolArgumentsError) Is(target error) bool {
+	return target == errAmbiguousToolArguments
+}
+
+// repairJSONKeysBySchemaWithOptions returns the repaired payload when a unique
+// repair exists. An ambiguous repair returns errAmbiguousToolArguments and no
+// payload; the input bytes are never modified.
+func repairJSONKeysBySchemaWithOptions(schema map[string]any, raw []byte, opts schemaRepairOptions) ([]byte, bool, error) {
+	if len(raw) == 0 || schema == nil {
+		return nil, false, nil
+	}
+	var v any
+	if err := json.Unmarshal(raw, &v); err != nil {
+		return nil, false, nil
+	}
+	m, ok := v.(map[string]any)
+	if !ok {
+		return nil, false, nil
+	}
+
+	repaired, changed, err := repairObjectBySchema(m, schema, opts)
+	if err != nil {
+		return nil, false, err
+	}
+	if !changed {
+		return nil, false, nil
+	}
+	b, err := json.Marshal(repaired)
+	if err != nil {
+		return nil, false, nil
+	}
+	return b, true, nil
+}
+
+// objectKeyMatcher maps non-exact argument names to schema properties. Each
+// normalized token keeps the set of distinct properties it can reach; a token
+// that reaches several properties is ambiguous and never resolved by map
+// iteration order, rule order, sorting or name length. Exact property names
+// always match themselves, even when other properties collide after
+// normalization.
 type objectKeyMatcher struct {
 	expected        map[string]struct{}
-	expectedNoDelim map[string]string
-	aliasByNoDelim  map[string]string
+	expectedNoDelim map[string]map[string]struct{}
+	aliasByNoDelim  map[string]map[string]struct{}
+}
+
+func addMatcherTarget(index map[string]map[string]struct{}, token, target string) {
+	if token == "" {
+		// Punctuation-only or non-ASCII names share the empty token; they can
+		// match exactly but never through normalization.
+		return
+	}
+	targets := index[token]
+	if targets == nil {
+		targets = map[string]struct{}{}
+		index[token] = targets
+	}
+	targets[target] = struct{}{}
 }
 
 func newObjectKeyMatcher(props map[string]any, toolName string) objectKeyMatcher {
 	matcher := objectKeyMatcher{
 		expected:        map[string]struct{}{},
-		expectedNoDelim: map[string]string{},
-		aliasByNoDelim:  map[string]string{},
+		expectedNoDelim: map[string]map[string]struct{}{},
+		aliasByNoDelim:  map[string]map[string]struct{}{},
 	}
 	for k := range props {
 		kk := strings.TrimSpace(k)
@@ -214,14 +268,14 @@ func newObjectKeyMatcher(props map[string]any, toolName string) objectKeyMatcher
 			continue
 		}
 		matcher.expected[kk] = struct{}{}
-		matcher.expectedNoDelim[normalizeKeyNoDelims(kk)] = kk
+		addMatcherTarget(matcher.expectedNoDelim, normalizeKeyNoDelims(kk), kk)
 	}
 	for k := range props {
 		for _, alias := range aliasKeysForExpected(toolName, k) {
 			if alias == "" {
 				continue
 			}
-			matcher.aliasByNoDelim[normalizeKeyNoDelims(alias)] = k
+			addMatcherTarget(matcher.aliasByNoDelim, normalizeKeyNoDelims(alias), k)
 		}
 	}
 	if len(props) == 1 {
@@ -230,7 +284,7 @@ func newObjectKeyMatcher(props map[string]any, toolName string) objectKeyMatcher
 				if alias == "" {
 					continue
 				}
-				matcher.aliasByNoDelim[normalizeKeyNoDelims(alias)] = k
+				addMatcherTarget(matcher.aliasByNoDelim, normalizeKeyNoDelims(alias), k)
 			}
 			break
 		}
@@ -238,35 +292,65 @@ func newObjectKeyMatcher(props map[string]any, toolName string) objectKeyMatcher
 	return matcher
 }
 
-func (m objectKeyMatcher) canonicalKey(k string) (string, bool) {
-	if _, ok := m.expected[k]; ok {
-		return k, true
+// matchedTargets returns every distinct schema property a non-exact key can
+// reach through the supported normalization, alias and candidate rules.
+func (m objectKeyMatcher) matchedTargets(k string) map[string]struct{} {
+	targets := map[string]struct{}{}
+	collect := func(token string) {
+		if token == "" {
+			return
+		}
+		for target := range m.expectedNoDelim[token] {
+			targets[target] = struct{}{}
+		}
+		for target := range m.aliasByNoDelim[token] {
+			targets[target] = struct{}{}
+		}
 	}
-	norm := normalizeKeyNoDelims(k)
-	if canon, ok := m.expectedNoDelim[norm]; ok {
-		return canon, true
+	collect(normalizeKeyNoDelims(k))
+	if cand := normalizeCandidateKey(k); cand != "" {
+		collect(normalizeKeyNoDelims(cand))
 	}
-	if canon, ok := m.aliasByNoDelim[norm]; ok {
-		return canon, true
-	}
-
-	cand := normalizeCandidateKey(k)
-	if cand == "" {
-		return "", false
-	}
-	candNorm := normalizeKeyNoDelims(cand)
-	if canon, ok := m.expectedNoDelim[candNorm]; ok {
-		return canon, true
-	}
-	if canon, ok := m.aliasByNoDelim[candNorm]; ok {
-		return canon, true
-	}
-	return "", false
+	return targets
 }
 
-func repairBySchemaValue(v any, schema map[string]any, opts schemaRepairOptions) (any, bool) {
+// keyMatch classifies one input key: exact, unique repair target, unknown or
+// ambiguous.
+type keyMatch int
+
+const (
+	keyMatchUnknown keyMatch = iota
+	keyMatchExact
+	keyMatchUnique
+	keyMatchAmbiguous
+)
+
+func (m objectKeyMatcher) classifyKey(k string) (string, keyMatch) {
+	if _, ok := m.expected[k]; ok {
+		return k, keyMatchExact
+	}
+	targets := m.matchedTargets(k)
+	switch len(targets) {
+	case 0:
+		return "", keyMatchUnknown
+	case 1:
+		for target := range targets {
+			return target, keyMatchUnique
+		}
+	}
+	return "", keyMatchAmbiguous
+}
+
+// canonicalKey reports the unique property a key maps to. Ambiguous keys are
+// not canonicalized.
+func (m objectKeyMatcher) canonicalKey(k string) (string, bool) {
+	target, match := m.classifyKey(k)
+	return target, match == keyMatchExact || match == keyMatchUnique
+}
+
+func repairBySchemaValue(v any, schema map[string]any, opts schemaRepairOptions) (any, bool, error) {
 	if schema == nil {
-		return v, false
+		return v, false, nil
 	}
 	switch vv := v.(type) {
 	case map[string]any:
@@ -274,31 +358,48 @@ func repairBySchemaValue(v any, schema map[string]any, opts schemaRepairOptions)
 	case []any:
 		return repairArrayBySchema(vv, schema, opts)
 	default:
-		return v, false
+		return v, false, nil
 	}
 }
 
-func repairArrayBySchema(in []any, schema map[string]any, opts schemaRepairOptions) ([]any, bool) {
+// repairArrayBySchema never mutates in; a changed array is returned as a copy.
+func repairArrayBySchema(in []any, schema map[string]any, opts schemaRepairOptions) ([]any, bool, error) {
 	if len(in) == 0 {
-		return in, false
+		return in, false, nil
 	}
 	itemSchema, ok := schema["items"].(map[string]any)
 	if !ok || itemSchema == nil {
-		return in, false
+		return in, false, nil
 	}
-	changed := false
+	var out []any
 	for i, item := range in {
-		repaired, itemChanged := repairBySchemaValue(item, itemSchema, opts)
+		repaired, itemChanged, err := repairBySchemaValue(item, itemSchema, opts)
+		if err != nil {
+			return nil, false, err
+		}
 		if !itemChanged {
 			continue
 		}
-		in[i] = repaired
-		changed = true
+		if out == nil {
+			out = append([]any(nil), in...)
+		}
+		out[i] = repaired
 	}
-	return in, changed
+	if out == nil {
+		return in, false, nil
+	}
+	return out, true, nil
 }
 
-func repairObjectBySchema(in map[string]any, schema map[string]any, opts schemaRepairOptions) (map[string]any, bool) {
+// repairObjectBySchema plans every key move against the original input before
+// building an owned result, so input order cannot choose between candidates:
+//   - an exact schema key keeps its value and redundant aliases of it are dropped;
+//   - a single unique alias for an absent property is renamed;
+//   - several aliases for one absent property, or one key matching several
+//     properties, reject the whole repair (even when values are equal).
+//
+// in is never mutated; any nested rejection rejects the whole object.
+func repairObjectBySchema(in map[string]any, schema map[string]any, opts schemaRepairOptions) (map[string]any, bool, error) {
 	props, _ := schema["properties"].(map[string]any)
 	matcher := newObjectKeyMatcher(props, opts.ToolName)
 	_, additionalSchema := schemaAllowsAdditionalProperties(schema)
@@ -308,25 +409,47 @@ func repairObjectBySchema(in map[string]any, schema map[string]any, opts schemaR
 		stripUnknown = false
 	}
 
-	out := make(map[string]any, len(in))
-	for k, v := range in {
-		out[k] = v
+	aliasSources := map[string]int{}
+	moves := map[string]string{}
+	var unknown []string
+	for k := range in {
+		target, match := matcher.classifyKey(k)
+		switch match {
+		case keyMatchExact:
+		case keyMatchUnique:
+			moves[k] = target
+			aliasSources[target]++
+		case keyMatchAmbiguous:
+			return nil, false, &ambiguousToolArgumentsError{Reason: ambiguousArgsReasonTarget}
+		default:
+			unknown = append(unknown, k)
+		}
 	}
-
-	changed := false
-	for k, v := range in {
-		canon, ok := matcher.canonicalKey(k)
-		if ok {
-			if canon != k {
-				if _, exists := out[canon]; !exists {
-					out[canon] = v
-				}
-				delete(out, k)
-				changed = true
-			}
+	for target, sources := range aliasSources {
+		if _, exact := in[target]; exact {
 			continue
 		}
-		if stripUnknown {
+		if sources > 1 {
+			return nil, false, &ambiguousToolArgumentsError{Reason: ambiguousArgsReasonSources}
+		}
+	}
+
+	out := make(map[string]any, len(in))
+	changed := false
+	for k, v := range in {
+		if target, ok := moves[k]; ok {
+			changed = true
+			if _, exact := in[target]; exact {
+				// The exact key keeps priority; its redundant alias is dropped.
+				continue
+			}
+			out[target] = v
+			continue
+		}
+		out[k] = v
+	}
+	if stripUnknown {
+		for _, k := range unknown {
 			delete(out, k)
 			changed = true
 		}
@@ -342,7 +465,10 @@ func repairObjectBySchema(in map[string]any, schema map[string]any, opts schemaR
 		if childSchema == nil {
 			continue
 		}
-		repaired, childChanged := repairBySchemaValue(v, childSchema, opts)
+		repaired, childChanged, err := repairBySchemaValue(v, childSchema, opts)
+		if err != nil {
+			return nil, false, err
+		}
 		if !childChanged {
 			continue
 		}
@@ -350,9 +476,9 @@ func repairObjectBySchema(in map[string]any, schema map[string]any, opts schemaR
 		changed = true
 	}
 	if !changed {
-		return in, false
+		return in, false, nil
 	}
-	return out, true
+	return out, true, nil
 }
 
 func schemaAllowsAdditionalProperties(schema map[string]any) (bool, map[string]any) {
