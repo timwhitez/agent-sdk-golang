@@ -115,14 +115,14 @@ func streamInvoke(ctx context.Context, model llm.StreamingChatModel, prompt stri
 // a bounded fallback answer, not a normally completed task.
 var errPartialResponse = errors.New("agent returned a partial response")
 
-// consumeAgentEvents prints the Agent's text deltas once each. The final
-// answer is printed only when no delta was streamed (a non-streaming model),
-// so text is never duplicated. Errors, partial answers, critically dropped
-// events and a stream without a final response are all failures.
 // finalMarker introduces an authoritative final answer that differs from the
 // text the last model turn streamed.
 const finalMarker = "[final answer]\n"
 
+// consumeAgentEvents prints the Agent's text deltas once each as progress and
+// then the authoritative final answer, unless the last model turn already
+// showed exactly that text. Errors, partial answers, critically dropped
+// events and a stream without a final response are all failures.
 func consumeAgentEvents(events <-chan agent.Event, w, diag io.Writer) error {
 	// turn is the text streamed by the current model turn. A tool call or tool
 	// result ends the turn: text streamed before a tool is progress, not the
