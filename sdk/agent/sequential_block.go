@@ -79,6 +79,24 @@ type SequentialBlockAdapter struct {
 	Publish  func(int, BlockTerminal, time.Duration)
 	Boundary func(int, BlockOutcome) BlockStop
 	OnPanic  func(int, context.Context, any) (llm.Content, error)
+
+	// parallel is an in-package opt-in for bounded waves. No production
+	// adapter sets it yet: nil keeps every call Exclusive and sequential.
+	parallel *blockParallelism
+}
+
+// blockParallelism lets consecutive eligible calls run in one bounded wave.
+// Workers only execute an owned PreparedCall and return its outcome; the
+// single owner keeps per-ordinal result slots and runs the existing
+// terminal/projection/commit/publication path strictly in model order.
+type blockParallelism struct {
+	// maxWorkers bounds concurrently running handlers and the wave's result
+	// slots; values below 2 disable waves.
+	maxWorkers int
+	// eligible reports, before admission, whether call i may share a wave.
+	// It must come from a trusted capability; false keeps the call Exclusive
+	// and ends the wave, acting as a barrier.
+	eligible func(int) bool
 }
 
 type sequentialScopeKey struct{}
@@ -247,7 +265,101 @@ func runSequentialBlock(root context.Context, state *toolBlockState, calls []llm
 		}
 		return nil
 	}
-	for i := range calls {
+	// execute runs one owned PreparedCall. It is the only work a wave worker
+	// performs: it never touches state, history, events or the adapter.
+	execute := func(admission BlockAdmission, ctx context.Context, scope *sequentialScope) (o BlockOutcome) {
+		started := time.Now()
+		defer func() { o.Duration = time.Since(started) }()
+		defer scope.finish()
+		defer func() { o.Panic = recover() }()
+		o.Content, o.Err = admission.Call.Execute(ctx, admission.Deps)
+		return o
+	}
+	begin := func(i int, admission BlockAdmission) (context.Context, *sequentialScope, error) {
+		if e := state.markRunning(i); e != nil {
+			return nil, nil, e
+		}
+		ctx := admission.Context
+		if ctx == nil {
+			ctx = root
+		}
+		scope := &sequentialScope{active: true, child: child}
+		return context.WithValue(ctx, sequentialScopeKey{}, scope), scope, nil
+	}
+	// settle is the owner's in-order completion of one started call.
+	// release stays owned by the caller's cleanup until it is invoked here, so
+	// a panicking OnPanic still leaves the stage to the deferred cleanup.
+	settle := func(i int, ctx context.Context, release *func() bool, outcome BlockOutcome) (BlockTerminal, BlockOutcome, error) {
+		if outcome.Panic != nil {
+			outcome.Err = fmt.Errorf("tool handler panicked; effects may have occurred")
+			if a.OnPanic != nil {
+				outcome.Content, outcome.Err = a.OnPanic(i, ctx, outcome.Panic)
+			}
+		}
+		if release != nil && *release != nil {
+			f := *release
+			*release = nil
+			outcome.Interrupted = f()
+		}
+		outcome.RootError = root.Err()
+		if e := state.markAttemptReturned(i, outcome.RootError != nil); e != nil {
+			return BlockTerminal{}, outcome, e
+		}
+		outcome.Metadata = tools.TakeToolResultMetadataSnapshot(ctx)
+		terminal, e := a.Project(i, outcome)
+		if e != nil {
+			return terminal, outcome, e
+		}
+		if e := commit(i, toolCallRunning, []BlockTerminal{terminal}); e != nil {
+			return terminal, outcome, e
+		}
+		if e := publish(i, terminal, outcome.Duration); e != nil {
+			return terminal, outcome, e
+		}
+		return terminal, outcome, nil
+	}
+	// after applies the post-commit root gate and Boundary for call i.
+	after := func(i int, terminal BlockTerminal, outcome BlockOutcome) BlockStop {
+		if root.Err() != nil {
+			if terminal.Reason == "task_complete" {
+				return BlockRootAfterDone
+			}
+			return BlockRootAfterHandler
+		}
+		if a.Boundary != nil {
+			return a.Boundary(i, outcome)
+		}
+		return BlockContinue
+	}
+	waveSize := func(i int) int {
+		p := a.parallel
+		if p == nil || p.maxWorkers < 2 || p.eligible == nil {
+			return 1
+		}
+		n := 0
+		for i+n < len(calls) && n < p.maxWorkers && p.eligible(i+n) {
+			n++
+		}
+		if n < 2 {
+			return 1
+		}
+		return n
+	}
+	for i := 0; i < len(calls); {
+		if n := waveSize(i); n > 1 {
+			var next int
+			var stop BlockStop
+			var e error
+			next, stop, e, finish = runOrderedWave(root, i, n, a, state, execute, begin, settle, after, commit, publish)
+			if e != nil {
+				return BlockContinue, e
+			}
+			if stop != BlockContinue {
+				return stop, tail(next, stop)
+			}
+			i = next
+			continue
+		}
 		if root.Err() != nil {
 			return BlockRootBeforeStart, tail(i, BlockRootBeforeStart)
 		}
@@ -267,6 +379,7 @@ func runSequentialBlock(root context.Context, state *toolBlockState, calls []llm
 			if e := publish(i, *admission.Skipped, 0); e != nil {
 				return BlockContinue, e
 			}
+			i++
 			continue
 		}
 		if admission.Call == nil {
@@ -282,61 +395,172 @@ func runSequentialBlock(root context.Context, state *toolBlockState, calls []llm
 			}
 			return BlockRootBeforeStart, tail(i, BlockRootBeforeStart)
 		}
-		if e := state.markRunning(i); e != nil {
-			return BlockContinue, e
-		}
-		ctx := admission.Context
-		if ctx == nil {
-			ctx = root
-		}
-		scope := &sequentialScope{active: true, child: child}
-		ctx = context.WithValue(ctx, sequentialScopeKey{}, scope)
-		started := time.Now()
-		outcome := func() (o BlockOutcome) {
-			defer scope.finish()
-			defer func() { o.Panic = recover() }()
-			o.Content, o.Err = admission.Call.Execute(ctx, admission.Deps)
-			return o
-		}()
-		outcome.Duration = time.Since(started)
-		if outcome.Panic != nil {
-			outcome.Err = fmt.Errorf("tool handler panicked; effects may have occurred")
-			if a.OnPanic != nil {
-				outcome.Content, outcome.Err = a.OnPanic(i, ctx, outcome.Panic)
-			}
-		}
-		if finish != nil {
-			f := finish
-			finish = nil
-			outcome.Interrupted = f()
-		}
-		outcome.RootError = root.Err()
-		if e := state.markAttemptReturned(i, outcome.RootError != nil); e != nil {
-			return BlockContinue, e
-		}
-		outcome.Metadata = tools.TakeToolResultMetadataSnapshot(ctx)
-		terminal, e := a.Project(i, outcome)
+		ctx, scope, e := begin(i, admission)
 		if e != nil {
 			return BlockContinue, e
 		}
-		if e := commit(i, toolCallRunning, []BlockTerminal{terminal}); e != nil {
+		outcome := execute(admission, ctx, scope)
+		terminal, outcome, e := settle(i, ctx, &finish, outcome)
+		if e != nil {
 			return BlockContinue, e
 		}
-		if e := publish(i, terminal, outcome.Duration); e != nil {
-			return BlockContinue, e
-		}
-		if root.Err() != nil {
-			reason := BlockRootAfterHandler
-			if terminal.Reason == "task_complete" {
-				reason = BlockRootAfterDone
-			}
+		if reason := after(i, terminal, outcome); reason != BlockContinue {
 			return reason, tail(i+1, reason)
 		}
-		if a.Boundary != nil {
-			if reason := a.Boundary(i, outcome); reason != BlockContinue {
-				return reason, tail(i+1, reason)
-			}
-		}
+		i++
 	}
 	return BlockContinue, nil
+}
+
+// waveCompletionSettled is a test-only observation point, called after the
+// owner has processed one worker completion (settling whatever became ready).
+var waveCompletionSettled func(index int)
+
+type waveSlot struct {
+	index     int
+	admission BlockAdmission
+	ctx       context.Context
+	release   func() bool
+	skipped   bool
+	started   bool
+	done      bool
+	outcome   BlockOutcome
+}
+
+type waveCompletion struct {
+	slot    int
+	outcome BlockOutcome
+}
+
+// runOrderedWave admits calls [start, start+n) in order, runs the started
+// handlers concurrently (at most n), and settles each call in model order as
+// soon as it and every earlier call have returned. It always waits for every
+// started worker before returning, so no handler outlives the owner. It
+// returns the first index that was neither started nor skipped, a stop reason
+// and any lifecycle error; a pending host stage (finish) is returned for the
+// caller's cleanup when admission failed.
+func runOrderedWave(
+	root context.Context, start, n int, a SequentialBlockAdapter, state *toolBlockState,
+	execute func(BlockAdmission, context.Context, *sequentialScope) BlockOutcome,
+	begin func(int, BlockAdmission) (context.Context, *sequentialScope, error),
+	settle func(int, context.Context, *func() bool, BlockOutcome) (BlockTerminal, BlockOutcome, error),
+	after func(int, BlockTerminal, BlockOutcome) BlockStop,
+	commit func(int, toolCallPhase, []BlockTerminal) error,
+	publish func(int, BlockTerminal, time.Duration) error,
+) (next int, stop BlockStop, err error, pendingFinish func() bool) {
+	slots := make([]waveSlot, 0, n)
+	completions := make(chan waveCompletion, n)
+	var workers sync.WaitGroup
+	running := 0
+	defer func() {
+		// Never abandon a started handler: wait, then release any stage the
+		// in-order settle did not reach.
+		workers.Wait()
+		for _, slot := range slots {
+			if slot.release != nil {
+				func() {
+					defer func() { _ = recover() }()
+					slot.release()
+				}()
+			}
+		}
+	}()
+
+	stop = BlockContinue
+	admitted := 0
+	for k := 0; k < n; k++ {
+		i := start + k
+		if root.Err() != nil {
+			stop = BlockRootBeforeStart
+			break
+		}
+		admission, e := a.Admit(root, i)
+		if e != nil {
+			return start + admitted, BlockContinue, e, admission.Finish
+		}
+		slot := waveSlot{index: i, admission: admission, release: admission.Finish}
+		if admission.Skipped != nil {
+			if admission.Call != nil || admission.Finish != nil {
+				return start + admitted, BlockContinue, errors.New("invalid skipped tool admission"), admission.Finish
+			}
+			slot.skipped, slot.done = true, true
+			slots = append(slots, slot)
+			admitted++
+			continue
+		}
+		if admission.Call == nil {
+			return start + admitted, BlockContinue, errors.New("tool admission is missing prepared call"), admission.Finish
+		}
+		if root.Err() != nil {
+			if admission.Finish != nil {
+				admission.Finish()
+			}
+			stop = BlockRootBeforeStart
+			break
+		}
+		ctx, scope, e := begin(i, admission)
+		if e != nil {
+			return start + admitted, BlockContinue, e, admission.Finish
+		}
+		slot.ctx, slot.started = ctx, true
+		slots = append(slots, slot)
+		position := len(slots) - 1
+		running++
+		workers.Add(1)
+		go func() {
+			defer workers.Done()
+			completions <- waveCompletion{slot: position, outcome: execute(admission, ctx, scope)}
+		}()
+		admitted++
+	}
+
+	settled := 0
+	settleReady := func() error {
+		for settled < len(slots) && slots[settled].done {
+			slot := &slots[settled]
+			var terminal BlockTerminal
+			outcome := slot.outcome
+			if slot.skipped {
+				terminal = *slot.admission.Skipped
+				if e := commit(slot.index, toolCallAccepted, []BlockTerminal{terminal}); e != nil {
+					return e
+				}
+				if e := publish(slot.index, terminal, 0); e != nil {
+					return e
+				}
+			} else {
+				var e error
+				terminal, outcome, e = settle(slot.index, slot.ctx, &slot.release, outcome)
+				if e != nil {
+					return e
+				}
+			}
+			settled++
+			// Started calls always settle with their real outcome; a stop
+			// only prevents later calls from being admitted.
+			if stop == BlockContinue {
+				stop = after(slot.index, terminal, outcome)
+			}
+		}
+		return nil
+	}
+	if e := settleReady(); e != nil {
+		return start + admitted, BlockContinue, e, nil
+	}
+	for running > 0 {
+		completion := <-completions
+		running--
+		slot := &slots[completion.slot]
+		if slot.done {
+			return start + admitted, BlockContinue, &toolBlockTransitionError{slot.index, "duplicate_completion"}, nil
+		}
+		slot.outcome, slot.done = completion.outcome, true
+		if e := settleReady(); e != nil {
+			return start + admitted, BlockContinue, e, nil
+		}
+		if waveCompletionSettled != nil {
+			waveCompletionSettled(slot.index)
+		}
+	}
+	return start + admitted, stop, nil, nil
 }
