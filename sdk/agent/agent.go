@@ -128,6 +128,10 @@ type Config struct {
 	ToolChoice              llm.ToolChoice
 
 	Compaction *compaction.Config
+	// DisableContextOverflowRecovery turns off the bounded recovery from a
+	// typed provider context overflow (llm.IsContextOverflow): such a
+	// rejection then ends the turn as before.
+	DisableContextOverflowRecovery bool
 
 	RequireDoneTool bool
 
@@ -162,10 +166,15 @@ type Agent struct {
 	eventClock                 func() time.Time
 	streamIdleTimeout          time.Duration
 	streamIdleMaxRecov         int
-	toolChoice                 llm.ToolChoice
-	requireDone                bool
-	warningf                   func(format string, args ...any)
-	hasCompactor               bool
+	// overflowRecoveryDisabled mirrors Config.DisableContextOverflowRecovery.
+	overflowRecoveryDisabled bool
+	// steeringEpoch counts real user steering accepted into a Query; each
+	// accepted message starts a new epoch for the overflow recovery budget.
+	steeringEpoch atomic.Uint64
+	toolChoice    llm.ToolChoice
+	requireDone   bool
+	warningf      func(format string, args ...any)
+	hasCompactor  bool
 
 	compactionAdmissionObserved func()
 	toolBlockStateObserved      func(*toolBlockState)
@@ -448,27 +457,28 @@ func New(cfg Config) (*Agent, error) {
 			Registered: cfg.ArtifactResolverCapability.Registered,
 			Recovery:   cloneArtifactRecovery(cfg.ArtifactResolverCapability.Recovery),
 		},
-		artifactEnvelopeCodec: cfg.ArtifactEnvelopeCodec,
-		toolResultDumpTTL:     cfg.ToolResultDumpTTL,
-		eventBufferSize:       cfg.EventBufferSize,
-		eventSendTimeout:      cfg.EventSendTimeout,
-		eventDropLogEvery:     uint64(cfg.EventDropLogEvery),
-		queryIDGenerator:      cfg.QueryIDGenerator,
-		eventClock:            cfg.EventClock,
-		streamIdleTimeout:     cfg.StreamIdleTimeout,
-		streamIdleMaxRecov:    cfg.StreamIdleMaxRecoveries,
-		toolChoice:            cfg.ToolChoice,
-		requireDone:           cfg.RequireDoneTool,
-		warningf:              cfg.Warningf,
-		hasCompactor:          hasCompactor,
-		tools:                 ownedTools,
-		toolMap:               toolMap,
-		toolMapNormalized:     buildNormalizedToolMap(toolMap, ownedTools),
-		deps:                  cfg.Deps,
-		compactor:             compSvc,
-		toolResultDumps:       make(map[string]toolResultDumpLifecycleEntry),
-		ephemeralByKey:        make(map[string][]int),
-		ephemeralSigByCall:    make(map[string]string),
+		artifactEnvelopeCodec:    cfg.ArtifactEnvelopeCodec,
+		toolResultDumpTTL:        cfg.ToolResultDumpTTL,
+		eventBufferSize:          cfg.EventBufferSize,
+		eventSendTimeout:         cfg.EventSendTimeout,
+		eventDropLogEvery:        uint64(cfg.EventDropLogEvery),
+		queryIDGenerator:         cfg.QueryIDGenerator,
+		eventClock:               cfg.EventClock,
+		streamIdleTimeout:        cfg.StreamIdleTimeout,
+		streamIdleMaxRecov:       cfg.StreamIdleMaxRecoveries,
+		overflowRecoveryDisabled: cfg.DisableContextOverflowRecovery,
+		toolChoice:               cfg.ToolChoice,
+		requireDone:              cfg.RequireDoneTool,
+		warningf:                 cfg.Warningf,
+		hasCompactor:             hasCompactor,
+		tools:                    ownedTools,
+		toolMap:                  toolMap,
+		toolMapNormalized:        buildNormalizedToolMap(toolMap, ownedTools),
+		deps:                     cfg.Deps,
+		compactor:                compSvc,
+		toolResultDumps:          make(map[string]toolResultDumpLifecycleEntry),
+		ephemeralByKey:           make(map[string][]int),
+		ephemeralSigByCall:       make(map[string]string),
 	}
 	if len(cfg.InitialMessages) > 0 {
 		ag.messages = llm.CloneMessages(cfg.InitialMessages)
@@ -640,6 +650,10 @@ func (a *Agent) queryStreamWithSteering(ctx context.Context, input llm.Content, 
 		pendingRequireDoneFinalResponseID := ""
 		streamIdleRecoveries := 0
 		streamIdleRecoveryTotal := 0
+		// At most one typed-overflow recovery per real user input: the Query
+		// itself, then each accepted steering message. Internal reminders,
+		// continuations and compaction results never refresh it.
+		overflowRecoveryEpoch := ^uint64(0)
 		usageFallbackWarned := false
 		cont := newToolCallContinuation(defaultMaxContinuationTurns)
 		// A new Query never inherits a previous Query's compaction relation.
@@ -867,6 +881,7 @@ func (a *Agent) queryStreamWithSteering(ctx context.Context, input llm.Content, 
 					// empty message means the host canceled a later stage after that
 					// steering had already been appended at an earlier boundary.
 					if strings.TrimSpace(steerErr.Message) != "" {
+						a.steeringEpoch.Add(1)
 						a.emitEvent(out, SteeringReceivedEvent{Content: steerErr.Message})
 					}
 					continue
@@ -903,6 +918,29 @@ func (a *Agent) queryStreamWithSteering(ctx context.Context, input llm.Content, 
 							maxRecov,
 						)
 						continue
+					}
+				}
+
+				// Typed provider context overflow: the request was rejected before
+				// any output, so it had no effect. Compact once for this real user
+				// input and send a new logical request (a new Frame). A second
+				// overflow in the same epoch, an unchanged history, partial
+				// output or a pending continuation ends the turn as before.
+				if llm.IsContextOverflow(err) && !a.overflowRecoveryDisabled && !cont.hasPending() && completionIsEmpty(comp) {
+					epoch := a.steeringEpoch.Load()
+					if overflowRecoveryEpoch != epoch {
+						overflowRecoveryEpoch = epoch
+						changed, recoveryErr := a.compactForProviderOverflow(ctx, frame.id, out)
+						if recoveryErr == nil && changed {
+							a.emitEvent(out, WarnEvent{
+								Kind:    "context_overflow_recovery",
+								Message: "provider rejected the request as exceeding the context window; compacted history once and retrying with a new request",
+							}, correlation)
+							continue
+						}
+						if recoveryErr != nil && ctx.Err() == nil {
+							a.warnf("warning: context overflow recovery failed: %v", recoveryErr)
+						}
 					}
 				}
 
@@ -5106,6 +5144,7 @@ func (a *Agent) collectSteering(ch <-chan SteeringMsg, out *eventOutput) []llm.M
 			Role:    llm.RoleUser,
 			Content: llm.TextContent(msg.Content),
 		})
+		a.steeringEpoch.Add(1)
 		a.emitEvent(out, SteeringReceivedEvent{Content: msg.Content})
 	}
 }
@@ -5648,4 +5687,35 @@ func sameToolCalls(a, b []llm.ToolCall) bool {
 		}
 	}
 	return true
+}
+
+// completionIsEmpty reports whether a failed invocation produced no visible
+// output, tool calls or provider state.
+func completionIsEmpty(comp *llm.Completion) bool {
+	return comp == nil || (comp.Content.IsEmpty() && !llm.HasProviderState(comp.Content) && len(comp.ToolCalls) == 0 && strings.TrimSpace(comp.Thinking) == "")
+}
+
+// compactForProviderOverflow runs the overflow compaction path after the
+// provider rejected a request with typed context-overflow evidence, and
+// reports whether history actually changed. The rejected request has no
+// usage; the decision input is a labeled local estimate raised to the
+// compactor's overflow limit, because the provider has stated the request
+// does not fit. It is never reported as observed usage.
+func (a *Agent) compactForProviderOverflow(ctx context.Context, sourceFrameID string, out *eventOutput) (bool, error) {
+	if !a.hasCompactor || a.compactor == nil {
+		return false, nil
+	}
+	a.mu.Lock()
+	estimate := llm.EstimateMessagesTokens(a.messages)
+	a.mu.Unlock()
+	if limit := a.compactor.OverflowLimit(); estimate <= limit {
+		estimate = limit + 1
+	}
+	decision := &llm.Usage{PromptTokens: estimate, TotalTokens: estimate, PromptTokensSource: llm.PromptTokensSourceEstimate}
+	before := a.compactionGeneration.Load()
+	// An empty completion carries no usage, so no trigger usage is recorded.
+	if err := a.compactSyncOverflow(ctx, sourceFrameID, &llm.Completion{}, decision, out); err != nil {
+		return false, err
+	}
+	return a.compactionGeneration.Load() != before, nil
 }

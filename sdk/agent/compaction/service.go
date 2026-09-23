@@ -197,6 +197,12 @@ func (s *Service) overflowLimit() int {
 	return s.promptBudgetWindow()
 }
 
+// OverflowLimit is the prompt-token boundary at which a request is treated as
+// overflowing the configured window.
+func (s *Service) OverflowLimit() int {
+	return s.overflowLimit()
+}
+
 func (s *Service) TotalTokens(u *llm.Usage) int {
 	if u == nil {
 		return 0
