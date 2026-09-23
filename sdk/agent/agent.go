@@ -2471,6 +2471,11 @@ func (a *Agent) invokeModelCompletionWithRetryAndSteering(ctx context.Context, m
 		if !retry {
 			break
 		}
+		// The failed attempt's usage belongs to that attempt, not the retry.
+		var failedCorrelation []eventCorrelation
+		if len(scopes) == 1 {
+			failedCorrelation = []eventCorrelation{scopes[0].completionCorrelation()}
+		}
 		// A cancellation while waiting for another retry is not a failure
 		// inside the preceding, already completed model invocation.
 		if len(scopes) == 1 {
@@ -2484,12 +2489,17 @@ func (a *Agent) invokeModelCompletionWithRetryAndSteering(ctx context.Context, m
 				if !t.Stop() {
 					<-t.C
 				}
+				// The caller reports lastComp's usage once on this path.
 				return lastComp, lastStreamed, ctx.Err()
 			case <-t.C:
 			}
-			continue
+		} else {
+			a.warnf("agent invoke transient failure (attempt %d/%d): %v; retrying", attempt, maxAttempts, err)
 		}
-		a.warnf("agent invoke transient failure (attempt %d/%d): %v; retrying", attempt, maxAttempts, err)
+		// Only now is the next attempt certain; the failed attempt's observed
+		// usage was billed and must not be replaced by the retry's usage.
+		a.emitPartialUsage(out, comp, failedCorrelation...)
+		lastComp = nil
 	}
 	return lastComp, lastStreamed, lastErr
 }
