@@ -88,6 +88,10 @@ type EventEnvelope struct {
 	// "applied" and InterventionResult a fixed outcome label. Empty means the
 	// event reports no intervention, not that none was considered. It is not
 	// proof of delivery, of model compliance or of full content provenance.
+	// Kinds: repeated_tool_signature (tool_suppressed, reminder_queued,
+	// guard_downgraded), evidence_progress (tool_suppressed, reminder_queued)
+	// and require_done_reminder (safety_fallback_accepted, where the strike
+	// counts the reminders appended before the fallback).
 	Intervention       string `json:"Intervention,omitempty"`
 	InterventionStage  string `json:"InterventionStage,omitempty"`
 	InterventionResult string `json:"InterventionResult,omitempty"`
