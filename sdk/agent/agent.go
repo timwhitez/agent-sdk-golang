@@ -133,6 +133,9 @@ type Config struct {
 	// typed provider context overflow (llm.IsContextOverflow): such a
 	// rejection then ends the turn as before.
 	DisableContextOverflowRecovery bool
+	// ToolParallelism opts the native tool loop into bounded waves. Nil (the
+	// default) keeps every call Exclusive. See ToolParallelism.
+	ToolParallelism *ToolParallelism
 
 	RequireDoneTool bool
 
@@ -167,6 +170,8 @@ type Agent struct {
 	eventClock                 func() time.Time
 	streamIdleTimeout          time.Duration
 	streamIdleMaxRecov         int
+	// toolParallelism is an owned copy of Config.ToolParallelism.
+	toolParallelism *ToolParallelism
 	// overflowRecoveryDisabled mirrors Config.DisableContextOverflowRecovery.
 	overflowRecoveryDisabled bool
 	// userInputEpoch counts real user input: each Query and each accepted
@@ -476,6 +481,7 @@ func New(cfg Config) (*Agent, error) {
 		streamIdleTimeout:        cfg.StreamIdleTimeout,
 		streamIdleMaxRecov:       cfg.StreamIdleMaxRecoveries,
 		overflowRecoveryDisabled: cfg.DisableContextOverflowRecovery,
+		toolParallelism:          cloneToolParallelism(cfg.ToolParallelism),
 		toolChoice:               cfg.ToolChoice,
 		requireDone:              cfg.RequireDoneTool,
 		warningf:                 cfg.Warningf,
@@ -1380,6 +1386,13 @@ func (a *Agent) queryStreamWithSteering(ctx context.Context, input llm.Content, 
 				ordinalByID[call.ID] = i
 			}
 			var completedMessage string
+			preparedCalls := make([]*nativePreparedCall, len(comp.ToolCalls))
+			preparedCall := func(idx int) *nativePreparedCall {
+				if preparedCalls[idx] == nil {
+					preparedCalls[idx] = prepareNativeCall(comp.ToolCalls[idx], frame.exact, frame.normalized)
+				}
+				return preparedCalls[idx]
+			}
 			adapter := SequentialBlockAdapter{
 				Admit: func(root context.Context, idx int) (BlockAdmission, error) {
 					tc := comp.ToolCalls[idx]
@@ -1390,24 +1403,13 @@ func (a *Agent) queryStreamWithSteering(ctx context.Context, input llm.Content, 
 					step := idx + 1
 					c.originalName = tc.Function.Name
 
-					// Resolve c.tool: exact match → normalized/alias match → fallback
-					var found, normalizedAlias bool
-					c.tool, c.resolvedName, found, normalizedAlias = resolveToolByName(tc.Function.Name, frame.exact, frame.normalized)
-					c.unknownToolFallback = false
-					execArgs := tc.Function.Arguments
-
-					if !found {
-						c.unknownToolFallback = true
-						c.resolvedName = "invalid"
-						execArgs = wrapInvalidToolArgs(c.originalName, tc.Function.Arguments)
-						if inv, ok := frame.exact["invalid"]; ok {
-							c.tool = inv
-						} else {
-							c.tool = autoInvalidTool()
-						}
-					}
-
-					prepared, norm := c.tool.PrepareCall(execArgs)
+					// Resolve tool: exact match → normalized/alias match → fallback.
+					// Planning may already have prepared this call; Admit executes
+					// exactly that preparation.
+					p := preparedCall(idx)
+					c.tool, c.resolvedName, c.unknownToolFallback = p.tool, p.resolvedName, !p.found
+					normalizedAlias, execArgs := p.normalizedAlias, p.execArgs
+					prepared, norm := p.prepared, p.norm
 					resolution := toolResolutionExact
 					if c.unknownToolFallback {
 						resolution = toolResolutionUnknownFallback
@@ -1462,7 +1464,7 @@ func (a *Agent) queryStreamWithSteering(ctx context.Context, input llm.Content, 
 						if decision.action == interventionActionSuppressTool {
 							// The decision is only proposed here. Its strike is consumed
 							// and its application reported once the suppressed result
-							// has been committed to history (c.postCommit).
+							// has been committed to history (postCommit).
 							record := interventionRecord{kind: InterventionRepeatedToolSignature, stage: interventionProposed, strikeLimit: a.loopGuardStrikeMax}
 							a.observeIntervention(record)
 							// Accepted blocks have non-empty IDs, so this helper returns
@@ -1476,7 +1478,7 @@ func (a *Agent) queryStreamWithSteering(ctx context.Context, input llm.Content, 
 								record.stage, record.strike = interventionApplied, loopGuardStrikes
 								record.reminderQueued, record.guardDowngraded = decision.queueReminder, decision.downgradeGuard
 								// Warnings and reminders carry only the intervention labels;
-								// c.tool identity stays on c.tool events.
+								// tool identity stays on tool events.
 								applied := eventCorrelation{}.withIntervention(InterventionResultToolSuppressed, loopGuardStrikes)
 								reminder := strings.TrimSpace(a.loopGuardUserMsg)
 								if repeatGuard.exhausted {
@@ -1488,9 +1490,9 @@ func (a *Agent) queryStreamWithSteering(ctx context.Context, input llm.Content, 
 								}
 								if decision.queueReminder {
 									// Buffered, not appended: this is a user-role
-									// message and the assistant c.tool-call block is not
+									// message and the assistant tool-call block is not
 									// closed yet. Appending here would interleave user
-									// text between two c.tool results of the same block
+									// text between two tool results of the same block
 									// and permanently invalidate the history.
 									pendingBlockMessages = append(pendingBlockMessages, messageorigin.NewInternalUserMessage(messageorigin.KindLoopGuard, reminder))
 									a.emitEvent(out, HiddenUserMessageEvent{Content: reminder}, eventCorrelation{}.withIntervention(InterventionResultReminderQueued, loopGuardStrikes))
@@ -1562,7 +1564,7 @@ func (a *Agent) queryStreamWithSteering(ctx context.Context, input llm.Content, 
 								if decision.recovery {
 									reminder := evidenceRecoveryMessage(c.evidenceReq)
 									queued := eventCorrelation{}.withInterventionKind(InterventionEvidenceProgress, InterventionResultReminderQueued, evidenceSuppressions)
-									// Deferred until the c.tool-call block is closed; see
+									// Deferred until the tool-call block is closed; see
 									// the loop-guard reminder above.
 									pendingBlockMessages = append(pendingBlockMessages, messageorigin.NewInternalUserMessage(messageorigin.KindEvidenceRecovery, reminder))
 									a.emitEvent(out, HiddenUserMessageEvent{Content: reminder}, queued)
@@ -1705,6 +1707,11 @@ func (a *Agent) queryStreamWithSteering(ctx context.Context, input llm.Content, 
 					}
 					return BlockContinue
 				},
+			}
+			if par := a.toolParallelism; par != nil && par.Plan != nil && par.MaxWorkers >= 2 {
+				adapter.Parallel = &BlockParallelism{MaxWorkers: par.MaxWorkers, Plan: func(idx int) BlockCallPlan {
+					return a.planNativeCall(idx, preparedCall(idx))
+				}}
 			}
 			stop, blockErr := runSequentialBlock(ctx, activeToolBlock, comp.ToolCalls, adapter, false)
 			if blockErr != nil {

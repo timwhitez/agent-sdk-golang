@@ -40,9 +40,19 @@ consecutive Concurrent calls without shared keys run in one bounded wave
 (`MaxWorkers`, hard-capped at `MaxBlockWorkers`). Workers only execute the
 owned PreparedCall; the owner still admits, projects, commits and publishes in
 model order, so out-of-order completion keeps one terminal per call. A missing,
-false or panicking plan is Exclusive. The native Agent loop sets no `Parallel`
-today; this is not a concurrent effect classifier or a promise about arbitrary
-host goroutines.
+false or panicking plan is Exclusive. The native Agent loop is Exclusive unless
+`Config.ToolParallelism` is set. Its per-call state is kept by ordinal, so
+interleaved admission and settlement never read another call's state. The SDK
+then only narrows the host's `Plan`: it is consulted only for a call that
+resolved exactly to a registered tool with valid arguments and belongs to an
+evidence family (read/search/list); every other successful tool may change
+what later reads observe (the progress ledger invalidates on it), so it stays
+Exclusive. Calls on one evidence target share an SDK resource key, so
+evidence suppression sees the same history as sequentially. All running
+calls of a wave are interruptible for steering; a steering message or stop
+after one call does not recall later calls of an admitted wave — they settle
+with their real outcome. This is not a concurrent effect classifier or a
+promise about arbitrary host goroutines.
 
 - A Frame owns a cloned logical request and resolver definitions. It calls an
   explicit `llm.FrameModelBinder` once before invocation; all SDK retries reuse
