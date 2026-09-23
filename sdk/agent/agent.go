@@ -9,6 +9,7 @@ import (
 	"net"
 	"os"
 	"reflect"
+	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -128,6 +129,10 @@ type Config struct {
 	ToolChoice              llm.ToolChoice
 
 	Compaction *compaction.Config
+	// DisableContextOverflowRecovery turns off the bounded recovery from a
+	// typed provider context overflow (llm.IsContextOverflow): such a
+	// rejection then ends the turn as before.
+	DisableContextOverflowRecovery bool
 
 	RequireDoneTool bool
 
@@ -162,10 +167,21 @@ type Agent struct {
 	eventClock                 func() time.Time
 	streamIdleTimeout          time.Duration
 	streamIdleMaxRecov         int
-	toolChoice                 llm.ToolChoice
-	requireDone                bool
-	warningf                   func(format string, args ...any)
-	hasCompactor               bool
+	// overflowRecoveryDisabled mirrors Config.DisableContextOverflowRecovery.
+	overflowRecoveryDisabled bool
+	// userInputEpoch counts real user input: each Query and each accepted
+	// steering message start a new epoch. Internal reminders, continuations
+	// and compaction results never advance it. Overflow recovery and the
+	// ineffective-summary suppression are bounded per epoch.
+	userInputEpoch atomic.Uint64
+	// ineffectiveSummaryEpoch is 1 + the userInputEpoch in which an automatic
+	// summary succeeded but left the history at or above the summary
+	// threshold; 0 means the automatic summary tier is not suppressed.
+	ineffectiveSummaryEpoch atomic.Uint64
+	toolChoice              llm.ToolChoice
+	requireDone             bool
+	warningf                func(format string, args ...any)
+	hasCompactor            bool
 
 	compactionAdmissionObserved func()
 	toolBlockStateObserved      func(*toolBlockState)
@@ -448,27 +464,28 @@ func New(cfg Config) (*Agent, error) {
 			Registered: cfg.ArtifactResolverCapability.Registered,
 			Recovery:   cloneArtifactRecovery(cfg.ArtifactResolverCapability.Recovery),
 		},
-		artifactEnvelopeCodec: cfg.ArtifactEnvelopeCodec,
-		toolResultDumpTTL:     cfg.ToolResultDumpTTL,
-		eventBufferSize:       cfg.EventBufferSize,
-		eventSendTimeout:      cfg.EventSendTimeout,
-		eventDropLogEvery:     uint64(cfg.EventDropLogEvery),
-		queryIDGenerator:      cfg.QueryIDGenerator,
-		eventClock:            cfg.EventClock,
-		streamIdleTimeout:     cfg.StreamIdleTimeout,
-		streamIdleMaxRecov:    cfg.StreamIdleMaxRecoveries,
-		toolChoice:            cfg.ToolChoice,
-		requireDone:           cfg.RequireDoneTool,
-		warningf:              cfg.Warningf,
-		hasCompactor:          hasCompactor,
-		tools:                 ownedTools,
-		toolMap:               toolMap,
-		toolMapNormalized:     buildNormalizedToolMap(toolMap, ownedTools),
-		deps:                  cfg.Deps,
-		compactor:             compSvc,
-		toolResultDumps:       make(map[string]toolResultDumpLifecycleEntry),
-		ephemeralByKey:        make(map[string][]int),
-		ephemeralSigByCall:    make(map[string]string),
+		artifactEnvelopeCodec:    cfg.ArtifactEnvelopeCodec,
+		toolResultDumpTTL:        cfg.ToolResultDumpTTL,
+		eventBufferSize:          cfg.EventBufferSize,
+		eventSendTimeout:         cfg.EventSendTimeout,
+		eventDropLogEvery:        uint64(cfg.EventDropLogEvery),
+		queryIDGenerator:         cfg.QueryIDGenerator,
+		eventClock:               cfg.EventClock,
+		streamIdleTimeout:        cfg.StreamIdleTimeout,
+		streamIdleMaxRecov:       cfg.StreamIdleMaxRecoveries,
+		overflowRecoveryDisabled: cfg.DisableContextOverflowRecovery,
+		toolChoice:               cfg.ToolChoice,
+		requireDone:              cfg.RequireDoneTool,
+		warningf:                 cfg.Warningf,
+		hasCompactor:             hasCompactor,
+		tools:                    ownedTools,
+		toolMap:                  toolMap,
+		toolMapNormalized:        buildNormalizedToolMap(toolMap, ownedTools),
+		deps:                     cfg.Deps,
+		compactor:                compSvc,
+		toolResultDumps:          make(map[string]toolResultDumpLifecycleEntry),
+		ephemeralByKey:           make(map[string][]int),
+		ephemeralSigByCall:       make(map[string]string),
 	}
 	if len(cfg.InitialMessages) > 0 {
 		ag.messages = llm.CloneMessages(cfg.InitialMessages)
@@ -640,6 +657,11 @@ func (a *Agent) queryStreamWithSteering(ctx context.Context, input llm.Content, 
 		pendingRequireDoneFinalResponseID := ""
 		streamIdleRecoveries := 0
 		streamIdleRecoveryTotal := 0
+		// At most one typed-overflow recovery per real user input: the Query
+		// itself, then each accepted steering message. Internal reminders,
+		// continuations and compaction results never refresh it.
+		overflowRecoveryEpoch := ^uint64(0)
+		a.userInputEpoch.Add(1)
 		usageFallbackWarned := false
 		cont := newToolCallContinuation(defaultMaxContinuationTurns)
 		// A new Query never inherits a previous Query's compaction relation.
@@ -647,6 +669,7 @@ func (a *Agent) queryStreamWithSteering(ctx context.Context, input llm.Content, 
 		repeatGuard := newRepeatedToolSignatureGuard(a.repeatSigThreshold, a.repeatSigWindow)
 		progressLedger := newEvidenceProgressLedger(a.deps, a.compactionGeneration.Load())
 		loopGuardStrikes := 0
+		evidenceSuppressions := 0
 		hasDoneTool := a.hasToolNamed("done")
 		out.setDropBaseline(a.eventDropCount.Load(), a.criticalEventDropCount.Load())
 		droppedThisTurn := func() uint64 {
@@ -867,6 +890,7 @@ func (a *Agent) queryStreamWithSteering(ctx context.Context, input llm.Content, 
 					// empty message means the host canceled a later stage after that
 					// steering had already been appended at an earlier boundary.
 					if strings.TrimSpace(steerErr.Message) != "" {
+						a.userInputEpoch.Add(1)
 						a.emitEvent(out, SteeringReceivedEvent{Content: steerErr.Message})
 					}
 					continue
@@ -903,6 +927,29 @@ func (a *Agent) queryStreamWithSteering(ctx context.Context, input llm.Content, 
 							maxRecov,
 						)
 						continue
+					}
+				}
+
+				// Typed provider context overflow: the request was rejected before
+				// any output, so it had no effect. Compact once for this real user
+				// input and send a new logical request (a new Frame). A second
+				// overflow in the same epoch, an unchanged history, partial
+				// output or a pending continuation ends the turn as before.
+				if llm.IsContextOverflow(err) && !a.overflowRecoveryDisabled && !cont.hasPending() && completionIsEmpty(comp) {
+					epoch := a.userInputEpoch.Load()
+					if overflowRecoveryEpoch != epoch {
+						overflowRecoveryEpoch = epoch
+						changed, recoveryErr := a.compactForProviderOverflow(ctx, frame.id, out)
+						if recoveryErr == nil && changed {
+							a.emitEvent(out, WarnEvent{
+								Kind:    "context_overflow_recovery",
+								Message: "provider rejected the request as exceeding the context window; compacted history once and retrying with a new request",
+							}, correlation)
+							continue
+						}
+						if recoveryErr != nil && ctx.Err() == nil {
+							a.warnf("warning: context overflow recovery failed: %v", recoveryErr)
+						}
 					}
 				}
 
@@ -1253,10 +1300,13 @@ func (a *Agent) queryStreamWithSteering(ctx context.Context, input llm.Content, 
 					// not permitted), not a fatal abort: accept the model's latest
 					// post-tool text and complete the turn.
 					if requireDoneReminders > defaultRequireDoneMaxReminders {
+						// Applied: the fallback final below is emitted after the
+						// reminders it counts were appended to history.
+						fallback := correlation.withInterventionKind(InterventionRequireDone, InterventionResultSafetyFallback, requireDoneReminders-1)
 						a.emitEvent(out, WarnEvent{
 							Message: "require-done: model kept answering with text after tool usage and could not be pushed to the done tool (e.g. forced tool choice is unavailable under extended thinking); accepting its latest response and completing the turn",
 							Kind:    "require_done_safety",
-						})
+						}, fallback)
 						if a.hasCompactor {
 							_ = a.checkAndCompact(ctx, frame.id, comp, out)
 						}
@@ -1271,7 +1321,7 @@ func (a *Agent) queryStreamWithSteering(ctx context.Context, input llm.Content, 
 						clearPendingTextContinuation()
 						requireDoneRecoveryDisableThinkingActive = false
 						requireDoneControlSource = ""
-						emitPartialFinal(finalContent, finalResponseID, "require_done_safety", correlation)
+						emitPartialFinal(finalContent, finalResponseID, "require_done_safety", fallback)
 						return
 					}
 					forceRequireDoneToolChoice = true
@@ -1509,10 +1559,11 @@ func (a *Agent) queryStreamWithSteering(ctx context.Context, input llm.Content, 
 							postPublish = func() {
 								if decision.recovery {
 									reminder := evidenceRecoveryMessage(evidenceReq)
+									queued := eventCorrelation{}.withInterventionKind(InterventionEvidenceProgress, InterventionResultReminderQueued, evidenceSuppressions)
 									// Deferred until the tool-call block is closed; see
 									// the loop-guard reminder above.
 									pendingBlockMessages = append(pendingBlockMessages, messageorigin.NewInternalUserMessage(messageorigin.KindEvidenceRecovery, reminder))
-									a.emitEvent(out, HiddenUserMessageEvent{Content: reminder})
+									a.emitEvent(out, HiddenUserMessageEvent{Content: reminder}, queued)
 									a.emitEvent(out, WarnEvent{
 										Kind:     "no_progress_recovery",
 										Metadata: decision.metadata,
@@ -1523,7 +1574,7 @@ func (a *Agent) queryStreamWithSteering(ctx context.Context, input llm.Content, 
 											evidenceReq.target,
 											evidenceReq.fingerprint,
 										),
-									})
+									}, queued)
 								}
 							}
 							terminal := blockTerminal(suppressedResult, "evidence_suppressed")
@@ -1606,6 +1657,11 @@ func (a *Agent) queryStreamWithSteering(ctx context.Context, input llm.Content, 
 					resultCorrelation := toolCorrelation
 					if t.Reason == "loop_guard" && appliedInterventionStrike > 0 {
 						resultCorrelation = toolCorrelation.withIntervention(InterventionResultToolSuppressed, appliedInterventionStrike)
+					}
+					if t.Reason == "evidence_suppressed" {
+						// Published after the suppressed result was committed.
+						evidenceSuppressions++
+						resultCorrelation = toolCorrelation.withInterventionKind(InterventionEvidenceProgress, InterventionResultToolSuppressed, evidenceSuppressions)
 					}
 					a.emitToolResultWithAccounting(out, t.projection(), duration, resultCorrelation)
 					status := "completed"
@@ -3507,6 +3563,9 @@ func (a *Agent) runCompactionAsync(ctx context.Context, sourceFrameID string, sn
 	}
 	newMsgs = a.withPreservedSystem(snapshot, newMsgs)
 	res = a.reconcileCompactionTelemetry(res, snapshot, newMsgs, 0)
+	if decision.recordsOutcome() {
+		a.noteSummaryEffect(decision.inputEpoch, res)
+	}
 
 	a.pendingCompactionMu.Lock()
 	a.pendingCompaction = &pendingCompaction{
@@ -3622,6 +3681,7 @@ func (a *Agent) compactSyncOverflow(ctx context.Context, sourceFrameID string, l
 	}
 	newMsgs = a.withPreservedSystem(messages, newMsgs)
 	res = a.reconcileCompactionTelemetry(res, messages, newMsgs, 0)
+	a.noteSummaryEffect(a.userInputEpoch.Load(), res)
 
 	a.pendingCompactionMu.Lock()
 	a.pendingCompaction = &pendingCompaction{
@@ -3727,6 +3787,43 @@ func (a *Agent) compactionInCooldown() bool {
 		return false
 	}
 	return true
+}
+
+// automaticSummarySuppressed reports whether an ineffective automatic summary
+// earlier in the same user input still suppresses the automatic summary tier.
+// A new user input, or a decision below the summary threshold, clears it.
+func (a *Agent) automaticSummarySuppressed(epoch uint64, usage *llm.Usage) bool {
+	armed := a.ineffectiveSummaryEpoch.Load()
+	if armed == 0 {
+		return false
+	}
+	if armed != epoch+1 || a.compactor == nil || a.compactor.DecisionTokens(usage) < a.compactor.ThresholdTokens() {
+		a.ineffectiveSummaryEpoch.CompareAndSwap(armed, 0)
+		return false
+	}
+	return true
+}
+
+// noteSummaryEffect records whether an automatic run's summary brought the
+// history under the summary threshold. A summary that did not suppresses the
+// automatic summary tier for the rest of its user input: repeating it would
+// pay for another summary of the same material. An effective summary clears
+// the suppression. Overflow and manual compaction are never suppressed.
+func (a *Agent) noteSummaryEffect(epoch uint64, res compaction.Result) {
+	if a == nil || a.compactor == nil || !slices.Contains(res.TiersApplied, "summarize") {
+		return
+	}
+	threshold := a.compactor.ThresholdTokens()
+	if res.NewTokens < threshold {
+		a.ineffectiveSummaryEpoch.Store(0)
+		return
+	}
+	if a.ineffectiveSummaryEpoch.Swap(epoch+1) != epoch+1 {
+		a.warnf(
+			"warning: automatic compaction summary left the context at %d estimated tokens, at or above the summary threshold of %d; the automatic summary tier is suppressed until new user input or the context falls below the threshold (overflow and manual compaction are unaffected)",
+			res.NewTokens, threshold,
+		)
+	}
 }
 
 // compactionSummaryAllowed reports whether the expensive summary tier should
@@ -5106,6 +5203,7 @@ func (a *Agent) collectSteering(ch <-chan SteeringMsg, out *eventOutput) []llm.M
 			Role:    llm.RoleUser,
 			Content: llm.TextContent(msg.Content),
 		})
+		a.userInputEpoch.Add(1)
 		a.emitEvent(out, SteeringReceivedEvent{Content: msg.Content})
 	}
 }
@@ -5648,4 +5746,35 @@ func sameToolCalls(a, b []llm.ToolCall) bool {
 		}
 	}
 	return true
+}
+
+// completionIsEmpty reports whether a failed invocation produced no visible
+// output, tool calls or provider state.
+func completionIsEmpty(comp *llm.Completion) bool {
+	return comp == nil || (comp.Content.IsEmpty() && !llm.HasProviderState(comp.Content) && len(comp.ToolCalls) == 0 && strings.TrimSpace(comp.Thinking) == "")
+}
+
+// compactForProviderOverflow runs the overflow compaction path after the
+// provider rejected a request with typed context-overflow evidence, and
+// reports whether history actually changed. The rejected request has no
+// usage; the decision input is a labeled local estimate raised to the
+// compactor's overflow limit, because the provider has stated the request
+// does not fit. It is never reported as observed usage.
+func (a *Agent) compactForProviderOverflow(ctx context.Context, sourceFrameID string, out *eventOutput) (bool, error) {
+	if !a.hasCompactor || a.compactor == nil {
+		return false, nil
+	}
+	a.mu.Lock()
+	estimate := llm.EstimateMessagesTokens(a.messages)
+	a.mu.Unlock()
+	if limit := a.compactor.OverflowLimit(); estimate <= limit {
+		estimate = limit + 1
+	}
+	decision := &llm.Usage{PromptTokens: estimate, TotalTokens: estimate, PromptTokensSource: llm.PromptTokensSourceEstimate}
+	before := a.compactionGeneration.Load()
+	// An empty completion carries no usage, so no trigger usage is recorded.
+	if err := a.compactSyncOverflow(ctx, sourceFrameID, &llm.Completion{}, decision, out); err != nil {
+		return false, err
+	}
+	return a.compactionGeneration.Load() != before, nil
 }

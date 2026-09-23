@@ -97,7 +97,7 @@ func parallelFixture(n int, g *gatedHandlers, trace *parallelTrace, maxWorkers i
 		trace.published = append(trace.published, i)
 		trace.mu.Unlock()
 	}
-	a.parallel = &blockParallelism{maxWorkers: maxWorkers, eligible: eligible}
+	a.Parallel = &BlockParallelism{MaxWorkers: maxWorkers, Plan: planFrom(eligible)}
 	return calls, a
 }
 
@@ -420,7 +420,7 @@ func TestToolBlockParallelPanicSettlesInOrder(t *testing.T) {
 	a.OnPanic = func(int, context.Context, any) (llm.Content, error) {
 		return llm.TextContent("panicked"), errors.New("panicked")
 	}
-	a.parallel = &blockParallelism{maxWorkers: 3, eligible: allEligible}
+	a.Parallel = &BlockParallelism{MaxWorkers: 3, Plan: planFrom(allEligible)}
 	state, _ := newToolBlockState(calls)
 	if _, err := runSequentialBlock(context.Background(), state, calls, a, false); err != nil {
 		t.Fatal(err)
@@ -498,4 +498,8 @@ func TestToolBlockParallelDefaultStaysSequential(t *testing.T) {
 		t.Fatalf("default executor ran %d handlers concurrently", peak.Load())
 	}
 	requireSingleTerminal(t, state)
+}
+
+func planFrom(eligible func(int) bool) func(int) BlockCallPlan {
+	return func(i int) BlockCallPlan { return BlockCallPlan{Concurrent: eligible(i)} }
 }

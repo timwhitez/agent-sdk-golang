@@ -34,8 +34,15 @@ start/return/terminal/commit/publication order. Adapters retain policy and outpu
 projection; child scoped records are not automatically written to parent history.
 A synchronous child scope rejects concurrent, nested or expired admission and
 waits for accepted children before its parent completes. No lock is held across
-a Handler. All managed calls are Exclusive, not a promise about arbitrary host
-goroutines or a concurrent effect classifier.
+a Handler. Calls are Exclusive unless the adapter sets `Parallel`: then the
+host's `Plan` may declare a call Concurrent (with opaque Resource keys), and
+consecutive Concurrent calls without shared keys run in one bounded wave
+(`MaxWorkers`, hard-capped at `MaxBlockWorkers`). Workers only execute the
+owned PreparedCall; the owner still admits, projects, commits and publishes in
+model order, so out-of-order completion keeps one terminal per call. A missing,
+false or panicking plan is Exclusive. The native Agent loop sets no `Parallel`
+today; this is not a concurrent effect classifier or a promise about arbitrary
+host goroutines.
 
 - A Frame owns a cloned logical request and resolver definitions. It calls an
   explicit `llm.FrameModelBinder` once before invocation; all SDK retries reuse
@@ -97,6 +104,29 @@ The canonical compaction pipeline is shared by private automatic paths and
 public manual/preflight entry points. Runtime-use barriers keep configuration
 replacement from changing an operation's service underneath it; that barrier
 is not a numeric Session/runtime revision.
+
+A provider rejection with typed context-overflow evidence
+(`llm.IsContextOverflow`: `ProviderError.Reason` set by an adapter from a
+documented structured field, never from status or message text) is recovered
+at most once per real user input — the Query, then each accepted steering
+message; internal reminders and continuations never refresh it. Recovery runs
+only when the rejected request produced no output and no continuation is
+pending: the overflow compaction path runs, and only if history actually
+changed does the driver send a new logical request under a new Frame.
+Otherwise, and on a second overflow, the provider error ends the turn as
+before. `Config.DisableContextOverflowRecovery` turns it off. Adapters without
+a documented structured code (Anthropic today) never type an overflow.
+
+Automatic compaction is bounded per real user input as well. An automatic
+summary that succeeds but leaves the history at or above the summary
+threshold (for example because the kept recent user input alone exceeds it)
+suppresses the automatic summary tier for the rest of that input: later
+automatic decisions run local tiers only instead of paying for another
+summary of the same material. A new Query or accepted steering message, a
+decision below the summary threshold, or a replacement compaction runtime
+clears it. Overflow compaction and manual/preflight entries are never
+suppressed. A failed summary continues to use the separate failure streak
+and cooldown.
 
 [CommitCompactionHistory](../sdk/agent/compaction_publication.go) accepts the exact
 source snapshot used to compute a candidate. It rejects admission, pending work

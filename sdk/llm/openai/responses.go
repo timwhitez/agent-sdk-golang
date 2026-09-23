@@ -183,7 +183,7 @@ func (c *ResponsesClient) Invoke(ctx context.Context, req llm.InvokeRequest) (*l
 			if resp.StatusCode == 429 {
 				lastErr = &llm.RateLimitError{Provider: local.Provider(), Message: msg, RetryAfter: retryAfter}
 			} else {
-				lastErr = &llm.ProviderError{Provider: local.Provider(), StatusCode: resp.StatusCode, Message: msg, RetryAfter: retryAfter}
+				lastErr = &llm.ProviderError{Provider: local.Provider(), StatusCode: resp.StatusCode, Message: msg, RetryAfter: retryAfter, Reason: openAIErrorReason(data)}
 			}
 			if local.isRetryableStatus(resp.StatusCode) && attempt < retry.maxRetries-1 {
 				local.sleepBackoff(ctx, attempt, retry.baseDelay, retry.maxDelay, retryAfter)
@@ -525,7 +525,7 @@ func (c *ResponsesClient) InvokeStream(ctx context.Context, req llm.InvokeReques
 				if resp.StatusCode == 429 {
 					lastErr = &llm.RateLimitError{Provider: local.Provider(), Message: msg, RetryAfter: retryAfter}
 				} else {
-					lastErr = &llm.ProviderError{Provider: local.Provider(), StatusCode: resp.StatusCode, Message: msg, RetryAfter: retryAfter}
+					lastErr = &llm.ProviderError{Provider: local.Provider(), StatusCode: resp.StatusCode, Message: msg, RetryAfter: retryAfter, Reason: openAIErrorReason(data)}
 				}
 				if local.isRetryableStatus(resp.StatusCode) && attempt < retry.maxRetries-1 {
 					local.sleepBackoff(ctx, attempt, retry.baseDelay, retry.maxDelay, retryAfter)
@@ -1252,7 +1252,7 @@ func parseResponsesStreamEventError(provider string, root map[string]any) error 
 	if rateLimited {
 		return &llm.RateLimitError{Provider: provider, Message: msg, RetryAfter: retryAfter}
 	}
-	return &llm.ProviderError{Provider: provider, StatusCode: statusCode, Message: msg, RetryAfter: retryAfter}
+	return &llm.ProviderError{Provider: provider, StatusCode: statusCode, Message: msg, RetryAfter: retryAfter, Reason: openAIErrorCodeReason(errObj["code"])}
 }
 
 func responsesHasError(resp map[string]any) bool {

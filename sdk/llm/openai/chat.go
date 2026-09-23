@@ -191,7 +191,7 @@ func (c *ChatClient) Invoke(ctx context.Context, req llm.InvokeRequest) (*llm.Co
 			if resp.StatusCode == 429 {
 				lastErr = &llm.RateLimitError{Provider: local.Provider(), Message: msg, RetryAfter: retryAfter}
 			} else {
-				lastErr = &llm.ProviderError{Provider: local.Provider(), StatusCode: resp.StatusCode, Message: msg, RetryAfter: retryAfter}
+				lastErr = &llm.ProviderError{Provider: local.Provider(), StatusCode: resp.StatusCode, Message: msg, RetryAfter: retryAfter, Reason: openAIErrorReason(data)}
 			}
 			if local.isRetryableStatus(resp.StatusCode) && attempt < retry.maxRetries-1 {
 				local.sleepBackoff(ctx, attempt, retry.baseDelay, retry.maxDelay, retryAfter)
@@ -342,7 +342,7 @@ func (c *ChatClient) InvokeStream(ctx context.Context, req llm.InvokeRequest) (<
 				if resp.StatusCode == 429 {
 					lastErr = &llm.RateLimitError{Provider: local.Provider(), Message: msg, RetryAfter: retryAfter}
 				} else {
-					lastErr = &llm.ProviderError{Provider: local.Provider(), StatusCode: resp.StatusCode, Message: msg, RetryAfter: retryAfter}
+					lastErr = &llm.ProviderError{Provider: local.Provider(), StatusCode: resp.StatusCode, Message: msg, RetryAfter: retryAfter, Reason: openAIErrorReason(data)}
 				}
 				if local.isRetryableStatus(resp.StatusCode) && attempt < retry.maxRetries-1 {
 					local.sleepBackoff(ctx, attempt, retry.baseDelay, retry.maxDelay, retryAfter)
@@ -1706,4 +1706,25 @@ func intFromAny(v any) int {
 	default:
 		return 0
 	}
+}
+
+// openAIErrorReason maps the documented structured error code of an OpenAI
+// error body to a provider-neutral reason. Message text is never consulted.
+func openAIErrorReason(body []byte) string {
+	var envelope struct {
+		Error struct {
+			Code any `json:"code"`
+		} `json:"error"`
+	}
+	if json.Unmarshal(body, &envelope) != nil {
+		return ""
+	}
+	return openAIErrorCodeReason(envelope.Error.Code)
+}
+
+func openAIErrorCodeReason(code any) string {
+	if value, ok := code.(string); ok && strings.TrimSpace(value) == "context_length_exceeded" {
+		return llm.ProviderErrorReasonContextOverflow
+	}
+	return ""
 }
