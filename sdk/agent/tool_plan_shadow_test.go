@@ -116,8 +116,9 @@ func TestToolPlanShadowObservesResolutionWithoutChangingExecution(t *testing.T) 
 	collectEvents(agent.QueryStream(context.Background(), llm.TextContent("run")))
 
 	wantObservations := []toolPlanningObservation{
-		{ordinal: 0, resolution: toolResolutionExact, args: toolArgsNormalized},
-		{ordinal: 1, resolution: toolResolutionNormalizedAlias, args: toolArgsNormalized},
+		// tools.Func calls prepare final typed arguments at planning time.
+		{ordinal: 0, resolution: toolResolutionExact, args: toolArgsFinalTyped},
+		{ordinal: 1, resolution: toolResolutionNormalizedAlias, args: toolArgsFinalTyped},
 		{ordinal: 2, resolution: toolResolutionExact, args: toolArgsInvalid},
 		{ordinal: 3, resolution: toolResolutionUnknownFallback, args: toolArgsNormalized},
 	}

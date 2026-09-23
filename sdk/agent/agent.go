@@ -1365,6 +1365,8 @@ func (a *Agent) queryStreamWithSteering(ctx context.Context, input llm.Content, 
 					argsState := toolArgsNormalized
 					if norm.Err != nil {
 						argsState = toolArgsInvalid
+					} else if _, final := prepared.FinalArgs(); final {
+						argsState = toolArgsFinalTyped
 					}
 					planningObservation := toolPlanningObservation{ordinal: idx, resolution: resolution, args: argsState}
 					legacyPlan := toolCallPlan{ordinal: idx, class: toolPlanExclusive}
