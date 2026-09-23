@@ -88,9 +88,10 @@ func overflowAgent(t *testing.T, model llm.ChatModel, mutate func(*Config)) *Age
 }
 
 type overflowRun struct {
-	errors, compactions, recoveries, finals int
-	lastError                               ErrorEvent
-	warnFrame, finalFrame                   string
+	errors, compactions, recoveries, finals  int
+	lastError                                ErrorEvent
+	warnFrame, finalFrame                    string
+	finalHistoryRelation, finalHistorySource string
 }
 
 func runOverflowQuery(ag *Agent, steering <-chan SteeringMsg) overflowRun {
@@ -110,6 +111,7 @@ func runOverflowQuery(ag *Agent, steering <-chan SteeringMsg) overflowRun {
 		case FinalResponseEvent:
 			r.finals++
 			r.finalFrame = env.FrameID
+			r.finalHistoryRelation, r.finalHistorySource = env.RequestHistoryRelation, env.RequestHistorySourceFrameID
 		}
 	}
 	return r
@@ -132,6 +134,11 @@ func TestTypedContextOverflowRecoversOnceWithNewFrame(t *testing.T) {
 	}
 	if r.warnFrame == "" || r.finalFrame == "" || r.warnFrame == r.finalFrame {
 		t.Fatalf("recovery reused the rejected Frame: warn=%q final=%q", r.warnFrame, r.finalFrame)
+	}
+	// Lineage: the retried request records the applied compaction and names
+	// the rejected Frame as its source (the producer of the change).
+	if r.finalHistoryRelation != RequestHistoryCompactionApplied || r.finalHistorySource != r.warnFrame {
+		t.Fatalf("retried request lineage=%q source=%q, want compaction from %q", r.finalHistoryRelation, r.finalHistorySource, r.warnFrame)
 	}
 	if !strings.Contains(main[1].Messages[len(main[1].Messages)-1].Content.PlainText(), "current request") {
 		t.Fatal("the user's request was lost by recovery")
