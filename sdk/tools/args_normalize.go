@@ -38,7 +38,14 @@ func DecodeTypedToolArgs[Args any](ctx context.Context, name string, schema map[
 			meta = ensureArgsRaw(meta, original)
 		}
 	}
-	if repaired, repairedMeta, ok := repairToolArgsBySchema(name, schema, raw, meta); ok {
+	repaired, repairedMeta, ok, repairErr := repairToolArgsBySchema(name, schema, raw, meta)
+	if repairErr != nil {
+		// An ambiguous repair is rejected before business execution; it is not
+		// "no repair", so the original decode error is not returned in its place.
+		var zero Args
+		return zero, repairErr
+	}
+	if ok {
 		if repairedArgs, repairedErr := decode(repaired); repairedErr == nil {
 			UpsertToolResultMetadata(ctx, repairedMeta)
 			return repairedArgs, nil
@@ -556,14 +563,17 @@ func ensureArgsRaw(meta map[string]any, raw string) map[string]any {
 	return meta
 }
 
-func repairToolArgsBySchema(toolName string, schema map[string]any, raw json.RawMessage, meta map[string]any) (json.RawMessage, map[string]any, bool) {
-	repaired, ok := repairJSONKeysBySchemaWithOptions(schema, raw, schemaRepairOptions{StripUnknown: true, ToolName: toolName})
+func repairToolArgsBySchema(toolName string, schema map[string]any, raw json.RawMessage, meta map[string]any) (json.RawMessage, map[string]any, bool, error) {
+	repaired, ok, err := repairJSONKeysBySchemaWithOptions(schema, raw, schemaRepairOptions{StripUnknown: true, ToolName: toolName})
+	if err != nil {
+		return nil, meta, false, err
+	}
 	if !ok {
-		return nil, meta, false
+		return nil, meta, false, nil
 	}
 	meta = appendArgsRepairKind(meta, "schema_key")
 	meta = ensureArgsRaw(meta, string(raw))
-	return repaired, meta, true
+	return repaired, meta, true, nil
 }
 
 func argsRepaired(meta map[string]any) bool {
