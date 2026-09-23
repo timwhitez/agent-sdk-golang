@@ -647,6 +647,7 @@ func (a *Agent) queryStreamWithSteering(ctx context.Context, input llm.Content, 
 		repeatGuard := newRepeatedToolSignatureGuard(a.repeatSigThreshold, a.repeatSigWindow)
 		progressLedger := newEvidenceProgressLedger(a.deps, a.compactionGeneration.Load())
 		loopGuardStrikes := 0
+		evidenceSuppressions := 0
 		hasDoneTool := a.hasToolNamed("done")
 		out.setDropBaseline(a.eventDropCount.Load(), a.criticalEventDropCount.Load())
 		droppedThisTurn := func() uint64 {
@@ -1253,10 +1254,13 @@ func (a *Agent) queryStreamWithSteering(ctx context.Context, input llm.Content, 
 					// not permitted), not a fatal abort: accept the model's latest
 					// post-tool text and complete the turn.
 					if requireDoneReminders > defaultRequireDoneMaxReminders {
+						// Applied: the fallback final below is emitted after the
+						// reminders it counts were appended to history.
+						fallback := correlation.withInterventionKind(InterventionRequireDone, InterventionResultSafetyFallback, requireDoneReminders-1)
 						a.emitEvent(out, WarnEvent{
 							Message: "require-done: model kept answering with text after tool usage and could not be pushed to the done tool (e.g. forced tool choice is unavailable under extended thinking); accepting its latest response and completing the turn",
 							Kind:    "require_done_safety",
-						})
+						}, fallback)
 						if a.hasCompactor {
 							_ = a.checkAndCompact(ctx, frame.id, comp, out)
 						}
@@ -1271,7 +1275,7 @@ func (a *Agent) queryStreamWithSteering(ctx context.Context, input llm.Content, 
 						clearPendingTextContinuation()
 						requireDoneRecoveryDisableThinkingActive = false
 						requireDoneControlSource = ""
-						emitPartialFinal(finalContent, finalResponseID, "require_done_safety", correlation)
+						emitPartialFinal(finalContent, finalResponseID, "require_done_safety", fallback)
 						return
 					}
 					forceRequireDoneToolChoice = true
@@ -1509,10 +1513,11 @@ func (a *Agent) queryStreamWithSteering(ctx context.Context, input llm.Content, 
 							postPublish = func() {
 								if decision.recovery {
 									reminder := evidenceRecoveryMessage(evidenceReq)
+									queued := eventCorrelation{}.withInterventionKind(InterventionEvidenceProgress, InterventionResultReminderQueued, evidenceSuppressions)
 									// Deferred until the tool-call block is closed; see
 									// the loop-guard reminder above.
 									pendingBlockMessages = append(pendingBlockMessages, messageorigin.NewInternalUserMessage(messageorigin.KindEvidenceRecovery, reminder))
-									a.emitEvent(out, HiddenUserMessageEvent{Content: reminder})
+									a.emitEvent(out, HiddenUserMessageEvent{Content: reminder}, queued)
 									a.emitEvent(out, WarnEvent{
 										Kind:     "no_progress_recovery",
 										Metadata: decision.metadata,
@@ -1523,7 +1528,7 @@ func (a *Agent) queryStreamWithSteering(ctx context.Context, input llm.Content, 
 											evidenceReq.target,
 											evidenceReq.fingerprint,
 										),
-									})
+									}, queued)
 								}
 							}
 							terminal := blockTerminal(suppressedResult, "evidence_suppressed")
@@ -1606,6 +1611,11 @@ func (a *Agent) queryStreamWithSteering(ctx context.Context, input llm.Content, 
 					resultCorrelation := toolCorrelation
 					if t.Reason == "loop_guard" && appliedInterventionStrike > 0 {
 						resultCorrelation = toolCorrelation.withIntervention(InterventionResultToolSuppressed, appliedInterventionStrike)
+					}
+					if t.Reason == "evidence_suppressed" {
+						// Published after the suppressed result was committed.
+						evidenceSuppressions++
+						resultCorrelation = toolCorrelation.withInterventionKind(InterventionEvidenceProgress, InterventionResultToolSuppressed, evidenceSuppressions)
 					}
 					a.emitToolResultWithAccounting(out, t.projection(), duration, resultCorrelation)
 					status := "completed"

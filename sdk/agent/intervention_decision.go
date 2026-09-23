@@ -42,10 +42,19 @@ func decideRepeatedSignatureIntervention(observation repeatedSignatureObservatio
 // happened produces no intervention fields.
 const (
 	InterventionRepeatedToolSignature = "repeated_tool_signature"
+	// InterventionRequireDone is the RequireDone reminder guard; it is
+	// reported when its bounded safety fallback accepted a partial answer.
+	InterventionRequireDone = "require_done_reminder"
+	// InterventionEvidenceProgress suppresses a repeated evidence read that
+	// adds no new coverage.
+	InterventionEvidenceProgress      = "evidence_progress"
 	InterventionStageApplied          = "applied"
 	InterventionResultToolSuppressed  = "tool_suppressed"
 	InterventionResultReminderQueued  = "reminder_queued"
 	InterventionResultGuardDowngraded = "guard_downgraded"
+	// InterventionResultSafetyFallback: the reminder budget was spent and the
+	// latest answer was accepted as a partial final response.
+	InterventionResultSafetyFallback = "safety_fallback_accepted"
 )
 
 type interventionStage uint8
@@ -69,7 +78,13 @@ type interventionRecord struct {
 
 // withIntervention returns c with the applied intervention labels.
 func (c eventCorrelation) withIntervention(result string, strike int) eventCorrelation {
-	c.intervention = InterventionRepeatedToolSignature
+	return c.withInterventionKind(InterventionRepeatedToolSignature, result, strike)
+}
+
+// withInterventionKind marks an event produced by an applied intervention of
+// kind; strike is its one-based applied count in this Query (0 omits it).
+func (c eventCorrelation) withInterventionKind(kind, result string, strike int) eventCorrelation {
+	c.intervention = kind
 	c.interventionResult = result
 	if strike > 0 {
 		c.interventionStrike = uint64(strike)
