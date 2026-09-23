@@ -13,6 +13,23 @@ type ProviderError struct {
 	StatusCode int
 	Message    string
 	RetryAfter time.Duration
+	// Reason is a provider-neutral classification a provider adapter sets
+	// only from a documented structured error field, never from status codes
+	// or message text alone. Empty means unclassified.
+	Reason string
+}
+
+// ProviderErrorReasonContextOverflow marks a request the provider rejected
+// because its input exceeded the model's context window.
+const ProviderErrorReasonContextOverflow = "context_overflow"
+
+// IsContextOverflow reports whether err carries typed provider evidence that
+// the request's input exceeded the model's context window. A 400/413/422
+// status or context-related message text without that evidence is not an
+// overflow.
+func IsContextOverflow(err error) bool {
+	var pe *ProviderError
+	return errors.As(err, &pe) && pe != nil && pe.Reason == ProviderErrorReasonContextOverflow
 }
 
 func (e *ProviderError) Error() string {

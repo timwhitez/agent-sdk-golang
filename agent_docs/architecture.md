@@ -98,6 +98,18 @@ public manual/preflight entry points. Runtime-use barriers keep configuration
 replacement from changing an operation's service underneath it; that barrier
 is not a numeric Session/runtime revision.
 
+A provider rejection with typed context-overflow evidence
+(`llm.IsContextOverflow`: `ProviderError.Reason` set by an adapter from a
+documented structured field, never from status or message text) is recovered
+at most once per real user input — the Query, then each accepted steering
+message; internal reminders and continuations never refresh it. Recovery runs
+only when the rejected request produced no output and no continuation is
+pending: the overflow compaction path runs, and only if history actually
+changed does the driver send a new logical request under a new Frame.
+Otherwise, and on a second overflow, the provider error ends the turn as
+before. `Config.DisableContextOverflowRecovery` turns it off. Adapters without
+a documented structured code (Anthropic today) never type an overflow.
+
 [CommitCompactionHistory](../sdk/agent/compaction_publication.go) accepts the exact
 source snapshot used to compute a candidate. It rejects admission, pending work
 or stale content before persistence, owns candidate data across callbacks, and
