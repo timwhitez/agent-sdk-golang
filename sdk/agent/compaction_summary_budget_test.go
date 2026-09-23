@@ -47,7 +47,7 @@ func TestOverflowSummaryAttemptBudget(t *testing.T) {
 				cancel()
 			}
 			usage := llm.WithPromptEstimate(nil, 4000)
-			err = ag.checkAndCompactWithGrowth(ctx, &llm.Completion{Usage: usage}, nil, 0, 0)
+			err = ag.checkAndCompactWithGrowth(ctx, "", &llm.Completion{Usage: usage}, nil, 0, 0)
 			if err == nil {
 				t.Error("irreducible overflow must remain an error")
 			}

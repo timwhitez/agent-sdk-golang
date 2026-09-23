@@ -21,6 +21,17 @@ type originalToolArgsKey struct{}
 // never decoded twice: their accepted keys and effects cannot be inferred from
 // the schema. This helper never invokes a business handler.
 func DecodeTypedToolArgs[Args any](ctx context.Context, name string, schema map[string]any, raw json.RawMessage) (Args, error) {
+	args, repaired, err := decodeTypedArgs[Args](name, schema, raw)
+	if err == nil && repaired {
+		publishSchemaKeyRepair(ctx, raw)
+	}
+	return args, err
+}
+
+// decodeTypedArgs is the pure part of DecodeTypedToolArgs: it decodes plain
+// argument types, runs no user code for them and publishes nothing. repaired
+// reports that the returned Args came from the schema-key repair.
+func decodeTypedArgs[Args any](name string, schema map[string]any, raw json.RawMessage) (Args, bool, error) {
 	decode := func(raw json.RawMessage) (Args, error) {
 		var args Args
 		dec := json.NewDecoder(bytes.NewReader(raw))
@@ -30,52 +41,76 @@ func DecodeTypedToolArgs[Args any](ctx context.Context, name string, schema map[
 	}
 	args, err := decode(raw)
 	if err == nil || !strings.Contains(err.Error(), "unknown field") || hasCustomArgumentDecoder(reflect.TypeOf((*Args)(nil)).Elem(), make(map[reflect.Type]bool)) {
-		return args, err
+		return args, false, err
 	}
+	repaired, ok, repairErr := repairJSONKeysBySchemaWithOptions(schema, raw, schemaRepairOptions{StripUnknown: true, ToolName: name})
+	if repairErr != nil {
+		// An ambiguous repair is rejected before business execution; it is not
+		// "no repair", so the original decode error is not returned in its place.
+		var zero Args
+		return zero, false, repairErr
+	}
+	if ok {
+		if repairedArgs, repairedErr := decode(repaired); repairedErr == nil {
+			return repairedArgs, true, nil
+		}
+	}
+	return args, false, err
+}
+
+// publishSchemaKeyRepair records a successful schema-key repair on the call's
+// result metadata, keeping the caller's original spelling.
+func publishSchemaKeyRepair(ctx context.Context, raw json.RawMessage) {
 	meta := ToolResultMetadataSnapshot(ctx)
 	if ctx != nil {
 		if original, ok := ctx.Value(originalToolArgsKey{}).(string); ok {
 			meta = ensureArgsRaw(meta, original)
 		}
 	}
-	repaired, repairedMeta, ok, repairErr := repairToolArgsBySchema(name, schema, raw, meta)
-	if repairErr != nil {
-		// An ambiguous repair is rejected before business execution; it is not
-		// "no repair", so the original decode error is not returned in its place.
-		var zero Args
-		return zero, repairErr
-	}
-	if ok {
-		if repairedArgs, repairedErr := decode(repaired); repairedErr == nil {
-			UpsertToolResultMetadata(ctx, repairedMeta)
-			return repairedArgs, nil
-		}
-	}
-	return args, err
+	meta = appendArgsRepairKind(meta, "schema_key")
+	meta = ensureArgsRaw(meta, string(raw))
+	UpsertToolResultMetadata(ctx, meta)
 }
 
 func hasCustomArgumentDecoder(typ reflect.Type, seen map[reflect.Type]bool) bool {
+	return hasCustomArgumentCodec(typ, seen, false)
+}
+
+// hasCustomArgumentCodec reports whether decoding (and, with encoders, also
+// encoding) typ could run user code: a JSON or Text (un)marshaler on the type,
+// a field, a container element or a map key.
+func hasCustomArgumentCodec(typ reflect.Type, seen map[reflect.Type]bool, encoders bool) bool {
 	if seen[typ] {
 		return false
 	}
 	seen[typ] = true
-	decoder := reflect.TypeOf((*json.Unmarshaler)(nil)).Elem()
-	textDecoder := reflect.TypeOf((*encoding.TextUnmarshaler)(nil)).Elem()
-	if typ.Implements(decoder) || reflect.PointerTo(typ).Implements(decoder) || typ.Implements(textDecoder) || reflect.PointerTo(typ).Implements(textDecoder) {
-		return true
+	hooks := []reflect.Type{
+		reflect.TypeOf((*json.Unmarshaler)(nil)).Elem(),
+		reflect.TypeOf((*encoding.TextUnmarshaler)(nil)).Elem(),
+	}
+	if encoders {
+		hooks = append(hooks,
+			reflect.TypeOf((*json.Marshaler)(nil)).Elem(),
+			reflect.TypeOf((*encoding.TextMarshaler)(nil)).Elem(),
+		)
+	}
+	for _, hook := range hooks {
+		if typ.Implements(hook) || reflect.PointerTo(typ).Implements(hook) {
+			return true
+		}
 	}
 	switch typ.Kind() {
 	case reflect.Pointer, reflect.Slice, reflect.Array:
-		return hasCustomArgumentDecoder(typ.Elem(), seen)
+		return hasCustomArgumentCodec(typ.Elem(), seen, encoders)
 	case reflect.Map:
-		return hasCustomArgumentDecoder(typ.Key(), seen) || hasCustomArgumentDecoder(typ.Elem(), seen)
+		return hasCustomArgumentCodec(typ.Key(), seen, encoders) || hasCustomArgumentCodec(typ.Elem(), seen, encoders)
 	case reflect.Struct:
 		for i := 0; i < typ.NumField(); i++ {
 			field := typ.Field(i)
 			if (field.PkgPath != "" && !field.Anonymous) || strings.Split(field.Tag.Get("json"), ",")[0] == "-" {
 				continue
 			}
-			if hasCustomArgumentDecoder(field.Type, seen) {
+			if hasCustomArgumentCodec(field.Type, seen, encoders) {
 				return true
 			}
 		}
@@ -561,19 +596,6 @@ func ensureArgsRaw(meta map[string]any, raw string) map[string]any {
 		meta["args_raw"] = raw
 	}
 	return meta
-}
-
-func repairToolArgsBySchema(toolName string, schema map[string]any, raw json.RawMessage, meta map[string]any) (json.RawMessage, map[string]any, bool, error) {
-	repaired, ok, err := repairJSONKeysBySchemaWithOptions(schema, raw, schemaRepairOptions{StripUnknown: true, ToolName: toolName})
-	if err != nil {
-		return nil, meta, false, err
-	}
-	if !ok {
-		return nil, meta, false, nil
-	}
-	meta = appendArgsRepairKind(meta, "schema_key")
-	meta = ensureArgsRaw(meta, string(raw))
-	return repaired, meta, true, nil
 }
 
 func argsRepaired(meta map[string]any) bool {

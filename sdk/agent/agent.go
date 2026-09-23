@@ -195,7 +195,11 @@ type Agent struct {
 	compactionRetryPending atomic.Bool
 	compactionInFlight     atomic.Bool
 	compactionGeneration   atomic.Uint64
-	accountingSequence     atomic.Uint64
+	// appliedCompactionSource is the triggering Frame of the automatic
+	// compaction most recently published into history, consumed once by the
+	// next Frame. Guarded by mu; empty is unknown.
+	appliedCompactionSource string
+	accountingSequence      atomic.Uint64
 
 	// compactionFailureStreak counts consecutive compaction failures so the
 	// loop can back off instead of re-running an expensive summary every turn.
@@ -280,6 +284,8 @@ type pendingCompaction struct {
 	snapshotLen  int
 	result       compaction.Result
 	triggerUsage *llm.Usage
+	// sourceFrameID is the Frame whose usage triggered this compaction.
+	sourceFrameID string
 }
 
 // SteeringMsg represents a user message injected mid-turn for real-time steering.
@@ -636,6 +642,8 @@ func (a *Agent) queryStreamWithSteering(ctx context.Context, input llm.Content, 
 		streamIdleRecoveryTotal := 0
 		usageFallbackWarned := false
 		cont := newToolCallContinuation(defaultMaxContinuationTurns)
+		// A new Query never inherits a previous Query's compaction relation.
+		_ = a.takeAppliedCompactionSource(out.queryID)
 		repeatGuard := newRepeatedToolSignatureGuard(a.repeatSigThreshold, a.repeatSigWindow)
 		progressLedger := newEvidenceProgressLedger(a.deps, a.compactionGeneration.Load())
 		loopGuardStrikes := 0
@@ -783,6 +791,11 @@ func (a *Agent) queryStreamWithSteering(ctx context.Context, input llm.Content, 
 			if frameErr == nil && frame.request.DisableThinking {
 				frame.controlSource = requireDoneControlSource
 			}
+			// An automatic compaction published since the previous Frame
+			// rewrote this request's history; record its triggering Frame once.
+			if historySource := a.takeAppliedCompactionSource(out.queryID); frameErr == nil {
+				frame.historySource = historySource
+			}
 			frameFailure := ""
 			frameFailureHint := "rebuild the Agent with consistent, cloneable tool definitions"
 			if frameErr != nil {
@@ -817,7 +830,7 @@ func (a *Agent) queryStreamWithSteering(ctx context.Context, input llm.Content, 
 				emitSDKErr(ErrorEvent{Kind: "invalid_request", Message: frameFailure + "; " + frameFailureHint})
 				return
 			}
-			invocation := &frameInvocation{frameID: frame.id, controlSource: frame.controlSource}
+			invocation := &frameInvocation{frameID: frame.id, controlSource: frame.controlSource, historySource: frame.historySource}
 			comp, streamedText, err := a.invokeModelCompletionWithRetryAndSteering(ctx, frame.model, frame.request, out, steeringCh, invocation)
 			correlation := invocation.correlation()
 			if err != nil {
@@ -1038,7 +1051,7 @@ func (a *Agent) queryStreamWithSteering(ctx context.Context, input llm.Content, 
 					}
 					reminder := messageorigin.NewInternalUserMessage(messageorigin.KindToolCallContinuation, messageorigin.ToolCallContinuationLimitText)
 					if a.hasCompactor {
-						if err := a.checkAndCompactWithGrowth(ctx, comp, out, additionalSinceCompletion(), pendingMessageTokens(reminder)); err != nil {
+						if err := a.checkAndCompactWithGrowth(ctx, frame.id, comp, out, additionalSinceCompletion(), pendingMessageTokens(reminder)); err != nil {
 							emitCompactionErr(a.errEvent(err))
 							return
 						}
@@ -1055,7 +1068,7 @@ func (a *Agent) queryStreamWithSteering(ctx context.Context, input llm.Content, 
 				}, correlation)
 				reminder := messageorigin.NewInternalUserMessage(messageorigin.KindToolCallContinuation, messageorigin.ResponseTruncatedContinuationText)
 				if a.hasCompactor {
-					if err := a.checkAndCompactWithGrowth(ctx, comp, out, additionalSinceCompletion(), pendingMessageTokens(reminder)); err != nil {
+					if err := a.checkAndCompactWithGrowth(ctx, frame.id, comp, out, additionalSinceCompletion(), pendingMessageTokens(reminder)); err != nil {
 						emitCompactionErr(a.errEvent(err))
 						return
 					}
@@ -1090,7 +1103,7 @@ func (a *Agent) queryStreamWithSteering(ctx context.Context, input llm.Content, 
 						}
 						reminder := messageorigin.NewInternalUserMessage(messageorigin.KindToolCallContinuation, messageorigin.InvalidToolCallContinuationText)
 						if a.hasCompactor {
-							if err := a.checkAndCompactWithGrowth(ctx, comp, out, additionalSinceCompletion(), pendingMessageTokens(reminder)); err != nil {
+							if err := a.checkAndCompactWithGrowth(ctx, frame.id, comp, out, additionalSinceCompletion(), pendingMessageTokens(reminder)); err != nil {
 								emitCompactionErr(a.errEvent(err))
 								return
 							}
@@ -1108,7 +1121,7 @@ func (a *Agent) queryStreamWithSteering(ctx context.Context, input llm.Content, 
 					}, correlation)
 					reminder := messageorigin.NewInternalUserMessage(messageorigin.KindToolCallContinuation, messageorigin.ResponseTruncatedContinuationText)
 					if a.hasCompactor {
-						if err := a.checkAndCompactWithGrowth(ctx, comp, out, additionalSinceCompletion(), pendingMessageTokens(reminder)); err != nil {
+						if err := a.checkAndCompactWithGrowth(ctx, frame.id, comp, out, additionalSinceCompletion(), pendingMessageTokens(reminder)); err != nil {
 							emitCompactionErr(a.errEvent(err))
 							return
 						}
@@ -1168,7 +1181,7 @@ func (a *Agent) queryStreamWithSteering(ctx context.Context, input llm.Content, 
 					pendingTextContinuation = combinedText
 					reminder := messageorigin.NewInternalUserMessage(messageorigin.KindMaxTokensContinuation, messageorigin.ResponseTruncatedContinuationText)
 					if a.hasCompactor {
-						if err := a.checkAndCompactWithGrowth(ctx, comp, out, additionalSinceCompletion(), pendingMessageTokens(reminder)); err != nil {
+						if err := a.checkAndCompactWithGrowth(ctx, frame.id, comp, out, additionalSinceCompletion(), pendingMessageTokens(reminder)); err != nil {
 							emitCompactionErr(a.errEvent(err))
 							return
 						}
@@ -1190,7 +1203,7 @@ func (a *Agent) queryStreamWithSteering(ctx context.Context, input llm.Content, 
 						})
 						reminder := messageorigin.NewInternalUserMessage(messageorigin.KindEarlyStop, earlyStopReminderText)
 						if a.hasCompactor {
-							if err := a.checkAndCompactWithGrowth(ctx, comp, out, additionalSinceCompletion(), pendingMessageTokens(reminder)); err != nil {
+							if err := a.checkAndCompactWithGrowth(ctx, frame.id, comp, out, additionalSinceCompletion(), pendingMessageTokens(reminder)); err != nil {
 								emitCompactionErr(a.errEvent(err))
 								return
 							}
@@ -1202,7 +1215,7 @@ func (a *Agent) queryStreamWithSteering(ctx context.Context, input llm.Content, 
 					}
 					// compaction check
 					if a.hasCompactor {
-						_ = a.checkAndCompact(ctx, comp, out)
+						_ = a.checkAndCompact(ctx, frame.id, comp, out)
 					}
 					clearPendingTextContinuation()
 					emitFinal(combinedText, responseID, correlation)
@@ -1215,7 +1228,7 @@ func (a *Agent) queryStreamWithSteering(ctx context.Context, input llm.Content, 
 					if !seenToolCallHistory {
 						// No tools were ever called — accept text-only as terminal.
 						if a.hasCompactor {
-							_ = a.checkAndCompact(ctx, comp, out)
+							_ = a.checkAndCompact(ctx, frame.id, comp, out)
 						}
 						clearPendingTextContinuation()
 						emitFinal(combinedText, responseID, correlation)
@@ -1245,7 +1258,7 @@ func (a *Agent) queryStreamWithSteering(ctx context.Context, input llm.Content, 
 							Kind:    "require_done_safety",
 						})
 						if a.hasCompactor {
-							_ = a.checkAndCompact(ctx, comp, out)
+							_ = a.checkAndCompact(ctx, frame.id, comp, out)
 						}
 						finalContent := combinedText
 						finalResponseID := responseID
@@ -1265,7 +1278,7 @@ func (a *Agent) queryStreamWithSteering(ctx context.Context, input llm.Content, 
 					requireDoneRecoveryDisableThinkingActive = true
 					reminder := messageorigin.NewInternalUserMessage(messageorigin.KindRequireDone, requireDoneReminderText)
 					if a.hasCompactor {
-						if err := a.checkAndCompactWithGrowth(ctx, comp, out, additionalSinceCompletion(), pendingMessageTokens(reminder)); err != nil {
+						if err := a.checkAndCompactWithGrowth(ctx, frame.id, comp, out, additionalSinceCompletion(), pendingMessageTokens(reminder)); err != nil {
 							emitCompactionErr(a.errEvent(err))
 							return
 						}
@@ -1352,6 +1365,8 @@ func (a *Agent) queryStreamWithSteering(ctx context.Context, input llm.Content, 
 					argsState := toolArgsNormalized
 					if norm.Err != nil {
 						argsState = toolArgsInvalid
+					} else if _, final := prepared.FinalArgs(); final {
+						argsState = toolArgsFinalTyped
 					}
 					planningObservation := toolPlanningObservation{ordinal: idx, resolution: resolution, args: argsState}
 					legacyPlan := toolCallPlan{ordinal: idx, class: toolPlanExclusive}
@@ -1642,7 +1657,7 @@ func (a *Agent) queryStreamWithSteering(ctx context.Context, input llm.Content, 
 				a.appendMessages(pendingBlockMessages)
 				pendingBlockMessages = nil
 				if a.hasCompactor {
-					_ = a.checkAndCompact(ctx, comp, out, additionalSinceCompletion())
+					_ = a.checkAndCompact(ctx, frame.id, comp, out, additionalSinceCompletion())
 				}
 				finalContent := strings.TrimSpace(completedMessage)
 				finalResponseID := responseID
@@ -1669,7 +1684,7 @@ func (a *Agent) queryStreamWithSteering(ctx context.Context, input llm.Content, 
 			a.appendMessages(pendingBlockMessages)
 			pendingBlockMessages = nil
 			if a.hasCompactor {
-				if err := a.checkAndCompact(ctx, comp, out, additionalSinceCompletion()); err != nil {
+				if err := a.checkAndCompact(ctx, frame.id, comp, out, additionalSinceCompletion()); err != nil {
 					emitCompactionErr(a.errEvent(err))
 					return
 				}
@@ -2861,6 +2876,10 @@ func applyEventCorrelation(envelope *EventEnvelope, correlations []eventCorrelat
 			envelope.RequestControlRelation = RequestControlRequireDoneDisableThinking
 			envelope.RequestControlSourceFrameID = correlation.controlSource
 		}
+		if correlation.historySource != "" {
+			envelope.RequestHistoryRelation = RequestHistoryCompactionApplied
+			envelope.RequestHistorySourceFrameID = correlation.historySource
+		}
 		envelope.ToolBlockID, envelope.ToolCallOrdinal, envelope.ToolBlockCallCount = correlation.toolBlockID, correlation.toolCallOrdinal, correlation.blockCallCount
 	}
 	if correlation.intervention != "" {
@@ -3380,17 +3399,19 @@ func (a *Agent) NotifyTodoCompletion() {
 	a.todoCompactionPending.Store(true)
 }
 
-func (a *Agent) checkAndCompact(ctx context.Context, last *llm.Completion, out *eventOutput, additionalTokens ...int) error {
+func (a *Agent) checkAndCompact(ctx context.Context, sourceFrameID string, last *llm.Completion, out *eventOutput, additionalTokens ...int) error {
 	currentHistoryGrowth := 0
 	for _, value := range additionalTokens {
 		if value > 0 {
 			currentHistoryGrowth += value
 		}
 	}
-	return a.checkAndCompactWithGrowth(ctx, last, out, currentHistoryGrowth, 0)
+	return a.checkAndCompactWithGrowth(ctx, sourceFrameID, last, out, currentHistoryGrowth, 0)
 }
 
-func (a *Agent) checkAndCompactWithGrowth(ctx context.Context, last *llm.Completion, out *eventOutput, currentHistoryGrowth, pendingHistoryGrowth int) error {
+// sourceFrameID names the Frame whose completion usage drives this decision;
+// empty means unknown. It is recorded only on a compaction that is published.
+func (a *Agent) checkAndCompactWithGrowth(ctx context.Context, sourceFrameID string, last *llm.Completion, out *eventOutput, currentHistoryGrowth, pendingHistoryGrowth int) error {
 	if !a.hasCompactor || a.compactor == nil || last == nil {
 		return nil
 	}
@@ -3401,7 +3422,7 @@ func (a *Agent) checkAndCompactWithGrowth(ctx context.Context, last *llm.Complet
 	decisionUsage := a.effectiveCompactionUsageWithGrowth(last.Usage, currentHistoryGrowth, pendingHistoryGrowth)
 	decision := a.automaticCompactionDecision(ctx, decisionUsage)
 	if decision.targetWatermark == "overflow" {
-		return a.compactSyncOverflow(ctx, last, decisionUsage, out)
+		return a.compactSyncOverflow(ctx, sourceFrameID, last, decisionUsage, out)
 	}
 	if !decision.run {
 		return nil
@@ -3421,7 +3442,7 @@ func (a *Agent) checkAndCompactWithGrowth(ctx context.Context, last *llm.Complet
 	releaseCompactionRuntime := a.retainCompactionRuntimeUse()
 	go func() {
 		defer releaseCompactionRuntime()
-		a.runCompactionAsync(ctx, messages, snapshotLen, decisionUsage, triggerUsage, decision)
+		a.runCompactionAsync(ctx, sourceFrameID, messages, snapshotLen, decisionUsage, triggerUsage, decision)
 	}()
 	return nil
 }
@@ -3458,7 +3479,7 @@ func (a *Agent) emitCompactionDecisionProvenance(out *eventOutput, decisionUsage
 	})
 }
 
-func (a *Agent) runCompactionAsync(ctx context.Context, snapshot []llm.Message, snapshotLen int, decisionUsage *llm.Usage, triggerUsage *llm.Usage, decision compactionDecision) {
+func (a *Agent) runCompactionAsync(ctx context.Context, sourceFrameID string, snapshot []llm.Message, snapshotLen int, decisionUsage *llm.Usage, triggerUsage *llm.Usage, decision compactionDecision) {
 	defer a.releaseCompactionInFlight()
 
 	compactCtx, cancelCompact := asyncCompactionContext(ctx)
@@ -3489,10 +3510,11 @@ func (a *Agent) runCompactionAsync(ctx context.Context, snapshot []llm.Message, 
 
 	a.pendingCompactionMu.Lock()
 	a.pendingCompaction = &pendingCompaction{
-		messages:     newMsgs,
-		snapshotLen:  snapshotLen,
-		result:       a.withCompactionTelemetry(res, decision.trigger, decision.targetWatermark, triggerUsage),
-		triggerUsage: triggerUsage,
+		messages:      newMsgs,
+		snapshotLen:   snapshotLen,
+		result:        a.withCompactionTelemetry(res, decision.trigger, decision.targetWatermark, triggerUsage),
+		triggerUsage:  triggerUsage,
+		sourceFrameID: sourceFrameID,
 	}
 	a.pendingCompactionMu.Unlock()
 }
@@ -3533,7 +3555,7 @@ func asyncCompactionContext(parent context.Context) (context.Context, context.Ca
 	return ctx, cancel
 }
 
-func (a *Agent) compactSyncOverflow(ctx context.Context, last *llm.Completion, decisionUsage *llm.Usage, out *eventOutput) error {
+func (a *Agent) compactSyncOverflow(ctx context.Context, sourceFrameID string, last *llm.Completion, decisionUsage *llm.Usage, out *eventOutput) error {
 	if !a.hasCompactor || a.compactor == nil || last == nil {
 		return nil
 	}
@@ -3603,10 +3625,11 @@ func (a *Agent) compactSyncOverflow(ctx context.Context, last *llm.Completion, d
 
 	a.pendingCompactionMu.Lock()
 	a.pendingCompaction = &pendingCompaction{
-		messages:     newMsgs,
-		snapshotLen:  snapshotLen,
-		result:       a.withCompactionTelemetry(res, trigger, watermark, triggerUsage),
-		triggerUsage: triggerUsage,
+		messages:      newMsgs,
+		snapshotLen:   snapshotLen,
+		result:        a.withCompactionTelemetry(res, trigger, watermark, triggerUsage),
+		triggerUsage:  triggerUsage,
+		sourceFrameID: sourceFrameID,
 	}
 	a.pendingCompactionMu.Unlock()
 	a.applyPendingCompaction(out)
@@ -4221,6 +4244,19 @@ func (a *Agent) hasPendingCompaction() bool {
 	return a.pendingCompaction != nil
 }
 
+// takeAppliedCompactionSource consumes the recorded compaction source. A
+// source from another Query is discarded rather than attributed.
+func (a *Agent) takeAppliedCompactionSource(queryID string) string {
+	a.mu.Lock()
+	source := a.appliedCompactionSource
+	a.appliedCompactionSource = ""
+	a.mu.Unlock()
+	if source == "" || queryID == "" || !strings.HasPrefix(source, queryID+"/frame/") {
+		return ""
+	}
+	return source
+}
+
 func (a *Agent) applyPendingCompaction(out *eventOutput) {
 	if !a.hasCompactor {
 		return
@@ -4305,6 +4341,9 @@ func (a *Agent) applyPendingCompaction(out *eventOutput) {
 	a.messages = merged
 	a.resetEphemeralTrackingLocked()
 	a.compactionGeneration.Add(1)
+	// Recorded only now that the compacted history is published; the next
+	// Frame built by the driver consumes it once.
+	a.appliedCompactionSource = pending.sourceFrameID
 	a.mu.Unlock()
 
 	a.emitCompactionWithAccounting(out, CompactionEvent{Result: commit.result, TriggerUsage: pending.triggerUsage})
@@ -4382,6 +4421,9 @@ func (a *Agent) CompactPipelineNow(ctx context.Context, req compaction.PipelineR
 		a.messages = newMsgs
 		a.resetEphemeralTrackingLocked()
 		a.compactionGeneration.Add(1)
+		// A manual/preflight rewrite has no Frame source; do not let an older
+		// automatic source describe the next request.
+		a.appliedCompactionSource = ""
 		a.mu.Unlock()
 	}
 	return res, nil
