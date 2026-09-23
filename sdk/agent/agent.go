@@ -169,7 +169,8 @@ type Agent struct {
 
 	compactionAdmissionObserved func()
 	toolBlockStateObserved      func(*toolBlockState)
-	toolBlockTestHook           func(*toolBlockState) // private failure-injection hook
+	interventionObserved        func(interventionRecord) // test-only lifecycle observer
+	toolBlockTestHook           func(*toolBlockState)    // private failure-injection hook
 
 	repeatResultRecycled    func(string) bool
 	toolPlanShadowEvaluator func(toolPlanningObservation) toolCallPlan
@@ -1311,11 +1312,13 @@ func (a *Agent) queryStreamWithSteering(ctx context.Context, input llm.Content, 
 			var evidenceReq evidenceRequest
 			var completedMessage string
 			var postCommit, postPublish func()
+			var appliedInterventionStrike int
 			var callStarted time.Time
 			adapter := SequentialBlockAdapter{
 				Admit: func(root context.Context, idx int) (BlockAdmission, error) {
 					tc := comp.ToolCalls[idx]
 					postCommit, postPublish, taskComplete = nil, nil, false
+					appliedInterventionStrike = 0
 					callStarted = time.Time{}
 
 					toolCorrelation := activeToolBlock.eventCorrelation(correlation, idx)
@@ -1390,13 +1393,24 @@ func (a *Agent) queryStreamWithSteering(ctx context.Context, input llm.Content, 
 						}
 						decision := decideRepeatedSignatureIntervention(observation)
 						if decision.action == interventionActionSuppressTool {
-							loopGuardStrikes++
+							// The decision is only proposed here. Its strike is consumed
+							// and its application reported once the suppressed result
+							// has been committed to history (postCommit).
+							record := interventionRecord{kind: InterventionRepeatedToolSignature, stage: interventionProposed, strikeLimit: a.loopGuardStrikeMax}
+							a.observeIntervention(record)
 							// Accepted blocks have non-empty IDs, so this helper returns
 							// one history result. Keep its richer history-only suffix.
 							guardHistory := loopGuardSkippedToolResults(tc, resolvedName)
 							guardResult := projectToolResult(guardHistory[0], map[string]any{"loop_guard_suppressed": true}, "[ERROR] Tool call skipped by loop guard - Repeated identical tool call blocked before execution.")
 							guardResult.visible = guardResult.original
 							postCommit = func() {
+								loopGuardStrikes++
+								appliedInterventionStrike = loopGuardStrikes
+								record.stage, record.strike = interventionApplied, loopGuardStrikes
+								record.reminderQueued, record.guardDowngraded = decision.queueReminder, decision.downgradeGuard
+								// Warnings and reminders carry only the intervention labels;
+								// tool identity stays on tool events.
+								applied := eventCorrelation{}.withIntervention(InterventionResultToolSuppressed, loopGuardStrikes)
 								reminder := strings.TrimSpace(a.loopGuardUserMsg)
 								if repeatGuard.exhausted {
 									// The default reminder can mislead here ("reuse prior
@@ -1412,7 +1426,7 @@ func (a *Agent) queryStreamWithSteering(ctx context.Context, input llm.Content, 
 									// text between two tool results of the same block
 									// and permanently invalidate the history.
 									pendingBlockMessages = append(pendingBlockMessages, messageorigin.NewInternalUserMessage(messageorigin.KindLoopGuard, reminder))
-									a.emitEvent(out, HiddenUserMessageEvent{Content: reminder})
+									a.emitEvent(out, HiddenUserMessageEvent{Content: reminder}, eventCorrelation{}.withIntervention(InterventionResultReminderQueued, loopGuardStrikes))
 								}
 								a.emitEvent(out, WarnEvent{
 									Message: fmt.Sprintf(
@@ -1424,7 +1438,7 @@ func (a *Agent) queryStreamWithSteering(ctx context.Context, input llm.Content, 
 										a.loopGuardStrikeMax,
 									),
 									Kind: "loop_guard",
-								})
+								}, applied)
 								repeatGuard.reset()
 								if decision.downgradeGuard {
 									// Repeat protection budget is spent. Rather than
@@ -1442,9 +1456,10 @@ func (a *Agent) queryStreamWithSteering(ctx context.Context, input llm.Content, 
 											loopGuardStrikes,
 										),
 										Kind: "loop_guard",
-									})
+									}, eventCorrelation{}.withIntervention(InterventionResultGuardDowngraded, loopGuardStrikes))
 									repeatGuard.exhausted = true
 								}
+								a.observeIntervention(record)
 								a.emitEvent(out, StepStartEvent{StepID: tc.ID, Title: resolvedName, StepNumber: step}, toolCorrelation)
 								a.emitEvent(out, ToolCallEvent{
 									Tool: resolvedName, Args: norm.Display, ArgsJSON: norm.Normalized,
@@ -1573,7 +1588,11 @@ func (a *Agent) queryStreamWithSteering(ctx context.Context, input llm.Content, 
 					if !callStarted.IsZero() {
 						duration = time.Since(callStarted)
 					}
-					a.emitToolResultWithAccounting(out, t.projection(), duration, toolCorrelation)
+					resultCorrelation := toolCorrelation
+					if t.Reason == "loop_guard" && appliedInterventionStrike > 0 {
+						resultCorrelation = toolCorrelation.withIntervention(InterventionResultToolSuppressed, appliedInterventionStrike)
+					}
+					a.emitToolResultWithAccounting(out, t.projection(), duration, resultCorrelation)
 					status := "completed"
 					if t.History.IsError {
 						status = "error"
@@ -2811,15 +2830,35 @@ func (a *Agent) emitEvent(out *eventOutput, ev Event, correlations ...eventCorre
 		return false
 	}
 	envelope := out.next(ev)
-	if len(correlations) == 1 && correlations[0].frameID != "" {
-		envelope.FrameID, envelope.InvokeAttempt = correlations[0].frameID, correlations[0].attempt
-		if correlations[0].controlSource != "" {
-			envelope.RequestControlRelation = RequestControlRequireDoneDisableThinking
-			envelope.RequestControlSourceFrameID = correlations[0].controlSource
-		}
-		envelope.ToolBlockID, envelope.ToolCallOrdinal, envelope.ToolBlockCallCount = correlations[0].toolBlockID, correlations[0].toolCallOrdinal, correlations[0].blockCallCount
-	}
+	applyEventCorrelation(&envelope, correlations)
 	return a.emitEnvelope(out, ev, envelope)
+}
+
+func (a *Agent) observeIntervention(record interventionRecord) {
+	if a != nil && a.interventionObserved != nil {
+		a.interventionObserved(record)
+	}
+}
+
+func applyEventCorrelation(envelope *EventEnvelope, correlations []eventCorrelation) {
+	if len(correlations) != 1 {
+		return
+	}
+	correlation := correlations[0]
+	if correlation.frameID != "" {
+		envelope.FrameID, envelope.InvokeAttempt = correlation.frameID, correlation.attempt
+		if correlation.controlSource != "" {
+			envelope.RequestControlRelation = RequestControlRequireDoneDisableThinking
+			envelope.RequestControlSourceFrameID = correlation.controlSource
+		}
+		envelope.ToolBlockID, envelope.ToolCallOrdinal, envelope.ToolBlockCallCount = correlation.toolBlockID, correlation.toolCallOrdinal, correlation.blockCallCount
+	}
+	if correlation.intervention != "" {
+		envelope.Intervention = correlation.intervention
+		envelope.InterventionStage = InterventionStageApplied
+		envelope.InterventionResult = correlation.interventionResult
+		envelope.InterventionStrike = correlation.interventionStrike
+	}
 }
 
 func (a *Agent) emitEventFrom(out *eventOutput, ev Event, origin EventOrigin, correlations ...eventCorrelation) bool {
@@ -2827,14 +2866,7 @@ func (a *Agent) emitEventFrom(out *eventOutput, ev Event, origin EventOrigin, co
 		return false
 	}
 	envelope := out.nextFrom(ev, origin)
-	if len(correlations) == 1 && correlations[0].frameID != "" {
-		envelope.FrameID, envelope.InvokeAttempt = correlations[0].frameID, correlations[0].attempt
-		if correlations[0].controlSource != "" {
-			envelope.RequestControlRelation = RequestControlRequireDoneDisableThinking
-			envelope.RequestControlSourceFrameID = correlations[0].controlSource
-		}
-		envelope.ToolBlockID, envelope.ToolCallOrdinal, envelope.ToolBlockCallCount = correlations[0].toolBlockID, correlations[0].toolCallOrdinal, correlations[0].blockCallCount
-	}
+	applyEventCorrelation(&envelope, correlations)
 	return a.emitEnvelope(out, ev, envelope)
 }
 
