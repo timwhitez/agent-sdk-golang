@@ -311,9 +311,7 @@ func TestSequentialNativeSuppressionEventOrder(t *testing.T) {
 					Text string `json:"text"`
 				}]("echo", "echo", func(context.Context, struct {
 					Text string `json:"text"`
-				}, *tools.Container) (any, error) {
-					return "ok", nil
-				}))
+				}, *tools.Container) (any, error) { return "ok", nil }))
 				cfg.RepeatToolSignatureThreshold = 2
 				cfg.RepeatToolSignatureWindow = 4
 				cfg.LoopGuardStrikeThreshold = 1
