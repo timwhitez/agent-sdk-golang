@@ -561,9 +561,6 @@ func runOrderedWave(
 		if waveCompletionSettled != nil {
 			waveCompletionSettled(slot.index)
 		}
-		if e := error(nil); e != nil {
-			return start + admitted, BlockContinue, e, nil
-		}
 	}
 	return start + admitted, stop, nil, nil
 }

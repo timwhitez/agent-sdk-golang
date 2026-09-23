@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"reflect"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -116,6 +117,120 @@ func requireSingleTerminal(t *testing.T, state *toolBlockState) {
 	}
 }
 
+// ownerEvent is one observation of the block owner, in the order the owner
+// produced it: a processed completion (settled >= 0) or the owner's return.
+type ownerEvent struct {
+	settled int
+	done    bool
+	stop    BlockStop
+	err     error
+}
+
+// ownerEvents carries the owner's completion acks and its final result on one
+// channel. Both are sent from the owner goroutine, so a completion ack sent
+// before the owner returned is always received before its done event; a done
+// event read while an ack is expected is a genuine early exit.
+type ownerEvents chan ownerEvent
+
+// expectSettled reads the next owner event and requires it to be the ack for
+// call want.
+func (e ownerEvents) expectSettled(want int, timeout time.Duration) error {
+	select {
+	case ev := <-e:
+		switch {
+		case ev.done:
+			return fmt.Errorf("owner exited before settling call %d: stop=%s err=%v", want, ev.stop, ev.err)
+		case ev.settled != want:
+			return fmt.Errorf("settled %d, want %d", ev.settled, want)
+		}
+		return nil
+	case <-time.After(timeout):
+		return fmt.Errorf("owner never settled call %d", want)
+	}
+}
+
+// expectDone reads the owner's final result, which must follow every ack.
+func (e ownerEvents) expectDone(timeout time.Duration) (ownerEvent, error) {
+	select {
+	case ev := <-e:
+		if !ev.done {
+			return ev, fmt.Errorf("unexpected extra ack for call %d", ev.settled)
+		}
+		return ev, nil
+	case <-time.After(timeout):
+		return ownerEvent{}, errors.New("owner never returned")
+	}
+}
+
+func (g *gatedHandlers) releaseAll() {
+	for _, ch := range g.release {
+		select {
+		case <-ch:
+		default:
+			close(ch)
+		}
+	}
+}
+
+// startObservedOwner installs the completion seam before the owner starts
+// and registers cleanup for every exit path, including t.Fatal: all gates
+// are released and the owner has returned before the seam is restored.
+func startObservedOwner(t *testing.T, g *gatedHandlers, run func() (BlockStop, error)) ownerEvents {
+	t.Helper()
+	events := make(ownerEvents, 2*len(g.release)+2) // never blocks the owner
+	exited := make(chan struct{})
+	waveCompletionSettled = func(i int) { events <- ownerEvent{settled: i} }
+	t.Cleanup(func() { waveCompletionSettled = nil }) // runs last
+	t.Cleanup(func() {
+		g.releaseAll()
+		select {
+		case <-exited:
+		case <-time.After(10 * time.Second):
+			t.Error("block owner did not return after all gates were released")
+		}
+	})
+	go func() {
+		defer close(exited)
+		stop, err := run()
+		events <- ownerEvent{settled: -1, done: true, stop: stop, err: err}
+	}()
+	return events
+}
+
+// The last ack and the owner's successful return may both be queued before
+// the test reads either; a correct owner must still be accepted. Early exit,
+// a missing ack and a wrong ordinal stay failures.
+func TestOwnerEventsProtocol(t *testing.T) {
+	queued := make(ownerEvents, 4)
+	queued <- ownerEvent{settled: 1}
+	queued <- ownerEvent{settled: -1, done: true, stop: BlockContinue}
+	if err := queued.expectSettled(1, time.Second); err != nil {
+		t.Fatalf("queued final ack rejected: %v", err)
+	}
+	if ev, err := queued.expectDone(time.Second); err != nil || ev.stop != BlockContinue {
+		t.Fatalf("queued done rejected: %+v %v", ev, err)
+	}
+
+	early := make(ownerEvents, 1)
+	early <- ownerEvent{settled: -1, done: true}
+	if err := early.expectSettled(0, time.Second); err == nil || !strings.Contains(err.Error(), "exited before") {
+		t.Fatalf("early exit accepted: %v", err)
+	}
+	wrong := make(ownerEvents, 1)
+	wrong <- ownerEvent{settled: 2}
+	if err := wrong.expectSettled(0, time.Second); err == nil {
+		t.Fatal("wrong ordinal accepted")
+	}
+	if err := make(ownerEvents).expectSettled(0, 10*time.Millisecond); err == nil {
+		t.Fatal("missing ack accepted")
+	}
+	extra := make(ownerEvents, 1)
+	extra <- ownerEvent{settled: 0}
+	if _, err := extra.expectDone(time.Second); err == nil {
+		t.Fatal("extra ack before done accepted")
+	}
+}
+
 // Handlers finish 3 -> 1 -> 2 (ordinals 2, 0, 1); the owner commits and
 // publishes in model order with exactly one terminal per call.
 func TestToolBlockParallelCompletionCommitsInModelOrder(t *testing.T) {
@@ -123,41 +238,16 @@ func TestToolBlockParallelCompletionCommitsInModelOrder(t *testing.T) {
 	trace := &parallelTrace{}
 	calls, a := parallelFixture(3, g, trace, 3, allEligible)
 	state, _ := newToolBlockState(calls)
-	type result struct {
-		stop BlockStop
-		err  error
-	}
-	done := make(chan result, 1)
-	go func() {
-		stop, err := runSequentialBlock(context.Background(), state, calls, a, false)
-		done <- result{stop, err}
-	}()
-	settled := make(chan int, 3)
-	waveCompletionSettled = func(i int) { settled <- i }
-	t.Cleanup(func() { waveCompletionSettled = nil })
+	events := startObservedOwner(t, g, func() (BlockStop, error) {
+		return runSequentialBlock(context.Background(), state, calls, a, false)
+	})
 	g.waitStarted(t, 3)
 	committedAfter := map[int][]string{}
 	for _, i := range []int{2, 0, 1} {
 		close(g.release[i])
 		// The owner has fully processed this completion before we look.
-		select {
-		case got := <-settled:
-			if got != i {
-				t.Fatalf("settled %d, want %d", got, i)
-			}
-		case res := <-done:
-			t.Fatalf("owner exited before settling call %d: stop=%s err=%v", i, res.stop, res.err)
-		case <-time.After(5 * time.Second):
-			// Failure path only: unblock the remaining workers so the owner
-			// (which must wait for them) can return, then fail.
-			for _, ch := range g.release {
-				select {
-				case <-ch:
-				default:
-					close(ch)
-				}
-			}
-			t.Fatalf("owner never settled call %d in model order", i)
+		if err := events.expectSettled(i, 5*time.Second); err != nil {
+			t.Fatal(err) // cleanup releases the remaining gates and waits
 		}
 		trace.mu.Lock()
 		committedAfter[i] = append([]string(nil), trace.committed...)
@@ -169,7 +259,10 @@ func TestToolBlockParallelCompletionCommitsInModelOrder(t *testing.T) {
 	if want := []string{"call-0=result-0"}; !reflect.DeepEqual(committedAfter[0], want) {
 		t.Fatalf("after call-0 returned committed=%v want %v", committedAfter[0], want)
 	}
-	res := <-done
+	res, err := events.expectDone(5 * time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
 	if res.err != nil || res.stop != BlockContinue {
 		t.Fatalf("stop=%s err=%v", res.stop, res.err)
 	}
