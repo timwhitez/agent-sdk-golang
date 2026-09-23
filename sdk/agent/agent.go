@@ -3421,31 +3421,27 @@ func (a *Agent) runCompactionAsync(ctx context.Context, snapshot []llm.Message, 
 
 	compactCtx, cancelCompact := asyncCompactionContext(ctx)
 	defer cancelCompact()
-	newMsgs, res, err := a.compactWithRetry(compactCtx, snapshot, compaction.PipelineRequest{
-		Trigger:         decision.trigger,
-		Usage:           decisionUsage,
-		TargetWatermark: decision.targetWatermark,
-		AllowSummary:    a.compactionSummaryAllowed(),
-	})
+	// The request comes from the decision sampled before launch; this
+	// goroutine never re-reads admission state such as the failure streak.
+	newMsgs, res, err := a.compactWithRetry(compactCtx, snapshot, decision.pipelineRequest(decisionUsage))
 	if err != nil {
 		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
 			return
 		}
 		a.warnf("compaction failed after %d attempt(s): %v", a.compactionMaxAttempts(), err)
 		a.compactionRetryPending.Store(true)
-		a.noteCompactionFailure()
+		if decision.recordsOutcome() {
+			a.noteCompactionFailure()
+		}
 		return
 	}
-	switch strings.TrimSpace(decision.trigger) {
-	case "todo_checkpoint":
-		a.todoCompactionPending.Store(false)
-	case "retry_checkpoint":
-		a.compactionRetryPending.Store(false)
-	}
+	a.clearSatisfiedCompactionWork(decision)
 	if !res.Compacted {
 		return
 	}
-	a.noteCompactionSuccess()
+	if decision.recordsOutcome() {
+		a.noteCompactionSuccess()
+	}
 	newMsgs = a.withPreservedSystem(snapshot, newMsgs)
 	res = a.reconcileCompactionTelemetry(res, snapshot, newMsgs, 0)
 
@@ -3457,6 +3453,18 @@ func (a *Agent) runCompactionAsync(ctx context.Context, snapshot []llm.Message, 
 		triggerUsage: triggerUsage,
 	}
 	a.pendingCompactionMu.Unlock()
+}
+
+// clearSatisfiedCompactionWork clears the pending work a successful run of
+// decision satisfies.
+func (a *Agent) clearSatisfiedCompactionWork(decision compactionDecision) {
+	todo, retry := decision.clearsPending()
+	if todo {
+		a.todoCompactionPending.Store(false)
+	}
+	if retry {
+		a.compactionRetryPending.Store(false)
+	}
 }
 
 const asyncCompactionCancelGrace = 100 * time.Millisecond
@@ -4302,8 +4310,12 @@ func (a *Agent) CompactPipelineNow(ctx context.Context, req compaction.PipelineR
 		return compaction.Result{Compacted: false}, nil
 	}
 	a.applyPendingCompaction(nil)
+	decision := manualCompactionDecision(req)
 	if !a.compactionInFlight.CompareAndSwap(false, true) {
-		return compaction.Result{Compacted: false}, fmt.Errorf("%w: compaction already in progress", ErrAgentBusy)
+		if decision.rejectsOverlap() {
+			return compaction.Result{Compacted: false}, fmt.Errorf("%w: compaction already in progress", ErrAgentBusy)
+		}
+		return compaction.Result{Compacted: false}, nil
 	}
 	defer a.releaseCompactionInFlight()
 
@@ -4312,12 +4324,11 @@ func (a *Agent) CompactPipelineNow(ctx context.Context, req compaction.PipelineR
 	copy(orig, a.messages)
 	a.mu.Unlock()
 
-	newMsgs, res, err := a.compactWithRetry(ctx, orig, req)
+	newMsgs, res, err := a.compactWithRetry(ctx, orig, decision.pipelineRequest(req.Usage))
 	if err != nil {
 		return res, err
 	}
-	a.todoCompactionPending.Store(false)
-	a.compactionRetryPending.Store(false)
+	a.clearSatisfiedCompactionWork(decision)
 	newMsgs = a.withPreservedSystem(orig, newMsgs)
 	if res.Compacted {
 		res = a.reconcileCompactionTelemetry(res, orig, newMsgs, req.AdditionalTokens)

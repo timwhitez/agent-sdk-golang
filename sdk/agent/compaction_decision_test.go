@@ -70,11 +70,11 @@ func TestAutomaticCompactionDecisionAdmission(t *testing.T) {
 		admissions int
 	}{
 		{"below", 69, false, compactionDecision{trigger: "usage"}, 1},
-		{"snip", 70, false, compactionDecision{true, "usage", "snip"}, 1},
-		{"prune", 80, false, compactionDecision{true, "usage", "prune"}, 1},
-		{"summary", 85, false, compactionDecision{true, "usage", "summarize"}, 1},
-		{"cooldown", 85, true, compactionDecision{false, "usage", "summarize"}, 1},
-		{"overflow", 100, true, compactionDecision{true, "overflow", "overflow"}, 0},
+		{"snip", 70, false, compactionDecision{run: true, trigger: "usage", targetWatermark: "snip", allowSummary: true}, 1},
+		{"prune", 80, false, compactionDecision{run: true, trigger: "usage", targetWatermark: "prune", allowSummary: true}, 1},
+		{"summary", 85, false, compactionDecision{run: true, trigger: "usage", targetWatermark: "summarize", allowSummary: true}, 1},
+		{"cooldown", 85, true, compactionDecision{trigger: "usage", targetWatermark: "summarize"}, 1},
+		{"overflow", 100, true, compactionDecision{run: true, trigger: "overflow", targetWatermark: "overflow", allowSummary: true}, 0},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			ag, err := New(Config{LLM: &countingCompactionModel{}, Compaction: &compaction.Config{
