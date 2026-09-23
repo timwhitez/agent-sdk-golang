@@ -27,6 +27,10 @@ type Tool struct {
 	Hidden bool
 
 	Handler func(ctx context.Context, args json.RawMessage, deps *Container) (llm.Content, error)
+
+	// typed is the sealed decoder of a Func tool. It never replaces Handler:
+	// execution always runs the complete (possibly wrapped) Handler chain.
+	typed *typedArgsBinding
 }
 
 const (
@@ -52,6 +56,7 @@ type PreparedCall struct {
 	normalized json.RawMessage
 	meta       map[string]any
 	err        error
+	final      *preparedTypedArgs
 }
 
 // PrepareCall normalizes once without invoking the Handler or resolving deps.
@@ -60,12 +65,44 @@ type PreparedCall struct {
 // inside the captured Handler; this observation is not final business authority.
 func (t Tool) PrepareCall(argsJSON string) (PreparedCall, ToolArgsNormalization) {
 	norm := NormalizeToolArgs(t.Name, argsJSON, t.Schema)
-	return PreparedCall{
+	prepared := PreparedCall{
 		tool: t, original: argsJSON, normalized: bytes.Clone(norm.Normalized),
 		// Normalization metadata consists only of bool/string scalars. Display
 		// may be nested, but is owned solely by the returned observation.
 		meta: maps.Clone(norm.Meta), err: norm.Err,
-	}, norm
+	}
+	if norm.Err == nil {
+		prepared.final = prepareTypedArgs(t.typed, prepared.normalized)
+	}
+	return prepared, norm
+}
+
+// FinalArgs returns an owned JSON view of the typed arguments a Func tool's
+// sealed decoder accepted when the call was prepared. Execution consumes that
+// same decoded object unless a wrapper changes the bytes it forwards (see
+// FinalArgsOutcome). ok is false for tools without a sealed decoder, types
+// with custom decoders and arguments that do not decode. The view is
+// observation only; it neither authorizes effects nor proves independence.
+func (p PreparedCall) FinalArgs() (json.RawMessage, bool) {
+	if p.final == nil {
+		return nil, false
+	}
+	return bytes.Clone(p.final.view), true
+}
+
+// FinalArgsOutcome reports, after Execute, whether the adapter consumed the
+// prepared object, decoded different bytes, or was never reached.
+func (p PreparedCall) FinalArgsOutcome() string {
+	switch {
+	case p.final == nil:
+		return FinalArgsUnavailable
+	case p.final.state.diverged.Load():
+		return FinalArgsDiverged
+	case p.final.state.consumed.Load():
+		return FinalArgsConsumed
+	default:
+		return FinalArgsUnused
+	}
 }
 
 func (t Tool) Execute(ctx context.Context, argsJSON string, deps *Container) (llm.Content, error) {
@@ -104,6 +141,9 @@ func (p PreparedCall) Execute(ctx context.Context, deps *Container) (llm.Content
 	// execution based on its error text; typed adapters prepare before decoding.
 	if ctx != nil {
 		ctx = context.WithValue(ctx, originalToolArgsKey{}, p.original)
+		if p.final != nil {
+			ctx = context.WithValue(ctx, preparedTypedArgsKey{}, p.final)
+		}
 	}
 	content, err := p.tool.Handler(ctx, bytes.Clone(p.normalized), deps)
 	if err != nil && content.IsEmpty() {
@@ -790,13 +830,15 @@ func jsonValueType(value any) string {
 // execution. Custom decoders and business handlers are never retried.
 func Func[Args any](name, description string, fn func(ctx context.Context, args Args, deps *Container) (any, error)) Tool {
 	schema := SchemaFor[Args]()
+	binding := newTypedArgsBinding[Args](name, schema)
 	return Tool{
 		Name:          name,
 		Description:   description,
 		EphemeralKeep: 0,
 		Schema:        schema,
+		typed:         binding,
 		Handler: func(ctx context.Context, raw json.RawMessage, deps *Container) (llm.Content, error) {
-			a, err := DecodeTypedToolArgs[Args](ctx, name, schema, raw)
+			a, err := consumeTypedArgs[Args](ctx, binding, name, schema, raw)
 			if err != nil {
 				return llm.TextContent(formatToolErrorDiagnostic("Invalid tool arguments", err, toolDiagnosticInvalidArgsAction)), err
 			}

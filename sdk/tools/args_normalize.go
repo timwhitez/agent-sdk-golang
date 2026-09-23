@@ -21,6 +21,17 @@ type originalToolArgsKey struct{}
 // never decoded twice: their accepted keys and effects cannot be inferred from
 // the schema. This helper never invokes a business handler.
 func DecodeTypedToolArgs[Args any](ctx context.Context, name string, schema map[string]any, raw json.RawMessage) (Args, error) {
+	args, repaired, err := decodeTypedArgs[Args](name, schema, raw)
+	if err == nil && repaired {
+		publishSchemaKeyRepair(ctx, raw)
+	}
+	return args, err
+}
+
+// decodeTypedArgs is the pure part of DecodeTypedToolArgs: it decodes plain
+// argument types, runs no user code for them and publishes nothing. repaired
+// reports that the returned Args came from the schema-key repair.
+func decodeTypedArgs[Args any](name string, schema map[string]any, raw json.RawMessage) (Args, bool, error) {
 	decode := func(raw json.RawMessage) (Args, error) {
 		var args Args
 		dec := json.NewDecoder(bytes.NewReader(raw))
@@ -30,21 +41,28 @@ func DecodeTypedToolArgs[Args any](ctx context.Context, name string, schema map[
 	}
 	args, err := decode(raw)
 	if err == nil || !strings.Contains(err.Error(), "unknown field") || hasCustomArgumentDecoder(reflect.TypeOf((*Args)(nil)).Elem(), make(map[reflect.Type]bool)) {
-		return args, err
+		return args, false, err
 	}
+	if repaired, ok := repairJSONKeysBySchemaWithOptions(schema, raw, schemaRepairOptions{StripUnknown: true, ToolName: name}); ok {
+		if repairedArgs, repairedErr := decode(repaired); repairedErr == nil {
+			return repairedArgs, true, nil
+		}
+	}
+	return args, false, err
+}
+
+// publishSchemaKeyRepair records a successful schema-key repair on the call's
+// result metadata, keeping the caller's original spelling.
+func publishSchemaKeyRepair(ctx context.Context, raw json.RawMessage) {
 	meta := ToolResultMetadataSnapshot(ctx)
 	if ctx != nil {
 		if original, ok := ctx.Value(originalToolArgsKey{}).(string); ok {
 			meta = ensureArgsRaw(meta, original)
 		}
 	}
-	if repaired, repairedMeta, ok := repairToolArgsBySchema(name, schema, raw, meta); ok {
-		if repairedArgs, repairedErr := decode(repaired); repairedErr == nil {
-			UpsertToolResultMetadata(ctx, repairedMeta)
-			return repairedArgs, nil
-		}
-	}
-	return args, err
+	meta = appendArgsRepairKind(meta, "schema_key")
+	meta = ensureArgsRaw(meta, string(raw))
+	UpsertToolResultMetadata(ctx, meta)
 }
 
 func hasCustomArgumentDecoder(typ reflect.Type, seen map[reflect.Type]bool) bool {
@@ -554,16 +572,6 @@ func ensureArgsRaw(meta map[string]any, raw string) map[string]any {
 		meta["args_raw"] = raw
 	}
 	return meta
-}
-
-func repairToolArgsBySchema(toolName string, schema map[string]any, raw json.RawMessage, meta map[string]any) (json.RawMessage, map[string]any, bool) {
-	repaired, ok := repairJSONKeysBySchemaWithOptions(schema, raw, schemaRepairOptions{StripUnknown: true, ToolName: toolName})
-	if !ok {
-		return nil, meta, false
-	}
-	meta = appendArgsRepairKind(meta, "schema_key")
-	meta = ensureArgsRaw(meta, string(raw))
-	return repaired, meta, true
 }
 
 func argsRepaired(meta map[string]any) bool {

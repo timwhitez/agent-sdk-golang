@@ -18,6 +18,9 @@ const (
 const (
 	toolArgsNormalized toolArgsState = iota
 	toolArgsInvalid
+	// toolArgsFinalTyped: a sealed typed decoder accepted final arguments
+	// that execution will consume unless a wrapper rewrites them.
+	toolArgsFinalTyped
 )
 
 // toolPlanningObservation intentionally excludes names, arguments, schemas,
