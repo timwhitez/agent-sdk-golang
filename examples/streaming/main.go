@@ -119,25 +119,70 @@ var errPartialResponse = errors.New("agent returned a partial response")
 // answer is printed only when no delta was streamed (a non-streaming model),
 // so text is never duplicated. Errors, partial answers, critically dropped
 // events and a stream without a final response are all failures.
+// finalMarker introduces an authoritative final answer that differs from the
+// text the last model turn streamed.
+const finalMarker = "[final answer]\n"
+
 func consumeAgentEvents(events <-chan agent.Event, w, diag io.Writer) error {
-	streamed := false
+	// turn is the text streamed by the current model turn. A tool call or tool
+	// result ends the turn: text streamed before a tool is progress, not the
+	// answer. The final answer is printed unless this turn already showed
+	// exactly that text; an empty turn, a lost delta or a final answer that
+	// comes from a tool (such as done) all print it.
+	var turn strings.Builder
+	printed, atLineStart := false, true
+	write := func(text string) error {
+		if text == "" {
+			return nil
+		}
+		if _, err := io.WriteString(w, text); err != nil {
+			return err
+		}
+		printed, atLineStart = true, strings.HasSuffix(text, "\n")
+		return nil
+	}
+	endLine := func() error {
+		if atLineStart {
+			return nil
+		}
+		return write("\n")
+	}
 	for event := range events {
 		switch e := event.(type) {
 		case agent.TextDeltaEvent:
-			streamed = true
-			if _, err := io.WriteString(w, e.Delta); err != nil {
+			turn.WriteString(e.Delta)
+			if err := write(e.Delta); err != nil {
+				return err
+			}
+		case agent.ToolCallEvent, agent.ToolResultEvent:
+			turn.Reset()
+			if err := endLine(); err != nil {
 				return err
 			}
 		case agent.ErrorEvent:
 			return fmt.Errorf("agent error (%s): %s", e.Kind, e.Message)
 		case agent.FinalResponseEvent:
-			if !streamed {
-				if _, err := io.WriteString(w, e.Content); err != nil {
+			shown := strings.TrimSpace(turn.String()) == strings.TrimSpace(e.Content)
+			if err := endLine(); err != nil {
+				return err
+			}
+			if !shown && e.Content != "" {
+				if printed {
+					if err := write(finalMarker); err != nil {
+						return err
+					}
+				}
+				if err := write(e.Content); err != nil {
+					return err
+				}
+				if err := endLine(); err != nil {
 					return err
 				}
 			}
-			if _, err := io.WriteString(w, "\n"); err != nil {
-				return err
+			if !printed {
+				if err := write("\n"); err != nil {
+					return err
+				}
 			}
 			if e.DroppedEvents > 0 {
 				fmt.Fprintf(diag, "[%d events were dropped; %d critical]\n", e.DroppedEvents, e.DroppedCriticalEvents)

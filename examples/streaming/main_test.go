@@ -392,3 +392,142 @@ func TestD05FragmentedToolArgumentsExecuteOnceComplete(t *testing.T) {
 		t.Fatalf("calls=%d args=%v out=%q", calls, got, out.String())
 	}
 }
+
+// scriptedStreamer is a streaming model whose turns are fixed event lists.
+type scriptedStreamer struct {
+	mu    sync.Mutex
+	turns [][]llm.StreamEvent
+	next  int
+}
+
+func (m *scriptedStreamer) Provider() string { return "fixture" }
+func (m *scriptedStreamer) Model() string    { return "scripted" }
+func (m *scriptedStreamer) Invoke(context.Context, llm.InvokeRequest) (*llm.Completion, error) {
+	return nil, errors.New("buffered call not expected")
+}
+func (m *scriptedStreamer) InvokeStream(context.Context, llm.InvokeRequest) (<-chan llm.StreamEvent, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.next >= len(m.turns) {
+		return nil, errors.New("no scripted turn left")
+	}
+	turn := m.turns[m.next]
+	m.next++
+	ch := make(chan llm.StreamEvent, len(turn))
+	for _, e := range turn {
+		ch <- e
+	}
+	close(ch)
+	return ch, nil
+}
+
+func toolCallTurn(text, id, name, args string) []llm.StreamEvent {
+	var events []llm.StreamEvent
+	if text != "" {
+		events = append(events, llm.StreamTextDeltaEvent{Delta: text})
+	}
+	return append(events,
+		llm.StreamToolCallDeltaEvent{Index: 0, ID: id, NameDelta: name, ArgumentsDelta: args},
+		llm.StreamDoneEvent{StopReason: "tool_calls"})
+}
+
+// D06 through a real Agent: progress text streamed before a tool is not the
+// answer; a different final answer delivered by the done tool is printed.
+func TestD06AgentPrintsDifferentFinalAfterProgress(t *testing.T) {
+	type noArgs struct{}
+	check := tools.Func[noArgs]("check", "inspect files", func(context.Context, noArgs, *tools.Container) (any, error) {
+		return "ok", nil
+	})
+	type doneArgs struct {
+		Message string `json:"message"`
+	}
+	done := tools.Func[doneArgs]("done", "finish with the answer", func(_ context.Context, args doneArgs, _ *tools.Container) (any, error) {
+		return nil, tools.TaskComplete(args.Message)
+	})
+	for _, tt := range []struct {
+		name  string
+		tools []tools.Tool
+		turns [][]llm.StreamEvent
+		want  string
+	}{
+		{
+			name:  "progress, tool, different final from done",
+			tools: []tools.Tool{check, done},
+			turns: [][]llm.StreamEvent{
+				toolCallTurn("Inspecting files...", "c1", "check", `{}`),
+				toolCallTurn("", "c2", "done", `{"message":"Verified answer."}`),
+			},
+			want: "Inspecting files...\n" + finalMarker + "Verified answer.\n",
+		},
+		{
+			name:  "streamed final answer is not repeated",
+			tools: []tools.Tool{check},
+			turns: [][]llm.StreamEvent{
+				toolCallTurn("Inspecting files...", "c1", "check", `{}`),
+				{llm.StreamTextDeltaEvent{Delta: "Verified "}, llm.StreamTextDeltaEvent{Delta: ""}, llm.StreamTextDeltaEvent{Delta: "answer."}, llm.StreamDoneEvent{StopReason: "stop"}},
+			},
+			want: "Inspecting files...\nVerified answer.\n",
+		},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			a, err := agent.New(agent.Config{LLM: &scriptedStreamer{turns: tt.turns}, Tools: tt.tools})
+			if err != nil {
+				t.Fatal(err)
+			}
+			var out, diag bytes.Buffer
+			if err := consumeAgentEvents(a.QueryStream(context.Background(), llm.TextContent("hi")), &out, &diag); err != nil {
+				t.Fatal(err)
+			}
+			if got := out.String(); got != tt.want {
+				t.Fatalf("output=%q want %q", got, tt.want)
+			}
+		})
+	}
+}
+
+// D06: the final answer is compared with what the current model turn
+// actually showed, not with whether any delta ever arrived.
+func TestD06FinalAnswerAgainstShownTurn(t *testing.T) {
+	run := func(events ...agent.Event) (string, error) {
+		ch := make(chan agent.Event, len(events))
+		for _, e := range events {
+			ch <- e
+		}
+		close(ch)
+		var out, diag bytes.Buffer
+		err := consumeAgentEvents(ch, &out, &diag)
+		return out.String(), err
+	}
+	for _, tt := range []struct {
+		name   string
+		events []agent.Event
+		want   string
+	}{
+		{"done final without deltas", []agent.Event{agent.ToolCallEvent{Tool: "done"}, agent.FinalResponseEvent{Content: "Answer."}}, "Answer.\n"},
+		{"same text once", []agent.Event{agent.TextDeltaEvent{Delta: "Hel"}, agent.TextDeltaEvent{Delta: "lo"}, agent.FinalResponseEvent{Content: "Hello"}}, "Hello\n"},
+		{"empty deltas", []agent.Event{agent.TextDeltaEvent{Delta: ""}, agent.FinalResponseEvent{Content: "Hello"}}, "Hello\n"},
+		{"lost delta recovered from final", []agent.Event{agent.TextDeltaEvent{Delta: "Hel"}, agent.FinalResponseEvent{Content: "Hello", DroppedEvents: 1}}, "Hel\n" + finalMarker + "Hello\n"},
+		{"earlier turn text is not the answer", []agent.Event{
+			agent.TextDeltaEvent{Delta: "Hello"}, agent.ToolCallEvent{Tool: "check"}, agent.ToolResultEvent{Tool: "check"},
+			agent.FinalResponseEvent{Content: "Hello"},
+		}, "Hello\n" + finalMarker + "Hello\n"},
+		{"multiple turns, last turn streamed the answer", []agent.Event{
+			agent.TextDeltaEvent{Delta: "Step 1."}, agent.ToolCallEvent{Tool: "a"}, agent.ToolResultEvent{Tool: "a"},
+			agent.TextDeltaEvent{Delta: "Step 2."}, agent.ToolCallEvent{Tool: "b"}, agent.ToolResultEvent{Tool: "b"},
+			agent.TextDeltaEvent{Delta: "Done."}, agent.FinalResponseEvent{Content: "Done."},
+		}, "Step 1.\nStep 2.\nDone.\n"},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := run(tt.events...)
+			if err != nil || got != tt.want {
+				t.Fatalf("output=%q err=%v want %q", got, err, tt.want)
+			}
+		})
+	}
+	if out, err := run(agent.TextDeltaEvent{Delta: "partial text"}, agent.FinalResponseEvent{Content: "fallback", Status: "partial", Reason: "require_done_safety"}); !errors.Is(err, errPartialResponse) || !strings.Contains(out, "fallback") {
+		t.Fatalf("partial: out=%q err=%v", out, err)
+	}
+	if _, err := run(agent.TextDeltaEvent{Delta: "x"}, agent.FinalResponseEvent{Content: "x", DroppedEvents: 3, DroppedCriticalEvents: 1}); err == nil {
+		t.Fatal("critical drop accepted")
+	}
+}
