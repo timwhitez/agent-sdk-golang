@@ -524,44 +524,136 @@ type chatCompletionStreamResponse struct {
 
 var errSSEDone = errors.New("_sse_done")
 
+// Default SSE parser budgets. They bound the bytes retained for one logical
+// event (including a pending malformed-fragment reassembly) and the number of
+// callback decode attempts for one unconsumed fragment group. They are local
+// parser limits, not provider limits, and do not cap the total stream size.
+const (
+	defaultSSEMaxEventBytes     = 32 * 1024 * 1024
+	defaultSSEMaxDecodeAttempts = 16
+)
+
+type sseLimits struct {
+	maxEventBytes     int
+	maxDecodeAttempts int
+}
+
+var defaultSSELimits = sseLimits{
+	maxEventBytes:     defaultSSEMaxEventBytes,
+	maxDecodeAttempts: defaultSSEMaxDecodeAttempts,
+}
+
+// SSE resource limit reasons are fixed values so callers and diagnostics never
+// need the raw stream content.
+const (
+	sseLimitEventBytes     = "event_bytes"
+	sseLimitDecodeAttempts = "decode_attempts"
+)
+
+// sseResourceLimitError reports that the local SSE parser stopped because one
+// logical event exceeded a fixed budget. It carries no stream content, is not a
+// provider status, and is deliberately worded so text-based retry or
+// context-overflow classifiers do not treat it as transient or as overflow.
+type sseResourceLimitError struct {
+	Reason string
+	Limit  int
+}
+
+func (e *sseResourceLimitError) Error() string {
+	return fmt.Sprintf("openai stream: local SSE parser resource budget reached (reason=%s, budget=%d); the response is incomplete", e.Reason, e.Limit)
+}
+
 func consumeSSE(r io.Reader, onData func(data string) error) error {
+	return consumeSSEWithLimits(r, onData, defaultSSELimits)
+}
+
+func consumeSSEWithLimits(r io.Reader, onData func(data string) error, limits sseLimits) error {
+	if limits.maxEventBytes <= 0 || limits.maxDecodeAttempts <= 0 {
+		return errors.New("openai stream: invalid SSE parser limits")
+	}
 	sc := bufio.NewScanner(r)
 	// Large chunks can appear in tool-call argument streaming.
 	sc.Buffer(make([]byte, 0, 64*1024), 32*1024*1024)
-	dataLines := []string{}
-	pending := ""
+
+	// One logical candidate is pending + "\n" + data lines joined by "\n".
+	// The candidate is built incrementally so its size is checked before any
+	// bytes are retained; used counts every retained byte including joins.
+	var candidate strings.Builder
+	used := 0
+	hasPending := false // candidate starts with a failed fragment group
+	hasData := false    // candidate has data lines not yet offered to onData
+	attempts := 0       // failed decode attempts for the current group
+	var lastDecodeErr error
+
+	resetGroup := func() {
+		candidate.Reset()
+		used = 0
+		hasPending = false
+		hasData = false
+		attempts = 0
+		lastDecodeErr = nil
+	}
+	reserve := func(extra int) error {
+		if used < 0 || used > limits.maxEventBytes || extra < 0 || extra > limits.maxEventBytes-used {
+			return &sseResourceLimitError{Reason: sseLimitEventBytes, Limit: limits.maxEventBytes}
+		}
+		used += extra
+		return nil
+	}
+	appendData := func(payload string) error {
+		sep := 0
+		if hasData || hasPending {
+			sep = 1
+		}
+		if err := reserve(sep); err != nil {
+			return err
+		}
+		if err := reserve(len(payload)); err != nil {
+			return err
+		}
+		if sep == 1 {
+			candidate.WriteByte('\n')
+		}
+		candidate.WriteString(payload)
+		hasData = true
+		return nil
+	}
 	flush := func() error {
-		if len(dataLines) == 0 {
+		if !hasData {
 			return nil
 		}
-		data := strings.Join(dataLines, "\n")
-		dataLines = nil
-		if pending != "" {
-			data = pending + "\n" + data
+		if attempts >= limits.maxDecodeAttempts {
+			return &sseResourceLimitError{Reason: sseLimitDecodeAttempts, Limit: limits.maxDecodeAttempts}
 		}
+		data := candidate.String()
+		hasData = false
 		err := onData(data)
 		if err != nil {
 			if isLikelyOpenAIDecodeError(err) {
 				// Some gateways emit a premature blank line in the middle of one JSON event.
-				// Keep buffering and retry decode with the next data fragment.
-				pending = data
+				// Keep buffering and retry decode with the next data fragment, within the
+				// same byte and attempt budget.
+				attempts++
+				lastDecodeErr = err
+				hasPending = true
+				if attempts >= limits.maxDecodeAttempts {
+					return &sseResourceLimitError{Reason: sseLimitDecodeAttempts, Limit: limits.maxDecodeAttempts}
+				}
 				return nil
 			}
 			return err
 		}
-		pending = ""
+		resetGroup()
 		return nil
 	}
 	flushFinal := func() error {
 		if err := flush(); err != nil {
 			return err
 		}
-		if strings.TrimSpace(pending) != "" {
-			err := onData(pending)
-			if err == nil {
-				pending = ""
-			}
-			return err
+		if hasPending {
+			// The retained fragment group already failed and no new data arrived;
+			// decoding the same candidate again cannot succeed.
+			return lastDecodeErr
 		}
 		return nil
 	}
@@ -574,7 +666,9 @@ func consumeSSE(r io.Reader, onData func(data string) error) error {
 			continue
 		}
 		if strings.HasPrefix(line, "data:") {
-			dataLines = append(dataLines, strings.TrimSpace(strings.TrimPrefix(line, "data:")))
+			if err := appendData(strings.TrimSpace(strings.TrimPrefix(line, "data:"))); err != nil {
+				return err
+			}
 		}
 	}
 	if err := sc.Err(); err != nil {

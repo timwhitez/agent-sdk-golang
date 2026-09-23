@@ -11,8 +11,8 @@ import (
 // typedArgsBinding is the sealed decoder half of a Func tool. Func creates one
 // per tool and its Handler closure holds the same pointer, so a prepared
 // object can only be consumed by the adapter that belongs to its decoder.
-// Bindings exist only for plain argument types: decoding them runs no user
-// code, so preparing final arguments has no side effects.
+// Bindings exist only for plain argument types: decoding and encoding them
+// runs no user code, so preparing final arguments has no side effects.
 type typedArgsBinding struct {
 	decode func(json.RawMessage) (any, bool, error)
 }
@@ -45,7 +45,9 @@ const (
 )
 
 func newTypedArgsBinding[Args any](name string, schema map[string]any) *typedArgsBinding {
-	if hasCustomArgumentDecoder(reflect.TypeOf((*Args)(nil)).Elem(), make(map[reflect.Type]bool)) {
+	// Preparing decodes and encodes the arguments; both must be free of user
+	// code (custom JSON/Text decoders or encoders anywhere in the type).
+	if hasCustomArgumentCodec(reflect.TypeOf((*Args)(nil)).Elem(), make(map[reflect.Type]bool), true) {
 		return nil
 	}
 	return &typedArgsBinding{decode: func(raw json.RawMessage) (any, bool, error) {

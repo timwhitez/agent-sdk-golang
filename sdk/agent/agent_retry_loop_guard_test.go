@@ -366,6 +366,11 @@ func TestInvokeRetryRetriesAfterMetadataOnlyStreamingError(t *testing.T) {
 		switch e := ev.(type) {
 		case UsageEvent:
 			usageEvents++
+			// The failed attempt's billed usage is reported once, under its
+			// own response; it never becomes the final response metadata.
+			if e.ResponseID != "resp_failed" || e.Usage.TotalTokens != 1 {
+				t.Fatalf("failed attempt usage=%#v", e)
+			}
 		case FinalResponseEvent:
 			finalText = e.Content
 			finalResponseID = e.ResponseID
@@ -373,8 +378,8 @@ func TestInvokeRetryRetriesAfterMetadataOnlyStreamingError(t *testing.T) {
 			t.Fatalf("did not expect terminal error event after metadata-only retry success: %#v", e)
 		}
 	}
-	if usageEvents != 0 {
-		t.Fatalf("expected failed attempt usage metadata not to leak into events, got %d usage events", usageEvents)
+	if usageEvents != 1 {
+		t.Fatalf("expected the failed attempt's observed usage exactly once, got %d usage events", usageEvents)
 	}
 	if finalText != "ok" {
 		t.Fatalf("final text = %q, want ok", finalText)

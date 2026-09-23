@@ -43,7 +43,14 @@ func decodeTypedArgs[Args any](name string, schema map[string]any, raw json.RawM
 	if err == nil || !strings.Contains(err.Error(), "unknown field") || hasCustomArgumentDecoder(reflect.TypeOf((*Args)(nil)).Elem(), make(map[reflect.Type]bool)) {
 		return args, false, err
 	}
-	if repaired, ok := repairJSONKeysBySchemaWithOptions(schema, raw, schemaRepairOptions{StripUnknown: true, ToolName: name}); ok {
+	repaired, ok, repairErr := repairJSONKeysBySchemaWithOptions(schema, raw, schemaRepairOptions{StripUnknown: true, ToolName: name})
+	if repairErr != nil {
+		// An ambiguous repair is rejected before business execution; it is not
+		// "no repair", so the original decode error is not returned in its place.
+		var zero Args
+		return zero, false, repairErr
+	}
+	if ok {
 		if repairedArgs, repairedErr := decode(repaired); repairedErr == nil {
 			return repairedArgs, true, nil
 		}
@@ -66,27 +73,44 @@ func publishSchemaKeyRepair(ctx context.Context, raw json.RawMessage) {
 }
 
 func hasCustomArgumentDecoder(typ reflect.Type, seen map[reflect.Type]bool) bool {
+	return hasCustomArgumentCodec(typ, seen, false)
+}
+
+// hasCustomArgumentCodec reports whether decoding (and, with encoders, also
+// encoding) typ could run user code: a JSON or Text (un)marshaler on the type,
+// a field, a container element or a map key.
+func hasCustomArgumentCodec(typ reflect.Type, seen map[reflect.Type]bool, encoders bool) bool {
 	if seen[typ] {
 		return false
 	}
 	seen[typ] = true
-	decoder := reflect.TypeOf((*json.Unmarshaler)(nil)).Elem()
-	textDecoder := reflect.TypeOf((*encoding.TextUnmarshaler)(nil)).Elem()
-	if typ.Implements(decoder) || reflect.PointerTo(typ).Implements(decoder) || typ.Implements(textDecoder) || reflect.PointerTo(typ).Implements(textDecoder) {
-		return true
+	hooks := []reflect.Type{
+		reflect.TypeOf((*json.Unmarshaler)(nil)).Elem(),
+		reflect.TypeOf((*encoding.TextUnmarshaler)(nil)).Elem(),
+	}
+	if encoders {
+		hooks = append(hooks,
+			reflect.TypeOf((*json.Marshaler)(nil)).Elem(),
+			reflect.TypeOf((*encoding.TextMarshaler)(nil)).Elem(),
+		)
+	}
+	for _, hook := range hooks {
+		if typ.Implements(hook) || reflect.PointerTo(typ).Implements(hook) {
+			return true
+		}
 	}
 	switch typ.Kind() {
 	case reflect.Pointer, reflect.Slice, reflect.Array:
-		return hasCustomArgumentDecoder(typ.Elem(), seen)
+		return hasCustomArgumentCodec(typ.Elem(), seen, encoders)
 	case reflect.Map:
-		return hasCustomArgumentDecoder(typ.Key(), seen) || hasCustomArgumentDecoder(typ.Elem(), seen)
+		return hasCustomArgumentCodec(typ.Key(), seen, encoders) || hasCustomArgumentCodec(typ.Elem(), seen, encoders)
 	case reflect.Struct:
 		for i := 0; i < typ.NumField(); i++ {
 			field := typ.Field(i)
 			if (field.PkgPath != "" && !field.Anonymous) || strings.Split(field.Tag.Get("json"), ",")[0] == "-" {
 				continue
 			}
-			if hasCustomArgumentDecoder(field.Type, seen) {
+			if hasCustomArgumentCodec(field.Type, seen, encoders) {
 				return true
 			}
 		}

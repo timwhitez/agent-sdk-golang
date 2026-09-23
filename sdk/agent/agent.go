@@ -169,7 +169,8 @@ type Agent struct {
 
 	compactionAdmissionObserved func()
 	toolBlockStateObserved      func(*toolBlockState)
-	toolBlockTestHook           func(*toolBlockState) // private failure-injection hook
+	interventionObserved        func(interventionRecord) // test-only lifecycle observer
+	toolBlockTestHook           func(*toolBlockState)    // private failure-injection hook
 
 	repeatResultRecycled    func(string) bool
 	toolPlanShadowEvaluator func(toolPlanningObservation) toolCallPlan
@@ -1311,11 +1312,13 @@ func (a *Agent) queryStreamWithSteering(ctx context.Context, input llm.Content, 
 			var evidenceReq evidenceRequest
 			var completedMessage string
 			var postCommit, postPublish func()
+			var appliedInterventionStrike int
 			var callStarted time.Time
 			adapter := SequentialBlockAdapter{
 				Admit: func(root context.Context, idx int) (BlockAdmission, error) {
 					tc := comp.ToolCalls[idx]
 					postCommit, postPublish, taskComplete = nil, nil, false
+					appliedInterventionStrike = 0
 					callStarted = time.Time{}
 
 					toolCorrelation := activeToolBlock.eventCorrelation(correlation, idx)
@@ -1392,13 +1395,24 @@ func (a *Agent) queryStreamWithSteering(ctx context.Context, input llm.Content, 
 						}
 						decision := decideRepeatedSignatureIntervention(observation)
 						if decision.action == interventionActionSuppressTool {
-							loopGuardStrikes++
+							// The decision is only proposed here. Its strike is consumed
+							// and its application reported once the suppressed result
+							// has been committed to history (postCommit).
+							record := interventionRecord{kind: InterventionRepeatedToolSignature, stage: interventionProposed, strikeLimit: a.loopGuardStrikeMax}
+							a.observeIntervention(record)
 							// Accepted blocks have non-empty IDs, so this helper returns
 							// one history result. Keep its richer history-only suffix.
 							guardHistory := loopGuardSkippedToolResults(tc, resolvedName)
 							guardResult := projectToolResult(guardHistory[0], map[string]any{"loop_guard_suppressed": true}, "[ERROR] Tool call skipped by loop guard - Repeated identical tool call blocked before execution.")
 							guardResult.visible = guardResult.original
 							postCommit = func() {
+								loopGuardStrikes++
+								appliedInterventionStrike = loopGuardStrikes
+								record.stage, record.strike = interventionApplied, loopGuardStrikes
+								record.reminderQueued, record.guardDowngraded = decision.queueReminder, decision.downgradeGuard
+								// Warnings and reminders carry only the intervention labels;
+								// tool identity stays on tool events.
+								applied := eventCorrelation{}.withIntervention(InterventionResultToolSuppressed, loopGuardStrikes)
 								reminder := strings.TrimSpace(a.loopGuardUserMsg)
 								if repeatGuard.exhausted {
 									// The default reminder can mislead here ("reuse prior
@@ -1414,7 +1428,7 @@ func (a *Agent) queryStreamWithSteering(ctx context.Context, input llm.Content, 
 									// text between two tool results of the same block
 									// and permanently invalidate the history.
 									pendingBlockMessages = append(pendingBlockMessages, messageorigin.NewInternalUserMessage(messageorigin.KindLoopGuard, reminder))
-									a.emitEvent(out, HiddenUserMessageEvent{Content: reminder})
+									a.emitEvent(out, HiddenUserMessageEvent{Content: reminder}, eventCorrelation{}.withIntervention(InterventionResultReminderQueued, loopGuardStrikes))
 								}
 								a.emitEvent(out, WarnEvent{
 									Message: fmt.Sprintf(
@@ -1426,7 +1440,7 @@ func (a *Agent) queryStreamWithSteering(ctx context.Context, input llm.Content, 
 										a.loopGuardStrikeMax,
 									),
 									Kind: "loop_guard",
-								})
+								}, applied)
 								repeatGuard.reset()
 								if decision.downgradeGuard {
 									// Repeat protection budget is spent. Rather than
@@ -1444,9 +1458,10 @@ func (a *Agent) queryStreamWithSteering(ctx context.Context, input llm.Content, 
 											loopGuardStrikes,
 										),
 										Kind: "loop_guard",
-									})
+									}, eventCorrelation{}.withIntervention(InterventionResultGuardDowngraded, loopGuardStrikes))
 									repeatGuard.exhausted = true
 								}
+								a.observeIntervention(record)
 								a.emitEvent(out, StepStartEvent{StepID: tc.ID, Title: resolvedName, StepNumber: step}, toolCorrelation)
 								a.emitEvent(out, ToolCallEvent{
 									Tool: resolvedName, Args: norm.Display, ArgsJSON: norm.Normalized,
@@ -1575,7 +1590,11 @@ func (a *Agent) queryStreamWithSteering(ctx context.Context, input llm.Content, 
 					if !callStarted.IsZero() {
 						duration = time.Since(callStarted)
 					}
-					a.emitToolResultWithAccounting(out, t.projection(), duration, toolCorrelation)
+					resultCorrelation := toolCorrelation
+					if t.Reason == "loop_guard" && appliedInterventionStrike > 0 {
+						resultCorrelation = toolCorrelation.withIntervention(InterventionResultToolSuppressed, appliedInterventionStrike)
+					}
+					a.emitToolResultWithAccounting(out, t.projection(), duration, resultCorrelation)
 					status := "completed"
 					if t.History.IsError {
 						status = "error"
@@ -2454,6 +2473,11 @@ func (a *Agent) invokeModelCompletionWithRetryAndSteering(ctx context.Context, m
 		if !retry {
 			break
 		}
+		// The failed attempt's usage belongs to that attempt, not the retry.
+		var failedCorrelation []eventCorrelation
+		if len(scopes) == 1 {
+			failedCorrelation = []eventCorrelation{scopes[0].completionCorrelation()}
+		}
 		// A cancellation while waiting for another retry is not a failure
 		// inside the preceding, already completed model invocation.
 		if len(scopes) == 1 {
@@ -2467,12 +2491,17 @@ func (a *Agent) invokeModelCompletionWithRetryAndSteering(ctx context.Context, m
 				if !t.Stop() {
 					<-t.C
 				}
+				// The caller reports lastComp's usage once on this path.
 				return lastComp, lastStreamed, ctx.Err()
 			case <-t.C:
 			}
-			continue
+		} else {
+			a.warnf("agent invoke transient failure (attempt %d/%d): %v; retrying", attempt, maxAttempts, err)
 		}
-		a.warnf("agent invoke transient failure (attempt %d/%d): %v; retrying", attempt, maxAttempts, err)
+		// Only now is the next attempt certain; the failed attempt's observed
+		// usage was billed and must not be replaced by the retry's usage.
+		a.emitPartialUsage(out, comp, failedCorrelation...)
+		lastComp = nil
 	}
 	return lastComp, lastStreamed, lastErr
 }
@@ -2813,15 +2842,35 @@ func (a *Agent) emitEvent(out *eventOutput, ev Event, correlations ...eventCorre
 		return false
 	}
 	envelope := out.next(ev)
-	if len(correlations) == 1 && correlations[0].frameID != "" {
-		envelope.FrameID, envelope.InvokeAttempt = correlations[0].frameID, correlations[0].attempt
-		if correlations[0].controlSource != "" {
-			envelope.RequestControlRelation = RequestControlRequireDoneDisableThinking
-			envelope.RequestControlSourceFrameID = correlations[0].controlSource
-		}
-		envelope.ToolBlockID, envelope.ToolCallOrdinal, envelope.ToolBlockCallCount = correlations[0].toolBlockID, correlations[0].toolCallOrdinal, correlations[0].blockCallCount
-	}
+	applyEventCorrelation(&envelope, correlations)
 	return a.emitEnvelope(out, ev, envelope)
+}
+
+func (a *Agent) observeIntervention(record interventionRecord) {
+	if a != nil && a.interventionObserved != nil {
+		a.interventionObserved(record)
+	}
+}
+
+func applyEventCorrelation(envelope *EventEnvelope, correlations []eventCorrelation) {
+	if len(correlations) != 1 {
+		return
+	}
+	correlation := correlations[0]
+	if correlation.frameID != "" {
+		envelope.FrameID, envelope.InvokeAttempt = correlation.frameID, correlation.attempt
+		if correlation.controlSource != "" {
+			envelope.RequestControlRelation = RequestControlRequireDoneDisableThinking
+			envelope.RequestControlSourceFrameID = correlation.controlSource
+		}
+		envelope.ToolBlockID, envelope.ToolCallOrdinal, envelope.ToolBlockCallCount = correlation.toolBlockID, correlation.toolCallOrdinal, correlation.blockCallCount
+	}
+	if correlation.intervention != "" {
+		envelope.Intervention = correlation.intervention
+		envelope.InterventionStage = InterventionStageApplied
+		envelope.InterventionResult = correlation.interventionResult
+		envelope.InterventionStrike = correlation.interventionStrike
+	}
 }
 
 func (a *Agent) emitEventFrom(out *eventOutput, ev Event, origin EventOrigin, correlations ...eventCorrelation) bool {
@@ -2829,14 +2878,7 @@ func (a *Agent) emitEventFrom(out *eventOutput, ev Event, origin EventOrigin, co
 		return false
 	}
 	envelope := out.nextFrom(ev, origin)
-	if len(correlations) == 1 && correlations[0].frameID != "" {
-		envelope.FrameID, envelope.InvokeAttempt = correlations[0].frameID, correlations[0].attempt
-		if correlations[0].controlSource != "" {
-			envelope.RequestControlRelation = RequestControlRequireDoneDisableThinking
-			envelope.RequestControlSourceFrameID = correlations[0].controlSource
-		}
-		envelope.ToolBlockID, envelope.ToolCallOrdinal, envelope.ToolBlockCallCount = correlations[0].toolBlockID, correlations[0].toolCallOrdinal, correlations[0].blockCallCount
-	}
+	applyEventCorrelation(&envelope, correlations)
 	return a.emitEnvelope(out, ev, envelope)
 }
 
@@ -3423,31 +3465,27 @@ func (a *Agent) runCompactionAsync(ctx context.Context, snapshot []llm.Message, 
 
 	compactCtx, cancelCompact := asyncCompactionContext(ctx)
 	defer cancelCompact()
-	newMsgs, res, err := a.compactWithRetry(compactCtx, snapshot, compaction.PipelineRequest{
-		Trigger:         decision.trigger,
-		Usage:           decisionUsage,
-		TargetWatermark: decision.targetWatermark,
-		AllowSummary:    a.compactionSummaryAllowed(),
-	})
+	// The request comes from the decision sampled before launch; this
+	// goroutine never re-reads admission state such as the failure streak.
+	newMsgs, res, err := a.compactWithRetry(compactCtx, snapshot, decision.pipelineRequest(decisionUsage))
 	if err != nil {
 		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
 			return
 		}
 		a.warnf("compaction failed after %d attempt(s): %v", a.compactionMaxAttempts(), err)
 		a.compactionRetryPending.Store(true)
-		a.noteCompactionFailure()
+		if decision.recordsOutcome() {
+			a.noteCompactionFailure()
+		}
 		return
 	}
-	switch strings.TrimSpace(decision.trigger) {
-	case "todo_checkpoint":
-		a.todoCompactionPending.Store(false)
-	case "retry_checkpoint":
-		a.compactionRetryPending.Store(false)
-	}
+	a.clearSatisfiedCompactionWork(decision)
 	if !res.Compacted {
 		return
 	}
-	a.noteCompactionSuccess()
+	if decision.recordsOutcome() {
+		a.noteCompactionSuccess()
+	}
 	newMsgs = a.withPreservedSystem(snapshot, newMsgs)
 	res = a.reconcileCompactionTelemetry(res, snapshot, newMsgs, 0)
 
@@ -3459,6 +3497,18 @@ func (a *Agent) runCompactionAsync(ctx context.Context, snapshot []llm.Message, 
 		triggerUsage: triggerUsage,
 	}
 	a.pendingCompactionMu.Unlock()
+}
+
+// clearSatisfiedCompactionWork clears the pending work a successful run of
+// decision satisfies.
+func (a *Agent) clearSatisfiedCompactionWork(decision compactionDecision) {
+	todo, retry := decision.clearsPending()
+	if todo {
+		a.todoCompactionPending.Store(false)
+	}
+	if retry {
+		a.compactionRetryPending.Store(false)
+	}
 }
 
 const asyncCompactionCancelGrace = 100 * time.Millisecond
@@ -4304,8 +4354,12 @@ func (a *Agent) CompactPipelineNow(ctx context.Context, req compaction.PipelineR
 		return compaction.Result{Compacted: false}, nil
 	}
 	a.applyPendingCompaction(nil)
+	decision := manualCompactionDecision(req)
 	if !a.compactionInFlight.CompareAndSwap(false, true) {
-		return compaction.Result{Compacted: false}, fmt.Errorf("%w: compaction already in progress", ErrAgentBusy)
+		if decision.rejectsOverlap() {
+			return compaction.Result{Compacted: false}, fmt.Errorf("%w: compaction already in progress", ErrAgentBusy)
+		}
+		return compaction.Result{Compacted: false}, nil
 	}
 	defer a.releaseCompactionInFlight()
 
@@ -4314,12 +4368,11 @@ func (a *Agent) CompactPipelineNow(ctx context.Context, req compaction.PipelineR
 	copy(orig, a.messages)
 	a.mu.Unlock()
 
-	newMsgs, res, err := a.compactWithRetry(ctx, orig, req)
+	newMsgs, res, err := a.compactWithRetry(ctx, orig, decision.pipelineRequest(req.Usage))
 	if err != nil {
 		return res, err
 	}
-	a.todoCompactionPending.Store(false)
-	a.compactionRetryPending.Store(false)
+	a.clearSatisfiedCompactionWork(decision)
 	newMsgs = a.withPreservedSystem(orig, newMsgs)
 	if res.Compacted {
 		res = a.reconcileCompactionTelemetry(res, orig, newMsgs, req.AdditionalTokens)
