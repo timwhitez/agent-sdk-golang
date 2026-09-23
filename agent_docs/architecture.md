@@ -117,6 +117,17 @@ Otherwise, and on a second overflow, the provider error ends the turn as
 before. `Config.DisableContextOverflowRecovery` turns it off. Adapters without
 a documented structured code (Anthropic today) never type an overflow.
 
+Automatic compaction is bounded per real user input as well. An automatic
+summary that succeeds but leaves the history at or above the summary
+threshold (for example because the kept recent user input alone exceeds it)
+suppresses the automatic summary tier for the rest of that input: later
+automatic decisions run local tiers only instead of paying for another
+summary of the same material. A new Query or accepted steering message, a
+decision below the summary threshold, or a replacement compaction runtime
+clears it. Overflow compaction and manual/preflight entries are never
+suppressed. A failed summary continues to use the separate failure streak
+and cooldown.
+
 [CommitCompactionHistory](../sdk/agent/compaction_publication.go) accepts the exact
 source snapshot used to compute a candidate. It rejects admission, pending work
 or stale content before persistence, owns candidate data across callbacks, and

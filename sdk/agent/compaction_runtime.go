@@ -166,11 +166,7 @@ func (a *Agent) applyCompactionRuntimeUpdateLocked(update *compactionRuntimeUpda
 		a.hasCompactor = true
 	}
 
-	// Retry/cooldown state describes failures of the superseded service. Carrying
-	// it into a replacement can incorrectly suppress the new configuration.
-	a.compactionRetryPending.Store(false)
-	a.compactionFailureStreak.Store(0)
-	a.compactionCooldownUntil.Store(0)
+	a.resetCompactionOutcomeState()
 	if !a.hasCompactor {
 		a.todoCompactionPending.Store(false)
 	}
@@ -182,4 +178,15 @@ func (a *Agent) signalCompactionRuntimeWaitersLocked() {
 	if wait != nil {
 		close(wait)
 	}
+}
+
+// resetCompactionOutcomeState clears the outcome state of the superseded
+// service. Retry/cooldown and ineffective-summary state describe that
+// service; carrying them into a replacement can incorrectly suppress the new
+// configuration.
+func (a *Agent) resetCompactionOutcomeState() {
+	a.compactionRetryPending.Store(false)
+	a.compactionFailureStreak.Store(0)
+	a.compactionCooldownUntil.Store(0)
+	a.ineffectiveSummaryEpoch.Store(0)
 }

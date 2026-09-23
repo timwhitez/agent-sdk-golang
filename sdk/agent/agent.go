@@ -9,6 +9,7 @@ import (
 	"net"
 	"os"
 	"reflect"
+	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -168,13 +169,19 @@ type Agent struct {
 	streamIdleMaxRecov         int
 	// overflowRecoveryDisabled mirrors Config.DisableContextOverflowRecovery.
 	overflowRecoveryDisabled bool
-	// steeringEpoch counts real user steering accepted into a Query; each
-	// accepted message starts a new epoch for the overflow recovery budget.
-	steeringEpoch atomic.Uint64
-	toolChoice    llm.ToolChoice
-	requireDone   bool
-	warningf      func(format string, args ...any)
-	hasCompactor  bool
+	// userInputEpoch counts real user input: each Query and each accepted
+	// steering message start a new epoch. Internal reminders, continuations
+	// and compaction results never advance it. Overflow recovery and the
+	// ineffective-summary suppression are bounded per epoch.
+	userInputEpoch atomic.Uint64
+	// ineffectiveSummaryEpoch is 1 + the userInputEpoch in which an automatic
+	// summary succeeded but left the history at or above the summary
+	// threshold; 0 means the automatic summary tier is not suppressed.
+	ineffectiveSummaryEpoch atomic.Uint64
+	toolChoice              llm.ToolChoice
+	requireDone             bool
+	warningf                func(format string, args ...any)
+	hasCompactor            bool
 
 	compactionAdmissionObserved func()
 	toolBlockStateObserved      func(*toolBlockState)
@@ -654,6 +661,7 @@ func (a *Agent) queryStreamWithSteering(ctx context.Context, input llm.Content, 
 		// itself, then each accepted steering message. Internal reminders,
 		// continuations and compaction results never refresh it.
 		overflowRecoveryEpoch := ^uint64(0)
+		a.userInputEpoch.Add(1)
 		usageFallbackWarned := false
 		cont := newToolCallContinuation(defaultMaxContinuationTurns)
 		// A new Query never inherits a previous Query's compaction relation.
@@ -882,7 +890,7 @@ func (a *Agent) queryStreamWithSteering(ctx context.Context, input llm.Content, 
 					// empty message means the host canceled a later stage after that
 					// steering had already been appended at an earlier boundary.
 					if strings.TrimSpace(steerErr.Message) != "" {
-						a.steeringEpoch.Add(1)
+						a.userInputEpoch.Add(1)
 						a.emitEvent(out, SteeringReceivedEvent{Content: steerErr.Message})
 					}
 					continue
@@ -928,7 +936,7 @@ func (a *Agent) queryStreamWithSteering(ctx context.Context, input llm.Content, 
 				// overflow in the same epoch, an unchanged history, partial
 				// output or a pending continuation ends the turn as before.
 				if llm.IsContextOverflow(err) && !a.overflowRecoveryDisabled && !cont.hasPending() && completionIsEmpty(comp) {
-					epoch := a.steeringEpoch.Load()
+					epoch := a.userInputEpoch.Load()
 					if overflowRecoveryEpoch != epoch {
 						overflowRecoveryEpoch = epoch
 						changed, recoveryErr := a.compactForProviderOverflow(ctx, frame.id, out)
@@ -3555,6 +3563,9 @@ func (a *Agent) runCompactionAsync(ctx context.Context, sourceFrameID string, sn
 	}
 	newMsgs = a.withPreservedSystem(snapshot, newMsgs)
 	res = a.reconcileCompactionTelemetry(res, snapshot, newMsgs, 0)
+	if decision.recordsOutcome() {
+		a.noteSummaryEffect(decision.inputEpoch, res)
+	}
 
 	a.pendingCompactionMu.Lock()
 	a.pendingCompaction = &pendingCompaction{
@@ -3670,6 +3681,7 @@ func (a *Agent) compactSyncOverflow(ctx context.Context, sourceFrameID string, l
 	}
 	newMsgs = a.withPreservedSystem(messages, newMsgs)
 	res = a.reconcileCompactionTelemetry(res, messages, newMsgs, 0)
+	a.noteSummaryEffect(a.userInputEpoch.Load(), res)
 
 	a.pendingCompactionMu.Lock()
 	a.pendingCompaction = &pendingCompaction{
@@ -3775,6 +3787,43 @@ func (a *Agent) compactionInCooldown() bool {
 		return false
 	}
 	return true
+}
+
+// automaticSummarySuppressed reports whether an ineffective automatic summary
+// earlier in the same user input still suppresses the automatic summary tier.
+// A new user input, or a decision below the summary threshold, clears it.
+func (a *Agent) automaticSummarySuppressed(epoch uint64, usage *llm.Usage) bool {
+	armed := a.ineffectiveSummaryEpoch.Load()
+	if armed == 0 {
+		return false
+	}
+	if armed != epoch+1 || a.compactor == nil || a.compactor.DecisionTokens(usage) < a.compactor.ThresholdTokens() {
+		a.ineffectiveSummaryEpoch.CompareAndSwap(armed, 0)
+		return false
+	}
+	return true
+}
+
+// noteSummaryEffect records whether an automatic run's summary brought the
+// history under the summary threshold. A summary that did not suppresses the
+// automatic summary tier for the rest of its user input: repeating it would
+// pay for another summary of the same material. An effective summary clears
+// the suppression. Overflow and manual compaction are never suppressed.
+func (a *Agent) noteSummaryEffect(epoch uint64, res compaction.Result) {
+	if a == nil || a.compactor == nil || !slices.Contains(res.TiersApplied, "summarize") {
+		return
+	}
+	threshold := a.compactor.ThresholdTokens()
+	if res.NewTokens < threshold {
+		a.ineffectiveSummaryEpoch.Store(0)
+		return
+	}
+	if a.ineffectiveSummaryEpoch.Swap(epoch+1) != epoch+1 {
+		a.warnf(
+			"warning: automatic compaction summary left the context at %d estimated tokens, at or above the summary threshold of %d; the automatic summary tier is suppressed until new user input or the context falls below the threshold (overflow and manual compaction are unaffected)",
+			res.NewTokens, threshold,
+		)
+	}
 }
 
 // compactionSummaryAllowed reports whether the expensive summary tier should
@@ -5154,7 +5203,7 @@ func (a *Agent) collectSteering(ch <-chan SteeringMsg, out *eventOutput) []llm.M
 			Role:    llm.RoleUser,
 			Content: llm.TextContent(msg.Content),
 		})
-		a.steeringEpoch.Add(1)
+		a.userInputEpoch.Add(1)
 		a.emitEvent(out, SteeringReceivedEvent{Content: msg.Content})
 	}
 }
