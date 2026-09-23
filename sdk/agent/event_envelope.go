@@ -83,6 +83,17 @@ type EventEnvelope struct {
 	// accepted history-only tails that may produce no envelope. Zero is unknown.
 	ToolCallOrdinal    uint64 `json:"ToolCallOrdinal,omitempty"`
 	ToolBlockCallCount uint64 `json:"ToolBlockCallCount,omitempty"`
+	// Intervention names an SDK intervention whose application was accepted
+	// into history before this event was produced; InterventionStage is then
+	// "applied" and InterventionResult a fixed outcome label. Empty means the
+	// event reports no intervention, not that none was considered. It is not
+	// proof of delivery, of model compliance or of full content provenance.
+	Intervention       string `json:"Intervention,omitempty"`
+	InterventionStage  string `json:"InterventionStage,omitempty"`
+	InterventionResult string `json:"InterventionResult,omitempty"`
+	// InterventionStrike is the one-based applied strike of that intervention
+	// within the Query; zero is unknown.
+	InterventionStrike uint64 `json:"InterventionStrike,omitempty"`
 	Sequence           uint64
 	Origin             EventOrigin
 	Kind               EventKind

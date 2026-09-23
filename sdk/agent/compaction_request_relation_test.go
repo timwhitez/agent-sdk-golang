@@ -209,3 +209,24 @@ func TestManualCompactionClearsAppliedRelation(t *testing.T) {
 		t.Fatalf("manual compaction kept source %q", ag.appliedCompactionSource)
 	}
 }
+
+// The shared correlation projection keeps every producer's labels: the
+// RequireDone control relation, the compaction history relation and an
+// applied intervention can coexist on one envelope without overwriting.
+func TestEventCorrelationComposesAllRelations(t *testing.T) {
+	var envelope EventEnvelope
+	correlation := eventCorrelation{frameID: "q/frame/2", attempt: 1, controlSource: "q/frame/1", historySource: "q/frame/1"}.withIntervention(InterventionResultToolSuppressed, 3)
+	applyEventCorrelation(&envelope, []eventCorrelation{correlation})
+	if envelope.FrameID != "q/frame/2" || envelope.RequestControlRelation != RequestControlRequireDoneDisableThinking ||
+		envelope.RequestHistoryRelation != RequestHistoryCompactionApplied || envelope.RequestHistorySourceFrameID != "q/frame/1" ||
+		envelope.Intervention != InterventionRepeatedToolSignature || envelope.InterventionStrike != 3 {
+		t.Fatalf("envelope=%+v", envelope)
+	}
+	// Without a Frame, the history relation is not attached (it describes a
+	// Frame's request), while intervention labels still are.
+	var bare EventEnvelope
+	applyEventCorrelation(&bare, []eventCorrelation{eventCorrelation{historySource: "q/frame/1"}.withIntervention(InterventionResultReminderQueued, 1)})
+	if bare.RequestHistoryRelation != "" || bare.Intervention == "" {
+		t.Fatalf("bare envelope=%+v", bare)
+	}
+}
