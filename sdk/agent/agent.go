@@ -1369,45 +1369,45 @@ func (a *Agent) queryStreamWithSteering(ctx context.Context, input llm.Content, 
 			if a.toolBlockTestHook != nil {
 				a.toolBlockTestHook(activeToolBlock)
 			}
-			var tool tools.Tool
-			var originalName, resolvedName string
-			var unknownToolFallback, evidenceTool, taskComplete bool
-			var evidenceReq evidenceRequest
+			// nativeCalls holds each call's state by ordinal, so Admit,
+			// Project, Commit, Publish and Boundary of one call never read
+			// another call's state, whatever order the owner interleaves them.
+			nativeCalls := make([]nativeToolCall, len(comp.ToolCalls))
+			ordinalByID := make(map[string]int, len(comp.ToolCalls))
+			for i, call := range comp.ToolCalls {
+				ordinalByID[call.ID] = i
+			}
 			var completedMessage string
-			var postCommit, postPublish func()
-			var appliedInterventionStrike int
-			var callStarted time.Time
 			adapter := SequentialBlockAdapter{
 				Admit: func(root context.Context, idx int) (BlockAdmission, error) {
 					tc := comp.ToolCalls[idx]
-					postCommit, postPublish, taskComplete = nil, nil, false
-					appliedInterventionStrike = 0
-					callStarted = time.Time{}
+					c := &nativeCalls[idx]
+					*c = nativeToolCall{}
 
 					toolCorrelation := activeToolBlock.eventCorrelation(correlation, idx)
 					step := idx + 1
-					originalName = tc.Function.Name
+					c.originalName = tc.Function.Name
 
-					// Resolve tool: exact match → normalized/alias match → fallback
+					// Resolve c.tool: exact match → normalized/alias match → fallback
 					var found, normalizedAlias bool
-					tool, resolvedName, found, normalizedAlias = resolveToolByName(tc.Function.Name, frame.exact, frame.normalized)
-					unknownToolFallback = false
+					c.tool, c.resolvedName, found, normalizedAlias = resolveToolByName(tc.Function.Name, frame.exact, frame.normalized)
+					c.unknownToolFallback = false
 					execArgs := tc.Function.Arguments
 
 					if !found {
-						unknownToolFallback = true
-						resolvedName = "invalid"
-						execArgs = wrapInvalidToolArgs(originalName, tc.Function.Arguments)
+						c.unknownToolFallback = true
+						c.resolvedName = "invalid"
+						execArgs = wrapInvalidToolArgs(c.originalName, tc.Function.Arguments)
 						if inv, ok := frame.exact["invalid"]; ok {
-							tool = inv
+							c.tool = inv
 						} else {
-							tool = autoInvalidTool()
+							c.tool = autoInvalidTool()
 						}
 					}
 
-					prepared, norm := tool.PrepareCall(execArgs)
+					prepared, norm := c.tool.PrepareCall(execArgs)
 					resolution := toolResolutionExact
-					if unknownToolFallback {
+					if c.unknownToolFallback {
 						resolution = toolResolutionUnknownFallback
 					} else if normalizedAlias {
 						resolution = toolResolutionNormalizedAlias
@@ -1425,8 +1425,8 @@ func (a *Agent) queryStreamWithSteering(ctx context.Context, input llm.Content, 
 						shadowPlan = a.toolPlanShadowEvaluator(planningObservation)
 					}
 					a.observeToolCallPlan(legacyPlan, shadowPlan)
-					evidenceReq, evidenceTool = newEvidenceRequest(resolvedName, norm.Normalized, execArgs, a.deps)
-					if !strings.EqualFold(strings.TrimSpace(resolvedName), "done") {
+					c.evidenceReq, c.evidenceTool = newEvidenceRequest(c.resolvedName, norm.Normalized, execArgs, a.deps)
+					if !strings.EqualFold(strings.TrimSpace(c.resolvedName), "done") {
 						pendingRequireDoneFinalText = ""
 						pendingRequireDoneFinalResponseID = ""
 					}
@@ -1436,8 +1436,8 @@ func (a *Agent) queryStreamWithSteering(ctx context.Context, input llm.Content, 
 							a.warnf("warning: tool-call argument merge conflict for call %q: %s", tc.ID, warning)
 						}
 					}
-					if repeatGuard != nil && !evidenceTool {
-						signature := normalizeToolSignature(resolvedName, norm.Normalized, execArgs)
+					if repeatGuard != nil && !c.evidenceTool {
+						signature := normalizeToolSignature(c.resolvedName, norm.Normalized, execArgs)
 						seen, blocked := repeatGuard.observe(signature)
 						lastResultRecycled := false
 						if blocked && repeatGuard.exhausted {
@@ -1460,21 +1460,21 @@ func (a *Agent) queryStreamWithSteering(ctx context.Context, input llm.Content, 
 						if decision.action == interventionActionSuppressTool {
 							// The decision is only proposed here. Its strike is consumed
 							// and its application reported once the suppressed result
-							// has been committed to history (postCommit).
+							// has been committed to history (c.postCommit).
 							record := interventionRecord{kind: InterventionRepeatedToolSignature, stage: interventionProposed, strikeLimit: a.loopGuardStrikeMax}
 							a.observeIntervention(record)
 							// Accepted blocks have non-empty IDs, so this helper returns
 							// one history result. Keep its richer history-only suffix.
-							guardHistory := loopGuardSkippedToolResults(tc, resolvedName)
+							guardHistory := loopGuardSkippedToolResults(tc, c.resolvedName)
 							guardResult := projectToolResult(guardHistory[0], map[string]any{"loop_guard_suppressed": true}, "[ERROR] Tool call skipped by loop guard - Repeated identical tool call blocked before execution.")
 							guardResult.visible = guardResult.original
-							postCommit = func() {
+							c.postCommit = func() {
 								loopGuardStrikes++
-								appliedInterventionStrike = loopGuardStrikes
+								c.appliedInterventionStrike = loopGuardStrikes
 								record.stage, record.strike = interventionApplied, loopGuardStrikes
 								record.reminderQueued, record.guardDowngraded = decision.queueReminder, decision.downgradeGuard
 								// Warnings and reminders carry only the intervention labels;
-								// tool identity stays on tool events.
+								// c.tool identity stays on c.tool events.
 								applied := eventCorrelation{}.withIntervention(InterventionResultToolSuppressed, loopGuardStrikes)
 								reminder := strings.TrimSpace(a.loopGuardUserMsg)
 								if repeatGuard.exhausted {
@@ -1486,9 +1486,9 @@ func (a *Agent) queryStreamWithSteering(ctx context.Context, input llm.Content, 
 								}
 								if decision.queueReminder {
 									// Buffered, not appended: this is a user-role
-									// message and the assistant tool-call block is not
+									// message and the assistant c.tool-call block is not
 									// closed yet. Appending here would interleave user
-									// text between two tool results of the same block
+									// text between two c.tool results of the same block
 									// and permanently invalidate the history.
 									pendingBlockMessages = append(pendingBlockMessages, messageorigin.NewInternalUserMessage(messageorigin.KindLoopGuard, reminder))
 									a.emitEvent(out, HiddenUserMessageEvent{Content: reminder}, eventCorrelation{}.withIntervention(InterventionResultReminderQueued, loopGuardStrikes))
@@ -1525,42 +1525,42 @@ func (a *Agent) queryStreamWithSteering(ctx context.Context, input llm.Content, 
 									repeatGuard.exhausted = true
 								}
 								a.observeIntervention(record)
-								a.emitEvent(out, StepStartEvent{StepID: tc.ID, Title: resolvedName, StepNumber: step}, toolCorrelation)
+								a.emitEvent(out, StepStartEvent{StepID: tc.ID, Title: c.resolvedName, StepNumber: step}, toolCorrelation)
 								a.emitEvent(out, ToolCallEvent{
-									Tool: resolvedName, Args: norm.Display, ArgsJSON: norm.Normalized,
-									ArgsMeta: norm.Meta, ToolCallID: tc.ID, DisplayName: resolvedName,
+									Tool: c.resolvedName, Args: norm.Display, ArgsJSON: norm.Normalized,
+									ArgsMeta: norm.Meta, ToolCallID: tc.ID, DisplayName: c.resolvedName,
 								}, toolCorrelation)
 							}
 							terminal := blockTerminal(guardResult, "loop_guard")
 							return BlockAdmission{Skipped: &terminal}, nil
 						}
 					}
-					a.emitEvent(out, StepStartEvent{StepID: tc.ID, Title: resolvedName, StepNumber: step}, toolCorrelation)
+					a.emitEvent(out, StepStartEvent{StepID: tc.ID, Title: c.resolvedName, StepNumber: step}, toolCorrelation)
 					argsMap := norm.Display
 					if argsMap == nil {
 						argsMap = map[string]any{"__raw": execArgs}
 					}
 					a.emitEvent(out, ToolCallEvent{
-						Tool:        resolvedName,
+						Tool:        c.resolvedName,
 						Args:        argsMap,
 						ArgsJSON:    norm.Normalized,
 						ArgsMeta:    norm.Meta,
 						ToolCallID:  tc.ID,
-						DisplayName: resolvedName,
+						DisplayName: c.resolvedName,
 					}, toolCorrelation)
-					if evidenceTool {
-						decision := progressLedger.preflight(evidenceReq, a.compactionGeneration.Load())
+					if c.evidenceTool {
+						decision := progressLedger.preflight(c.evidenceReq, a.compactionGeneration.Load())
 						if decision.suppress {
 							content := llm.TextContent(decision.content)
 							suppressedResult := projectToolResult(llm.Message{
-								Role: llm.RoleTool, ToolCallID: tc.ID, ToolName: resolvedName,
-								Content: content, IsError: false, Ephemeral: tool.EphemeralKeep > 0,
+								Role: llm.RoleTool, ToolCallID: tc.ID, ToolName: c.resolvedName,
+								Content: content, IsError: false, Ephemeral: c.tool.EphemeralKeep > 0,
 							}, decision.metadata, content.PlainText())
-							postPublish = func() {
+							c.postPublish = func() {
 								if decision.recovery {
-									reminder := evidenceRecoveryMessage(evidenceReq)
+									reminder := evidenceRecoveryMessage(c.evidenceReq)
 									queued := eventCorrelation{}.withInterventionKind(InterventionEvidenceProgress, InterventionResultReminderQueued, evidenceSuppressions)
-									// Deferred until the tool-call block is closed; see
+									// Deferred until the c.tool-call block is closed; see
 									// the loop-guard reminder above.
 									pendingBlockMessages = append(pendingBlockMessages, messageorigin.NewInternalUserMessage(messageorigin.KindEvidenceRecovery, reminder))
 									a.emitEvent(out, HiddenUserMessageEvent{Content: reminder}, queued)
@@ -1569,10 +1569,10 @@ func (a *Agent) queryStreamWithSteering(ctx context.Context, input llm.Content, 
 										Metadata: decision.metadata,
 										Message: fmt.Sprintf(
 											"suppressed repeated %s evidence call after %d execution(s); target=%s fingerprint=%s action=change_target_range_or_action",
-											evidenceReq.family,
+											c.evidenceReq.family,
 											decision.metadata["evidence_executed"],
-											evidenceReq.target,
-											evidenceReq.fingerprint,
+											c.evidenceReq.target,
+											c.evidenceReq.fingerprint,
 										),
 									}, queued)
 								}
@@ -1582,19 +1582,21 @@ func (a *Agent) queryStreamWithSteering(ctx context.Context, input llm.Content, 
 						}
 					}
 
-					callStarted = time.Now()
+					c.callStarted = time.Now()
 					ctxTool := tools.WithToolResultMetadata(tools.WithToolCallID(root, tc.ID))
 					ctxTool, finish := a.beginSteeringInterruptibleStage(ctxTool)
 					return BlockAdmission{Call: &prepared, Context: ctxTool, Deps: a.deps, Finish: finish}, nil
 				},
-				OnPanic: func(_ int, ctx context.Context, recovered any) (llm.Content, error) {
-					panicMsg := fmt.Sprintf("tool %q panicked: %v", tool.Name, recovered)
-					a.warnf("error: recovered panic from tool %q: %v", tool.Name, recovered)
-					tools.UpsertToolResultMetadata(ctx, map[string]any{"panic": true, "panic_message": panicMsg, "tool": tool.Name})
+				OnPanic: func(idx int, ctx context.Context, recovered any) (llm.Content, error) {
+					c := &nativeCalls[idx]
+					panicMsg := fmt.Sprintf("tool %q panicked: %v", c.tool.Name, recovered)
+					a.warnf("error: recovered panic from tool %q: %v", c.tool.Name, recovered)
+					tools.UpsertToolResultMetadata(ctx, map[string]any{"panic": true, "panic_message": panicMsg, "tool": c.tool.Name})
 					return llm.TextContent("Error: " + panicMsg), fmt.Errorf("%s", panicMsg)
 				},
 				Project: func(idx int, outcome BlockOutcome) (BlockTerminal, error) {
 					tc := comp.ToolCalls[idx]
+					c := &nativeCalls[idx]
 					if outcome.NotStarted != BlockContinue {
 						text := toolSkippedByCancellationText
 						if outcome.NotStarted == BlockDone {
@@ -1610,30 +1612,30 @@ func (a *Agent) queryStreamWithSteering(ctx context.Context, input llm.Content, 
 						toolErr = outcome.RootError
 						content = llm.TextContent("Tool execution canceled before turn continuation: " + outcome.RootError.Error())
 					}
-					isError := toolErr != nil || unknownToolFallback
-					if unknownToolFallback {
+					isError := toolErr != nil || c.unknownToolFallback
+					if c.unknownToolFallback {
 						if meta == nil {
 							meta = map[string]any{}
 						}
-						meta["error_kind"], meta["tool"] = "tool_not_found", originalName
+						meta["error_kind"], meta["tool"] = "tool_not_found", c.originalName
 					}
 					reason := "handler_return"
 					var tce *tools.TaskCompleteError
 					if outcome.RootError == nil && errors.As(toolErr, &tce) {
-						taskComplete = true
+						c.taskComplete = true
 						completedMessage = tce.Message
 						reason = "task_complete"
 						isError = false
 						content = llm.TextContent("Task completed: " + tce.Message)
 					} else {
-						if evidenceTool {
-							meta = mergeToolResultMetadata(meta, progressLedger.observe(evidenceReq, content.PlainText(), isError))
+						if c.evidenceTool {
+							meta = mergeToolResultMetadata(meta, progressLedger.observe(c.evidenceReq, content.PlainText(), isError))
 						}
-						progressLedger.invalidateAfter(resolvedName, isError)
+						progressLedger.invalidateAfter(c.resolvedName, isError)
 					}
 					original := content.PlainText()
-					content, meta = a.applyToolResultTruncation(ctx, content, meta, resolvedName, tc.ID)
-					return blockTerminal(projectToolResult(llm.Message{Role: llm.RoleTool, ToolCallID: tc.ID, ToolName: resolvedName, Content: content, IsError: isError, Ephemeral: tool.EphemeralKeep > 0}, meta, original), reason), nil
+					content, meta = a.applyToolResultTruncation(ctx, content, meta, c.resolvedName, tc.ID)
+					return blockTerminal(projectToolResult(llm.Message{Role: llm.RoleTool, ToolCallID: tc.ID, ToolName: c.resolvedName, Content: content, IsError: isError, Ephemeral: c.tool.EphemeralKeep > 0}, meta, original), reason), nil
 				},
 				Commit: func(terminals []BlockTerminal) error {
 					rows := make([]llm.Message, len(terminals))
@@ -1641,22 +1643,25 @@ func (a *Agent) queryStreamWithSteering(ctx context.Context, input llm.Content, 
 						rows[i] = t.History
 					}
 					commitToolHistory(rows)
-					if len(terminals) == 1 && terminals[0].Reason == "loop_guard" && postCommit != nil {
-						postCommit()
+					if len(terminals) == 1 && terminals[0].Reason == "loop_guard" {
+						if idx, ok := ordinalByID[terminals[0].History.ToolCallID]; ok && nativeCalls[idx].postCommit != nil {
+							nativeCalls[idx].postCommit()
+						}
 					}
 					return nil
 				},
 				Publish: func(idx int, t BlockTerminal, duration time.Duration) {
 					tc := comp.ToolCalls[idx]
+					c := &nativeCalls[idx]
 					toolCorrelation := activeToolBlock.eventCorrelation(correlation, idx)
 					// Preserve legacy wall time: stage setup, projection and commit
 					// are included, with StepComplete sampled after publication.
-					if !callStarted.IsZero() {
-						duration = time.Since(callStarted)
+					if !c.callStarted.IsZero() {
+						duration = time.Since(c.callStarted)
 					}
 					resultCorrelation := toolCorrelation
-					if t.Reason == "loop_guard" && appliedInterventionStrike > 0 {
-						resultCorrelation = toolCorrelation.withIntervention(InterventionResultToolSuppressed, appliedInterventionStrike)
+					if t.Reason == "loop_guard" && c.appliedInterventionStrike > 0 {
+						resultCorrelation = toolCorrelation.withIntervention(InterventionResultToolSuppressed, c.appliedInterventionStrike)
 					}
 					if t.Reason == "evidence_suppressed" {
 						// Published after the suppressed result was committed.
@@ -1668,19 +1673,20 @@ func (a *Agent) queryStreamWithSteering(ctx context.Context, input llm.Content, 
 					if t.History.IsError {
 						status = "error"
 					}
-					if !callStarted.IsZero() {
-						duration = time.Since(callStarted)
+					if !c.callStarted.IsZero() {
+						duration = time.Since(c.callStarted)
 					}
 					a.emitEvent(out, StepCompleteEvent{StepID: tc.ID, Status: status, DurationMS: duration.Milliseconds()}, toolCorrelation)
-					if t.Reason == "evidence_suppressed" && postPublish != nil {
-						postPublish()
+					if t.Reason == "evidence_suppressed" && c.postPublish != nil {
+						c.postPublish()
 					}
 				},
-				Boundary: func(_ int, outcome BlockOutcome) BlockStop {
-					if taskComplete {
+				Boundary: func(idx int, outcome BlockOutcome) BlockStop {
+					c := &nativeCalls[idx]
+					if c.taskComplete {
 						return BlockDone
 					}
-					if strings.EqualFold(strings.TrimSpace(resolvedName), "done") {
+					if strings.EqualFold(strings.TrimSpace(c.resolvedName), "done") {
 						requireDoneRecoveryDisableThinkingActive = false
 						requireDoneControlSource = ""
 					}
@@ -5777,4 +5783,17 @@ func (a *Agent) compactForProviderOverflow(ctx context.Context, sourceFrameID st
 		return false, err
 	}
 	return a.compactionGeneration.Load() != before, nil
+}
+
+// nativeToolCall is the native driver's per-call state within one accepted
+// tool block, indexed by the call's ordinal.
+type nativeToolCall struct {
+	tool                       tools.Tool
+	originalName, resolvedName string
+	unknownToolFallback        bool
+	evidenceTool, taskComplete bool
+	evidenceReq                evidenceRequest
+	postCommit, postPublish    func()
+	appliedInterventionStrike  int
+	callStarted                time.Time
 }
