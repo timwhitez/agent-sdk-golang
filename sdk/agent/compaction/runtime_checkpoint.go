@@ -3,6 +3,7 @@ package compaction
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"strings"
 
@@ -98,3 +99,25 @@ func cloneCheckpointResult(res Result) Result {
 	out.previousLedger = nil
 	return out
 }
+
+// CheckpointOutcomeUnknown is implemented by a checkpoint writer's error when
+// the checkpoint may already be durable although the write reported failure
+// (for example an append whose state is indeterminate). The Agent then never
+// rolls back the ledger, retries the checkpoint or publishes history for it.
+type CheckpointOutcomeUnknown interface {
+	CheckpointOutcomeUnknown() bool
+}
+
+// CheckpointOutcomeIsUnknown reports whether err, or an error it wraps,
+// declares an unknown checkpoint outcome. A plain error does not: the writer
+// is the only party that knows whether its store may have been changed.
+func CheckpointOutcomeIsUnknown(err error) bool {
+	var unknown CheckpointOutcomeUnknown
+	return errors.As(err, &unknown) && unknown.CheckpointOutcomeUnknown()
+}
+
+// ErrCheckpointStoreQuarantined refuses a checkpoint write after an earlier
+// write of the same compaction runtime had an unknown outcome. No write was
+// attempted. The host must reconcile its store and replace the compaction
+// runtime before checkpoints are written again.
+var ErrCheckpointStoreQuarantined = errors.New("compaction: checkpoint store quarantined after an unknown checkpoint outcome; reconcile the store and replace the compaction runtime")

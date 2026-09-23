@@ -189,4 +189,5 @@ func (a *Agent) resetCompactionOutcomeState() {
 	a.compactionFailureStreak.Store(0)
 	a.compactionCooldownUntil.Store(0)
 	a.ineffectiveSummaryEpoch.Store(0)
+	a.checkpointQuarantined.Store(false)
 }

@@ -174,6 +174,10 @@ type Agent struct {
 	// and compaction results never advance it. Overflow recovery and the
 	// ineffective-summary suppression are bounded per epoch.
 	userInputEpoch atomic.Uint64
+	// checkpointQuarantined is set after a checkpoint write of this
+	// compaction runtime had an unknown outcome; checkpoint writes and
+	// automatic compaction stop until the runtime is replaced.
+	checkpointQuarantined atomic.Bool
 	// ineffectiveSummaryEpoch is 1 + the userInputEpoch in which an automatic
 	// summary succeeded but left the history at or above the summary
 	// threshold; 0 means the automatic summary tier is not suppressed.
@@ -4405,6 +4409,16 @@ func (a *Agent) applyPendingCompaction(out *eventOutput) {
 	// history lock for the same re-entrancy reason as checkpoint persistence.
 	pending.result = a.reconcileCompactionTelemetry(pending.result, source, merged, 0)
 	commit, commitErr := a.persistCompactionCheckpoint(context.Background(), merged, pending.result)
+	if commitErr != nil && (compaction.CheckpointOutcomeIsUnknown(commitErr) || errors.Is(commitErr, compaction.ErrCheckpointStoreQuarantined)) {
+		// Not requeued and not retried: the checkpoint store must be
+		// reconciled first.
+		warning := commitErr.Error()
+		if len(commit.result.Warnings) > 0 {
+			warning = commit.result.Warnings[len(commit.result.Warnings)-1]
+		}
+		a.warnf("%s", warning)
+		return
+	}
 	if commitErr != nil {
 		a.requeuePendingCompaction(pending)
 		a.compactionRetryPending.Store(true)
@@ -4546,6 +4560,13 @@ func (a *Agent) persistCompactionCheckpoint(ctx context.Context, messages []llm.
 	if ctx == nil {
 		ctx = context.Background()
 	}
+	if a.checkpointQuarantined.Load() {
+		failed := res
+		failed.Compacted, failed.CheckpointID = false, ""
+		failed.Warnings = append(failed.Warnings, "[ERROR] Compaction checkpoint not written - an earlier checkpoint write had an unknown outcome; history was not replaced. (stage=append_compaction_checkpoint action=reconcile the checkpoint store, then replace the compaction runtime)")
+		commit.result = failed
+		return commit, compaction.ErrCheckpointStoreQuarantined
+	}
 	transaction := res
 	if err := a.compactor.CommitPendingLedger(ctx, &transaction); err != nil {
 		warning := fmt.Sprintf("[WARN] Compaction ledger persistence failed before runtime checkpoint - original in-memory history was preserved and compaction remains retryable. (stage=save_compaction_ledger action=check ledger storage and retry: %v)", err)
@@ -4559,6 +4580,17 @@ func (a *Agent) persistCompactionCheckpoint(ctx context.Context, messages []llm.
 	checkpoint, err := compaction.NewCompactionCheckpoint(messages, transaction)
 	if err == nil {
 		err = a.compactor.Config.CheckpointWriter.SaveCompactionCheckpoint(ctx, checkpoint)
+	}
+	if err != nil && compaction.CheckpointOutcomeIsUnknown(err) {
+		// The checkpoint may already be durable: rolling the ledger back or
+		// retrying could contradict it or write it twice. Keep both as they
+		// are, publish nothing and stop writing until the host reconciles.
+		a.checkpointQuarantined.Store(true)
+		failed := res
+		failed.Compacted, failed.CheckpointID = false, ""
+		failed.Warnings = append(failed.Warnings, fmt.Sprintf("[ERROR] Compaction checkpoint outcome unknown - it may already be durable; in-memory history was not replaced, the ledger was kept and no retry will be made. (stage=append_compaction_checkpoint action=reconcile the checkpoint store, then replace the compaction runtime: %v)", err))
+		commit.result = failed
+		return commit, fmt.Errorf("compaction checkpoint outcome unknown: %w", err)
 	}
 	if err != nil {
 		rollbackErr := a.compactor.RollbackPendingLedger(context.Background(), &transaction)
@@ -4635,6 +4667,11 @@ func (a *Agent) shouldAttemptCompactionUsage(ctx context.Context, usage *llm.Usa
 		return false
 	}
 	if a.compactionInFlight.Load() || a.hasPendingCompaction() {
+		return false
+	}
+	if a.checkpointQuarantined.Load() {
+		// An earlier checkpoint write had an unknown outcome: a new
+		// compaction could not be persisted, so it is not paid for.
 		return false
 	}
 	if a.compactor.IsOverflow(usage) {

@@ -133,6 +133,14 @@ source snapshot used to compute a candidate. It rejects admission, pending work
 or stale content before persistence, owns candidate data across callbacks, and
 publishes after acknowledgement before finalizing the deferred ledger.
 A successful acknowledgement followed by cancellation is not an automatic rollback.
+A checkpoint writer whose failure may still have left the checkpoint durable
+(for example an append in an indeterminate state) says so by implementing
+`compaction.CheckpointOutcomeUnknown` on its error; a plain error is treated as
+not written, as before. For an unknown outcome the Agent neither rolls back
+the ledger nor retries or requeues the compaction, publishes no history for
+it, and refuses every later checkpoint write (`ErrCheckpointStoreQuarantined`,
+before any I/O) and automatic compaction until the compaction runtime is
+replaced after the host reconciled its store.
 
 The checkpoint-only compatibility API does not own a later history replacement.
 Content equality is not Session revision binding; external writers and prior
