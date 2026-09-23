@@ -230,10 +230,12 @@ type Agent struct {
 	pendingCompactionMu sync.Mutex
 	pendingCompaction   *pendingCompaction
 
+	// activeStages are the provider or tool stages currently interruptible
+	// for steering, by generation: one at a time sequentially, several while
+	// a bounded wave runs tool calls concurrently.
 	activeStageMu         sync.Mutex
-	activeStageCancel     context.CancelFunc
+	activeStages          map[uint64]*activeStage
 	activeStageGeneration uint64
-	activeStageSteering   bool
 
 	mu              sync.Mutex
 	messages        []llm.Message
