@@ -287,15 +287,19 @@ func runSequentialBlock(root context.Context, state *toolBlockState, calls []llm
 		return context.WithValue(ctx, sequentialScopeKey{}, scope), scope, nil
 	}
 	// settle is the owner's in-order completion of one started call.
-	settle := func(i int, ctx context.Context, release func() bool, outcome BlockOutcome) (BlockTerminal, BlockOutcome, error) {
+	// release stays owned by the caller's cleanup until it is invoked here, so
+	// a panicking OnPanic still leaves the stage to the deferred cleanup.
+	settle := func(i int, ctx context.Context, release *func() bool, outcome BlockOutcome) (BlockTerminal, BlockOutcome, error) {
 		if outcome.Panic != nil {
 			outcome.Err = fmt.Errorf("tool handler panicked; effects may have occurred")
 			if a.OnPanic != nil {
 				outcome.Content, outcome.Err = a.OnPanic(i, ctx, outcome.Panic)
 			}
 		}
-		if release != nil {
-			outcome.Interrupted = release()
+		if release != nil && *release != nil {
+			f := *release
+			*release = nil
+			outcome.Interrupted = f()
 		}
 		outcome.RootError = root.Err()
 		if e := state.markAttemptReturned(i, outcome.RootError != nil); e != nil {
@@ -396,9 +400,7 @@ func runSequentialBlock(root context.Context, state *toolBlockState, calls []llm
 			return BlockContinue, e
 		}
 		outcome := execute(admission, ctx, scope)
-		release := finish
-		finish = nil
-		terminal, outcome, e := settle(i, ctx, release, outcome)
+		terminal, outcome, e := settle(i, ctx, &finish, outcome)
 		if e != nil {
 			return BlockContinue, e
 		}
@@ -409,6 +411,10 @@ func runSequentialBlock(root context.Context, state *toolBlockState, calls []llm
 	}
 	return BlockContinue, nil
 }
+
+// waveCompletionSettled is a test-only observation point, called after the
+// owner has processed one worker completion (settling whatever became ready).
+var waveCompletionSettled func(index int)
 
 type waveSlot struct {
 	index     int
@@ -437,7 +443,7 @@ func runOrderedWave(
 	root context.Context, start, n int, a SequentialBlockAdapter, state *toolBlockState,
 	execute func(BlockAdmission, context.Context, *sequentialScope) BlockOutcome,
 	begin func(int, BlockAdmission) (context.Context, *sequentialScope, error),
-	settle func(int, context.Context, func() bool, BlockOutcome) (BlockTerminal, BlockOutcome, error),
+	settle func(int, context.Context, *func() bool, BlockOutcome) (BlockTerminal, BlockOutcome, error),
 	after func(int, BlockTerminal, BlockOutcome) BlockStop,
 	commit func(int, toolCallPhase, []BlockTerminal) error,
 	publish func(int, BlockTerminal, time.Duration) error,
@@ -523,10 +529,8 @@ func runOrderedWave(
 					return e
 				}
 			} else {
-				release := slot.release
-				slot.release = nil
 				var e error
-				terminal, outcome, e = settle(slot.index, slot.ctx, release, outcome)
+				terminal, outcome, e = settle(slot.index, slot.ctx, &slot.release, outcome)
 				if e != nil {
 					return e
 				}
@@ -552,6 +556,12 @@ func runOrderedWave(
 		}
 		slot.outcome, slot.done = completion.outcome, true
 		if e := settleReady(); e != nil {
+			return start + admitted, BlockContinue, e, nil
+		}
+		if waveCompletionSettled != nil {
+			waveCompletionSettled(slot.index)
+		}
+		if e := error(nil); e != nil {
 			return start + admitted, BlockContinue, e, nil
 		}
 	}

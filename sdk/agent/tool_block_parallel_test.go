@@ -102,6 +102,20 @@ func parallelFixture(n int, g *gatedHandlers, trace *parallelTrace, maxWorkers i
 
 func allEligible(int) bool { return true }
 
+// requireSingleTerminal checks that every accepted call ended with exactly one
+// terminal record and that the block is closed.
+func requireSingleTerminal(t *testing.T, state *toolBlockState) {
+	t.Helper()
+	for i, call := range state.calls {
+		if call.phase != toolCallTerminal || call.terminalCount != 1 {
+			t.Fatalf("call %d state=%+v", i, call)
+		}
+	}
+	if err := state.validateClosed(); err != nil {
+		t.Fatal(err)
+	}
+}
+
 // Handlers finish 3 -> 1 -> 2 (ordinals 2, 0, 1); the owner commits and
 // publishes in model order with exactly one terminal per call.
 func TestToolBlockParallelCompletionCommitsInModelOrder(t *testing.T) {
@@ -118,10 +132,42 @@ func TestToolBlockParallelCompletionCommitsInModelOrder(t *testing.T) {
 		stop, err := runSequentialBlock(context.Background(), state, calls, a, false)
 		done <- result{stop, err}
 	}()
+	settled := make(chan int, 3)
+	waveCompletionSettled = func(i int) { settled <- i }
+	t.Cleanup(func() { waveCompletionSettled = nil })
 	g.waitStarted(t, 3)
+	committedAfter := map[int][]string{}
 	for _, i := range []int{2, 0, 1} {
 		close(g.release[i])
-		time.Sleep(10 * time.Millisecond) // lets a wrong implementation commit early
+		// The owner has fully processed this completion before we look.
+		select {
+		case got := <-settled:
+			if got != i {
+				t.Fatalf("settled %d, want %d", got, i)
+			}
+		case res := <-done:
+			t.Fatalf("owner exited before settling call %d: stop=%s err=%v", i, res.stop, res.err)
+		case <-time.After(5 * time.Second):
+			// Failure path only: unblock the remaining workers so the owner
+			// (which must wait for them) can return, then fail.
+			for _, ch := range g.release {
+				select {
+				case <-ch:
+				default:
+					close(ch)
+				}
+			}
+			t.Fatalf("owner never settled call %d in model order", i)
+		}
+		trace.mu.Lock()
+		committedAfter[i] = append([]string(nil), trace.committed...)
+		trace.mu.Unlock()
+	}
+	if len(committedAfter[2]) != 0 {
+		t.Fatalf("call-2 returned first but %v was committed before call-0", committedAfter[2])
+	}
+	if want := []string{"call-0=result-0"}; !reflect.DeepEqual(committedAfter[0], want) {
+		t.Fatalf("after call-0 returned committed=%v want %v", committedAfter[0], want)
 	}
 	res := <-done
 	if res.err != nil || res.stop != BlockContinue {
@@ -146,88 +192,73 @@ func TestToolBlockParallelCompletionCommitsInModelOrder(t *testing.T) {
 	}
 }
 
-// The worker bound holds across consecutive waves: with blocked handlers no
-// third call starts while two are running.
+// The worker bound holds across consecutive waves: a call of wave k starts
+// only after every call of the earlier waves has settled.
 func TestToolBlockParallelRespectsWorkerBound(t *testing.T) {
 	g := newGatedHandlers(5)
 	trace := &parallelTrace{}
+	var settled atomic.Int32
+	waveCompletionSettled = func(int) { settled.Add(1) }
+	t.Cleanup(func() { waveCompletionSettled = nil })
+	var settledAtStart [5]int32
 	calls, a := parallelFixture(5, g, trace, 2, allEligible)
-	state, _ := newToolBlockState(calls)
-	done := make(chan error, 1)
-	go func() {
-		_, err := runSequentialBlock(context.Background(), state, calls, a, false)
-		done <- err
-	}()
-	defer func() {
-		for _, ch := range g.release {
-			select {
-			case <-ch:
-			default:
-				close(ch)
-			}
-		}
-	}()
-	for wave, members := range [][]int{{0, 1}, {2, 3}, {4}} {
-		g.waitStarted(t, len(members))
-		select {
-		case i := <-g.started:
-			t.Fatalf("wave %d: call %d started beyond the bound", wave, i)
-		case <-time.After(30 * time.Millisecond):
-		}
-		for _, i := range members {
-			close(g.release[i])
-		}
+	admit := a.Admit
+	a.Admit = func(ctx context.Context, i int) (BlockAdmission, error) {
+		settledAtStart[i] = settled.Load()
+		return admit(ctx, i)
 	}
-	if err := <-done; err != nil {
+	for _, ch := range g.release {
+		close(ch)
+	}
+	state, _ := newToolBlockState(calls)
+	if _, err := runSequentialBlock(context.Background(), state, calls, a, false); err != nil {
 		t.Fatal(err)
+	}
+	for i, want := range []int32{0, 0, 2, 2, 4} {
+		if settledAtStart[i] < want {
+			t.Fatalf("call %d admitted after %d settled completions, want >= %d (bound exceeded)", i, settledAtStart[i], want)
+		}
 	}
 	if peak := g.peak.Load(); peak > 2 {
 		t.Fatalf("peak concurrency=%d exceeds bound 2", peak)
 	}
-	if len(trace.committed) != 5 || !reflect.DeepEqual(trace.published, []int{0, 1, 2, 3, 4}) {
-		t.Fatalf("committed=%v published=%v", trace.committed, trace.published)
+	if !reflect.DeepEqual(trace.published, []int{0, 1, 2, 3, 4}) {
+		t.Fatalf("published=%v", trace.published)
 	}
+	requireSingleTerminal(t, state)
 }
 
 // An ineligible call is a barrier: it starts only after every earlier call
-// has settled, and later eligible calls wait for it.
+// has committed, and later calls start only after it has committed.
 func TestToolBlockParallelIneligibleCallIsBarrier(t *testing.T) {
 	g := newGatedHandlers(4)
 	trace := &parallelTrace{}
 	calls, a := parallelFixture(4, g, trace, 4, func(i int) bool { return i != 2 })
+	var committedAtStart [4][]string
+	admit := a.Admit
+	a.Admit = func(ctx context.Context, i int) (BlockAdmission, error) {
+		trace.mu.Lock()
+		committedAtStart[i] = append([]string(nil), trace.committed...)
+		trace.mu.Unlock()
+		return admit(ctx, i)
+	}
+	for _, ch := range g.release {
+		close(ch)
+	}
 	state, _ := newToolBlockState(calls)
-	done := make(chan error, 1)
-	go func() {
-		_, err := runSequentialBlock(context.Background(), state, calls, a, false)
-		done <- err
-	}()
-	if started := g.waitStarted(t, 2); len(started) != 2 {
-		t.Fatalf("started=%v", started)
-	}
-	select {
-	case i := <-g.started:
-		t.Fatalf("call %d crossed the barrier before the wave settled", i)
-	case <-time.After(30 * time.Millisecond):
-	}
-	close(g.release[1])
-	close(g.release[0])
-	if started := g.waitStarted(t, 1); started[0] != 2 {
-		t.Fatalf("barrier call started=%v", started)
-	}
-	select {
-	case i := <-g.started:
-		t.Fatalf("call %d ran alongside the exclusive call", i)
-	case <-time.After(30 * time.Millisecond):
-	}
-	close(g.release[2])
-	g.waitStarted(t, 1)
-	close(g.release[3])
-	if err := <-done; err != nil {
+	if _, err := runSequentialBlock(context.Background(), state, calls, a, false); err != nil {
 		t.Fatal(err)
+	}
+	if len(committedAtStart[2]) != 2 {
+		t.Fatalf("barrier call admitted after commits %v, want both wave calls", committedAtStart[2])
+	}
+	if len(committedAtStart[3]) != 3 {
+		t.Fatalf("call after barrier admitted after commits %v, want three", committedAtStart[3])
 	}
 	if !reflect.DeepEqual(trace.published, []int{0, 1, 2, 3}) {
 		t.Fatalf("published=%v", trace.published)
 	}
+	requireSingleTerminal(t, state)
 }
 
 // Root cancellation mid-wave: started handlers settle with their real
@@ -272,6 +303,7 @@ func TestToolBlockParallelRootCancelKeepsStartedKnowledge(t *testing.T) {
 	if len(trace.committed) != 4 {
 		t.Fatalf("committed=%v", trace.committed)
 	}
+	requireSingleTerminal(t, state)
 }
 
 // A panicking worker settles through OnPanic in order; siblings still commit
@@ -308,6 +340,7 @@ func TestToolBlockParallelPanicSettlesInOrder(t *testing.T) {
 			t.Fatalf("call %d ran %d times", i, runs[i].Load())
 		}
 	}
+	requireSingleTerminal(t, state)
 }
 
 // A commit failure after out-of-order returns stops settlement without
@@ -346,11 +379,9 @@ func TestToolBlockParallelCommitFailureWaitsForWorkers(t *testing.T) {
 	if len(g.returnedOrder) != 3 {
 		t.Fatalf("handlers returned %v", g.returnedOrder)
 	}
-	for i, call := range state.calls {
-		if call.terminalCount > 1 {
-			t.Fatalf("call %d closed twice: %+v", i, call)
-		}
-	}
+	// The failed commit's call and every still-open call are closed exactly
+	// once (the latter by the owner's lifecycle-failure recovery).
+	requireSingleTerminal(t, state)
 }
 
 // Without the in-package opt-in the executor keeps the legacy sequential
@@ -373,4 +404,5 @@ func TestToolBlockParallelDefaultStaysSequential(t *testing.T) {
 	if peak.Load() != 1 {
 		t.Fatalf("default executor ran %d handlers concurrently", peak.Load())
 	}
+	requireSingleTerminal(t, state)
 }
