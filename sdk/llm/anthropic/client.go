@@ -26,6 +26,9 @@ var retryAfterWarningf = log.Printf
 var backoffRandRead = cryptorand.Read
 var toolIDNormalizationWarningf = log.Printf
 
+// Client streams over HTTP SSE through InvokeStream.
+var _ llm.StreamingChatModel = (*Client)(nil)
+
 type Client struct {
 	HTTPClient *http.Client
 	BaseURL    string
