@@ -91,6 +91,22 @@ func (p PreparedCall) FinalArgs() (json.RawMessage, bool) {
 	return bytes.Clone(p.final.view), true
 }
 
+// RequireFinalArgs returns a copy of p whose execution must consume exactly
+// the prepared final arguments: if a wrapper forwards different bytes to the
+// Func adapter, the adapter refuses with ErrFinalArgsChanged instead of
+// decoding them, so the tool never runs on arguments other than the ones
+// FinalArgs showed. Without final arguments it returns p unchanged.
+func (p PreparedCall) RequireFinalArgs() PreparedCall {
+	if p.final == nil {
+		return p
+	}
+	required := *p.final
+	required.required = true
+	required.state = &finalArgsState{}
+	p.final = &required
+	return p
+}
+
 // FinalArgsOutcome reports, after Execute, whether the adapter consumed the
 // prepared object, decoded different bytes, or was never reached.
 func (p PreparedCall) FinalArgsOutcome() string {

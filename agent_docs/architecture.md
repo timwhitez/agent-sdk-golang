@@ -43,15 +43,25 @@ model order, so out-of-order completion keeps one terminal per call. A missing,
 false or panicking plan is Exclusive. The native Agent loop is Exclusive unless
 `Config.ToolParallelism` is set. Its per-call state is kept by ordinal, so
 interleaved admission and settlement never read another call's state. The SDK
-then only narrows the host's `Plan`: it is consulted only for a call that
-resolved exactly to a registered tool with valid arguments and belongs to an
-evidence family (read/search/list); every other successful tool may change
-what later reads observe (the progress ledger invalidates on it), so it stays
-Exclusive. Calls on one evidence target share an SDK resource key, so
-evidence suppression sees the same history as sequentially. All running
-calls of a wave are interruptible for steering; a steering message or stop
-after one call does not recall later calls of an admitted wave — they settle
-with their real outcome. This is not a concurrent effect classifier or a
+then only narrows the host's `Plan`, and planning is pure: it reads only the
+call's own preparation (SDK normalization and, for a `tools.Func` whose
+argument type has no custom codec, the sealed decode), so it resolves no
+dependency, touches no file system and runs no user decoder, encoder, Handler
+or confirmation. `Plan` is consulted once per call, only for an exact-resolved
+evidence-family call (read/search/list) with final arguments; it sees an owned
+copy of those final arguments, and the SDK adds a resource per lexically
+cleaned target named in them, so one executed target never shares a wave.
+Everything else — other tools, which the progress ledger treats as possible
+mutations, unknown tools, tools without final arguments — stays Exclusive.
+Inside a wave the call must consume exactly the planned arguments
+(`PreparedCall.RequireFinalArgs`): a wrapper that forwards different bytes
+makes the call fail before the tool runs (`tools.ErrFinalArgsChanged`), and a
+tool whose wave call did not provably consume its plan is Exclusive from then
+on. Lexical targets do not prove two paths are different files; the ledger
+keeps sampling at admission and may run, in a wave, a read it would have
+suppressed sequentially. All running calls of a wave are interruptible for
+steering; a steering message or stop after one call does not recall later
+calls of an admitted wave — they settle with their real outcome. This is not a concurrent effect classifier or a
 promise about arbitrary host goroutines.
 
 - A Frame owns a cloned logical request and resolver definitions. It calls an

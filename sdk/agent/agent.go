@@ -172,6 +172,9 @@ type Agent struct {
 	streamIdleMaxRecov         int
 	// toolParallelism is an owned copy of Config.ToolParallelism.
 	toolParallelism *ToolParallelism
+	// nativeUnproven holds tool names whose wave execution could not be
+	// shown to consume the planned arguments; they are planned Exclusive.
+	nativeUnproven sync.Map
 	// overflowRecoveryDisabled mirrors Config.DisableContextOverflowRecovery.
 	overflowRecoveryDisabled bool
 	// userInputEpoch counts real user input: each Query and each accepted
@@ -1420,6 +1423,13 @@ func (a *Agent) queryStreamWithSteering(ctx context.Context, input llm.Content, 
 					c.tool, c.resolvedName, c.unknownToolFallback = p.tool, p.resolvedName, !p.found
 					normalizedAlias, execArgs := p.normalizedAlias, p.execArgs
 					prepared, norm := p.prepared, p.norm
+					if admittedIntoWave(root) {
+						// A wave call runs on exactly the arguments it was
+						// planned on, or not at all.
+						prepared = prepared.RequireFinalArgs()
+						c.requiredFinal = true
+					}
+					c.prepared = prepared
 					resolution := toolResolutionExact
 					if c.unknownToolFallback {
 						resolution = toolResolutionUnknownFallback
@@ -1611,6 +1621,11 @@ func (a *Agent) queryStreamWithSteering(ctx context.Context, input llm.Content, 
 				Project: func(idx int, outcome BlockOutcome) (BlockTerminal, error) {
 					tc := comp.ToolCalls[idx]
 					c := &nativeCalls[idx]
+					if c.requiredFinal && outcome.NotStarted == BlockContinue && c.prepared.FinalArgsOutcome() != tools.FinalArgsConsumed {
+						// The wave call did not provably run on its planned
+						// arguments; later blocks run this tool Exclusive.
+						a.nativeUnproven.Store(c.resolvedName, true)
+					}
 					if outcome.NotStarted != BlockContinue {
 						text := toolSkippedByCancellationText
 						if outcome.NotStarted == BlockDone {
@@ -1719,8 +1734,15 @@ func (a *Agent) queryStreamWithSteering(ctx context.Context, input llm.Content, 
 				},
 			}
 			if par := a.toolParallelism; par != nil && par.Plan != nil && par.MaxWorkers >= 2 {
+				// Each call is planned once: the host plan is user code and a
+				// wave may be planned again from a later start.
+				plans := make([]*BlockCallPlan, len(comp.ToolCalls))
 				adapter.Parallel = &BlockParallelism{MaxWorkers: par.MaxWorkers, Plan: func(idx int) BlockCallPlan {
-					return a.planNativeCall(idx, preparedCall(idx))
+					if plans[idx] == nil {
+						plan := a.planNativeCall(idx, preparedCall(idx))
+						plans[idx] = &plan
+					}
+					return *plans[idx]
 				}}
 			}
 			stop, blockErr := runSequentialBlock(ctx, activeToolBlock, comp.ToolCalls, adapter, false)
@@ -5815,4 +5837,8 @@ type nativeToolCall struct {
 	postCommit, postPublish    func()
 	appliedInterventionStrike  int
 	callStarted                time.Time
+	// prepared is the call Admit handed to execution; requiredFinal marks a
+	// wave call that had to consume its planned final arguments.
+	prepared      tools.PreparedCall
+	requiredFinal bool
 }

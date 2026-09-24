@@ -353,9 +353,14 @@ func TestNativeWaveKeepsEachCallsOwnState(t *testing.T) {
 		t.Fatal(err)
 	}
 	events := runQuery(t, a, g, context.Background())
+	// Registered after runQuery, so it runs first: every failure path opens
+	// the ls gate before the cleanup waits for the query to end.
+	var openLS sync.Once
+	releaseLS := func() { openLS.Do(func() { close(lsGate) }) }
+	t.Cleanup(releaseLS)
 	wait(t, g.started, "read start")
 	wait(t, lsStarted, "ls start")
-	close(lsGate)
+	releaseLS()
 	g.release("a.txt")
 	wait(t, g.returned, "read end")
 	wait(t, events, "query end")

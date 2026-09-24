@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"reflect"
 	"sync/atomic"
 )
@@ -32,7 +33,15 @@ type preparedTypedArgs struct {
 	repaired bool
 	view     json.RawMessage
 	state    *finalArgsState
+	// required: the adapter refuses bytes other than the prepared ones
+	// instead of decoding them anew (see PreparedCall.RequireFinalArgs).
+	required bool
 }
+
+// ErrFinalArgsChanged refuses a call whose prepared final arguments were
+// required but whose adapter received different bytes (a wrapper rewrote
+// them). The tool function was not run.
+var ErrFinalArgsChanged = errors.New("tool arguments changed after they were prepared for concurrent execution; the tool was not run")
 
 type preparedTypedArgsKey struct{}
 
@@ -79,6 +88,11 @@ func prepareTypedArgs(binding *typedArgsBinding, normalized json.RawMessage) *pr
 func consumeTypedArgs[Args any](ctx context.Context, binding *typedArgsBinding, name string, schema map[string]any, raw json.RawMessage) (Args, error) {
 	if binding != nil && ctx != nil {
 		if prepared, ok := ctx.Value(preparedTypedArgsKey{}).(*preparedTypedArgs); ok && prepared.binding == binding {
+			if prepared.required && !bytes.Equal(prepared.raw, raw) {
+				prepared.state.diverged.Store(true)
+				var zero Args
+				return zero, ErrFinalArgsChanged
+			}
 			if bytes.Equal(prepared.raw, raw) && prepared.state.consumed.CompareAndSwap(false, true) {
 				if args, ok := prepared.args.(Args); ok {
 					if prepared.repaired {
