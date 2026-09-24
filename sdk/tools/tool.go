@@ -158,7 +158,12 @@ func (p PreparedCall) Execute(ctx context.Context, deps *Container) (llm.Content
 	// execution based on its error text; typed adapters prepare before decoding.
 	if ctx != nil {
 		ctx = context.WithValue(ctx, originalToolArgsKey{}, p.original)
-		if p.final != nil {
+		// A required preparation already governing this call scope is never
+		// replaced: a wrapper re-entering through Tool.Execute or
+		// PreparedCall.Execute cannot downgrade it to a fresh, unrequired one.
+		if outer, ok := ctx.Value(preparedTypedArgsKey{}).(*preparedTypedArgs); ok && outer.required {
+			// keep the outer requirement
+		} else if p.final != nil {
 			ctx = context.WithValue(ctx, preparedTypedArgsKey{}, p.final)
 		}
 	}

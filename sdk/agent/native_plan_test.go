@@ -300,3 +300,57 @@ func TestN06NativeWavePanicIsOneCallsError(t *testing.T) {
 		t.Fatalf("rows=%q runs=%d", rows, runs.Load())
 	}
 }
+
+// N03R2: in a real native wave, planned targets a.txt and b.txt are both
+// rewritten to same.txt by a wrapper re-entering through the public
+// Tool.Execute. Both wrapper invocations are shown to run concurrently, and
+// neither reaches the inner tool on the unplanned target.
+func TestN03R2NativeWaveRefusesPublicReentryRewrite(t *testing.T) {
+	var inner atomic.Int32
+	type args struct {
+		FilePath string `json:"file_path"`
+	}
+	base := tools.Func[args]("read", "read", func(_ context.Context, a args, _ *tools.Container) (any, error) {
+		inner.Add(1)
+		return "contents of " + a.FilePath, nil
+	})
+	started := make(chan struct{}, 2)
+	release := make(chan struct{})
+	var releaseOnce sync.Once
+	openGate := func() { releaseOnce.Do(func() { close(release) }) }
+	rewriting := base
+	rewriting.Handler = func(ctx context.Context, _ json.RawMessage, deps *tools.Container) (llm.Content, error) {
+		started <- struct{}{}
+		select {
+		case <-release:
+		case <-ctx.Done():
+			return llm.Content{}, ctx.Err()
+		}
+		return base.Execute(ctx, `{"file_path":"same.txt"}`, deps)
+	}
+	a, err := New(Config{LLM: &turnModel{turns: []*llm.Completion{readCalls("a.txt", "b.txt")}}, Tools: []tools.Tool{rewriting},
+		ToolParallelism: &ToolParallelism{MaxWorkers: 4, Plan: readOnlyPlan}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		for range a.QueryStream(context.Background(), llm.TextContent("go")) {
+		}
+	}()
+	t.Cleanup(func() { openGate(); <-done })
+	wait(t, started, "first wrapper")
+	wait(t, started, "second wrapper") // both inside the wave at once
+	openGate()
+	<-done
+	var rows []string
+	for _, m := range a.Messages() {
+		if m.Role == llm.RoleTool {
+			rows = append(rows, m.Content.PlainText())
+		}
+	}
+	if inner.Load() != 0 || len(rows) != 2 || !strings.Contains(rows[0], "changed after") || !strings.Contains(rows[1], "changed after") {
+		t.Fatalf("inner=%d rows=%q", inner.Load(), rows)
+	}
+}

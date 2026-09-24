@@ -38,10 +38,12 @@ type preparedTypedArgs struct {
 	required bool
 }
 
-// ErrFinalArgsChanged refuses a call whose prepared final arguments were
-// required but whose adapter received different bytes (a wrapper rewrote
-// them). The tool function was not run.
-var ErrFinalArgsChanged = errors.New("tool arguments changed after they were prepared for concurrent execution; the tool was not run")
+// ErrFinalArgsChanged refuses a Func adapter reached inside a call whose
+// prepared final arguments were required, when it would run on other bytes
+// (a wrapper rewrote them, directly or by re-entering Tool.Execute or
+// PreparedCall.Execute) or is another Func tool. The typed function was not
+// run; whatever the wrapper itself did before is not undone or replayed.
+var ErrFinalArgsChanged = errors.New("tool arguments changed after they were prepared for concurrent execution; the tool function was not run on them")
 
 type preparedTypedArgsKey struct{}
 
@@ -87,7 +89,15 @@ func prepareTypedArgs(binding *typedArgsBinding, normalized json.RawMessage) *pr
 // prepared object is marked diverged. A prepared object is consumed once.
 func consumeTypedArgs[Args any](ctx context.Context, binding *typedArgsBinding, name string, schema map[string]any, raw json.RawMessage) (Args, error) {
 	if binding != nil && ctx != nil {
-		if prepared, ok := ctx.Value(preparedTypedArgsKey{}).(*preparedTypedArgs); ok && prepared.binding == binding {
+		prepared, _ := ctx.Value(preparedTypedArgsKey{}).(*preparedTypedArgs)
+		if prepared != nil && prepared.required && prepared.binding != binding {
+			// Another Func tool reached inside a call whose arguments are
+			// required: its effect was not planned, so it is refused.
+			prepared.state.diverged.Store(true)
+			var zero Args
+			return zero, ErrFinalArgsChanged
+		}
+		if prepared != nil && prepared.binding == binding {
 			if prepared.required && !bytes.Equal(prepared.raw, raw) {
 				prepared.state.diverged.Store(true)
 				var zero Args

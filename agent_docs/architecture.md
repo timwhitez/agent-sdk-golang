@@ -55,9 +55,12 @@ Everything else — other tools, which the progress ledger treats as possible
 mutations, unknown tools, tools without final arguments — stays Exclusive.
 Inside a wave the call must consume exactly the planned arguments
 (`PreparedCall.RequireFinalArgs`): a wrapper that forwards different bytes
-makes the call fail before the tool runs (`tools.ErrFinalArgsChanged`), and a
-tool whose wave call did not provably consume its plan is Exclusive from then
-on. Lexical targets do not prove two paths are different files; the ledger
+makes the call fail before the tool function runs (`tools.ErrFinalArgsChanged`),
+also when it re-enters through the public `Tool.Execute` or
+`PreparedCall.Execute` (a nested preparation never replaces a required one)
+or reaches another Func tool; whatever the wrapper already did is neither
+undone nor replayed. A tool whose wave call did not provably consume its plan
+is Exclusive from then on, which only affects later blocks. Lexical targets do not prove two paths are different files; the ledger
 keeps sampling at admission and may run, in a wave, a read it would have
 suppressed sequentially. All running calls of a wave are interruptible for
 steering; a steering message or stop after one call does not recall later
