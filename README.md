@@ -19,16 +19,18 @@ We prioritize explicit control flow over hidden prompts or complex abstractions.
 ## ✨ Key Features
 
 - 🎛 **Control First**: No hidden magic. You control the loop, the prompts, and the tools.
-- 🔄 **Streaming Support**: Built-in `QueryStream` for real-time token and event streaming.
+- 🔄 **Streaming Support**: all three built-in protocol clients stream over HTTP SSE; `QueryStream` delivers real-time deltas and Agent events (see [Streaming](#-streaming)).
 - 🛠 **Robust Tooling**:
   - Automatic JSON schema generation (with `additionalProperties=false` support).
   - Dependency injection for tools.
   - Ephemeral output cleanup to save context.
   - "Done tool" pattern enforcement.
 - 🔌 **Multiple Providers**:
-  - **Anthropic**
-  - **OpenAI Chat Completions**
-  - **OpenAI Responses** (Best-effort, non-streaming)
+  - **Anthropic Messages** — `anthropic.Client`
+  - **OpenAI Chat Completions** — `openai.ChatClient`
+  - **OpenAI Responses** — `openai.ResponsesClient`
+
+  Each client supports buffered `Invoke` and HTTP SSE `InvokeStream` (`stream: true`). Protocol details: [agent_docs/providers.md](agent_docs/providers.md).
 - 📉 **Context Compaction**: Smart auto-summarization of conversation history when token limits are reached.
 - 🎮 **Real-time Steering**: Inject user feedback mid-flight during agent execution (boundary-aware).
 - 💾 **Session Management**: Restore and resume conversation history with ease.
@@ -82,9 +84,33 @@ func main() {
 }
 ```
 
+`Query` returns only the aggregated final answer. It still uses SSE underneath when the model implements `llm.StreamingChatModel`, but it does not show deltas as they arrive; use `QueryStream` for that.
+
+## 🔄 Streaming
+
+Three levels, from lowest to highest:
+
+| API | Returns | Use it for |
+|---|---|---|
+| `ChatModel.Invoke` | one `*llm.Completion` | a single buffered model call |
+| `StreamingChatModel.InvokeStream` | `<-chan llm.StreamEvent` for one model call | raw deltas of one call; you run any tool loop yourself |
+| `Agent.QueryStream` (and `QueryStreamWithSteering`) | `<-chan agent.Event` for the whole Agent run | real-time text plus the managed tool loop |
+| `Agent.QueryStreamEnveloped` (and `…WithSteering`) | `<-chan agent.EventEnvelope` (the same events with query/Frame correlation) | the same, when you need correlation metadata |
+
+`anthropic.Client`, `openai.ChatClient` and `openai.ResponsesClient` all implement `llm.StreamingChatModel`. A wrapper that implements only `ChatModel` hides that capability from the Agent, which then falls back to buffered calls; keep `InvokeStream` on custom wrappers. The SDK never infers streaming support from a type name or provider string.
+
+Reading the outcome correctly:
+
+- **InvokeStream**: append each `StreamTextDeltaEvent.Delta` once. Return the error from `InvokeStream` itself and from any `StreamErrorEvent.AsError()`. `StreamDoneEvent` is the provider's normal terminal; its `StopReason` is the provider's own value and can still report a length limit. A channel that closes without `StreamDoneEvent` is incomplete, not a success. Tool-call argument deltas are partial JSON: never execute them before the stream ends (the Agent does this for you).
+- **QueryStream**: print `TextDeltaEvent` deltas as progress. `FinalResponseEvent.Content` is the authoritative answer and is **not** guaranteed to equal the deltas: text streamed before a tool call is progress, a later turn or the `done` tool can deliver a different answer, a turn may stream nothing, and a dropped delta leaves the shown text incomplete. Compare the final answer with what the **last model turn** actually showed (the example resets at each tool call/result) and print it when they differ; never skip it just because some delta arrived earlier in the query. `ErrorEvent` ends the run with a failure. `FinalResponseEvent.Status == "partial"` is a bounded fallback answer, not a normally completed task, and `DroppedEvents`/`DroppedCriticalEvents` say the delivered stream is incomplete or inconsistent with history.
+- Cancel the `context` to stop a request; an early return should always cancel so the HTTP body is closed.
+
+[`examples/streaming`](examples/streaming) is a runnable example for all three protocols in both modes (configuration via `STREAM_MODEL`, `OPENAI_API_KEY`/`ANTHROPIC_API_KEY`, optional `STREAM_BASE_URL`; missing settings fail before any request). Its tests use local HTTP fixtures only.
+
 ## 📂 Layout
 
 - `sdk/`: Core SDK implementation (agent, llm, tools, tokens).
+- `examples/streaming`: streaming usage for the three built-in protocols.
 
 
 ## 🤝 Contributing
@@ -115,16 +141,18 @@ This project is licensed under the MIT License - see the [LICENSE](LICENSE) file
 ## ✨ 核心能力
 
 - 🎛 **掌控一切**：没有隐藏的魔法。你完全控制循环、提示词和工具行为。
-- 🔄 **流式支持**：内置 `QueryStream`，支持实时的 Token 和事件流输出。
+- 🔄 **流式支持**：三个内置协议客户端均通过 HTTP SSE 流式输出；`QueryStream` 实时提供增量与 Agent 事件（见 [流式调用](#-流式调用)）。
 - 🛠 **强大的工具系统**：
   - 自动生成 JSON Schema（支持 `additionalProperties=false`）。
   - 工具依赖注入（DI）。
   - Ephemeral（临时）输出清理，节省上下文。
   - 强制 "Done tool" 模式。
 - 🔌 **多模型支持**：
-  - **Anthropic**
-  - **OpenAI Chat Completions**
-  - **OpenAI Responses**（Best-effort，非流式）
+  - **Anthropic Messages** — `anthropic.Client`
+  - **OpenAI Chat Completions** — `openai.ChatClient`
+  - **OpenAI Responses** — `openai.ResponsesClient`
+
+  每个客户端都支持缓冲的 `Invoke` 与 HTTP SSE 的 `InvokeStream`（`stream: true`）。协议细节见 [agent_docs/providers.md](agent_docs/providers.md)。
 - 📉 **上下文压缩**：当达到 Token 限制时，自动对历史记录进行摘要压缩。
 - 🎮 **实时干预 (Real-time Steering)**：在 Agent 执行过程中（工具调用边界）实时注入用户反馈，纠正行为。
 - 💾 **会话管理**：支持通过 `InitialMessages` 轻松恢复和继续历史会话。
@@ -176,9 +204,33 @@ func main() {
 }
 ```
 
+`Query` 只返回聚合后的最终答案。模型实现 `llm.StreamingChatModel` 时它在底层仍使用 SSE，但不会实时展示增量；需要实时输出请使用 `QueryStream`。
+
+## 🔄 流式调用
+
+三个层次，由低到高：
+
+| API | 返回 | 适用场景 |
+|---|---|---|
+| `ChatModel.Invoke` | 一个 `*llm.Completion` | 单次缓冲模型调用 |
+| `StreamingChatModel.InvokeStream` | 单次模型调用的 `<-chan llm.StreamEvent` | 单次调用的原始增量；工具循环需自行实现 |
+| `Agent.QueryStream`（及 `QueryStreamWithSteering`） | 整个 Agent 执行过程的 `<-chan agent.Event` | 实时文本 + 托管的工具循环 |
+| `Agent.QueryStreamEnveloped`（及 `…WithSteering`） | `<-chan agent.EventEnvelope`（同样的事件，附带 query/Frame 关联） | 同上，需要关联元数据时使用 |
+
+`anthropic.Client`、`openai.ChatClient`、`openai.ResponsesClient` 都实现了 `llm.StreamingChatModel`。只实现 `ChatModel` 的 wrapper 会对 Agent 隐藏该能力，Agent 随之退回缓冲调用；自定义 wrapper 请保留 `InvokeStream`。SDK 不会根据类型名或 Provider 字符串推断是否支持流式。
+
+正确判断结果：
+
+- **InvokeStream**：每个 `StreamTextDeltaEvent.Delta` 只追加一次。同时处理 `InvokeStream` 本身返回的 error 与 `StreamErrorEvent.AsError()`。`StreamDoneEvent` 是 Provider 的正常终态，其 `StopReason` 为 Provider 原值，仍可能表示输出被长度截断。未收到 `StreamDoneEvent` 就关闭的通道表示响应不完整，不是成功。工具参数增量是不完整的 JSON，流结束前绝不能执行（Agent 会替你处理）。
+- **QueryStream**：`TextDeltaEvent` 增量作为进度打印。`FinalResponseEvent.Content` 是权威最终答案，**不保证**等于此前的增量：工具调用前流出的文本只是进度，后续轮次或 `done` 工具可能给出不同的答案，某一轮可能没有任何增量，丢失的增量也会使已显示文本不完整。应将最终答案与**最后一个模型轮次**实际显示的内容比较（示例在每次工具调用/结果处重置），不同则打印；不能仅因本次 Query 曾收到过增量就跳过最终答案。`ErrorEvent` 表示失败结束。`FinalResponseEvent.Status == "partial"` 是有界的兜底答案，不是正常完成的任务；`DroppedEvents`/`DroppedCriticalEvents` 表示交付的事件流不完整或与历史不一致。
+- 通过取消 `context` 终止请求；提前返回时务必 cancel，确保 HTTP body 被关闭。
+
+[`examples/streaming`](examples/streaming) 是覆盖三种协议、两种模式的可运行示例（通过 `STREAM_MODEL`、`OPENAI_API_KEY`/`ANTHROPIC_API_KEY` 及可选的 `STREAM_BASE_URL` 配置；缺少配置会在发起请求前报错）。其测试只使用本地 HTTP fixture。
+
 ## 📂 目录结构
 
 - `sdk/`：SDK 核心实现（agent/llm/tools/tokens）。
+- `examples/streaming`：三种内置协议的流式用法示例。
 
 ## 📄 许可证
 
