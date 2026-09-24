@@ -116,6 +116,17 @@ type BlockCallPlan struct {
 }
 
 type sequentialScopeKey struct{}
+
+// waveAdmissionKey marks the context Admit receives for a call admitted
+// into a bounded wave (it runs concurrently with other calls of the wave).
+type waveAdmissionKey struct{}
+
+// admittedIntoWave reports whether ctx is an Admit context of a wave call.
+func admittedIntoWave(ctx context.Context) bool {
+	v, _ := ctx.Value(waveAdmissionKey{}).(bool)
+	return v
+}
+
 type sequentialScope struct {
 	mu            sync.Mutex
 	active, child bool
@@ -524,7 +535,7 @@ func runOrderedWave(
 			stop = BlockRootBeforeStart
 			break
 		}
-		admission, e := a.Admit(root, i)
+		admission, e := a.Admit(context.WithValue(root, waveAdmissionKey{}, true), i)
 		if e != nil {
 			return start + admitted, BlockContinue, e, admission.Finish
 		}

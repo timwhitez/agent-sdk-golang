@@ -91,6 +91,22 @@ func (p PreparedCall) FinalArgs() (json.RawMessage, bool) {
 	return bytes.Clone(p.final.view), true
 }
 
+// RequireFinalArgs returns a copy of p whose execution must consume exactly
+// the prepared final arguments: if a wrapper forwards different bytes to the
+// Func adapter, the adapter refuses with ErrFinalArgsChanged instead of
+// decoding them, so the tool never runs on arguments other than the ones
+// FinalArgs showed. Without final arguments it returns p unchanged.
+func (p PreparedCall) RequireFinalArgs() PreparedCall {
+	if p.final == nil {
+		return p
+	}
+	required := *p.final
+	required.required = true
+	required.state = &finalArgsState{}
+	p.final = &required
+	return p
+}
+
 // FinalArgsOutcome reports, after Execute, whether the adapter consumed the
 // prepared object, decoded different bytes, or was never reached.
 func (p PreparedCall) FinalArgsOutcome() string {
@@ -142,7 +158,12 @@ func (p PreparedCall) Execute(ctx context.Context, deps *Container) (llm.Content
 	// execution based on its error text; typed adapters prepare before decoding.
 	if ctx != nil {
 		ctx = context.WithValue(ctx, originalToolArgsKey{}, p.original)
-		if p.final != nil {
+		// A required preparation already governing this call scope is never
+		// replaced: a wrapper re-entering through Tool.Execute or
+		// PreparedCall.Execute cannot downgrade it to a fresh, unrequired one.
+		if outer, ok := ctx.Value(preparedTypedArgsKey{}).(*preparedTypedArgs); ok && outer.required {
+			// keep the outer requirement
+		} else if p.final != nil {
 			ctx = context.WithValue(ctx, preparedTypedArgsKey{}, p.final)
 		}
 	}
