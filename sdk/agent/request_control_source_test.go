@@ -88,6 +88,15 @@ func TestRequireDoneControlSourceRetryWorkSteeringAndLegacyParity(t *testing.T) 
 							}
 							observed[e.FrameID] = true
 						}
+						// Steering accepted in Frame 3's block relates only
+						// Frame 4 and never replaces the control relation.
+						wantSteering := ""
+						if steer && strings.HasSuffix(e.FrameID, "/frame/4") {
+							wantSteering = "control-query/frame/3"
+						}
+						if e.RequestSteeringSourceFrameID != wantSteering || (e.RequestSteeringRelation != "") != (wantSteering != "") {
+							t.Errorf("wrong steering metadata kind=%s frame=%s source=%s", e.Kind, e.FrameID, e.RequestSteeringSourceFrameID)
+						}
 						if e.Kind == EventKindSteeringReceived && (e.FrameID != "" || e.RequestControlRelation != "") {
 							t.Error("steering inherited control source")
 						}
