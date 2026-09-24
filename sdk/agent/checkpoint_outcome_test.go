@@ -68,8 +68,8 @@ func commitCandidate(t *testing.T, ag *Agent) ([]llm.Message, compaction.Result,
 
 // #86: a checkpoint write whose outcome is unknown is never rolled back or
 // retried: history stays unpublished, the ledger is kept, and every later
-// checkpoint write is refused before I/O until the compaction runtime is
-// replaced after the host reconciled its store.
+// checkpoint write is refused before I/O until the host reconciled its store
+// and released it explicitly.
 func TestUnknownCheckpointOutcomeIsNeitherRolledBackNorRetried(t *testing.T) {
 	writer := &outcomeWriter{fail: func(n int) error {
 		if n == 1 {
@@ -101,10 +101,15 @@ func TestUnknownCheckpointOutcomeIsNeitherRolledBackNorRetried(t *testing.T) {
 		t.Fatal("refusal did not release the operation")
 	}
 
-	// A replacement runtime (the host reconciled its store) writes again.
+	// Resetting the runtime's policy state does not release the store.
 	ag.resetCompactionOutcomeState()
+	if _, _, err = commitCandidate(t, ag); !errors.Is(err, compaction.ErrCheckpointStoreQuarantined) || writer.count() != 1 {
+		t.Fatalf("after policy reset: err=%v writes=%d", err, writer.count())
+	}
+	// The host's explicit reconciliation does.
+	ag.CheckpointStoreReconciled()
 	if _, out, err = commitCandidate(t, ag); err != nil || !out.Compacted || writer.count() != 2 {
-		t.Fatalf("after replacement: compacted=%v err=%v writes=%d", out.Compacted, err, writer.count())
+		t.Fatalf("after reconciliation: compacted=%v err=%v writes=%d", out.Compacted, err, writer.count())
 	}
 }
 

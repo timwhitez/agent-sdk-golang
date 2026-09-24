@@ -139,8 +139,12 @@ A checkpoint writer whose failure may still have left the checkpoint durable
 not written, as before. For an unknown outcome the Agent neither rolls back
 the ledger nor retries or requeues the compaction, publishes no history for
 it, and refuses every later checkpoint write (`ErrCheckpointStoreQuarantined`,
-before any I/O) and automatic compaction until the compaction runtime is
-replaced after the host reconciled its store.
+before any I/O) and automatic compaction until the host, after reconciling
+its store with the live history and ledger, calls
+`Agent.CheckpointStoreReconciled`. Configuration updates (thresholds,
+disable/enable, a new writer) reset only compaction policy state and never
+release the quarantine. Any positive marker anywhere in the error tree
+(wrapped or joined) counts; a marker returning false speaks only for itself.
 
 The checkpoint-only compatibility API does not own a later history replacement.
 Content equality is not Session revision binding; external writers and prior

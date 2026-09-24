@@ -4573,7 +4573,7 @@ func (a *Agent) persistCompactionCheckpoint(ctx context.Context, messages []llm.
 	if a.checkpointQuarantined.Load() {
 		failed := res
 		failed.Compacted, failed.CheckpointID = false, ""
-		failed.Warnings = append(failed.Warnings, "[ERROR] Compaction checkpoint not written - an earlier checkpoint write had an unknown outcome; history was not replaced. (stage=append_compaction_checkpoint action=reconcile the checkpoint store, then replace the compaction runtime)")
+		failed.Warnings = append(failed.Warnings, "[ERROR] Compaction checkpoint not written - an earlier checkpoint write had an unknown outcome; history was not replaced. (stage=append_compaction_checkpoint action=reconcile the checkpoint store, then call CheckpointStoreReconciled)")
 		commit.result = failed
 		return commit, compaction.ErrCheckpointStoreQuarantined
 	}
@@ -4598,7 +4598,7 @@ func (a *Agent) persistCompactionCheckpoint(ctx context.Context, messages []llm.
 		a.checkpointQuarantined.Store(true)
 		failed := res
 		failed.Compacted, failed.CheckpointID = false, ""
-		failed.Warnings = append(failed.Warnings, fmt.Sprintf("[ERROR] Compaction checkpoint outcome unknown - it may already be durable; in-memory history was not replaced, the ledger was kept and no retry will be made. (stage=append_compaction_checkpoint action=reconcile the checkpoint store, then replace the compaction runtime: %v)", err))
+		failed.Warnings = append(failed.Warnings, fmt.Sprintf("[ERROR] Compaction checkpoint outcome unknown - it may already be durable; in-memory history was not replaced, the ledger was kept and no retry will be made. (stage=append_compaction_checkpoint action=reconcile the checkpoint store, then call CheckpointStoreReconciled: %v)", err))
 		commit.result = failed
 		return commit, fmt.Errorf("compaction checkpoint outcome unknown: %w", err)
 	}

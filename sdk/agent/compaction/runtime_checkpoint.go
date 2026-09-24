@@ -108,16 +108,36 @@ type CheckpointOutcomeUnknown interface {
 	CheckpointOutcomeUnknown() bool
 }
 
-// CheckpointOutcomeIsUnknown reports whether err, or an error it wraps,
-// declares an unknown checkpoint outcome. A plain error does not: the writer
-// is the only party that knows whether its store may have been changed.
+// CheckpointOutcomeIsUnknown reports whether any error in err's tree (every
+// error it wraps or joins) declares an unknown checkpoint outcome. A marker
+// returning false speaks only for its own node and never hides a positive
+// one below or beside it. A plain error does not declare one: the writer is
+// the only party that knows whether its store may have been changed.
 func CheckpointOutcomeIsUnknown(err error) bool {
-	var unknown CheckpointOutcomeUnknown
-	return errors.As(err, &unknown) && unknown.CheckpointOutcomeUnknown()
+	const maxNodes = 256 // bounds pathological or cyclic trees
+	pending := []error{err}
+	for visited := 0; len(pending) > 0 && visited < maxNodes; visited++ {
+		node := pending[len(pending)-1]
+		pending = pending[:len(pending)-1]
+		if node == nil {
+			continue
+		}
+		if marker, ok := node.(CheckpointOutcomeUnknown); ok && marker.CheckpointOutcomeUnknown() {
+			return true
+		}
+		switch wrapped := node.(type) {
+		case interface{ Unwrap() []error }:
+			pending = append(pending, wrapped.Unwrap()...)
+		case interface{ Unwrap() error }:
+			pending = append(pending, wrapped.Unwrap())
+		}
+	}
+	return false
 }
 
 // ErrCheckpointStoreQuarantined refuses a checkpoint write after an earlier
-// write of the same compaction runtime had an unknown outcome. No write was
-// attempted. The host must reconcile its store and replace the compaction
-// runtime before checkpoints are written again.
-var ErrCheckpointStoreQuarantined = errors.New("compaction: checkpoint store quarantined after an unknown checkpoint outcome; reconcile the store and replace the compaction runtime")
+// checkpoint write of the Agent had an unknown outcome. No write was
+// attempted. The host must reconcile its store and call
+// Agent.CheckpointStoreReconciled before checkpoints are written again;
+// configuration updates do not release it.
+var ErrCheckpointStoreQuarantined = errors.New("compaction: checkpoint store quarantined after an unknown checkpoint outcome; reconcile the store, then release it explicitly")
