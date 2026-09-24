@@ -8,6 +8,7 @@ import (
 	"reflect"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -15,9 +16,9 @@ import (
 	"github.com/timwhitez/agent-sdk-golang/sdk/tools"
 )
 
-// #84: a projection failure after out-of-order returns stops settlement
-// without re-running effects, waits for every started worker and closes each
-// call exactly once.
+// #84: a projection failure after an out-of-order return (call 2 returns
+// first) stops settlement without re-running effects, waits for the worker
+// still running and closes each call exactly once.
 func TestToolBlockParallelProjectionFailureWaitsForWorkers(t *testing.T) {
 	g := newGatedHandlers(3)
 	trace := &parallelTrace{}
@@ -38,19 +39,20 @@ func TestToolBlockParallelProjectionFailureWaitsForWorkers(t *testing.T) {
 		done <- err
 	}()
 	g.waitStarted(t, 3)
+	close(g.release[2])
+	waitReturned(t, g, 1)
 	close(g.release[0])
 	if got := wait(t, projected, "failing projection"); got != 0 {
 		t.Fatalf("projected %d first", got)
 	}
-	// Calls 1 and 2 are still running: the owner must not return yet.
+	// Call 1 is still running: the owner must not return yet.
 	select {
 	case err := <-done:
-		t.Fatalf("owner returned while workers were running: %v", err)
+		t.Fatalf("owner returned while a worker was running: %v", err)
 	case <-time.After(30 * time.Millisecond):
 	}
-	close(g.release[2])
 	close(g.release[1])
-	if err := <-done; err == nil {
+	if err := wait(t, done, "owner exit"); err == nil {
 		t.Fatal("expected projection failure")
 	}
 	if len(g.returnedSnapshot()) != 3 {
@@ -87,18 +89,18 @@ func TestToolBlockParallelSlowPublisherKeepsModelOrder(t *testing.T) {
 	if got := wait(t, entered, "first publication"); got != 0 {
 		t.Fatalf("first publication for call %d", got)
 	}
+	// Call 2 returns before call 1, both while call 0's consumer is blocked.
 	close(g.release[2])
+	waitReturned(t, g, 2)
 	close(g.release[1])
-	// Both later calls return while call 0's consumer is blocked.
-	for len(g.returnedSnapshot()) < 3 {
-		select {
-		case i := <-entered:
-			t.Fatalf("call %d published while call 0's consumer was blocked", i)
-		case <-time.After(10 * time.Millisecond):
-		}
+	waitReturned(t, g, 3)
+	select {
+	case i := <-entered:
+		t.Fatalf("call %d published while call 0's consumer was blocked", i)
+	default:
 	}
 	close(consumerReady)
-	if err := <-done; err != nil {
+	if err := wait(t, done, "owner exit"); err != nil {
 		t.Fatal(err)
 	}
 	trace.mu.Lock()
@@ -108,6 +110,19 @@ func TestToolBlockParallelSlowPublisherKeepsModelOrder(t *testing.T) {
 		t.Fatalf("published %v", published)
 	}
 	requireSingleTerminal(t, state)
+}
+
+// waitReturned waits until n handlers have returned; the deadline is only a
+// failure bound.
+func waitReturned(t *testing.T, g *gatedHandlers, n int) {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for len(g.returnedSnapshot()) < n {
+		if time.Now().After(deadline) {
+			t.Fatalf("only %v returned, want %d", g.returnedSnapshot(), n)
+		}
+		time.Sleep(time.Millisecond)
+	}
 }
 
 func (g *gatedHandlers) returnedSnapshot() []int {
@@ -149,6 +164,7 @@ func mixedCalls(names ...string) *llm.Completion {
 }
 
 type waveParityRun struct {
+	peak     int32
 	history  []llm.Message
 	requests [][]llm.Message
 	events   []string
@@ -159,10 +175,23 @@ func runWaveParity(t *testing.T, parallel *ToolParallelism, turns []*llm.Complet
 	t.Helper()
 	var mu sync.Mutex
 	var executed []string
+	var active, peak atomic.Int32
 	type readArgs struct {
 		FilePath string `json:"file_path"`
 	}
 	read := tools.Func[readArgs]("read", "read a file", func(_ context.Context, a readArgs, _ *tools.Container) (any, error) {
+		now := active.Add(1)
+		for p := peak.Load(); now > p && !peak.CompareAndSwap(p, now); p = peak.Load() {
+		}
+		if parallel != nil {
+			// Give a wave's other calls a bounded chance to overlap, so the
+			// test can see that waves really formed.
+			deadline := time.Now().Add(time.Second)
+			for peak.Load() < 2 && time.Now().Before(deadline) {
+				time.Sleep(time.Millisecond)
+			}
+		}
+		active.Add(-1)
 		mu.Lock()
 		executed = append(executed, "read:"+a.FilePath)
 		mu.Unlock()
@@ -193,6 +222,7 @@ func runWaveParity(t *testing.T, parallel *ToolParallelism, turns []*llm.Complet
 			run.events = append(run.events, "final")
 		}
 	}
+	run.peak = peak.Load()
 	run.history = a.Messages()
 	run.requests = model.requests
 	run.executed = executed
@@ -213,6 +243,9 @@ func TestNativeWaveMatchesExclusiveHistoryAcrossReuseAndDone(t *testing.T) {
 	}
 	exclusive := runWaveParity(t, nil, turns())
 	wave := runWaveParity(t, &ToolParallelism{MaxWorkers: 4, Plan: readOnlyPlan}, turns())
+	if exclusive.peak != 1 || wave.peak < 2 {
+		t.Fatalf("peak exclusive=%d wave=%d: the wave run did not overlap calls", exclusive.peak, wave.peak)
+	}
 	if !reflect.DeepEqual(exclusive.history, wave.history) {
 		t.Fatalf("history differs:\nexclusive=%+v\nwave=%+v", exclusive.history, wave.history)
 	}
