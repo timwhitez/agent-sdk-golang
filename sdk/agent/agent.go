@@ -665,6 +665,7 @@ func (a *Agent) queryStreamWithSteering(ctx context.Context, input llm.Content, 
 		// itself, then each accepted steering message. Internal reminders,
 		// continuations and compaction results never refresh it.
 		overflowRecoveryEpoch := ^uint64(0)
+		overflowRecoveries := 0
 		a.userInputEpoch.Add(1)
 		usageFallbackWarned := false
 		cont := newToolCallContinuation(defaultMaxContinuationTurns)
@@ -930,6 +931,12 @@ func (a *Agent) queryStreamWithSteering(ctx context.Context, input llm.Content, 
 							streamIdleRecoveries,
 							maxRecov,
 						)
+						// Applied: the recovery reminder is already in history.
+						a.observeIntervention(interventionRecord{kind: InterventionStreamIdleRecovery, stage: interventionApplied, strike: streamIdleRecoveryTotal})
+						a.emitEvent(out, WarnEvent{
+							Kind:    "stream_idle_recovery",
+							Message: fmt.Sprintf("response stream idle-timed out after %s; continuing with a recovery reminder (%d/%d)", idleErr.Duration, streamIdleRecoveries, maxRecov),
+						}, correlation.withInterventionKind(InterventionStreamIdleRecovery, InterventionResultRecoveryReminderAppended, streamIdleRecoveryTotal))
 						continue
 					}
 				}
@@ -945,10 +952,13 @@ func (a *Agent) queryStreamWithSteering(ctx context.Context, input llm.Content, 
 						overflowRecoveryEpoch = epoch
 						changed, recoveryErr := a.compactForProviderOverflow(ctx, frame.id, out)
 						if recoveryErr == nil && changed {
+							// Applied: the compacted history is already in place.
+							overflowRecoveries++
+							a.observeIntervention(interventionRecord{kind: InterventionContextOverflowRecovery, stage: interventionApplied, strike: overflowRecoveries})
 							a.emitEvent(out, WarnEvent{
 								Kind:    "context_overflow_recovery",
 								Message: "provider rejected the request as exceeding the context window; compacted history once and retrying with a new request",
-							}, correlation)
+							}, correlation.withInterventionKind(InterventionContextOverflowRecovery, InterventionResultHistoryCompacted, overflowRecoveries))
 							continue
 						}
 						if recoveryErr != nil && ctx.Err() == nil {

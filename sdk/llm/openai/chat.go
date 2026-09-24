@@ -21,6 +21,9 @@ import (
 
 const defaultBaseURL = "https://api.openai.com"
 
+// ChatClient streams over HTTP SSE through InvokeStream.
+var _ llm.StreamingChatModel = (*ChatClient)(nil)
+
 type ChatClient struct {
 	HTTPClient *http.Client
 	BaseURL    string
