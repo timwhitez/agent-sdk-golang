@@ -113,10 +113,17 @@ type CheckpointOutcomeUnknown interface {
 // returning false speaks only for its own node and never hides a positive
 // one below or beside it. A plain error does not declare one: the writer is
 // the only party that knows whether its store may have been changed.
+//
+// The walk is bounded (maxCheckpointErrorNodes). A tree it cannot finish
+// checking within the bound, including a cyclic one, is reported as unknown:
+// only a completely checked tree without a positive marker is negative, so a
+// positive can never be hidden by depth, width or join order.
 func CheckpointOutcomeIsUnknown(err error) bool {
-	const maxNodes = 256 // bounds pathological or cyclic trees
 	pending := []error{err}
-	for visited := 0; len(pending) > 0 && visited < maxNodes; visited++ {
+	for visited := 0; len(pending) > 0; visited++ {
+		if visited >= maxCheckpointErrorNodes || len(pending) > maxCheckpointErrorNodes {
+			return true // not completely checked: cannot confirm "not written"
+		}
 		node := pending[len(pending)-1]
 		pending = pending[:len(pending)-1]
 		if node == nil {
@@ -134,6 +141,9 @@ func CheckpointOutcomeIsUnknown(err error) bool {
 	}
 	return false
 }
+
+// maxCheckpointErrorNodes bounds CheckpointOutcomeIsUnknown's walk.
+const maxCheckpointErrorNodes = 256
 
 // ErrCheckpointStoreQuarantined refuses a checkpoint write after an earlier
 // checkpoint write of the Agent had an unknown outcome. No write was

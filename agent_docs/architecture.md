@@ -145,6 +145,8 @@ its store with the live history and ledger, calls
 disable/enable, a new writer) reset only compaction policy state and never
 release the quarantine. Any positive marker anywhere in the error tree
 (wrapped or joined) counts; a marker returning false speaks only for itself.
+The walk is bounded (256 nodes); a tree it cannot finish checking, including
+a cyclic one, is treated as unknown rather than as "not written".
 
 The checkpoint-only compatibility API does not own a later history replacement.
 Content equality is not Session revision binding; external writers and prior

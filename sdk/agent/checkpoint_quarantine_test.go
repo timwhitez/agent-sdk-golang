@@ -28,12 +28,17 @@ func TestQ02ConfigUpdatesKeepCheckpointQuarantine(t *testing.T) {
 	if _, _, err := commitCandidate(t, ag); !compaction.CheckpointOutcomeIsUnknown(err) {
 		t.Fatalf("first commit err=%v", err)
 	}
-	for name, cfg := range map[string]*compaction.Config{
-		"threshold":  {Enabled: true, SessionID: "outcome", LedgerStore: store, CheckpointWriter: writer, ThresholdRatio: 0.5},
-		"disabled":   {Enabled: false},
-		"re-enabled": {Enabled: true, SessionID: "outcome", LedgerStore: store, CheckpointWriter: writer},
-		"new writer": {Enabled: true, SessionID: "outcome", LedgerStore: store, CheckpointWriter: &outcomeWriter{}},
+	// Ordered: disable happens before re-enable.
+	for _, step := range []struct {
+		name string
+		cfg  *compaction.Config
+	}{
+		{"threshold", &compaction.Config{Enabled: true, SessionID: "outcome", LedgerStore: store, CheckpointWriter: writer, ThresholdRatio: 0.5}},
+		{"disabled", &compaction.Config{Enabled: false}},
+		{"re-enabled", &compaction.Config{Enabled: true, SessionID: "outcome", LedgerStore: store, CheckpointWriter: writer}},
+		{"new writer", &compaction.Config{Enabled: true, SessionID: "outcome", LedgerStore: store, CheckpointWriter: &outcomeWriter{}}},
 	} {
+		name, cfg := step.name, step.cfg
 		ag.UpdateCompactionConfig(cfg)
 		if !cfg.Enabled {
 			continue
