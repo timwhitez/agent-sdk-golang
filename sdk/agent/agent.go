@@ -133,6 +133,20 @@ type Config struct {
 	// typed provider context overflow (llm.IsContextOverflow): such a
 	// rejection then ends the turn as before.
 	DisableContextOverflowRecovery bool
+	// ObserveThinkingOnlyResponses opts into an observe-only diagnostic; the
+	// default false reports nothing. When true, a model response that
+	// completed normally (no error, cancellation, stall or incomplete stream;
+	// stop reason end_turn, stop or stop_sequence; not part of a max-tokens or
+	// tool-call continuation), carries reasoning activity (non-empty Thinking or
+	// a thinking/redacted_thinking content block) and has neither visible
+	// content nor tool calls is reported by one WarnEvent of kind
+	// "thinking_only_observed" whose envelope carries Intervention
+	// "thinking_only", InterventionStage "detected" and InterventionResult
+	// "observed_only". Opaque provider state alone is not reasoning evidence.
+	// Detection is not application: requests, tool choice, thinking controls,
+	// model call count, history and provider state are unchanged, no recovery
+	// is attempted, and the event carries no reasoning text or length.
+	ObserveThinkingOnlyResponses bool
 	// ToolParallelism opts the native tool loop into bounded waves. Nil (the
 	// default) keeps every call Exclusive. See ToolParallelism.
 	ToolParallelism *ToolParallelism
@@ -177,6 +191,8 @@ type Agent struct {
 	nativeUnproven sync.Map
 	// overflowRecoveryDisabled mirrors Config.DisableContextOverflowRecovery.
 	overflowRecoveryDisabled bool
+	// observeThinkingOnly mirrors Config.ObserveThinkingOnlyResponses.
+	observeThinkingOnly bool
 	// userInputEpoch counts real user input: each Query and each accepted
 	// steering message start a new epoch. Internal reminders, continuations
 	// and compaction results never advance it. Overflow recovery and the
@@ -488,6 +504,7 @@ func New(cfg Config) (*Agent, error) {
 		streamIdleTimeout:        cfg.StreamIdleTimeout,
 		streamIdleMaxRecov:       cfg.StreamIdleMaxRecoveries,
 		overflowRecoveryDisabled: cfg.DisableContextOverflowRecovery,
+		observeThinkingOnly:      cfg.ObserveThinkingOnlyResponses,
 		toolParallelism:          cloneToolParallelism(cfg.ToolParallelism),
 		toolChoice:               cfg.ToolChoice,
 		requireDone:              cfg.RequireDoneTool,
@@ -1089,6 +1106,12 @@ func (a *Agent) queryStreamWithSteering(ctx context.Context, input llm.Content, 
 			})
 			a.messages = append(a.messages, currentAssistant)
 			a.mu.Unlock()
+			// Observe-only: the response is already in history unchanged, and
+			// nothing below depends on this report.
+			if a.observeThinkingOnly && ctx.Err() == nil && !cont.hasPending() && pendingTextContinuation == "" && completionIsThinkingOnly(comp) {
+				a.emitEvent(out, WarnEvent{Kind: thinkingOnlyObservedKind, Message: thinkingOnlyObservedMessage},
+					correlation.withInterventionDetection(InterventionThinkingOnly, InterventionResultObservedOnly))
+			}
 			postCompletionEstimate := 0
 			if a.hasCompactor && a.compactor != nil {
 				postCompletionEstimate = a.compactor.EstimateMessages(a.Messages())
@@ -3006,6 +3029,9 @@ func applyEventCorrelation(envelope *EventEnvelope, correlations []eventCorrelat
 	if correlation.intervention != "" {
 		envelope.Intervention = correlation.intervention
 		envelope.InterventionStage = InterventionStageApplied
+		if correlation.interventionStage != "" {
+			envelope.InterventionStage = correlation.interventionStage
+		}
 		envelope.InterventionResult = correlation.interventionResult
 		envelope.InterventionStrike = correlation.interventionStrike
 	}

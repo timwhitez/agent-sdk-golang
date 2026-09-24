@@ -197,6 +197,32 @@ secrets, full prompts/source/results or hidden reasoning. A Frame or model name
 alone is not evidence of model failure. [Testing guidance](testing.md) maps the
 relevant contract suites; historical receipts do not prove current behavior.
 
+### Thinking-only observation (opt-in, observe-only)
+
+`Config.ObserveThinkingOnlyResponses` (default false) reports a model response
+that is *thinking-only*: it returned without error (so it was not cancelled,
+a transport/provider failure, a stream-idle stall or an incomplete stream that
+closed before its done event), its stop reason is `end_turn`, `stop` or
+`stop_sequence` (never `max_tokens`/`length`, `content_filter`, `refusal`,
+`pause_turn`, empty or unknown), it is not part of a max-tokens text or
+tool-call continuation, it has reasoning activity — non-empty `Thinking` or a
+`thinking`/`redacted_thinking` content block — and it has no tool calls and no
+visible content (whitespace-only text is not visible; any other block is).
+Opaque provider state is preserved but never interpreted, so on its own it is
+not reasoning evidence.
+
+The report is one `WarnEvent` of kind `thinking_only_observed` with a fixed
+message, emitted after the response entered history, on the existing Query
+sequence and with the response's Frame/attempt correlation. Its Envelope
+carries `Intervention=thinking_only`, `InterventionStage=detected`,
+`InterventionResult=observed_only` and no strike. Detection is not
+application: the request, tool choice, thinking controls, model call count,
+history and opaque provider state are identical with the switch on or off,
+and existing guards (early-stop, RequireDone) run unchanged. The event carries
+no reasoning text, length or provider data. Active recovery is deliberately
+not implemented; any future recovery needs its own opt-in, budget and
+same-budget evaluation.
+
 ### RequireDone thinking-control provenance
 
 The optional Envelope `RequestControlRelation=require_done_disable_thinking`
