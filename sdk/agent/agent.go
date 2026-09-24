@@ -673,6 +673,9 @@ func (a *Agent) queryStreamWithSteering(ctx context.Context, input llm.Content, 
 		// continuations and compaction results never refresh it.
 		overflowRecoveryEpoch := ^uint64(0)
 		overflowRecoveries := 0
+		// pendingRecoverySource is the stalled Frame of a stream-idle recovery
+		// whose reminder the next Frame's request will contain.
+		pendingRecoverySource := ""
 		a.userInputEpoch.Add(1)
 		usageFallbackWarned := false
 		cont := newToolCallContinuation(defaultMaxContinuationTurns)
@@ -831,6 +834,12 @@ func (a *Agent) queryStreamWithSteering(ctx context.Context, input llm.Content, 
 			if historySource := a.takeAppliedCompactionSource(out.queryID); frameErr == nil {
 				frame.historySource = historySource
 			}
+			// A stream-idle recovery reminder appended since the previous
+			// Frame changed this request; record the stalled Frame once.
+			if frameErr == nil {
+				frame.recoverySource = pendingRecoverySource
+			}
+			pendingRecoverySource = ""
 			frameFailure := ""
 			frameFailureHint := "rebuild the Agent with consistent, cloneable tool definitions"
 			if frameErr != nil {
@@ -865,7 +874,7 @@ func (a *Agent) queryStreamWithSteering(ctx context.Context, input llm.Content, 
 				emitSDKErr(ErrorEvent{Kind: "invalid_request", Message: frameFailure + "; " + frameFailureHint})
 				return
 			}
-			invocation := &frameInvocation{frameID: frame.id, controlSource: frame.controlSource, historySource: frame.historySource}
+			invocation := &frameInvocation{frameID: frame.id, controlSource: frame.controlSource, historySource: frame.historySource, recoverySource: frame.recoverySource}
 			comp, streamedText, err := a.invokeModelCompletionWithRetryAndSteering(ctx, frame.model, frame.request, out, steeringCh, invocation)
 			correlation := invocation.correlation()
 			if err != nil {
@@ -932,6 +941,7 @@ func (a *Agent) queryStreamWithSteering(ctx context.Context, input llm.Content, 
 						a.mu.Lock()
 						a.messages = append(a.messages, messageorigin.NewInternalUserMessage(messageorigin.KindStreamIdleRecovery, streamIdleRecoveryText))
 						a.mu.Unlock()
+						pendingRecoverySource = frame.id
 						a.warnf(
 							"warning: response stream idle-timed out after %s; auto-recovering (%d/%d)",
 							idleErr.Duration,
@@ -2982,6 +2992,10 @@ func applyEventCorrelation(envelope *EventEnvelope, correlations []eventCorrelat
 		if correlation.historySource != "" {
 			envelope.RequestHistoryRelation = RequestHistoryCompactionApplied
 			envelope.RequestHistorySourceFrameID = correlation.historySource
+		}
+		if correlation.recoverySource != "" {
+			envelope.RequestRecoveryRelation = RequestRecoveryStreamIdle
+			envelope.RequestRecoverySourceFrameID = correlation.recoverySource
 		}
 		envelope.ToolBlockID, envelope.ToolCallOrdinal, envelope.ToolBlockCallCount = correlation.toolBlockID, correlation.toolCallOrdinal, correlation.blockCallCount
 	}
