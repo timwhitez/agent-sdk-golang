@@ -180,13 +180,29 @@ func (a *Agent) signalCompactionRuntimeWaitersLocked() {
 	}
 }
 
-// resetCompactionOutcomeState clears the outcome state of the superseded
+// resetCompactionOutcomeState clears the policy state of the superseded
 // service. Retry/cooldown and ineffective-summary state describe that
 // service; carrying them into a replacement can incorrectly suppress the new
-// configuration.
+// configuration. The checkpoint quarantine is not policy state: it records
+// that a store may hold a checkpoint the Agent never published, and only
+// CheckpointStoreReconciled releases it.
 func (a *Agent) resetCompactionOutcomeState() {
 	a.compactionRetryPending.Store(false)
 	a.compactionFailureStreak.Store(0)
 	a.compactionCooldownUntil.Store(0)
 	a.ineffectiveSummaryEpoch.Store(0)
+}
+
+// CheckpointStoreReconciled releases the checkpoint quarantine set after a
+// checkpoint write had an unknown outcome. Call it only after the host has
+// reconciled that store with the live history and ledger (for example by
+// repairing its event log, or by moving to a new independent store and
+// resuming from what it holds). The SDK cannot verify the reconciliation;
+// configuration updates, a new writer or a restart of the same runtime
+// never release the quarantine on their own.
+func (a *Agent) CheckpointStoreReconciled() {
+	if a == nil {
+		return
+	}
+	a.checkpointQuarantined.Store(false)
 }
