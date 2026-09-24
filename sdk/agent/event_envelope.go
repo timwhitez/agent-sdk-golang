@@ -95,15 +95,27 @@ type EventEnvelope struct {
 	// accepted history-only tails that may produce no envelope. Zero is unknown.
 	ToolCallOrdinal    uint64 `json:"ToolCallOrdinal,omitempty"`
 	ToolBlockCallCount uint64 `json:"ToolBlockCallCount,omitempty"`
-	// Intervention names an SDK intervention whose application was accepted
-	// into history before this event was produced; InterventionStage is then
-	// "applied" and InterventionResult a fixed outcome label. Empty means the
-	// event reports no intervention, not that none was considered. It is not
-	// proof of delivery, of model compliance or of full content provenance.
+	// Intervention names an SDK intervention that was applied before this
+	// event was produced; InterventionStage is then "applied" and
+	// InterventionResult a fixed outcome label saying what was applied:
+	//   - tool_suppressed: the suppressed tool result was committed to history.
+	//   - reminder_queued: the suppression was committed and a reminder was
+	//     queued; the reminder itself enters history only when the tool block
+	//     closes, and never if the block fails first.
+	//   - guard_downgraded: the repeat guard's state changed.
+	//   - safety_fallback_accepted: the partial final answer was accepted; the
+	//     strike counts the reminders appended before it.
+	//   - recovery_reminder_appended: the stream-idle recovery reminder is in
+	//     history.
+	//   - history_compacted: overflow recovery replaced history before the new
+	//     request.
 	// Kinds: repeated_tool_signature (tool_suppressed, reminder_queued,
-	// guard_downgraded), evidence_progress (tool_suppressed, reminder_queued)
-	// and require_done_reminder (safety_fallback_accepted, where the strike
-	// counts the reminders appended before the fallback).
+	// guard_downgraded), evidence_progress (tool_suppressed, reminder_queued),
+	// require_done_reminder (safety_fallback_accepted), stream_idle_recovery
+	// (recovery_reminder_appended) and context_overflow_recovery
+	// (history_compacted). Empty means the event reports no intervention, not
+	// that none was considered. It is not proof of delivery, of model
+	// compliance or of full content provenance.
 	Intervention       string `json:"Intervention,omitempty"`
 	InterventionStage  string `json:"InterventionStage,omitempty"`
 	InterventionResult string `json:"InterventionResult,omitempty"`

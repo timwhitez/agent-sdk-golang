@@ -26,7 +26,13 @@ func TestStreamIdleRecoveryRecordsRequestRelation(t *testing.T) {
 	}
 	var stalledFrame, finalFrame string
 	relations := map[string]string{} // frame → recovery source
+	labeledFrame := ""
 	for env := range ag.QueryStreamEnveloped(context.Background(), llm.TextContent("hello")) {
+		// Independent oracle: the applied recovery warning (#170) is emitted
+		// by the stalled Frame.
+		if w, ok := env.Event.(WarnEvent); ok && w.Kind == "stream_idle_recovery" {
+			labeledFrame = env.FrameID
+		}
 		if _, ok := env.Event.(FinalResponseEvent); ok {
 			finalFrame = env.FrameID
 		}
@@ -43,6 +49,9 @@ func TestStreamIdleRecoveryRecordsRequestRelation(t *testing.T) {
 	}
 	if stalledFrame == "" || finalFrame == "" || stalledFrame == finalFrame {
 		t.Fatalf("frames stalled=%q final=%q", stalledFrame, finalFrame)
+	}
+	if labeledFrame != stalledFrame {
+		t.Fatalf("applied warning frame=%q, stalled frame=%q", labeledFrame, stalledFrame)
 	}
 	if len(relations) != 1 || relations[finalFrame] != stalledFrame {
 		t.Fatalf("relations=%v, want only %s → %s", relations, finalFrame, stalledFrame)

@@ -55,6 +55,18 @@ const (
 	// InterventionResultSafetyFallback: the reminder budget was spent and the
 	// latest answer was accepted as a partial final response.
 	InterventionResultSafetyFallback = "safety_fallback_accepted"
+	// InterventionStreamIdleRecovery: a provider stream stalled and the
+	// driver continued with a recovery reminder instead of ending the turn.
+	InterventionStreamIdleRecovery = "stream_idle_recovery"
+	// InterventionResultRecoveryReminderAppended: the recovery reminder was
+	// appended to history before the event.
+	InterventionResultRecoveryReminderAppended = "recovery_reminder_appended"
+	// InterventionContextOverflowRecovery: a typed provider context overflow
+	// was recovered by compacting history for a new request.
+	InterventionContextOverflowRecovery = "context_overflow_recovery"
+	// InterventionResultHistoryCompacted: compaction changed history before
+	// the event; the next request is a new logical request.
+	InterventionResultHistoryCompacted = "history_compacted"
 )
 
 type interventionStage uint8
