@@ -21,6 +21,12 @@ const RequestControlRequireDoneDisableThinking = "require_done_disable_thinking"
 // not the sole source of the request's content.
 const RequestHistoryCompactionApplied = "compaction_applied"
 
+// RequestRecoveryStreamIdle reports that the stream of
+// RequestRecoverySourceFrameID stalled and the driver appended a recovery
+// reminder before this Frame's request was built. It names that one
+// producer, not the sole source of the request's content.
+const RequestRecoveryStreamIdle = "stream_idle_recovery"
+
 type EventKind string
 
 const (
@@ -68,8 +74,14 @@ type EventEnvelope struct {
 	// empty means unreported, not that history was unchanged.
 	RequestHistoryRelation      string `json:"RequestHistoryRelation,omitempty"`
 	RequestHistorySourceFrameID string `json:"RequestHistorySourceFrameID,omitempty"`
-	SchemaVersion               int
-	QueryID                     string
+	// Optional, producer-captured recovery provenance for this logical
+	// request: a recovery reminder appended after the source Frame stalled.
+	// Set only on the first Frame built after it (retries reuse it); empty
+	// means unreported.
+	RequestRecoveryRelation      string `json:"RequestRecoveryRelation,omitempty"`
+	RequestRecoverySourceFrameID string `json:"RequestRecoverySourceFrameID,omitempty"`
+	SchemaVersion                int
+	QueryID                      string
 	// FrameID identifies the explicitly correlated execution context, not the
 	// sole provenance of aggregated continuation content. Empty means unknown.
 	FrameID string `json:"FrameID,omitempty"`
