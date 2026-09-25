@@ -215,8 +215,12 @@ func TestManualCompactionClearsAppliedRelation(t *testing.T) {
 // applied intervention can coexist on one envelope without overwriting.
 func TestEventCorrelationComposesAllRelations(t *testing.T) {
 	var envelope EventEnvelope
-	correlation := eventCorrelation{frameID: "q/frame/2", attempt: 1, controlSource: "q/frame/1", historySource: "q/frame/1"}.withIntervention(InterventionResultToolSuppressed, 3)
+	correlation := eventCorrelation{frameID: "q/frame/2", attempt: 1, controlSource: "q/frame/1", historySource: "q/frame/1", recoverySource: "q/frame/1", steeringSource: "q/frame/1"}.withIntervention(InterventionResultToolSuppressed, 3)
 	applyEventCorrelation(&envelope, []eventCorrelation{correlation})
+	if envelope.RequestRecoveryRelation != RequestRecoveryStreamIdle || envelope.RequestRecoverySourceFrameID != "q/frame/1" ||
+		envelope.RequestSteeringRelation != RequestSteeringAccepted || envelope.RequestSteeringSourceFrameID != "q/frame/1" {
+		t.Fatalf("envelope=%+v", envelope)
+	}
 	if envelope.FrameID != "q/frame/2" || envelope.RequestControlRelation != RequestControlRequireDoneDisableThinking ||
 		envelope.RequestHistoryRelation != RequestHistoryCompactionApplied || envelope.RequestHistorySourceFrameID != "q/frame/1" ||
 		envelope.Intervention != InterventionRepeatedToolSignature || envelope.InterventionStrike != 3 {
@@ -225,8 +229,8 @@ func TestEventCorrelationComposesAllRelations(t *testing.T) {
 	// Without a Frame, the history relation is not attached (it describes a
 	// Frame's request), while intervention labels still are.
 	var bare EventEnvelope
-	applyEventCorrelation(&bare, []eventCorrelation{eventCorrelation{historySource: "q/frame/1"}.withIntervention(InterventionResultReminderQueued, 1)})
-	if bare.RequestHistoryRelation != "" || bare.Intervention == "" {
+	applyEventCorrelation(&bare, []eventCorrelation{eventCorrelation{historySource: "q/frame/1", steeringSource: "q/frame/1"}.withIntervention(InterventionResultReminderQueued, 1)})
+	if bare.RequestHistoryRelation != "" || bare.RequestSteeringRelation != "" || bare.Intervention == "" {
 		t.Fatalf("bare envelope=%+v", bare)
 	}
 }

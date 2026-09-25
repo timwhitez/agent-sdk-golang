@@ -680,6 +680,13 @@ func (a *Agent) queryStreamWithSteering(ctx context.Context, input llm.Content, 
 		// pendingRecoverySource is the stalled Frame of a stream-idle recovery
 		// whose reminder the next Frame's request will contain.
 		pendingRecoverySource := ""
+		// pendingSteeringSource is the Frame whose execution was interrupted
+		// or extended by user steering that has already entered history and
+		// that the next Frame's request will contain. boundaryFrame is the
+		// Frame whose iteration ended at the next top-of-loop boundary; none
+		// exists before the Query's first Frame.
+		pendingSteeringSource := ""
+		boundaryFrame := ""
 		a.userInputEpoch.Add(1)
 		usageFallbackWarned := false
 		cont := newToolCallContinuation(defaultMaxContinuationTurns)
@@ -789,6 +796,10 @@ func (a *Agent) queryStreamWithSteering(ctx context.Context, input llm.Content, 
 
 			// *** Boundary-aware steering: check for new user messages before each LLM call ***
 			if a.drainSteering(steeringCh, out) > 0 {
+				// Appended after boundaryFrame's iteration ended.
+				if boundaryFrame != "" {
+					pendingSteeringSource = boundaryFrame
+				}
 				requireDoneReminders = 0
 				forceRequireDoneToolChoice = false
 				requireDoneRecoveryDisableThinkingActive = false
@@ -844,6 +855,12 @@ func (a *Agent) queryStreamWithSteering(ctx context.Context, input llm.Content, 
 				frame.recoverySource = pendingRecoverySource
 			}
 			pendingRecoverySource = ""
+			// Accepted steering appended since the previous Frame changed this
+			// request; record the Frame it interrupted or extended once.
+			if frameErr == nil {
+				frame.steeringSource = pendingSteeringSource
+			}
+			pendingSteeringSource = ""
 			frameFailure := ""
 			frameFailureHint := "rebuild the Agent with consistent, cloneable tool definitions"
 			if frameErr != nil {
@@ -878,7 +895,8 @@ func (a *Agent) queryStreamWithSteering(ctx context.Context, input llm.Content, 
 				emitSDKErr(ErrorEvent{Kind: "invalid_request", Message: frameFailure + "; " + frameFailureHint})
 				return
 			}
-			invocation := &frameInvocation{frameID: frame.id, controlSource: frame.controlSource, historySource: frame.historySource, recoverySource: frame.recoverySource}
+			invocation := &frameInvocation{frameID: frame.id, controlSource: frame.controlSource, historySource: frame.historySource, recoverySource: frame.recoverySource, steeringSource: frame.steeringSource}
+			boundaryFrame = frame.id
 			comp, streamedText, err := a.invokeModelCompletionWithRetryAndSteering(ctx, frame.model, frame.request, out, steeringCh, invocation)
 			correlation := invocation.correlation()
 			if err != nil {
@@ -910,6 +928,8 @@ func (a *Agent) queryStreamWithSteering(ctx context.Context, input llm.Content, 
 						a.mu.Lock()
 						a.messages = append(a.messages, llm.NewUserMessage(msg))
 						a.mu.Unlock()
+						// Only now is the steering in history.
+						pendingSteeringSource = frame.id
 					}
 					// A non-empty message was consumed directly from the channel. An
 					// empty message means the host canceled a later stage after that
@@ -1401,6 +1421,9 @@ func (a *Agent) queryStreamWithSteering(ctx context.Context, input llm.Content, 
 				return
 			}
 			pendingBlockMessages = nil
+			// blockSteering reports that pendingBlockMessages holds accepted
+			// user steering; it enters history only when the block closes.
+			blockSteering := false
 			if a.toolBlockTestHook != nil {
 				a.toolBlockTestHook(activeToolBlock)
 			}
@@ -1734,6 +1757,7 @@ func (a *Agent) queryStreamWithSteering(ctx context.Context, input llm.Content, 
 						requireDoneControlSource = ""
 					}
 					steeringMessages := a.collectSteering(steeringCh, out)
+					blockSteering = blockSteering || len(steeringMessages) > 0
 					if len(steeringMessages) > 0 || outcome.Interrupted {
 						requireDoneReminders = 0
 						forceRequireDoneToolChoice = false
@@ -1800,6 +1824,10 @@ func (a *Agent) queryStreamWithSteering(ctx context.Context, input llm.Content, 
 			}
 			a.appendMessages(pendingBlockMessages)
 			pendingBlockMessages = nil
+			if blockSteering {
+				// The block is closed and the steering is now in history.
+				pendingSteeringSource = frame.id
+			}
 			if a.hasCompactor {
 				if err := a.checkAndCompact(ctx, frame.id, comp, out, additionalSinceCompletion()); err != nil {
 					emitCompactionErr(a.errEvent(err))
@@ -3000,6 +3028,10 @@ func applyEventCorrelation(envelope *EventEnvelope, correlations []eventCorrelat
 		if correlation.recoverySource != "" {
 			envelope.RequestRecoveryRelation = RequestRecoveryStreamIdle
 			envelope.RequestRecoverySourceFrameID = correlation.recoverySource
+		}
+		if correlation.steeringSource != "" {
+			envelope.RequestSteeringRelation = RequestSteeringAccepted
+			envelope.RequestSteeringSourceFrameID = correlation.steeringSource
 		}
 		envelope.ToolBlockID, envelope.ToolCallOrdinal, envelope.ToolBlockCallCount = correlation.toolBlockID, correlation.toolCallOrdinal, correlation.blockCallCount
 	}

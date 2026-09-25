@@ -208,3 +208,17 @@ thinking mode. Steering and done/safety resets clear future control state, witho
 relabeling events from an already-created Frame. A new Query starts without it.
 Absent fields are unreported, not proof of a complete request/content lineage.
 Compaction, steering and multi-source continuation content retain separate scope.
+
+### Steering request provenance
+
+The optional Envelope `RequestSteeringRelation=steering_accepted` and
+`RequestSteeringSourceFrameID` name the Frame whose execution a non-empty user
+steering message interrupted (provider stream or tool stage) or extended (the
+loop boundary after it). The source is captured only once the message is in
+history — for a tool block, after the block closes — and is copied into the
+first Frame built afterwards; retries reuse it and later Frames do not inherit
+it. Empty messages, stage cancellations that apply no message and steering
+drained before a Query's first Frame record nothing; a new Query starts clean.
+The pair is separate from the control, compaction and recovery pairs, which
+can appear on the same Frame. It is not a content source: a continuation's
+finalizing Frame is still not the sole source of merged tool-call content.

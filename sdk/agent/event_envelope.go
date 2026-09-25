@@ -27,6 +27,13 @@ const RequestHistoryCompactionApplied = "compaction_applied"
 // producer, not the sole source of the request's content.
 const RequestRecoveryStreamIdle = "stream_idle_recovery"
 
+// RequestSteeringAccepted reports that a non-empty user steering message
+// entered history while RequestSteeringSourceFrameID was executing (its
+// stream or tool block was interrupted, or its iteration ended) and before
+// this Frame's request was built. It names that one producer, not the
+// sole source of the request's content.
+const RequestSteeringAccepted = "steering_accepted"
+
 type EventKind string
 
 const (
@@ -80,6 +87,12 @@ type EventEnvelope struct {
 	// means unreported.
 	RequestRecoveryRelation      string `json:"RequestRecoveryRelation,omitempty"`
 	RequestRecoverySourceFrameID string `json:"RequestRecoverySourceFrameID,omitempty"`
+	// Optional, producer-captured steering provenance for this logical
+	// request: accepted user steering appended after the source Frame.
+	// Set only on the first Frame built after it (retries reuse it); empty
+	// means unreported, not that no steering occurred.
+	RequestSteeringRelation      string `json:"RequestSteeringRelation,omitempty"`
+	RequestSteeringSourceFrameID string `json:"RequestSteeringSourceFrameID,omitempty"`
 	SchemaVersion                int
 	QueryID                      string
 	// FrameID identifies the explicitly correlated execution context, not the

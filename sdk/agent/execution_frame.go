@@ -22,6 +22,10 @@ type executionFrame struct {
 	// recoverySource is the Frame whose stalled stream made the driver append
 	// a recovery reminder into this request's history; empty is unknown.
 	recoverySource string
+	// steeringSource is the Frame whose execution a real user steering
+	// message interrupted or extended before it entered this request's
+	// history; empty is unknown or no accepted steering.
+	steeringSource string
 	id             string
 	model          llm.ChatModel
 	request        llm.InvokeRequest
@@ -69,6 +73,7 @@ type eventCorrelation struct {
 	interventionStrike uint64
 	historySource      string
 	recoverySource     string
+	steeringSource     string
 	controlSource      string
 	toolBlockID        string
 	toolCallOrdinal    uint64
@@ -82,6 +87,7 @@ type eventCorrelation struct {
 type frameInvocation struct {
 	historySource  string
 	recoverySource string
+	steeringSource string
 	controlSource  string
 	frameID        string
 	entries        uint64
@@ -105,7 +111,7 @@ func (s *frameInvocation) correlation() eventCorrelation {
 	if s == nil || s.frameID == "" {
 		return eventCorrelation{}
 	}
-	return eventCorrelation{frameID: s.frameID, attempt: s.current, controlSource: s.controlSource, historySource: s.historySource, recoverySource: s.recoverySource}
+	return eventCorrelation{frameID: s.frameID, attempt: s.current, controlSource: s.controlSource, historySource: s.historySource, recoverySource: s.recoverySource, steeringSource: s.steeringSource}
 }
 
 // A completion retained across retry backoff belongs to the last actual model
@@ -115,7 +121,7 @@ func (s *frameInvocation) completionCorrelation() eventCorrelation {
 	if s == nil || s.frameID == "" {
 		return eventCorrelation{}
 	}
-	return eventCorrelation{frameID: s.frameID, attempt: s.entries, controlSource: s.controlSource, historySource: s.historySource, recoverySource: s.recoverySource}
+	return eventCorrelation{frameID: s.frameID, attempt: s.entries, controlSource: s.controlSource, historySource: s.historySource, recoverySource: s.recoverySource, steeringSource: s.steeringSource}
 }
 
 // validBindings checks structural agreement, not mutable closure identity.
