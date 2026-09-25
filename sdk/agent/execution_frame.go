@@ -26,11 +26,14 @@ type executionFrame struct {
 	// message interrupted or extended before it entered this request's
 	// history; empty is unknown or no accepted steering.
 	steeringSource string
-	id             string
-	model          llm.ChatModel
-	request        llm.InvokeRequest
-	exact          map[string]tools.Tool
-	normalized     map[string]tools.Tool
+	// hostPublication is the HistoryPublication.Revision whose system
+	// messages this request carries; zero is unknown.
+	hostPublication uint64
+	id              string
+	model           llm.ChatModel
+	request         llm.InvokeRequest
+	exact           map[string]tools.Tool
+	normalized      map[string]tools.Tool
 }
 
 func newExecutionFrame(id string, model llm.ChatModel, request llm.InvokeRequest, exact, normalized map[string]tools.Tool) (*executionFrame, error) {
@@ -77,6 +80,7 @@ type eventCorrelation struct {
 	recoverySource     string
 	steeringSource     string
 	controlSource      string
+	hostPublication    uint64
 	toolBlockID        string
 	toolCallOrdinal    uint64
 	blockCallCount     uint64
@@ -87,13 +91,14 @@ type eventCorrelation struct {
 // frameInvocation is query-driver-local bookkeeping, separate from immutable
 // executionFrame state. Only actual ChatModel entries advance the counter.
 type frameInvocation struct {
-	historySource  string
-	recoverySource string
-	steeringSource string
-	controlSource  string
-	frameID        string
-	entries        uint64
-	current        uint64
+	historySource   string
+	recoverySource  string
+	steeringSource  string
+	controlSource   string
+	hostPublication uint64
+	frameID         string
+	entries         uint64
+	current         uint64
 }
 
 func (s *frameInvocation) resetAttempt() {
@@ -113,7 +118,7 @@ func (s *frameInvocation) correlation() eventCorrelation {
 	if s == nil || s.frameID == "" {
 		return eventCorrelation{}
 	}
-	return eventCorrelation{frameID: s.frameID, attempt: s.current, controlSource: s.controlSource, historySource: s.historySource, recoverySource: s.recoverySource, steeringSource: s.steeringSource}
+	return eventCorrelation{frameID: s.frameID, attempt: s.current, controlSource: s.controlSource, historySource: s.historySource, recoverySource: s.recoverySource, steeringSource: s.steeringSource, hostPublication: s.hostPublication}
 }
 
 // A completion retained across retry backoff belongs to the last actual model
@@ -123,7 +128,7 @@ func (s *frameInvocation) completionCorrelation() eventCorrelation {
 	if s == nil || s.frameID == "" {
 		return eventCorrelation{}
 	}
-	return eventCorrelation{frameID: s.frameID, attempt: s.entries, controlSource: s.controlSource, historySource: s.historySource, recoverySource: s.recoverySource, steeringSource: s.steeringSource}
+	return eventCorrelation{frameID: s.frameID, attempt: s.entries, controlSource: s.controlSource, historySource: s.historySource, recoverySource: s.recoverySource, steeringSource: s.steeringSource, hostPublication: s.hostPublication}
 }
 
 // validBindings checks structural agreement, not mutable closure identity.

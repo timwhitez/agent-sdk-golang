@@ -82,6 +82,8 @@ func (a *Agent) CommitCompactionHistory(ctx context.Context, expected, messages 
 	}
 	a.mu.Lock()
 	a.messages = candidate
+	// The host computed this candidate, including its system messages.
+	a.recordHostPublicationLocked()
 	a.resetEphemeralTrackingLocked()
 	a.compactionGeneration.Add(1)
 	a.mu.Unlock()

@@ -262,3 +262,18 @@ drained before a Query's first Frame record nothing; a new Query starts clean.
 The pair is separate from the control, compaction and recovery pairs, which
 can appear on the same Frame. It is not a content source: a continuation's
 finalizing Frame is still not the sole source of merged tool-call content.
+
+### Host publication revision
+
+`ReplaceHistoryCheckedRevision` returns the `HistoryPublication` it made under
+the history lock: a process-wide, non-zero, increasing `Revision` and the
+`Replaced` revision (zero when unknown). `ReplaceHistoryChecked`,
+`ReplaceHistory`, `ClearHistoryChecked` and `CommitCompactionHistory` publish
+the same way. Each Frame captures, together with its request messages, the
+revision whose system messages that request carries and reports it as the
+optional Envelope `HostPublicationRevision`; retries reuse it, and a
+publication made meanwhile applies from the next Frame. The SDK clears it
+(zero, unknown) when it changes system messages itself: inserting the
+configured SystemPrompt into an empty history, or installing an automatic,
+overflow, emergency-trim or `CompactPipelineNow` result. It names a
+publication, not its content, a session revision, the wire payload or delivery.
