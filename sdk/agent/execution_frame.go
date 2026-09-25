@@ -67,8 +67,10 @@ func newExecutionFrame(id string, model llm.ChatModel, request llm.InvokeRequest
 // eventCorrelation is copied at the producer, never read from ambient output
 // state. The original eventOutput remains the sequence/backpressure owner.
 type eventCorrelation struct {
-	// Applied intervention labels; empty is unreported.
+	// Intervention labels; empty is unreported. An empty stage with a kind
+	// means applied; only an observe-only detection sets another stage.
 	intervention       string
+	interventionStage  string
 	interventionResult string
 	interventionStrike uint64
 	historySource      string

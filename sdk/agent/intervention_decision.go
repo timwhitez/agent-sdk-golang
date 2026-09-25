@@ -67,6 +67,18 @@ const (
 	// InterventionResultHistoryCompacted: compaction changed history before
 	// the event; the next request is a new logical request.
 	InterventionResultHistoryCompacted = "history_compacted"
+	// InterventionThinkingOnly is the opt-in, observe-only thinking-only
+	// detector (Config.ObserveThinkingOnlyResponses). It is only ever reported
+	// with InterventionStageDetected and InterventionResultObservedOnly: a
+	// detection, never an application. No recovery exists for it.
+	InterventionThinkingOnly = "thinking_only"
+	// InterventionStageDetected marks a detection that changed nothing; it is
+	// not "applied" and does not imply that any decision or action followed.
+	InterventionStageDetected = "detected"
+	// InterventionResultObservedOnly: the condition was observed and the
+	// request, tool choice, thinking controls, model call count, history and
+	// opaque provider state were left unchanged.
+	InterventionResultObservedOnly = "observed_only"
 )
 
 type interventionStage uint8
@@ -91,6 +103,16 @@ type interventionRecord struct {
 // withIntervention returns c with the applied intervention labels.
 func (c eventCorrelation) withIntervention(result string, strike int) eventCorrelation {
 	return c.withInterventionKind(InterventionRepeatedToolSignature, result, strike)
+}
+
+// withInterventionDetection marks an event reporting an observe-only
+// detection of kind: stage "detected", never "applied", and no strike.
+func (c eventCorrelation) withInterventionDetection(kind, result string) eventCorrelation {
+	c.intervention = kind
+	c.interventionStage = InterventionStageDetected
+	c.interventionResult = result
+	c.interventionStrike = 0
+	return c
 }
 
 // withInterventionKind marks an event produced by an applied intervention of

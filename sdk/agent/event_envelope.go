@@ -129,6 +129,12 @@ type EventEnvelope struct {
 	// (history_compacted). Empty means the event reports no intervention, not
 	// that none was considered. It is not proof of delivery, of model
 	// compliance or of full content provenance.
+	//
+	// The one exception to "applied" is the opt-in, observe-only
+	// thinking_only kind (Config.ObserveThinkingOnlyResponses): its
+	// InterventionStage is "detected" and its InterventionResult
+	// "observed_only", on a "thinking_only_observed" WarnEvent, with no
+	// strike. Detection is not application: nothing was changed.
 	Intervention       string `json:"Intervention,omitempty"`
 	InterventionStage  string `json:"InterventionStage,omitempty"`
 	InterventionResult string `json:"InterventionResult,omitempty"`
