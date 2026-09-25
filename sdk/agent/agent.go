@@ -634,6 +634,15 @@ func (a *Agent) QueryStreamEnvelopedWithSteering(ctx context.Context, input llm.
 	return a.queryStreamWithSteering(ctx, input, steeringCh, true).enveloped
 }
 
+// QueryStreamEnvelopedWithReceipt is QueryStreamEnvelopedWithSteering plus
+// the producer's receipt for the same stream. The receipt's Summary becomes
+// available once the returned channel is closed. The steering channel
+// remains caller-owned.
+func (a *Agent) QueryStreamEnvelopedWithReceipt(ctx context.Context, input llm.Content, steeringCh <-chan SteeringMsg) (<-chan EventEnvelope, *QueryStreamReceipt) {
+	out := a.queryStreamWithSteering(ctx, input, steeringCh, true)
+	return out.enveloped, out.receipt
+}
+
 func (a *Agent) queryStreamWithSteering(ctx context.Context, input llm.Content, steeringCh <-chan SteeringMsg, enveloped bool) *eventOutput {
 	bufferSize := defaultEventBufferSize
 	if a != nil && a.eventBufferSize > 0 {
@@ -643,7 +652,10 @@ func (a *Agent) queryStreamWithSteering(ctx context.Context, input llm.Content, 
 	if !a.turnActive.CompareAndSwap(false, true) {
 		// Admission is synchronous and out is buffered, so callers receive a
 		// deterministic terminal rejection without scheduling another goroutine.
-		out.trySend(out.next(ErrorEvent{Kind: "agent_busy", Message: ErrAgentBusy.Error()}))
+		busy := ErrorEvent{Kind: "agent_busy", Message: ErrAgentBusy.Error()}
+		if !out.trySend(out.next(busy)) {
+			out.countDrop(busy)
+		}
 		out.close()
 		return out
 	}
@@ -3172,7 +3184,7 @@ func (a *Agent) emitEnvelope(out *eventOutput, ev Event, envelope EventEnvelope)
 		}
 	}
 	if timeout <= 0 {
-		a.logDroppedEvent(ev, "channel_full")
+		a.dropEvent(out, ev, "channel_full")
 		return false
 	}
 
@@ -3195,10 +3207,10 @@ func (a *Agent) emitEnvelope(out *eventOutput, ev Event, envelope EventEnvelope)
 	case eventSent:
 		return true
 	case eventTurnCanceled:
-		a.logDroppedEvent(ev, "turn_canceled")
+		a.dropEvent(out, ev, "turn_canceled")
 		return false
 	default:
-		a.logDroppedEvent(ev, fmt.Sprintf("send_timeout_%s", timeout))
+		a.dropEvent(out, ev, fmt.Sprintf("send_timeout_%s", timeout))
 		return false
 	}
 }
@@ -3334,10 +3346,10 @@ func (a *Agent) tryEnqueueTerminalEvent(out *eventOutput, envelope EventEnvelope
 	}
 	if isTerminalAgentEvent(buffered.Event) && terminalEventPriority(buffered.Event) > terminalEventPriority(envelope.Event) {
 		out.sendAfterReceive(buffered)
-		a.logDroppedEvent(envelope.Event, "terminal_priority_loss")
+		a.dropEvent(out, envelope.Event, "terminal_priority_loss")
 		return terminalRejected
 	}
-	a.logDroppedEvent(buffered.Event, "evicted_for_terminal")
+	a.dropEvent(out, buffered.Event, "evicted_for_terminal")
 	if final, ok := envelope.Event.(FinalResponseEvent); ok {
 		final.DroppedEvents = dropsSince(a.eventDropCount.Load(), out.dropStart)
 		final.DroppedCriticalEvents = dropsSince(a.criticalEventDropCount.Load(), out.criticalDropStart)
@@ -3410,6 +3422,13 @@ func isCriticalAgentEvent(ev Event) bool {
 	default:
 		return false
 	}
+}
+
+// dropEvent counts one undelivered envelope against its own stream and logs
+// it against the Agent-wide counters used by FinalResponseEvent.
+func (a *Agent) dropEvent(out *eventOutput, ev Event, reason string) {
+	out.countDrop(ev)
+	a.logDroppedEvent(ev, reason)
 }
 
 func (a *Agent) logDroppedEvent(ev Event, reason string) {

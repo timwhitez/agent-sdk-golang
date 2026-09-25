@@ -163,6 +163,61 @@ type eventOutput struct {
 	sequence          atomic.Uint64
 	dropStart         uint64
 	criticalDropStart uint64
+	// dropped and droppedCritical count this output's own allocated
+	// envelopes that were not delivered; the receipt reports them at close.
+	dropped         atomic.Uint64
+	droppedCritical atomic.Uint64
+	receipt         *QueryStreamReceipt
+}
+
+// QueryStreamReceipt is the producer's account of one Query stream. It is
+// filled immediately before the stream channel closes, so a consumer that
+// has observed the closed channel reads its final values and can compare the Sequence range it received
+// with the range the SDK allocated. It reuses the Query's only Sequence; it
+// is not a second counter, a delivery acknowledgement or a success report.
+type QueryStreamReceipt struct {
+	summary atomic.Pointer[QueryStreamSummary]
+}
+
+// QueryStreamSummary describes a closed Query stream.
+type QueryStreamSummary struct {
+	// QueryID is the QueryID carried by every envelope of the stream.
+	QueryID string
+	// LastSequence is the last Sequence allocated for the Query. Every
+	// allocated envelope was either delivered or counted in DroppedEvents,
+	// including any allocated after a terminal event.
+	LastSequence uint64
+	// DroppedEvents counts this stream's allocated envelopes that were not
+	// delivered; DroppedCriticalEvents is the subset that were terminal or
+	// consistency-critical. Unlike FinalResponseEvent's counts, which stop
+	// at the final answer, they cover the whole stream.
+	DroppedEvents         uint64
+	DroppedCriticalEvents uint64
+}
+
+// Summary returns the stream's final summary. ok may become true just
+// before the channel closes (the summary is published first); the values
+// never change afterwards and are the complete account of the stream once
+// the consumer has observed the close.
+func (r *QueryStreamReceipt) Summary() (summary QueryStreamSummary, ok bool) {
+	if r == nil {
+		return QueryStreamSummary{}, false
+	}
+	if loaded := r.summary.Load(); loaded != nil {
+		return *loaded, true
+	}
+	return QueryStreamSummary{}, false
+}
+
+// countDrop records one undelivered envelope of this output.
+func (o *eventOutput) countDrop(ev Event) {
+	if o == nil {
+		return
+	}
+	o.dropped.Add(1)
+	if isTerminalAgentEvent(ev) || isCriticalAgentEvent(ev) {
+		o.droppedCritical.Add(1)
+	}
 }
 
 func (o *eventOutput) setDropBaseline(dropped, critical uint64) {
@@ -178,7 +233,7 @@ func dropsSince(current, baseline uint64) uint64 {
 }
 
 func newEventOutput(bufferSize int, enveloped bool, queryID string, clock func() time.Time) *eventOutput {
-	out := &eventOutput{queryID: queryID, clock: clock}
+	out := &eventOutput{queryID: queryID, clock: clock, receipt: &QueryStreamReceipt{}}
 	if enveloped {
 		out.enveloped = make(chan EventEnvelope, bufferSize)
 	} else {
@@ -286,6 +341,17 @@ func (o *eventOutput) sendAfterReceive(envelope EventEnvelope) {
 }
 
 func (o *eventOutput) close() {
+	// Publish the receipt before closing: the close happens before any
+	// receive that observes it, so a consumer that saw the closed channel
+	// reads the final values.
+	if o.receipt != nil {
+		o.receipt.summary.Store(&QueryStreamSummary{
+			QueryID:               o.queryID,
+			LastSequence:          o.sequence.Load(),
+			DroppedEvents:         o.dropped.Load(),
+			DroppedCriticalEvents: o.droppedCritical.Load(),
+		})
+	}
 	if o.enveloped != nil {
 		close(o.enveloped)
 		return
