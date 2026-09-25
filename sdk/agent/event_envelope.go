@@ -172,7 +172,7 @@ type eventOutput struct {
 
 // QueryStreamReceipt is the producer's account of one Query stream. It is
 // filled immediately before the stream channel closes, so a consumer that
-// has observed the closed channel can compare the Sequence range it received
+// has observed the closed channel reads its final values and can compare the Sequence range it received
 // with the range the SDK allocated. It reuses the Query's only Sequence; it
 // is not a second counter, a delivery acknowledgement or a success report.
 type QueryStreamReceipt struct {
@@ -195,8 +195,10 @@ type QueryStreamSummary struct {
 	DroppedCriticalEvents uint64
 }
 
-// Summary returns the closed stream's summary. ok is false until the stream
-// channel has been closed; the values never change afterwards.
+// Summary returns the stream's final summary. ok may become true just
+// before the channel closes (the summary is published first); the values
+// never change afterwards and are the complete account of the stream once
+// the consumer has observed the close.
 func (r *QueryStreamReceipt) Summary() (summary QueryStreamSummary, ok bool) {
 	if r == nil {
 		return QueryStreamSummary{}, false

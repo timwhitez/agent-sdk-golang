@@ -96,7 +96,7 @@ Three levels, from lowest to highest:
 | `StreamingChatModel.InvokeStream` | `<-chan llm.StreamEvent` for one model call | raw deltas of one call; you run any tool loop yourself |
 | `Agent.QueryStream` (and `QueryStreamWithSteering`) | `<-chan agent.Event` for the whole Agent run | real-time text plus the managed tool loop |
 | `Agent.QueryStreamEnveloped` (and `…WithSteering`) | `<-chan agent.EventEnvelope` (the same events with query/Frame correlation) | the same, when you need correlation metadata |
-| `Agent.QueryStreamEnvelopedWithReceipt` | the same channel plus a `*agent.QueryStreamReceipt` | when you must prove you received the whole stream: after the channel closes, `Summary()` gives the last allocated `Sequence` and the envelopes dropped (and critical ones) over the whole stream, including any after the terminal event |
+| `Agent.QueryStreamEnvelopedWithReceipt` (takes an optional steering channel like `…WithSteering`) | the same channel plus a `*agent.QueryStreamReceipt` | when you must prove you received the whole stream: after the channel closes, `Summary()` gives the last allocated `Sequence` and the envelopes dropped (and critical ones) over the whole stream, including any after the terminal event (`ok` may turn true just before the close; the values are final once you have observed it) |
 
 `anthropic.Client`, `openai.ChatClient` and `openai.ResponsesClient` all implement `llm.StreamingChatModel`. A wrapper that implements only `ChatModel` hides that capability from the Agent, which then falls back to buffered calls; keep `InvokeStream` on custom wrappers. The SDK never infers streaming support from a type name or provider string.
 
@@ -217,7 +217,7 @@ func main() {
 | `StreamingChatModel.InvokeStream` | 单次模型调用的 `<-chan llm.StreamEvent` | 单次调用的原始增量；工具循环需自行实现 |
 | `Agent.QueryStream`（及 `QueryStreamWithSteering`） | 整个 Agent 执行过程的 `<-chan agent.Event` | 实时文本 + 托管的工具循环 |
 | `Agent.QueryStreamEnveloped`（及 `…WithSteering`） | `<-chan agent.EventEnvelope`（同样的事件，附带 query/Frame 关联） | 同上，需要关联元数据时使用 |
-| `Agent.QueryStreamEnvelopedWithReceipt` | 同一 channel 加 `*agent.QueryStreamReceipt` | 需要证明收到了完整事件流时：channel 关闭后 `Summary()` 给出最后分配的 `Sequence` 及整个流（含终态之后）丢弃的信封数和其中关键事件数 |
+| `Agent.QueryStreamEnvelopedWithReceipt`（与 `…WithSteering` 一样接受可选 steering channel） | 同一 channel 加 `*agent.QueryStreamReceipt` | 需要证明收到了完整事件流时：channel 关闭后 `Summary()` 给出最后分配的 `Sequence` 及整个流（含终态之后）丢弃的信封数和其中关键事件数 |
 
 `anthropic.Client`、`openai.ChatClient`、`openai.ResponsesClient` 都实现了 `llm.StreamingChatModel`。只实现 `ChatModel` 的 wrapper 会对 Agent 隐藏该能力，Agent 随之退回缓冲调用；自定义 wrapper 请保留 `InvokeStream`。SDK 不会根据类型名或 Provider 字符串推断是否支持流式。
 
