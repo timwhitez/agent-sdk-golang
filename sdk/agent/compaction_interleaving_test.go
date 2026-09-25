@@ -285,6 +285,10 @@ func TestInFlightAutomaticSummaryDoesNotOverwriteReplacedHistory(t *testing.T) {
 			if !messageJSONEqual(next, want) {
 				t.Fatalf("next request is not the replacement plus the new input:\n got %d messages\nwant %d messages", len(next), len(want))
 			}
+			// The dropped work stays owed, so the next decision is labeled a retry.
+			if !ag.compactionRetryPending.Load() {
+				t.Fatal("discarded compaction did not leave a retry pending")
+			}
 		})
 	}
 }
