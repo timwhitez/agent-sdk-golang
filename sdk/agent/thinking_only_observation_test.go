@@ -307,6 +307,10 @@ func TestThinkingOnlyObservationExclusions(t *testing.T) {
 		{name: "unknown stop", steps: []thinkingStep{with(thinking, func(s *thinkingStep) { s.stop = "" })}, observe: true},
 		{name: "content filter", steps: []thinkingStep{with(thinking, func(s *thinkingStep) { s.stop = "content_filter" })}, observe: true},
 		{name: "continuation completion", steps: []thinkingStep{{text: "part", stop: "max_tokens"}, thinking}, observe: true},
+		// Extended thinking can use up max_tokens before any text: the reply
+		// to that continuation is still part of the truncated response.
+		{name: "continuation of a thinking-only truncation", steps: []thinkingStep{with(thinking, func(s *thinkingStep) { s.stop = "max_tokens" }), thinking}, observe: true},
+		{name: "continuation of a truncated tool call", steps: []thinkingStep{with(thinking, func(s *thinkingStep) { s.toolCall, s.stop = true, "max_tokens" }), thinking}, observe: true},
 		{name: "opaque state without reasoning", steps: []thinkingStep{{state: true, stop: "end_turn"}}, observe: true},
 		{name: "no reasoning", steps: []thinkingStep{{stop: "end_turn"}}, observe: true},
 		{name: "cancellation", steps: []thinkingStep{with(thinking, func(s *thinkingStep) { s.cancel = true })}, observe: true, wantErr: true},
@@ -458,5 +462,22 @@ func TestCompletionIsThinkingOnlyEvidence(t *testing.T) {
 		if got := completionIsThinkingOnly(tc.comp); got != tc.want {
 			t.Errorf("%s: got %v want %v", name, got, tc.want)
 		}
+	}
+}
+
+// A text continuation that finished does not suppress later judgements: with
+// RequireDone, thinking-only replies after "part"(max_tokens)+"rest" are
+// observed (the continuation flag does not go stale on the reminder path).
+func TestThinkingOnlyObservationAfterFinishedContinuation(t *testing.T) {
+	thinking := thinkingStep{thinking: thinkingOnlyCanary, state: true, stop: "end_turn"}
+	steps := []thinkingStep{{toolCall: true, stop: "tool_use"}, {text: "part", stop: "max_tokens"}, {text: "rest", stop: "end_turn"}, thinking, thinking}
+	for mode, build := range newThinkingModels(steps...) {
+		t.Run(mode, func(t *testing.T) {
+			model := build()
+			_, envs := runThinkingQueries(t, model, true, func(cfg *Config) { cfg.RequireDoneTool = true }, "PRIVATE_PROMPT")
+			if labeled := thinkingOnlyEnvelopes(envs); len(labeled) == 0 {
+				t.Fatal("thinking-only replies after a finished continuation were not observed")
+			}
+		})
 	}
 }

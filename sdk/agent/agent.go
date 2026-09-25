@@ -685,6 +685,9 @@ func (a *Agent) queryStreamWithSteering(ctx context.Context, input llm.Content, 
 		seenToolCallHistory := false
 		lastResponseID := ""
 		pendingTextContinuation := ""
+		// previousResponseTruncated reports that the last judged response
+		// stopped at max_tokens, so the next one continues it.
+		previousResponseTruncated := false
 		pendingRequireDoneFinalText := ""
 		pendingRequireDoneFinalResponseID := ""
 		streamIdleRecoveries := 0
@@ -1108,10 +1111,14 @@ func (a *Agent) queryStreamWithSteering(ctx context.Context, input llm.Content, 
 			a.mu.Unlock()
 			// Observe-only: the response is already in history unchanged, and
 			// nothing below depends on this report.
-			if a.observeThinkingOnly && ctx.Err() == nil && !cont.hasPending() && pendingTextContinuation == "" && completionIsThinkingOnly(comp) {
+			// A response that continues a max_tokens truncation (text or tool
+			// call; a pending tool-call continuation always follows one) is part
+			// of that episode and is never judged.
+			if a.observeThinkingOnly && ctx.Err() == nil && !previousResponseTruncated && completionIsThinkingOnly(comp) {
 				a.emitEvent(out, WarnEvent{Kind: thinkingOnlyObservedKind, Message: thinkingOnlyObservedMessage},
 					correlation.withInterventionDetection(InterventionThinkingOnly, InterventionResultObservedOnly))
 			}
+			previousResponseTruncated = comp.StopReason == "max_tokens"
 			postCompletionEstimate := 0
 			if a.hasCompactor && a.compactor != nil {
 				postCompletionEstimate = a.compactor.EstimateMessages(a.Messages())
