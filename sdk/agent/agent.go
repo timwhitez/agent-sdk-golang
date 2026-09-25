@@ -8,7 +8,6 @@ import (
 	"log"
 	"net"
 	"os"
-	"reflect"
 	"slices"
 	"strings"
 	"sync"
@@ -3847,7 +3846,12 @@ func (a *Agent) compactSyncOverflow(ctx context.Context, sourceFrameID string, l
 		sourceFrameID: sourceFrameID,
 	}
 	a.pendingCompactionMu.Unlock()
-	a.applyPendingCompaction(out)
+	if !a.applyPendingCompaction(out) {
+		// The summary was requeued (history shrank, checkpoint failure) or
+		// discarded (history changed), so the live history still exceeds the
+		// window. Returning nil would let the caller send it anyway.
+		return errors.New("overflow compaction result was not published; the history still exceeds the context window")
+	}
 	return nil
 }
 
@@ -4531,7 +4535,7 @@ func (a *Agent) applyPendingCompaction(out *eventOutput) (published bool) {
 	a.mu.Lock()
 	source := llm.CloneMessages(a.messages)
 	currentLen := len(source)
-	merged, tailStart, ok := rebasePendingCompaction(pending, source)
+	merged, tailStart, ok := rebasePendingCompaction(pending, source, a.systemPrompt)
 	if !ok && currentLen < pending.snapshotLen {
 		a.mu.Unlock()
 		a.warnf("compaction apply skipped: history shrank (%d < %d); scheduling retry", currentLen, pending.snapshotLen)
@@ -4591,7 +4595,10 @@ func (a *Agent) applyPendingCompaction(out *eventOutput) (published bool) {
 	}
 
 	a.mu.Lock()
-	if !reflect.DeepEqual(a.messages, source) {
+	// The same JSON identity as the source check: source is a clone, and a
+	// clone may normalize fields (an empty ThoughtSig becomes nil) without
+	// changing the history the provider sees.
+	if !sameMessageIdentity(a.messages, source) {
 		a.mu.Unlock()
 		rollbackErr := error(nil)
 		if commit.persisted {
@@ -4630,8 +4637,11 @@ func (a *Agent) applyPendingCompaction(out *eventOutput) (published bool) {
 // messages (the change ReplaceHistoryChecked accepts during a query, such as a
 // refreshed host context message), the live system messages replace the
 // candidate's. Any other change makes the candidate stale (ok=false).
-// tailStart is the index in live where the kept tail begins.
-func rebasePendingCompaction(pending *pendingCompaction, live []llm.Message) (merged []llm.Message, tailStart int, ok bool) {
+// tailStart is the index in live where the kept tail begins. basePrompt is the
+// configured system prompt that withPreservedSystem injects when the source
+// had no system message; once the live prefix carries its own system message
+// that injected fallback is stale and is not restored.
+func rebasePendingCompaction(pending *pendingCompaction, live []llm.Message, basePrompt string) (merged []llm.Message, tailStart int, ok bool) {
 	n := pending.snapshotLen
 	if len(pending.source) != n {
 		return nil, 0, false
@@ -4660,19 +4670,31 @@ func rebasePendingCompaction(pending *pendingCompaction, live []llm.Message) (me
 			kept[systemMessageSignature(m)] = struct{}{}
 		}
 	}
+	liveHasSystem := false
 	for _, m := range prefix {
 		if m.Role == llm.RoleSystem {
 			merged = append(merged, m)
+			liveHasSystem = true
 		}
 	}
-	// System messages the compaction itself added are not host state; keep them.
+	injected := ""
+	if strings.TrimSpace(basePrompt) != "" {
+		injected = systemMessageSignature(llm.NewSystemMessage(basePrompt))
+	}
+	// System messages the compaction itself added are not host state; keep
+	// them, except the injected base prompt when the host now has its own.
 	for _, m := range pending.messages {
 		if m.Role != llm.RoleSystem {
 			continue
 		}
-		if _, fromSource := kept[systemMessageSignature(m)]; !fromSource {
-			merged = append(merged, m)
+		sig := systemMessageSignature(m)
+		if _, fromSource := kept[sig]; fromSource {
+			continue
 		}
+		if liveHasSystem && injected != "" && sig == injected {
+			continue
+		}
+		merged = append(merged, m)
 	}
 	merged = append(merged, nonSystemMessages(pending.messages)...)
 	merged = append(merged, live[tailStart:]...)
