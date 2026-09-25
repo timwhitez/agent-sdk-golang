@@ -910,6 +910,7 @@ func (a *Agent) queryStreamWithSteering(ctx context.Context, input llm.Content, 
 					requireDoneRecoveryDisableThinkingActive = false
 					requireDoneControlSource = ""
 					pendingTextContinuation = ""
+					previousResponseTruncated = false
 					pendingRequireDoneFinalText = ""
 					pendingRequireDoneFinalResponseID = ""
 					// Save partial assistant output, including a terminal
@@ -1112,9 +1113,10 @@ func (a *Agent) queryStreamWithSteering(ctx context.Context, input llm.Content, 
 			// Observe-only: the response is already in history unchanged, and
 			// nothing below depends on this report.
 			// A response that continues a max_tokens truncation (text or tool
-			// call; a pending tool-call continuation always follows one) is part
-			// of that episode and is never judged.
-			if a.observeThinkingOnly && ctx.Err() == nil && !previousResponseTruncated && completionIsThinkingOnly(comp) {
+			// call) or a pending tool-call continuation (which an invalid merge
+			// can request without a max_tokens stop) is part of that episode
+			// and is never judged.
+			if a.observeThinkingOnly && ctx.Err() == nil && !cont.hasPending() && !previousResponseTruncated && completionIsThinkingOnly(comp) {
 				a.emitEvent(out, WarnEvent{Kind: thinkingOnlyObservedKind, Message: thinkingOnlyObservedMessage},
 					correlation.withInterventionDetection(InterventionThinkingOnly, InterventionResultObservedOnly))
 			}

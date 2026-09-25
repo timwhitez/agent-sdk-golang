@@ -28,7 +28,9 @@ type thinkingStep struct {
 	block     string // "", "thinking" or "redacted_thinking": a structured block
 	text      string
 	toolCall  bool
-	state     bool // attach opaque provider state
+	toolID    string // buffered only: fixed tool call ID (default probe-<call>)
+	toolArgs  string // buffered only: raw tool call arguments (default {})
+	state     bool   // attach opaque provider state
 	stop      string
 	noDone    bool // stream closes without StreamDoneEvent
 	streamErr bool // stream ends with a StreamErrorEvent / buffered error
@@ -96,7 +98,14 @@ func (m *thinkingBufferedModel) Invoke(_ context.Context, req llm.InvokeRequest)
 	}
 	comp := &llm.Completion{Content: content, Thinking: step.thinking, StopReason: step.stop, Usage: &llm.Usage{PromptTokens: 10, CompletionTokens: 5, TotalTokens: 15}}
 	if step.toolCall {
-		comp.ToolCalls = []llm.ToolCall{{ID: "probe-" + strconv.Itoa(call), Type: "function", Function: llm.FunctionCall{Name: "probe", Arguments: `{}`}}}
+		id, args := "probe-"+strconv.Itoa(call), `{}`
+		if step.toolID != "" {
+			id = step.toolID
+		}
+		if step.toolArgs != "" {
+			args = step.toolArgs
+		}
+		comp.ToolCalls = []llm.ToolCall{{ID: id, Type: "function", Function: llm.FunctionCall{Name: "probe", Arguments: args}}}
 	}
 	if step.cancel {
 		m.cancel()
@@ -479,5 +488,30 @@ func TestThinkingOnlyObservationAfterFinishedContinuation(t *testing.T) {
 				t.Fatal("thinking-only replies after a finished continuation were not observed")
 			}
 		})
+	}
+}
+
+// A tool-call merge that is still invalid JSON requests another continuation
+// although that response did not stop at max_tokens; the reply to it is part
+// of the continuation and is not observed.
+func TestThinkingOnlyObservationSkipsInvalidMergeContinuation(t *testing.T) {
+	thinking := thinkingStep{thinking: thinkingOnlyCanary, state: true, stop: "end_turn"}
+	model := &thinkingBufferedModel{thinkingScript{steps: []thinkingStep{
+		{toolCall: true, toolID: "call-merge", toolArgs: `{"a":`, stop: "max_tokens"},
+		{toolCall: true, toolID: "call-merge", toolArgs: `"x`, stop: "tool_use"},
+		thinking,
+	}}}
+	_, envs := runThinkingQueries(t, model, true, nil, "PRIVATE_PROMPT")
+	merging := false
+	for _, env := range envs {
+		if w, ok := env.Event.(WarnEvent); ok && strings.Contains(w.Message, "merge") {
+			merging = true
+		}
+	}
+	if !merging {
+		t.Fatal("fixture did not reach the invalid-merge continuation")
+	}
+	if labeled := thinkingOnlyEnvelopes(envs); len(labeled) != 0 {
+		t.Fatalf("continuation reply observed: %+v", labeled)
 	}
 }
