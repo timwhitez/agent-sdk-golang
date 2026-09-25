@@ -147,9 +147,18 @@ suppresses the automatic summary tier for the rest of that input: later
 automatic decisions run local tiers only instead of paying for another
 summary of the same material. A new Query or accepted steering message, a
 decision below the summary threshold, or a replacement compaction runtime
-clears it. Overflow compaction and manual/preflight entries are never
-suppressed. A failed summary continues to use the separate failure streak
-and cooldown.
+clears it. Every runtime installed by `UpdateCompactionConfig` counts as a
+new identity (configurations are not compared); a replacement queued while
+the old runtime is in use clears it when that use ends. Overflow compaction
+and manual/preflight entries are never suppressed. A failed summary continues
+to use the separate failure streak and cooldown.
+
+An automatic or overflow compaction result is published only onto the
+history it was computed from. Messages appended meanwhile (steering, tool
+results, reminders) are kept after it; if that source history was otherwise
+changed, for example replaced by the host while an end-of-turn summary was
+still running, the result is discarded before any checkpoint or ledger write
+and a later decision starts from the current history.
 
 [CommitCompactionHistory](../sdk/agent/compaction_publication.go) accepts the exact
 source snapshot used to compute a candidate. It rejects admission, pending work

@@ -326,8 +326,12 @@ type turnBackpressure struct {
 }
 
 type pendingCompaction struct {
-	messages     []llm.Message
-	snapshotLen  int
+	messages    []llm.Message
+	snapshotLen int
+	// source is the history the candidate was computed from (snapshotLen
+	// messages). Publication splices only an appended tail onto the candidate,
+	// so any other change to that prefix makes the candidate stale.
+	source       []llm.Message
 	result       compaction.Result
 	triggerUsage *llm.Usage
 	// sourceFrameID is the Frame whose usage triggered this compaction.
@@ -3703,6 +3707,7 @@ func (a *Agent) runCompactionAsync(ctx context.Context, sourceFrameID string, sn
 	a.pendingCompaction = &pendingCompaction{
 		messages:      newMsgs,
 		snapshotLen:   snapshotLen,
+		source:        snapshot,
 		result:        a.withCompactionTelemetry(res, decision.trigger, decision.targetWatermark, triggerUsage),
 		triggerUsage:  triggerUsage,
 		sourceFrameID: sourceFrameID,
@@ -3819,6 +3824,7 @@ func (a *Agent) compactSyncOverflow(ctx context.Context, sourceFrameID string, l
 	a.pendingCompaction = &pendingCompaction{
 		messages:      newMsgs,
 		snapshotLen:   snapshotLen,
+		source:        messages,
 		result:        a.withCompactionTelemetry(res, trigger, watermark, triggerUsage),
 		triggerUsage:  triggerUsage,
 		sourceFrameID: sourceFrameID,
@@ -3854,6 +3860,7 @@ func (a *Agent) applyEmergencyTrim(messages []llm.Message, snapshotLen int, trig
 	a.pendingCompaction = &pendingCompaction{
 		messages:     trimmed,
 		snapshotLen:  snapshotLen,
+		source:       messages,
 		result:       a.withCompactionTelemetry(emergencyRes, "overflow", "overflow", triggerUsage),
 		triggerUsage: triggerUsage,
 	}
@@ -4514,6 +4521,15 @@ func (a *Agent) applyPendingCompaction(out *eventOutput) {
 		a.compactionRetryPending.Store(true)
 		return
 	}
+	if !sameMessages(source[:pending.snapshotLen], pending.source) {
+		// The history the candidate summarizes was replaced (a host branch,
+		// rewind or system update), not only appended to. Publishing it would
+		// overwrite that change, so it is dropped before any persistence; a
+		// later decision samples the current history again.
+		a.mu.Unlock()
+		a.warnf("compaction apply discarded: the history it was computed from changed before publication; nothing was persisted")
+		return
+	}
 	tailCap := currentLen - pending.snapshotLen
 	pairingRepaired := false
 	merged := llm.CloneMessages(pending.messages)
@@ -4586,6 +4602,19 @@ func (a *Agent) applyPendingCompaction(out *eventOutput) {
 	a.mu.Unlock()
 
 	a.emitCompactionWithAccounting(out, CompactionEvent{Result: commit.result, TriggerUsage: pending.triggerUsage})
+}
+
+// sameMessages reports whether two histories hold the same messages.
+func sameMessages(left, right []llm.Message) bool {
+	if len(left) != len(right) {
+		return false
+	}
+	for i := range left {
+		if !reflect.DeepEqual(left[i], right[i]) {
+			return false
+		}
+	}
+	return true
 }
 
 func (a *Agent) requeuePendingCompaction(pending *pendingCompaction) {
