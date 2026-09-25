@@ -2,6 +2,8 @@ package agent
 
 import (
 	"context"
+	"errors"
+	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -224,10 +226,12 @@ func TestSteeringDuringOverflowRecoverySummaryIsKeptOnce(t *testing.T) {
 }
 
 // G2: an automatic summary launched at the end of a turn is still in flight
-// when the host replaces the idle history (branch switch, rewind, a context
-// system message refresh). Its result was computed from the superseded
-// history, so it must not be published over the replacement: no checkpoint is
-// written for it and the next request carries the replacement verbatim.
+// when the host replaces the idle history with different conversation
+// content (branch switch, an edited earlier turn). Its result was computed
+// from the superseded history, so it must not be published over the
+// replacement: no checkpoint is written for it and the next request carries
+// the replacement verbatim. (A change of system messages only is rebased;
+// see TestInFlightAutomaticSummaryRebasesOntoHostMemoryRefresh.)
 func TestInFlightAutomaticSummaryDoesNotOverwriteReplacedHistory(t *testing.T) {
 	branch := func() []llm.Message {
 		msgs := []llm.Message{llm.NewSystemMessage("system")}
@@ -236,14 +240,14 @@ func TestInFlightAutomaticSummaryDoesNotOverwriteReplacedHistory(t *testing.T) {
 		}
 		return msgs
 	}
-	systemRefresh := func(current []llm.Message) []llm.Message {
+	editedAnswer := func(current []llm.Message) []llm.Message {
 		out := llm.CloneMessages(current)
-		out[0] = llm.NewSystemMessage("system with refreshed host context")
+		out[len(out)-1] = llm.NewAssistantMessage("rewritten first answer", nil)
 		return out
 	}
 	for name, replace := range map[string]func([]llm.Message) []llm.Message{
-		"longer branch":  func([]llm.Message) []llm.Message { return branch() },
-		"system refresh": systemRefresh,
+		"longer branch":         func([]llm.Message) []llm.Message { return branch() },
+		"edited earlier answer": editedAnswer,
 	} {
 		t.Run(name, func(t *testing.T) {
 			var high *llm.Usage
@@ -330,11 +334,13 @@ func TestRequeuedStaleSummaryIsNotPublishedAfterHistoryRegrows(t *testing.T) {
 
 // Live publication failure after an acknowledged checkpoint: a host system
 // update lands while the checkpoint writer runs, so the acknowledged result no
-// longer matches the live history. The Agent keeps the host's update, does
-// not publish the summary and ends the recovery; the stale result is not
-// written again at a later boundary (one write in total) and never replaces
-// the updated history.
-func TestAcknowledgedCheckpointWithConcurrentHostUpdateIsNotRepublished(t *testing.T) {
+// longer matches the live history. As before, the Agent keeps the live
+// history, rolls the ledger back and ends the recovery; the acknowledged
+// checkpoint is left unreferenced. At the next boundary the requeued result is
+// rebased onto the host's system update and written once more (two writes in
+// total), so the published history carries the update and never the stale
+// system message.
+func TestAcknowledgedCheckpointWithConcurrentHostUpdateIsRebasedOnce(t *testing.T) {
 	model := newGatedSummaryModel(
 		func() (*llm.Completion, error) { return nil, typedOverflow() },
 	)
@@ -361,16 +367,167 @@ func TestAcknowledgedCheckpointWithConcurrentHostUpdateIsNotRepublished(t *testi
 	}
 	updated := ag.Messages()
 	if countText(updated, "prior work summarized") != 0 || updated[0].Content.PlainText() != "system with refreshed host context" {
-		t.Fatal("the acknowledged but stale summary replaced the host update")
+		t.Fatal("the acknowledged result was published over the host update")
 	}
 
 	compactions, errs, finals = drainQuery(ag, context.Background(), "next request", nil)
-	main, _ = model.snapshot()
-	if compactions != 0 || errs != 0 || finals != 1 || writes.Load() != 1 {
-		t.Fatalf("next turn: compactions=%d errors=%d finals=%d writes=%d", compactions, errs, finals, writes.Load())
+	main, summaries = model.snapshot()
+	if compactions != 1 || errs != 0 || finals != 1 || writes.Load() != 2 || summaries != 1 || len(main) != 2 {
+		t.Fatalf("next turn: compactions=%d errors=%d finals=%d writes=%d summaries=%d main=%d", compactions, errs, finals, writes.Load(), summaries, len(main))
 	}
-	want := append(llm.CloneMessages(updated), llm.NewUserMessage("next request"))
-	if !messageJSONEqual(main[len(main)-1].Messages, want) {
-		t.Fatal("next request is not the updated history plus the new input")
+	next := main[1].Messages
+	if countText(next, "prior work summarized") == 0 || countText(next, "system with refreshed host context") != 1 {
+		t.Fatal("next request does not carry the rebased summary with the host update")
+	}
+	for _, m := range next {
+		if m.Role == llm.RoleSystem && m.Content.PlainText() == "system" {
+			t.Fatal("next request carries the superseded system message")
+		}
+	}
+	if got := countText(next, "next request"); got != 1 {
+		t.Fatalf("new input appears %d times, want 1", got)
+	}
+	assertLegalToolPairs(t, next)
+}
+
+// G2 (Goode memory refresh): while an end-of-turn summary is in flight the
+// host refreshes its memory context the way Goode does before each prompt:
+// the old memory system message is removed from the middle of the history
+// and the new one appended at the end. Only system messages changed, so the
+// summary is rebased and published once (one checkpoint write) instead of
+// being paid for and discarded; the next request carries the new memory, not
+// the old, and legal tool pairs.
+func TestInFlightAutomaticSummaryRebasesOntoHostMemoryRefresh(t *testing.T) {
+	memory := func(text string) llm.Message {
+		m := llm.NewSystemMessage(text)
+		m.Name = "memory_context"
+		return m
+	}
+	refresh := func(history []llm.Message, text string) []llm.Message {
+		out := make([]llm.Message, 0, len(history)+1)
+		for _, m := range history {
+			if m.Role == llm.RoleSystem && m.Name == "memory_context" {
+				continue
+			}
+			out = append(out, m)
+		}
+		return append(out, memory(text))
+	}
+	var high *llm.Usage
+	model := newGatedSummaryModel(
+		func() (*llm.Completion, error) {
+			return &llm.Completion{ToolCalls: []llm.ToolCall{{ID: "c1", Type: "function", Function: llm.FunctionCall{Name: "noop", Arguments: "{}"}}}}, nil
+		},
+		func() (*llm.Completion, error) {
+			return &llm.Completion{Content: llm.TextContent("first answer"), Usage: high}, nil
+		},
+	)
+	noop := tools.Func[struct{}]("noop", "noop", func(context.Context, struct{}, *tools.Container) (any, error) {
+		return "tool output", nil
+	})
+	writer := &countingCheckpointWriter{}
+	initial := longHistory()
+	initial = append(initial[:9], append([]llm.Message{memory("memory v1")}, initial[9:]...)...)
+	ag, usage := interleaveAgent(t, model, writer, func(c *Config) {
+		c.Tools = []tools.Tool{noop}
+		c.InitialMessages = initial
+	})
+	high = usage
+	if _, errs, finals := drainQuery(ag, context.Background(), "first request", nil); errs != 0 || finals != 1 {
+		t.Fatalf("first turn errors=%d finals=%d", errs, finals)
+	}
+	<-model.summaryStarted
+	if err := ag.ReplaceHistoryChecked(refresh(ag.Messages(), "memory v2")); err != nil {
+		t.Fatalf("memory refresh rejected: %v", err)
+	}
+	close(model.gate)
+
+	compactions, errs, finals := drainQuery(ag, context.Background(), "second request", nil)
+	main, summaries := model.snapshot()
+	if len(main) != 3 || summaries != 1 || compactions != 1 || errs != 0 || finals != 1 || writer.writes.Load() != 1 {
+		t.Fatalf("main=%d summaries=%d compactions=%d errors=%d finals=%d writes=%d", len(main), summaries, compactions, errs, finals, writer.writes.Load())
+	}
+	next := main[2].Messages
+	if countText(next, "prior work summarized") == 0 {
+		t.Fatal("the rebased summary was not published")
+	}
+	if countText(next, "memory v2") != 1 || countText(next, "memory v1") != 0 {
+		t.Fatalf("next request memory: v2=%d v1=%d, want 1 and 0", countText(next, "memory v2"), countText(next, "memory v1"))
+	}
+	if got := countText(next, "second request"); got != 1 {
+		t.Fatalf("new input appears %d times, want 1", got)
+	}
+	if next[0].Role != llm.RoleSystem || next[0].Content.PlainText() != "system" {
+		t.Fatalf("base system prompt not first: %+v", next[0])
+	}
+	assertLegalToolPairs(t, next)
+	if got := ag.Messages(); countText(got, "memory v1") != 0 || countText(got, "memory v2") != 1 {
+		t.Fatal("history after publication lost the refreshed memory")
+	}
+}
+
+// N1: the emergency trim at the overflow boundary publishes the trimmed
+// history through the same checked publication (one checkpoint write, one
+// CompactionEvent), and reports failure to the overflow caller when that
+// publication does not happen, instead of claiming the overflow was handled.
+func TestEmergencyTrimIsPublishedOrReportedAsFailure(t *testing.T) {
+	history := []llm.Message{
+		llm.NewSystemMessage("sys"),
+		llm.NewUserMessage("real request"),
+		llm.NewAssistantMessage(strings.Repeat("a ", 800), nil),
+		llm.NewAssistantMessage(strings.Repeat("b ", 800), nil),
+		llm.NewAssistantMessage(strings.Repeat("c ", 800), nil),
+	}
+	for _, failWrite := range []bool{false, true} {
+		t.Run(map[bool]string{false: "published", true: "checkpoint failure"}[failWrite], func(t *testing.T) {
+			writes := 0
+			ag, err := New(Config{
+				LLM:             &countingCompactionModel{},
+				InitialMessages: history,
+				Warningf:        func(string, ...any) {},
+				Compaction: &compaction.Config{
+					Enabled: true, ContextWindow: 1000, ThresholdRatio: 1.0,
+					CheckpointWriter: compaction.CompactionCheckpointWriterFunc(func(context.Context, compaction.CompactionCheckpoint) error {
+						writes++
+						if failWrite {
+							return errors.New("checkpoint store unavailable")
+						}
+						return nil
+					}),
+				},
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			// Summary tier suppressed, local tiers cannot reduce assistant text:
+			// the overflow path must fall back to the emergency trim.
+			ag.compactionFailureStreak.Store(compactionSummaryDisableStreak)
+			events := make(chan Event, 64)
+			completion := &llm.Completion{Usage: &llm.Usage{TotalTokens: 4000, PromptTokens: 4000}}
+			compactErr := ag.compactSyncOverflow(context.Background(), "", completion, completion.Usage, wrapLegacyEventOutput(events))
+			close(events)
+			trims := 0
+			for ev := range events {
+				if c, ok := ev.(CompactionEvent); ok && slices.Contains(c.Result.TiersApplied, "emergency_trim") {
+					trims++
+				}
+			}
+			got := ag.Messages()
+			if writes != 1 {
+				t.Fatalf("checkpoint writes = %d, want 1", writes)
+			}
+			if failWrite {
+				if compactErr == nil || trims != 0 || !messageJSONEqual(got, history) {
+					t.Fatalf("unpublished trim reported: err=%v trims=%d history changed=%v", compactErr, trims, !messageJSONEqual(got, history))
+				}
+				return
+			}
+			if compactErr != nil || trims != 1 || len(got) >= len(history) {
+				t.Fatalf("trim not published: err=%v trims=%d messages %d -> %d", compactErr, trims, len(history), len(got))
+			}
+			if estimate := ag.compactor.EstimateMessages(got); estimate > ag.compactor.ThresholdTokens() {
+				t.Fatalf("published trim is over budget: %d > %d", estimate, ag.compactor.ThresholdTokens())
+			}
+		})
 	}
 }

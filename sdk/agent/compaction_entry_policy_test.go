@@ -56,7 +56,7 @@ func TestCompactionExecutorUsesSampledSummaryAdmission(t *testing.T) {
 			}
 			snapshot := ag.Messages()
 			ag.compactionInFlight.Store(true)
-			ag.runCompactionAsync(context.Background(), "", snapshot, len(snapshot), usage, usage, decision)
+			ag.runCompactionAsync(context.Background(), "", snapshot, llm.CloneMessages(snapshot), len(snapshot), usage, usage, decision)
 			if got := model.Calls() > 0; got != test.wantSummaries {
 				t.Fatalf("summary calls=%d, want summaries=%v", model.Calls(), test.wantSummaries)
 			}

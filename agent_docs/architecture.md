@@ -155,10 +155,15 @@ to use the separate failure streak and cooldown.
 
 An automatic or overflow compaction result is published only onto the
 history it was computed from. Messages appended meanwhile (steering, tool
-results, reminders) are kept after it; if that source history was otherwise
-changed, for example replaced by the host while an end-of-turn summary was
-still running, the result is discarded before any checkpoint or ledger write
-and a later decision starts from the current history.
+results, reminders, a new host context message) are kept after it. If the
+summarized part changed only in plain system messages (the change
+`ReplaceHistoryChecked` accepts during a query, such as a refreshed host
+memory message), the result is rebased: the live system messages replace
+the ones it was computed with. Any other change, for example a host branch
+or rewind while an end-of-turn summary was still running, discards the
+result before any checkpoint or ledger write and a later decision starts
+from the current history. An emergency trim that is not published this way
+is reported to the overflow caller as a failure.
 
 [CommitCompactionHistory](../sdk/agent/compaction_publication.go) accepts the exact
 source snapshot used to compute a candidate. It rejects admission, pending work
