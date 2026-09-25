@@ -243,7 +243,11 @@ type Agent struct {
 	// compaction most recently published into history, consumed once by the
 	// next Frame. Guarded by mu; empty is unknown.
 	appliedCompactionSource string
-	accountingSequence      atomic.Uint64
+	// hostPublication is the HistoryPublication.Revision whose system
+	// messages the current history still carries without an SDK change to
+	// its system messages; zero is unknown. Guarded by mu.
+	hostPublication    uint64
+	accountingSequence atomic.Uint64
 
 	// compactionFailureStreak counts consecutive compaction failures so the
 	// loop can back off instead of re-running an expensive summary every turn.
@@ -676,6 +680,8 @@ func (a *Agent) queryStreamWithSteering(ctx context.Context, input llm.Content, 
 		a.mu.Lock()
 		if len(a.messages) == 0 && a.systemPrompt != "" {
 			a.messages = append(a.messages, llm.NewSystemMessage(a.systemPrompt))
+			// The configured prompt is an SDK change, not a host publication.
+			a.hostPublication = 0
 		}
 		a.messages = append(a.messages, llm.Message{Role: llm.RoleUser, Content: input})
 		a.mu.Unlock()
@@ -835,7 +841,8 @@ func (a *Agent) queryStreamWithSteering(ctx context.Context, input llm.Content, 
 			// Remove old ephemeral messages before the next LLM call.
 			a.destroyEphemeralMessages()
 
-			messages := a.Messages()
+			// The history and the publication it carries are read together.
+			messages, hostPublication := a.messagesAndHostPublication()
 			toolDefs := make([]llm.ToolDefinition, 0, len(a.tools))
 			for _, t := range a.tools {
 				if t.Hidden {
@@ -885,6 +892,11 @@ func (a *Agent) queryStreamWithSteering(ctx context.Context, input llm.Content, 
 				frame.steeringSource = pendingSteeringSource
 			}
 			pendingSteeringSource = ""
+			// The host publication this request's system messages came from;
+			// retries reuse it even if the host publishes again meanwhile.
+			if frameErr == nil {
+				frame.hostPublication = hostPublication
+			}
 			frameFailure := ""
 			frameFailureHint := "rebuild the Agent with consistent, cloneable tool definitions"
 			if frameErr != nil {
@@ -919,7 +931,7 @@ func (a *Agent) queryStreamWithSteering(ctx context.Context, input llm.Content, 
 				emitSDKErr(ErrorEvent{Kind: "invalid_request", Message: frameFailure + "; " + frameFailureHint})
 				return
 			}
-			invocation := &frameInvocation{frameID: frame.id, controlSource: frame.controlSource, historySource: frame.historySource, recoverySource: frame.recoverySource, steeringSource: frame.steeringSource}
+			invocation := &frameInvocation{frameID: frame.id, controlSource: frame.controlSource, historySource: frame.historySource, recoverySource: frame.recoverySource, steeringSource: frame.steeringSource, hostPublication: frame.hostPublication}
 			boundaryFrame = frame.id
 			comp, streamedText, err := a.invokeModelCompletionWithRetryAndSteering(ctx, frame.model, frame.request, out, steeringCh, invocation)
 			correlation := invocation.correlation()
@@ -3069,6 +3081,7 @@ func applyEventCorrelation(envelope *EventEnvelope, correlations []eventCorrelat
 			envelope.RequestSteeringRelation = RequestSteeringAccepted
 			envelope.RequestSteeringSourceFrameID = correlation.steeringSource
 		}
+		envelope.HostPublicationRevision = correlation.hostPublication
 		envelope.ToolBlockID, envelope.ToolCallOrdinal, envelope.ToolBlockCallCount = correlation.toolBlockID, correlation.toolCallOrdinal, correlation.blockCallCount
 	}
 	if correlation.intervention != "" {
@@ -4602,6 +4615,9 @@ func (a *Agent) applyPendingCompaction(out *eventOutput) (published bool) {
 	// Recorded only now that the compacted history is published; the next
 	// Frame built by the driver consumes it once.
 	a.appliedCompactionSource = pending.sourceFrameID
+	// The SDK arranged this history's system messages (preserved, rebased or
+	// trimmed), so no host publication describes them any more.
+	a.hostPublication = 0
 	a.mu.Unlock()
 
 	a.emitCompactionWithAccounting(out, CompactionEvent{Result: commit.result, TriggerUsage: pending.triggerUsage})
@@ -4768,6 +4784,8 @@ func (a *Agent) CompactPipelineNow(ctx context.Context, req compaction.PipelineR
 		// A manual/preflight rewrite has no Frame source; do not let an older
 		// automatic source describe the next request.
 		a.appliedCompactionSource = ""
+		// The SDK computed these system messages; the host did not publish them.
+		a.hostPublication = 0
 		a.mu.Unlock()
 	}
 	return res, nil

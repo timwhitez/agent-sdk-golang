@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"errors"
+	"sync/atomic"
 
 	"github.com/timwhitez/agent-sdk-golang/sdk/llm"
 )
@@ -22,17 +23,61 @@ var errAssistantHistoryChanged = errors.New("agent: current assistant history ch
 // An independent manual compaction rejects all replacements until publication
 // completes, including System-only updates and callback attempts.
 func (a *Agent) ReplaceHistoryChecked(messages []llm.Message) error {
+	_, err := a.ReplaceHistoryCheckedRevision(messages)
+	return err
+}
+
+// hostPublicationRevisions allocates HistoryPublication revisions for every
+// Agent in the process, so one revision never names two publications.
+var hostPublicationRevisions atomic.Uint64
+
+// HistoryPublication identifies one successful host history publication.
+// It is a process-local counter, not content, a session revision or proof
+// that a request was delivered.
+type HistoryPublication struct {
+	// Revision is non-zero and unique among the publications of every Agent
+	// in this process; later publications have larger revisions.
+	Revision uint64
+	// Replaced is the Revision whose system messages the replaced history
+	// still carried without an SDK change to its system messages; zero is
+	// unknown (no host publication yet, or the SDK changed them since).
+	Replaced uint64
+}
+
+// ReplaceHistoryCheckedRevision is ReplaceHistoryChecked that also returns
+// the publication it made, read under the same history lock. A Frame built
+// afterward reports Revision as EventEnvelope.HostPublicationRevision until
+// the host publishes again or the SDK changes the system messages itself
+// (a configured SystemPrompt insertion or a compaction/trim installation).
+func (a *Agent) ReplaceHistoryCheckedRevision(messages []llm.Message) (HistoryPublication, error) {
 	a.mu.Lock()
 	owned := llm.CloneMessages(messages)
 	if a.manualCompactionActive || (a.turnActive.Load() && !activeHistoryReplacementSafe(a.messages, owned)) {
 		a.mu.Unlock()
-		return ErrActiveHistoryMutation
+		return HistoryPublication{}, ErrActiveHistoryMutation
 	}
 	a.messages = owned
+	publication := a.recordHostPublicationLocked()
 	a.resetEphemeralTrackingLocked()
 	a.mu.Unlock()
 	a.cleanupToolResultDumps(toolResultDumpNow(), true)
-	return nil
+	return publication, nil
+}
+
+// recordHostPublicationLocked makes the just-installed host history the
+// current publication. Callers hold a.mu.
+func (a *Agent) recordHostPublicationLocked() HistoryPublication {
+	publication := HistoryPublication{Revision: hostPublicationRevisions.Add(1), Replaced: a.hostPublication}
+	a.hostPublication = publication.Revision
+	return publication
+}
+
+// messagesAndHostPublication returns an owned history and the publication
+// whose system messages it carries (zero is unknown), read together.
+func (a *Agent) messagesAndHostPublication() ([]llm.Message, uint64) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return llm.CloneMessages(a.messages), a.hostPublication
 }
 
 // ClearHistoryChecked rejects destructive clearing during an active query.

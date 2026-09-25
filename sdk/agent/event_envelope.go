@@ -93,8 +93,15 @@ type EventEnvelope struct {
 	// means unreported, not that no steering occurred.
 	RequestSteeringRelation      string `json:"RequestSteeringRelation,omitempty"`
 	RequestSteeringSourceFrameID string `json:"RequestSteeringSourceFrameID,omitempty"`
-	SchemaVersion                int
-	QueryID                      string
+	// HostPublicationRevision is the HistoryPublication.Revision whose system
+	// messages this Frame's request carries: the latest host publication when
+	// the request was built, provided the SDK had not changed the system
+	// messages since (compaction, trim, configured SystemPrompt). Retries
+	// reuse it. Zero is unknown, not "no publication"; it names a publication,
+	// not its content, the final wire payload or delivery.
+	HostPublicationRevision uint64 `json:"HostPublicationRevision,omitempty"`
+	SchemaVersion           int
+	QueryID                 string
 	// FrameID identifies the explicitly correlated execution context, not the
 	// sole provenance of aggregated continuation content. Empty means unknown.
 	FrameID string `json:"FrameID,omitempty"`
