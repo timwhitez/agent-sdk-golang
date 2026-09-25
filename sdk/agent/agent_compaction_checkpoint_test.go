@@ -411,6 +411,7 @@ func TestAutomaticCompactionCheckpointFailurePreservesHistory(t *testing.T) {
 			llm.Message{Role: llm.RoleUser, Name: compaction.CompactionSummaryMessageName, Content: llm.TextContent("summary")},
 		},
 		snapshotLen: len(original),
+		source:      original,
 		result: compaction.Result{
 			Compacted:      true,
 			Trigger:        "usage",

@@ -38,6 +38,7 @@ func installPendingCompactionForCallbackTest(t *testing.T, writer compaction.Com
 	agent.pendingCompaction = &pendingCompaction{
 		messages:    []llm.Message{llm.NewUserMessage("after")},
 		snapshotLen: 1,
+		source:      []llm.Message{llm.NewUserMessage("before")},
 		result:      compaction.Result{Compacted: true},
 	}
 	agent.pendingCompactionMu.Unlock()
@@ -189,6 +190,7 @@ func TestApplyPendingCompactionTokenEstimatorCanReadMessages(t *testing.T) {
 	agent.pendingCompaction = &pendingCompaction{
 		messages:    []llm.Message{llm.NewUserMessage("after")},
 		snapshotLen: 1,
+		source:      []llm.Message{llm.NewUserMessage("before")},
 		result:      compaction.Result{Compacted: true},
 	}
 	agent.pendingCompactionMu.Unlock()

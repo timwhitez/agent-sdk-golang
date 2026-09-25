@@ -214,3 +214,76 @@ func TestIneffectiveSummarySuppressionEndsWithQuery(t *testing.T) {
 		t.Fatalf("summaries across the new Query = %d, want 2 (one per user input)", got)
 	}
 }
+
+// G4: suppression identity. The suppression belongs to the compaction
+// runtime that armed it and to the user input it was armed in. Installing a
+// runtime through the public UpdateCompactionConfig rearms the automatic
+// summary: a changed context window, and equally an identical
+// configuration, since the SDK treats every replacement as a new identity and
+// does not compare configurations. A replacement queued while the old runtime
+// is still in use takes effect, and rearms, only when that use ends; until
+// then the old runtime and its suppression stay coherent.
+func TestIneffectiveSummarySuppressionFollowsConfiguredRuntimeIdentity(t *testing.T) {
+	config := func(f ineffectiveSummaryFixture, windowFactor int) *compaction.Config {
+		estimate := f.high.PromptTokens / 2
+		return &compaction.Config{
+			Enabled: true, ContextWindow: windowFactor * estimate, ReserveOutputTokens: 1,
+			ThresholdRatio: 0.2, SnipThresholdRatio: 0.1, PruneThresholdRatio: 0.15,
+		}
+	}
+	armed := func(t *testing.T) ineffectiveSummaryFixture {
+		t.Helper()
+		f := newIneffectiveSummaryFixture(t)
+		f.decide(t, f.high)
+		f.decide(t, f.high)
+		if got := f.model.Calls(); got != 1 || f.agent.ineffectiveSummaryEpoch.Load() == 0 {
+			t.Fatalf("fixture not suppressed: calls=%d", got)
+		}
+		return f
+	}
+	t.Run("context window change", func(t *testing.T) {
+		f := armed(t)
+		oldThreshold := f.agent.compactor.ThresholdTokens()
+		f.agent.UpdateCompactionConfig(config(f, 5))
+		if f.agent.compactor.ThresholdTokens() == oldThreshold {
+			t.Fatal("replacement did not change the window")
+		}
+		if f.agent.compactor.DecisionTokens(f.high) < f.agent.compactor.ThresholdTokens() {
+			t.Fatal("fixture sizing: the new window must still need a summary")
+		}
+		f.decide(t, f.high)
+		if got := f.model.Calls(); got != 2 {
+			t.Fatalf("calls = %d, want 2 (new window rearms the summary)", got)
+		}
+		// The new runtime arms its own suppression for the same material.
+		f.decide(t, f.high)
+		if got := f.model.Calls(); got != 2 {
+			t.Fatalf("calls = %d, want 2 (new runtime suppresses its own ineffective summary)", got)
+		}
+	})
+	t.Run("identical configuration", func(t *testing.T) {
+		f := armed(t)
+		f.agent.UpdateCompactionConfig(config(f, 4))
+		f.decide(t, f.high)
+		if got := f.model.Calls(); got != 2 {
+			t.Fatalf("calls = %d, want 2 (any replacement is a new identity)", got)
+		}
+	})
+	t.Run("replacement queued during use", func(t *testing.T) {
+		f := armed(t)
+		release, ok := f.agent.tryBeginCompactionRuntimeUse()
+		if !ok {
+			t.Fatal("runtime use not acquired")
+		}
+		f.agent.UpdateCompactionConfig(config(f, 5))
+		f.decide(t, f.high)
+		if got := f.model.Calls(); got != 1 {
+			t.Fatalf("calls = %d, want 1 (the old runtime is still in use and suppressed)", got)
+		}
+		release()
+		f.decide(t, f.high)
+		if got := f.model.Calls(); got != 2 {
+			t.Fatalf("calls = %d, want 2 (the queued runtime rearmed on installation)", got)
+		}
+	})
+}

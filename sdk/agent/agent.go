@@ -326,8 +326,12 @@ type turnBackpressure struct {
 }
 
 type pendingCompaction struct {
-	messages     []llm.Message
-	snapshotLen  int
+	messages    []llm.Message
+	snapshotLen int
+	// source is the history the candidate was computed from (snapshotLen
+	// messages). Publication splices only an appended tail onto the candidate,
+	// so any other change to that prefix makes the candidate stale.
+	source       []llm.Message
 	result       compaction.Result
 	triggerUsage *llm.Usage
 	// sourceFrameID is the Frame whose usage triggered this compaction.
@@ -3622,6 +3626,9 @@ func (a *Agent) checkAndCompactWithGrowth(ctx context.Context, sourceFrameID str
 	a.mu.Lock()
 	messages := make([]llm.Message, len(a.messages))
 	copy(messages, a.messages)
+	// An owned copy, so no later change to shared message contents can make
+	// the publication check compare the live history with itself.
+	source := llm.CloneMessages(a.messages)
 	a.mu.Unlock()
 	snapshotLen := len(messages)
 	triggerUsage := cloneUsage(last.Usage)
@@ -3630,7 +3637,7 @@ func (a *Agent) checkAndCompactWithGrowth(ctx context.Context, sourceFrameID str
 	releaseCompactionRuntime := a.retainCompactionRuntimeUse()
 	go func() {
 		defer releaseCompactionRuntime()
-		a.runCompactionAsync(ctx, sourceFrameID, messages, snapshotLen, decisionUsage, triggerUsage, decision)
+		a.runCompactionAsync(ctx, sourceFrameID, messages, source, snapshotLen, decisionUsage, triggerUsage, decision)
 	}()
 	return nil
 }
@@ -3667,7 +3674,7 @@ func (a *Agent) emitCompactionDecisionProvenance(out *eventOutput, decisionUsage
 	})
 }
 
-func (a *Agent) runCompactionAsync(ctx context.Context, sourceFrameID string, snapshot []llm.Message, snapshotLen int, decisionUsage *llm.Usage, triggerUsage *llm.Usage, decision compactionDecision) {
+func (a *Agent) runCompactionAsync(ctx context.Context, sourceFrameID string, snapshot, source []llm.Message, snapshotLen int, decisionUsage *llm.Usage, triggerUsage *llm.Usage, decision compactionDecision) {
 	defer a.releaseCompactionInFlight()
 
 	compactCtx, cancelCompact := asyncCompactionContext(ctx)
@@ -3703,6 +3710,7 @@ func (a *Agent) runCompactionAsync(ctx context.Context, sourceFrameID string, sn
 	a.pendingCompaction = &pendingCompaction{
 		messages:      newMsgs,
 		snapshotLen:   snapshotLen,
+		source:        source,
 		result:        a.withCompactionTelemetry(res, decision.trigger, decision.targetWatermark, triggerUsage),
 		triggerUsage:  triggerUsage,
 		sourceFrameID: sourceFrameID,
@@ -3769,6 +3777,7 @@ func (a *Agent) compactSyncOverflow(ctx context.Context, sourceFrameID string, l
 	a.mu.Lock()
 	messages := make([]llm.Message, len(a.messages))
 	copy(messages, a.messages)
+	source := llm.CloneMessages(a.messages)
 	a.mu.Unlock()
 
 	snapshotLen := len(messages)
@@ -3786,7 +3795,7 @@ func (a *Agent) compactSyncOverflow(ctx context.Context, sourceFrameID string, l
 		// Overflow means the next provider request cannot be sent as-is, so
 		// returning the error aborts the turn and every later turn identically.
 		// Fall back to an emergency trim so the session keeps an escape path.
-		if !a.applyEmergencyTrim(messages, snapshotLen, triggerUsage, err, out) {
+		if !a.applyEmergencyTrim(messages, source, snapshotLen, triggerUsage, err, out) {
 			return err
 		}
 		return nil
@@ -3800,7 +3809,7 @@ func (a *Agent) compactSyncOverflow(ctx context.Context, sourceFrameID string, l
 			// returning nil here would mask the overflow and let the turn send a
 			// request that is still over the window.
 			overflowErr := errors.New("summary tier suppressed by the compaction failure cooldown and local reduction changed nothing")
-			if !a.applyEmergencyTrim(messages, snapshotLen, triggerUsage, overflowErr, out) {
+			if !a.applyEmergencyTrim(messages, source, snapshotLen, triggerUsage, overflowErr, out) {
 				return overflowErr
 			}
 		}
@@ -3819,6 +3828,7 @@ func (a *Agent) compactSyncOverflow(ctx context.Context, sourceFrameID string, l
 	a.pendingCompaction = &pendingCompaction{
 		messages:      newMsgs,
 		snapshotLen:   snapshotLen,
+		source:        source,
 		result:        a.withCompactionTelemetry(res, trigger, watermark, triggerUsage),
 		triggerUsage:  triggerUsage,
 		sourceFrameID: sourceFrameID,
@@ -3830,8 +3840,9 @@ func (a *Agent) compactSyncOverflow(ctx context.Context, sourceFrameID string, l
 
 // applyEmergencyTrim publishes an emergency-trimmed history as a compaction
 // result. It reports false when the trim could not produce a legal sendable
-// history, in which case the caller must keep surfacing the original failure.
-func (a *Agent) applyEmergencyTrim(messages []llm.Message, snapshotLen int, triggerUsage *llm.Usage, cause error, out *eventOutput) bool {
+// history or was not published (checkpoint failure, changed source history),
+// in which case the caller must keep surfacing the original failure.
+func (a *Agent) applyEmergencyTrim(messages, source []llm.Message, snapshotLen int, triggerUsage *llm.Usage, cause error, out *eventOutput) bool {
 	trimmed, trimmedOK := a.emergencyTrimHistory(messages)
 	if !trimmedOK {
 		return false
@@ -3854,12 +3865,12 @@ func (a *Agent) applyEmergencyTrim(messages []llm.Message, snapshotLen int, trig
 	a.pendingCompaction = &pendingCompaction{
 		messages:     trimmed,
 		snapshotLen:  snapshotLen,
+		source:       source,
 		result:       a.withCompactionTelemetry(emergencyRes, "overflow", "overflow", triggerUsage),
 		triggerUsage: triggerUsage,
 	}
 	a.pendingCompactionMu.Unlock()
-	a.applyPendingCompaction(out)
-	return true
+	return a.applyPendingCompaction(out)
 }
 
 // compactionFailureCooldown parameters bound the cost of a compaction pipeline
@@ -4486,9 +4497,9 @@ func (a *Agent) takeAppliedCompactionSource(queryID string) string {
 	return source
 }
 
-func (a *Agent) applyPendingCompaction(out *eventOutput) {
+func (a *Agent) applyPendingCompaction(out *eventOutput) (published bool) {
 	if !a.hasCompactor {
-		return
+		return false
 	}
 	a.pendingCompactionMu.Lock()
 	pending := a.pendingCompaction
@@ -4497,7 +4508,7 @@ func (a *Agent) applyPendingCompaction(out *eventOutput) {
 	}
 	a.pendingCompactionMu.Unlock()
 	if pending == nil || !pending.result.Compacted {
-		return
+		return false
 	}
 
 	// Build an immutable candidate under the history lock, then release the
@@ -4507,18 +4518,26 @@ func (a *Agent) applyPendingCompaction(out *eventOutput) {
 	a.mu.Lock()
 	source := llm.CloneMessages(a.messages)
 	currentLen := len(source)
-	if currentLen < pending.snapshotLen {
+	merged, tailStart, ok := rebasePendingCompaction(pending, source)
+	if !ok && currentLen < pending.snapshotLen {
 		a.mu.Unlock()
 		a.warnf("compaction apply skipped: history shrank (%d < %d); scheduling retry", currentLen, pending.snapshotLen)
 		a.requeuePendingCompaction(pending)
 		a.compactionRetryPending.Store(true)
-		return
+		return false
 	}
-	tailCap := currentLen - pending.snapshotLen
+	if !ok {
+		// The history the candidate summarizes was changed, not only appended
+		// to or updated in its system messages (a host branch or rewind).
+		// Publishing it would overwrite that change, so it is dropped before
+		// any persistence; a later decision samples the current history again.
+		a.mu.Unlock()
+		a.warnf("compaction apply discarded: the history it was computed from changed before publication; nothing was persisted")
+		a.compactionRetryPending.Store(true)
+		return false
+	}
 	pairingRepaired := false
-	merged := llm.CloneMessages(pending.messages)
-	if tailCap > 0 {
-		merged = append(merged, llm.CloneMessages(source[pending.snapshotLen:])...)
+	if tailStart < currentLen {
 		// pending.messages dropped every assistant tool_use block, so a tail
 		// that starts inside a tool block would splice orphaned tool results
 		// onto the summary. Repair rather than trust the caller to compact only
@@ -4545,7 +4564,7 @@ func (a *Agent) applyPendingCompaction(out *eventOutput) {
 			warning = commit.result.Warnings[len(commit.result.Warnings)-1]
 		}
 		a.warnf("%s", warning)
-		return
+		return false
 	}
 	if commitErr != nil {
 		a.requeuePendingCompaction(pending)
@@ -4555,7 +4574,7 @@ func (a *Agent) applyPendingCompaction(out *eventOutput) {
 			warning = commit.result.Warnings[len(commit.result.Warnings)-1]
 		}
 		a.warnf("%s", warning)
-		return
+		return false
 	}
 
 	a.mu.Lock()
@@ -4572,7 +4591,7 @@ func (a *Agent) applyPendingCompaction(out *eventOutput) {
 		} else {
 			a.warnf("compaction apply deferred because history changed while checkpoint persistence was running; ledger state was rolled back and the unreferenced checkpoint can be garbage-collected")
 		}
-		return
+		return false
 	}
 	if commit.persisted {
 		a.compactor.FinalizePendingLedger(&commit.transaction)
@@ -4586,6 +4605,92 @@ func (a *Agent) applyPendingCompaction(out *eventOutput) {
 	a.mu.Unlock()
 
 	a.emitCompactionWithAccounting(out, CompactionEvent{Result: commit.result, TriggerUsage: pending.triggerUsage})
+	return true
+}
+
+// rebasePendingCompaction builds the history that publishes pending onto the
+// live history. Messages appended after the candidate's source are kept after
+// it. When the source prefix differs from the live one only in plain system
+// messages (the change ReplaceHistoryChecked accepts during a query, such as a
+// refreshed host context message), the live system messages replace the
+// candidate's. Any other change makes the candidate stale (ok=false).
+// tailStart is the index in live where the kept tail begins.
+func rebasePendingCompaction(pending *pendingCompaction, live []llm.Message) (merged []llm.Message, tailStart int, ok bool) {
+	n := pending.snapshotLen
+	if len(pending.source) != n {
+		return nil, 0, false
+	}
+	if len(live) >= n && sameMessageIdentity(live[:n], pending.source) {
+		return append(llm.CloneMessages(pending.messages), llm.CloneMessages(live[n:])...), n, true
+	}
+	body := nonSystemMessages(pending.source)
+	if len(body) == 0 {
+		return nil, 0, false
+	}
+	seen := 0
+	for tailStart < len(live) && seen < len(body) {
+		if live[tailStart].Role != llm.RoleSystem {
+			seen++
+		}
+		tailStart++
+	}
+	prefix := live[:tailStart]
+	if seen < len(body) || !sameMessageIdentity(nonSystemMessages(prefix), body) || !plainSystemMessages(prefix) || !plainSystemMessages(pending.source) {
+		return nil, 0, false
+	}
+	kept := map[string]struct{}{}
+	for _, m := range pending.source {
+		if m.Role == llm.RoleSystem {
+			kept[systemMessageSignature(m)] = struct{}{}
+		}
+	}
+	for _, m := range prefix {
+		if m.Role == llm.RoleSystem {
+			merged = append(merged, m)
+		}
+	}
+	// System messages the compaction itself added are not host state; keep them.
+	for _, m := range pending.messages {
+		if m.Role != llm.RoleSystem {
+			continue
+		}
+		if _, fromSource := kept[systemMessageSignature(m)]; !fromSource {
+			merged = append(merged, m)
+		}
+	}
+	merged = append(merged, nonSystemMessages(pending.messages)...)
+	merged = append(merged, live[tailStart:]...)
+	return llm.CloneMessages(merged), tailStart, true
+}
+
+// sameMessageIdentity compares histories by the JSON identity that
+// ReplaceHistoryChecked uses.
+func sameMessageIdentity(left, right []llm.Message) bool {
+	if len(left) != len(right) {
+		return false
+	}
+	return len(left) == 0 || messageJSONEqual(left, right)
+}
+
+func nonSystemMessages(messages []llm.Message) []llm.Message {
+	out := make([]llm.Message, 0, len(messages))
+	for _, m := range messages {
+		if m.Role != llm.RoleSystem {
+			out = append(out, m)
+		}
+	}
+	return out
+}
+
+// plainSystemMessages reports whether every system message is plain content,
+// the only system change ReplaceHistoryChecked accepts during a query.
+func plainSystemMessages(messages []llm.Message) bool {
+	for _, m := range messages {
+		if m.Role == llm.RoleSystem && (len(m.ToolCalls) != 0 || m.ToolCallID != "" || m.ToolName != "" || m.IsError || m.Ephemeral || m.Destroyed) {
+			return false
+		}
+	}
+	return true
 }
 
 func (a *Agent) requeuePendingCompaction(pending *pendingCompaction) {
