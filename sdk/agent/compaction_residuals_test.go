@@ -3,6 +3,8 @@ package agent
 import (
 	"context"
 	"errors"
+	"fmt"
+	"strings"
 	"testing"
 
 	"github.com/timwhitez/agent-sdk-golang/sdk/agent/compaction"
@@ -133,4 +135,60 @@ func TestPublicationIgnoresCloneNormalization(t *testing.T) {
 	if got := ag.Messages(); !messageJSONEqual(got, summary) {
 		t.Fatalf("published history = %d messages, want the summary", len(got))
 	}
+}
+
+// #180 review N1/N2: rebasing a candidate that injected the configured base
+// prompt (its source had no system message). The injected copy is dropped
+// only when the host now has its own base prompt (an unnamed system message
+// or the same prompt in the prefix) or the kept tail already carries the same
+// prompt; a named host context message alone keeps it, as the unchanged path
+// does, and the prompt is never duplicated.
+func TestRebaseInjectedBasePromptCases(t *testing.T) {
+	const basePrompt = "configured base prompt"
+	named := func(name, text string) llm.Message {
+		m := llm.NewSystemMessage(text)
+		m.Name = name
+		return m
+	}
+	user, answer := llm.NewUserMessage("question"), llm.NewAssistantMessage("answer", nil)
+	summary := llm.NewUserMessage("prior work summarized")
+	base := llm.NewSystemMessage(basePrompt)
+	mem := named("memory_context", "memory v1")
+	cases := []struct {
+		name string
+		live []llm.Message
+		want []llm.Message
+	}{
+		{"unchanged", []llm.Message{user, answer}, []llm.Message{base, summary}},
+		{"host base prompt in prefix", []llm.Message{llm.NewSystemMessage("host prompt"), user, answer}, []llm.Message{llm.NewSystemMessage("host prompt"), summary}},
+		{"same prompt in prefix", []llm.Message{base, user, answer}, []llm.Message{base, summary}},
+		{"C: named context only in prefix", []llm.Message{mem, user, answer}, []llm.Message{mem, base, summary}},
+		{"D: same prompt appended after the source", []llm.Message{user, answer, base}, []llm.Message{summary, base}},
+		{"D: same prompt appended after a changed prefix", []llm.Message{mem, user, answer, base}, []llm.Message{mem, summary, base}},
+		{"named prompt text appended after the source", []llm.Message{user, answer, named("other", basePrompt)}, []llm.Message{base, summary, named("other", basePrompt)}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			pending := &pendingCompaction{
+				messages:    []llm.Message{base, summary},
+				snapshotLen: 2,
+				source:      []llm.Message{user, answer},
+			}
+			merged, _, ok := rebasePendingCompaction(pending, tc.live, basePrompt)
+			if !ok {
+				t.Fatal("rebase rejected a system-only change")
+			}
+			if !messageJSONEqual(merged, tc.want) {
+				t.Fatalf("merged:\n%s\nwant:\n%s", describeMessages(merged), describeMessages(tc.want))
+			}
+		})
+	}
+}
+
+func describeMessages(messages []llm.Message) string {
+	var b strings.Builder
+	for _, m := range messages {
+		fmt.Fprintf(&b, "  %s[%s] %q\n", m.Role, m.Name, m.Content.PlainText())
+	}
+	return b.String()
 }

@@ -159,9 +159,11 @@ results, reminders, a new host context message) are kept after it. If the
 summarized part changed only in plain system messages (the change
 `ReplaceHistoryChecked` accepts during a query, such as a refreshed host
 memory message), the result is rebased: the live system messages replace
-the ones it was computed with; the configured system prompt the compaction
-inserted because its source had no system message is dropped once the live
-history has its own. Any other change, for example a host branch
+the ones it was computed with. The configured system prompt the compaction
+inserted because its source had no system message is dropped when the live
+history now has its own base prompt (an unnamed system message) or already
+carries the same prompt; a named host context message alone keeps it. Any
+other change, for example a host branch
 or rewind while an end-of-turn summary was still running, discards the
 result before any checkpoint or ledger write and a later decision starts
 from the current history. After the checkpoint write, the live history is

@@ -4658,15 +4658,33 @@ func (a *Agent) applyPendingCompaction(out *eventOutput) (published bool) {
 // candidate's. Any other change makes the candidate stale (ok=false).
 // tailStart is the index in live where the kept tail begins. basePrompt is the
 // configured system prompt that withPreservedSystem injects when the source
-// had no system message; once the live prefix carries its own system message
-// that injected fallback is stale and is not restored.
+// had no system message; see injectedPromptSuperseded for when that injected
+// copy is not restored.
 func rebasePendingCompaction(pending *pendingCompaction, live []llm.Message, basePrompt string) (merged []llm.Message, tailStart int, ok bool) {
 	n := pending.snapshotLen
 	if len(pending.source) != n {
 		return nil, 0, false
 	}
+	injected := ""
+	if strings.TrimSpace(basePrompt) != "" {
+		injected = systemMessageSignature(llm.NewSystemMessage(basePrompt))
+	}
+	kept := map[string]struct{}{}
+	for _, m := range pending.source {
+		if m.Role == llm.RoleSystem {
+			kept[systemMessageSignature(m)] = struct{}{}
+		}
+	}
+	if _, fromSource := kept[injected]; fromSource {
+		// The prompt was in the source, so the candidate did not inject it.
+		injected = ""
+	}
 	if len(live) >= n && sameMessageIdentity(live[:n], pending.source) {
-		return append(llm.CloneMessages(pending.messages), llm.CloneMessages(live[n:])...), n, true
+		candidate := pending.messages
+		if injectedPromptSuperseded(injected, nil, live[n:]) {
+			candidate = withoutSystemSignature(candidate, injected)
+		}
+		return append(llm.CloneMessages(candidate), llm.CloneMessages(live[n:])...), n, true
 	}
 	body := nonSystemMessages(pending.source)
 	if len(body) == 0 {
@@ -4683,25 +4701,14 @@ func rebasePendingCompaction(pending *pendingCompaction, live []llm.Message, bas
 	if seen < len(body) || !sameMessageIdentity(nonSystemMessages(prefix), body) || !plainSystemMessages(prefix) || !plainSystemMessages(pending.source) {
 		return nil, 0, false
 	}
-	kept := map[string]struct{}{}
-	for _, m := range pending.source {
-		if m.Role == llm.RoleSystem {
-			kept[systemMessageSignature(m)] = struct{}{}
-		}
-	}
-	liveHasSystem := false
 	for _, m := range prefix {
 		if m.Role == llm.RoleSystem {
 			merged = append(merged, m)
-			liveHasSystem = true
 		}
 	}
-	injected := ""
-	if strings.TrimSpace(basePrompt) != "" {
-		injected = systemMessageSignature(llm.NewSystemMessage(basePrompt))
-	}
+	dropInjected := injectedPromptSuperseded(injected, prefix, live[tailStart:])
 	// System messages the compaction itself added are not host state; keep
-	// them, except the injected base prompt when the host now has its own.
+	// them, except a superseded injected base prompt.
 	for _, m := range pending.messages {
 		if m.Role != llm.RoleSystem {
 			continue
@@ -4710,7 +4717,7 @@ func rebasePendingCompaction(pending *pendingCompaction, live []llm.Message, bas
 		if _, fromSource := kept[sig]; fromSource {
 			continue
 		}
-		if liveHasSystem && injected != "" && sig == injected {
+		if dropInjected && sig == injected {
 			continue
 		}
 		merged = append(merged, m)
@@ -4718,6 +4725,40 @@ func rebasePendingCompaction(pending *pendingCompaction, live []llm.Message, bas
 	merged = append(merged, nonSystemMessages(pending.messages)...)
 	merged = append(merged, live[tailStart:]...)
 	return llm.CloneMessages(merged), tailStart, true
+}
+
+// injectedPromptSuperseded reports whether the base prompt a candidate
+// injected (signature injected, empty when it injected none) must not be
+// restored: the live prefix now carries an unnamed system message (the host's
+// own base prompt) or the same prompt, or the kept tail already carries the
+// same prompt, which would otherwise be duplicated. A named host context
+// message (memory and the like) is not a base prompt and does not supersede it.
+func injectedPromptSuperseded(injected string, prefix, tail []llm.Message) bool {
+	if injected == "" {
+		return false
+	}
+	for _, m := range prefix {
+		if m.Role == llm.RoleSystem && (strings.TrimSpace(m.Name) == "" || systemMessageSignature(m) == injected) {
+			return true
+		}
+	}
+	for _, m := range tail {
+		if m.Role == llm.RoleSystem && systemMessageSignature(m) == injected {
+			return true
+		}
+	}
+	return false
+}
+
+func withoutSystemSignature(messages []llm.Message, sig string) []llm.Message {
+	out := make([]llm.Message, 0, len(messages))
+	for _, m := range messages {
+		if m.Role == llm.RoleSystem && systemMessageSignature(m) == sig {
+			continue
+		}
+		out = append(out, m)
+	}
+	return out
 }
 
 // sameMessageIdentity compares histories by the JSON identity that
