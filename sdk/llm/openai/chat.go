@@ -84,6 +84,7 @@ const (
 	downgradeThinkingMessage        = "OpenAI chat provider rejected thinking settings; retrying without thinking extras."
 	downgradeMaxTokensMessage       = "OpenAI chat provider rejected max_completion_tokens; retrying with legacy max_tokens."
 	downgradeStreamOptionsMessage   = "OpenAI chat provider rejected stream_options; retrying without stream usage reporting."
+	downgradeToolChoiceChatMessage  = "OpenAI chat provider rejected forced tool_choice; retried with auto."
 )
 
 func (c *ChatClient) Provider() string { return openAIProviderLabel(c.ProviderLabel) }
@@ -183,6 +184,11 @@ func (c *ChatClient) Invoke(ctx context.Context, req llm.InvokeRequest) (*llm.Co
 					local.UseLegacyMaxTokens = true
 					compatChanged = true
 					diagnostics = append(diagnostics, llm.Diagnostic{Kind: "provider_compatibility_downgrade", Message: downgradeMaxTokensMessage})
+				}
+				if downgradeForcedToolChoice(&req, payload.ToolChoice, msg) {
+					compatChanged = true
+					local.warnf("[WARN] %s", downgradeToolChoiceChatMessage)
+					diagnostics = append(diagnostics, llm.Diagnostic{Kind: "provider_compatibility_downgrade", Message: downgradeToolChoiceChatMessage})
 				}
 			}
 			if compatChanged && attempt < retry.maxRetries-1 {
@@ -332,6 +338,10 @@ func (c *ChatClient) InvokeStream(ctx context.Context, req llm.InvokeRequest) (<
 						includeStreamOptions = false
 						compatChanged = true
 						local.warnf("[WARN] %s", downgradeStreamOptionsMessage)
+					}
+					if downgradeForcedToolChoice(&req, payload.ToolChoice, msg) {
+						compatChanged = true
+						local.warnf("[WARN] %s", downgradeToolChoiceChatMessage)
 					}
 				}
 				if compatChanged && attempt < retry.maxRetries-1 {
@@ -873,6 +883,55 @@ func looksLikeThinkingUnsupported(msg string) bool {
 	}
 	if strings.Contains(s, "thinking") && strings.Contains(s, "unrecognized") {
 		return true
+	}
+	return false
+}
+
+// isForcedToolChoice reports whether choice forces a tool call on the wire:
+// "required" or a named function. Empty/"auto" and "none" are not forced.
+func isForcedToolChoice(choice llm.ToolChoice) bool {
+	switch string(choice) {
+	case "", "auto", "none":
+		return false
+	}
+	return true
+}
+
+// downgradeForcedToolChoice relaxes one request's forced tool_choice to auto
+// when the provider explicitly rejected it (e.g. reasoning models whose
+// thinking mode only accepts auto). sent is the tool_choice actually
+// serialized for the rejected attempt; nil means none was sent. The change is
+// local to req, so it happens at most once per request and never becomes
+// sticky for the client.
+func downgradeForcedToolChoice(req *llm.InvokeRequest, sent any, msg string) bool {
+	if req == nil || sent == nil || !isForcedToolChoice(req.ToolChoice) || !looksLikeToolChoiceUnsupported(msg) {
+		return false
+	}
+	req.ToolChoice = ""
+	return true
+}
+
+// looksLikeToolChoiceUnsupported reports whether a provider error names
+// tool_choice as the unsupported or invalid setting. A bare
+// "invalid_request_error" type does not count as naming it invalid.
+func looksLikeToolChoiceUnsupported(msg string) bool {
+	s := strings.ToLower(msg)
+	s = strings.ReplaceAll(s, "invalid_request_error", "")
+	if !strings.Contains(s, "tool_choice") {
+		return false
+	}
+	for _, phrase := range []string{
+		"unsupported",
+		"not support", // "not supported", "does not support"
+		"doesn't support",
+		"invalid tool_choice",
+		"tool_choice is invalid",
+		"invalid value",
+		"invalid parameter",
+	} {
+		if strings.Contains(s, phrase) {
+			return true
+		}
 	}
 	return false
 }

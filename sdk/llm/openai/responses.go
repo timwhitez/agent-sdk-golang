@@ -59,6 +59,10 @@ type ResponsesClient struct {
 	Warningf func(format string, args ...any)
 }
 
+// downgradeToolChoiceResponsesMessage reports a forced tool_choice relaxed to
+// auto for one request after the provider rejected it.
+const downgradeToolChoiceResponsesMessage = "OpenAI Responses provider rejected forced tool_choice; retried with auto."
+
 func (c *ResponsesClient) warnf(format string, args ...any) {
 	if c != nil && c.Warningf != nil {
 		c.Warningf(format, args...)
@@ -175,6 +179,11 @@ func (c *ResponsesClient) Invoke(ctx context.Context, req llm.InvokeRequest) (*l
 					compatStage = responsesCompatLegacy
 					compatChanged = true
 					diagnostics = append(diagnostics, llm.Diagnostic{Kind: "provider_compatibility_downgrade", Message: "OpenAI Responses provider rejected Responses-style input; retrying with legacy chat-compatible input."})
+				}
+				if downgradeForcedToolChoice(&req, payload.ToolChoice, msg) {
+					compatChanged = true
+					local.warnf("[WARN] %s", downgradeToolChoiceResponsesMessage)
+					diagnostics = append(diagnostics, llm.Diagnostic{Kind: "provider_compatibility_downgrade", Message: downgradeToolChoiceResponsesMessage})
 				}
 			}
 			if compatChanged && attempt < retry.maxRetries-1 {
@@ -515,6 +524,10 @@ func (c *ResponsesClient) InvokeStream(ctx context.Context, req llm.InvokeReques
 					if autoCompat && compatStage == responsesCompatFull && looksLikeResponsesInputUnsupported(msg) {
 						compatStage = responsesCompatLegacy
 						compatChanged = true
+					}
+					if downgradeForcedToolChoice(&req, payload.ToolChoice, msg) {
+						compatChanged = true
+						local.warnf("[WARN] %s", downgradeToolChoiceResponsesMessage)
 					}
 				}
 				if compatChanged && attempt < retry.maxRetries-1 {

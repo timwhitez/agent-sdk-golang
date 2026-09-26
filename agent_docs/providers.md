@@ -82,6 +82,14 @@ stream normalization, and response metadata behavior.
 - Strict tool schema conversion recurses through nested object properties and array item schemas, including arrays of objects and nested arrays, before Chat or Responses sends tool definitions to OpenAI-compatible gateways (`sdk/llm/openai/chat.go:1009`, `sdk/llm/openai/responses.go:1506`)
 - Endpoint resolution now only treats `/api/vN` (numeric version segment) as pre-versioned, so paths like `/api/openai` or `/api/v2beta` still receive `/v1/` (`sdk/llm/openai/chat.go:445`, `sdk/llm/openai/chat.go:466`)
 - Tool choice mapping supports auto/none/required and explicit forced function name (`sdk/llm/openai/chat.go:733`)
+- A forced `tool_choice` (`required` or a named function) that the provider
+  rejects on 400/422 with a message naming `tool_choice` as unsupported or
+  invalid (for example reasoning models whose thinking mode only accepts auto)
+  is retried once for that request with the auto representation; the warning
+  sink reports it and buffered completions also carry a
+  `provider_compatibility_downgrade` diagnostic. Chat and Responses, streaming
+  and buffered, share this behavior; the downgrade is not sticky for the
+  client. `InvokeRequest.DisableThinking` has no OpenAI wire mapping.
 - Content serialization for chat requests is text-focused (`sdk/llm/openai/chat.go:791`)
 
 ## OpenAI Responses API
