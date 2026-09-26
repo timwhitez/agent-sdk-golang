@@ -20,8 +20,9 @@ type Provider[T any] func(ctx context.Context) (T, error)
 type ctxKey string
 
 const (
-	toolCallIDKey     ctxKey = "tools.tool_call_id"
-	toolResultMetaKey ctxKey = "tools.tool_result_meta"
+	toolCallIDKey         ctxKey = "tools.tool_call_id"
+	toolExecutionFrameKey ctxKey = "tools.tool_execution_frame"
+	toolResultMetaKey     ctxKey = "tools.tool_result_meta"
 )
 
 // WithToolCallID attaches a tool_call_id to the context for tool handlers.
@@ -40,6 +41,32 @@ func ToolCallID(ctx context.Context) string {
 	}
 	v, _ := ctx.Value(toolCallIDKey).(string)
 	return strings.TrimSpace(v)
+}
+
+// ToolExecutionFrame is the finalizing model request that accepted a native
+// tool call. HostPublicationRevision is zero when the request's host-published
+// system history is unknown. Merged tool arguments may also have earlier
+// source Frames; this is correlation, not proof of complete request content.
+type ToolExecutionFrame struct {
+	FrameID                 string
+	HostPublicationRevision uint64
+}
+
+// WithToolExecutionFrame scopes a Frame to one native tool call. Even an empty
+// value shadows an enclosing call's Frame when a nested Agent executes a tool.
+func WithToolExecutionFrame(ctx context.Context, frame ToolExecutionFrame) context.Context {
+	if ctx == nil {
+		return nil
+	}
+	return context.WithValue(ctx, toolExecutionFrameKey, frame)
+}
+
+func CurrentToolExecutionFrame(ctx context.Context) (ToolExecutionFrame, bool) {
+	if ctx == nil {
+		return ToolExecutionFrame{}, false
+	}
+	frame, ok := ctx.Value(toolExecutionFrameKey).(ToolExecutionFrame)
+	return frame, ok && frame.FrameID != ""
 }
 
 // ---- tool result metadata ----

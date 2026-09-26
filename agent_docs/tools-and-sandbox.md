@@ -69,6 +69,7 @@ are never retried, and the original execution error/result is preserved.
 
 ## Tool Result Metadata Contract
 - `WithToolCallID` injects `tool_call_id` into context (`sdk/tools/deps.go:27`)
+- Native handlers receive `CurrentToolExecutionFrame`: the finalizing Frame ID and its request-local host-publication revision. Zero revision is unknown. This value is scoped to one call (including nested agents) and is correlation only; merged arguments may have earlier source Frames, and the value does not prove a complete frozen history or authorize a publication.
 - `WithToolResultMetadata` enables per-call metadata storage (`sdk/tools/deps.go:56`)
 - Metadata merges and snapshots via `UpsertToolResultMetadata` and `TakeToolResultMetadataSnapshot` (`sdk/tools/deps.go:98`, `sdk/tools/deps.go:136`)
 - `Container` offers dependency provisioning with memoization and inflight

@@ -10,6 +10,17 @@ import (
 	"time"
 )
 
+func TestToolExecutionFrameIsScopedAcrossNestedCalls(t *testing.T) {
+	parent := WithToolExecutionFrame(context.Background(), ToolExecutionFrame{FrameID: "parent/frame/1", HostPublicationRevision: 7})
+	if got, ok := CurrentToolExecutionFrame(parent); !ok || got.FrameID != "parent/frame/1" || got.HostPublicationRevision != 7 {
+		t.Fatalf("parent frame=%+v known=%v", got, ok)
+	}
+	child := WithToolExecutionFrame(parent, ToolExecutionFrame{})
+	if got, ok := CurrentToolExecutionFrame(child); ok || got != (ToolExecutionFrame{}) {
+		t.Fatalf("nested call inherited parent frame=%+v known=%v", got, ok)
+	}
+}
+
 func TestContainerGetConcurrent(t *testing.T) {
 	t.Parallel()
 
