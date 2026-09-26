@@ -98,3 +98,37 @@ func cloneCheckpointResult(res Result) Result {
 	out.previousLedger = nil
 	return out
 }
+
+// CompactionCheckpointOutcome is the Agent's final report for one checkpoint
+// its CompactionCheckpointWriter acknowledged (SaveCompactionCheckpoint
+// returned nil). Exactly one outcome is reported per acknowledged checkpoint
+// whose publication the Agent owns (every path except the checkpoint-only
+// Agent.CommitCompactionCheckpoint, whose caller owns publication).
+type CompactionCheckpointOutcome struct {
+	// CheckpointID is the acknowledged checkpoint's content identity.
+	CheckpointID string
+	// Published reports that the Agent installed history whose first Messages
+	// messages have exactly the checkpoint's JSON identity. It is reported
+	// before the matching CompactionEvent, if any, is emitted.
+	//
+	// When false, the checkpoint was abandoned after the acknowledgement: no
+	// history carrying it was installed, the live history is the one the
+	// Agent had before, and no CompactionEvent follows for it. A later
+	// compaction, if any, writes a new checkpoint.
+	Published bool
+	// Messages is the checkpoint's message count (Result.CheckpointMessages).
+	Messages int
+	// Reason is a diagnostic for an abandoned checkpoint; empty when published.
+	Reason string
+}
+
+// CompactionCheckpointSettler is optionally implemented by a
+// CompactionCheckpointWriter that must learn the outcome of a checkpoint it
+// acknowledged, for example because the acknowledgement made the checkpoint
+// durable and replayable. The Agent calls it synchronously on the goroutine
+// that published or abandoned the checkpoint, without holding its history
+// lock. An error is reported through the Agent's warning sink; it cannot undo
+// the reported outcome, so the settler must fail closed on its own side.
+type CompactionCheckpointSettler interface {
+	SettleCompactionCheckpoint(context.Context, CompactionCheckpointOutcome) error
+}
