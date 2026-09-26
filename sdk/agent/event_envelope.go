@@ -34,6 +34,19 @@ const RequestRecoveryStreamIdle = "stream_idle_recovery"
 // sole source of the request's content.
 const RequestSteeringAccepted = "steering_accepted"
 
+// RequestContinuationToolResults reports that this Frame's request carries
+// the tool results of a closed tool block to which no model response had
+// been accepted when it was built. RequestContinuationSourceFrameIDs names
+// the Frames whose responses produced the answered tool calls: the Frame
+// that finalized the block and every earlier Frame whose truncated
+// tool-call fragments the SDK merged into those calls. It names those
+// producers only, not every source of the request's content.
+const RequestContinuationToolResults = "tool_results_carried"
+
+// MaxRequestContinuationSources bounds RequestContinuationSourceFrameIDs. A
+// set the SDK cannot report within it is left unreported, never truncated.
+const MaxRequestContinuationSources = 16
+
 type EventKind string
 
 const (
@@ -93,6 +106,19 @@ type EventEnvelope struct {
 	// means unreported, not that no steering occurred.
 	RequestSteeringRelation      string `json:"RequestSteeringRelation,omitempty"`
 	RequestSteeringSourceFrameID string `json:"RequestSteeringSourceFrameID,omitempty"`
+	// Optional, producer-captured continuation provenance for this logical
+	// request (see RequestContinuationToolResults): the Frames, in build
+	// order and at most MaxRequestContinuationSources, whose responses
+	// produced the tool calls this request answers with tool results. It is
+	// set on every Frame built while those results await an accepted model
+	// response (a retry, or a Frame after steering or stream-idle recovery,
+	// reuses it) and cleared once a response is accepted, a compaction
+	// rewrites history or an ephemeral result is released. Empty means
+	// unreported, not that the request carries no earlier output. It holds
+	// Frame IDs only, never content, CallIDs or fingerprints; each envelope
+	// owns its copy.
+	RequestContinuationRelation       string   `json:"RequestContinuationRelation,omitempty"`
+	RequestContinuationSourceFrameIDs []string `json:"RequestContinuationSourceFrameIDs,omitempty"`
 	// HostPublicationRevision is the HistoryPublication.Revision whose system
 	// messages this Frame's request carries: the latest host publication when
 	// the request was built, provided the SDK had not changed the system

@@ -728,6 +728,14 @@ func (a *Agent) queryStreamWithSteering(ctx context.Context, input llm.Content, 
 		// exists before the Query's first Frame.
 		pendingSteeringSource := ""
 		boundaryFrame := ""
+		// pendingContinuation holds the Frames whose responses produced the
+		// tool calls of the last closed tool block while its committed results
+		// await an accepted model response; every Frame built meanwhile
+		// carries them. pendingContinuationGeneration is the compaction
+		// generation of the history those calls and results were committed
+		// to: a rewrite since then makes the set unknown, never inferred.
+		var pendingContinuation []string
+		pendingContinuationGeneration := uint64(0)
 		a.userInputEpoch.Add(1)
 		usageFallbackWarned := false
 		cont := newToolCallContinuation(defaultMaxContinuationTurns)
@@ -849,11 +857,19 @@ func (a *Agent) queryStreamWithSteering(ctx context.Context, input llm.Content, 
 				pendingRequireDoneFinalResponseID = ""
 			}
 
-			// Remove old ephemeral messages before the next LLM call.
-			a.destroyEphemeralMessages()
+			// Remove old ephemeral messages before the next LLM call. A
+			// released result may belong to the pending block, so the
+			// continuation set becomes unknown rather than overstated.
+			if a.destroyEphemeralMessages() > 0 {
+				pendingContinuation = nil
+			}
 
-			// The history and the publication it carries are read together.
-			messages, hostPublication := a.messagesAndHostPublication()
+			// The history, the publication it carries and its compaction
+			// generation are read together.
+			messages, hostPublication, historyGeneration := a.messagesAndHostPublication()
+			if historyGeneration != pendingContinuationGeneration {
+				pendingContinuation = nil
+			}
 			toolDefs := make([]llm.ToolDefinition, 0, len(a.tools))
 			for _, t := range a.tools {
 				if t.Hidden {
@@ -880,7 +896,8 @@ func (a *Agent) queryStreamWithSteering(ctx context.Context, input llm.Content, 
 				// until done, steering, or turn termination closes the subloop.
 				DisableThinking: requireDoneRecoveryDisableThinkingActive,
 			}
-			frame, frameErr := newExecutionFrame(fmt.Sprintf("%s/frame/%d", out.queryID, iter+1), a.llm, request, a.toolMap, a.toolMapNormalized)
+			frameOrdinal := iter + 1
+			frame, frameErr := newExecutionFrame(executionFrameID(out.queryID, frameOrdinal), a.llm, request, a.toolMap, a.toolMapNormalized)
 			// Capture only this request's disable-thinking control provenance.
 			// Later resets never relabel events from an already-created Frame.
 			if frameErr == nil && frame.request.DisableThinking {
@@ -903,6 +920,12 @@ func (a *Agent) queryStreamWithSteering(ctx context.Context, input llm.Content, 
 				frame.steeringSource = pendingSteeringSource
 			}
 			pendingSteeringSource = ""
+			// The tool results of the last closed block still await an
+			// accepted response; this Frame (and its retries) carries them.
+			// Not consumed here: steering or recovery Frames carry them too.
+			if frameErr == nil {
+				frame.continuationSources = pendingContinuation
+			}
 			// The host publication this request's system messages came from;
 			// retries reuse it even if the host publishes again meanwhile.
 			if frameErr == nil {
@@ -942,7 +965,7 @@ func (a *Agent) queryStreamWithSteering(ctx context.Context, input llm.Content, 
 				emitSDKErr(ErrorEvent{Kind: "invalid_request", Message: frameFailure + "; " + frameFailureHint})
 				return
 			}
-			invocation := &frameInvocation{frameID: frame.id, controlSource: frame.controlSource, historySource: frame.historySource, recoverySource: frame.recoverySource, steeringSource: frame.steeringSource, hostPublication: frame.hostPublication}
+			invocation := &frameInvocation{frameID: frame.id, controlSource: frame.controlSource, historySource: frame.historySource, recoverySource: frame.recoverySource, steeringSource: frame.steeringSource, continuationSources: frame.continuationSources, hostPublication: frame.hostPublication}
 			boundaryFrame = frame.id
 			comp, streamedText, err := a.invokeModelCompletionWithRetryAndSteering(ctx, frame.model, frame.request, out, steeringCh, invocation)
 			correlation := invocation.correlation()
@@ -1085,6 +1108,9 @@ func (a *Agent) queryStreamWithSteering(ctx context.Context, input llm.Content, 
 				return
 			}
 			streamIdleRecoveries = 0
+			// A model response to the carried tool results is now accepted;
+			// later Frames no longer continue that block.
+			pendingContinuation = nil
 			responseID := strings.TrimSpace(comp.ResponseID)
 			if responseID != "" {
 				lastResponseID = responseID
@@ -1156,7 +1182,14 @@ func (a *Agent) queryStreamWithSteering(ctx context.Context, input llm.Content, 
 				ToolCalls: comp.ToolCalls,
 			})
 			a.messages = append(a.messages, currentAssistant)
+			// The history generation this response's tool calls, and any
+			// block results that follow them, are committed to.
+			assistantGeneration := a.compactionGeneration.Load()
 			a.mu.Unlock()
+			// The Frames whose responses produced the tool calls a block of
+			// this response answers: this Frame, plus earlier truncated
+			// fragments when a continuation is merged below.
+			blockSources := []int{frameOrdinal}
 			// Observe-only: the response is already in history unchanged, and
 			// nothing below depends on this report.
 			// A response that continues a max_tokens truncation (text or tool
@@ -1222,7 +1255,7 @@ func (a *Agent) queryStreamWithSteering(ctx context.Context, input llm.Content, 
 					a.mu.Unlock()
 					continue
 				}
-				cont.addPartial(comp.ToolCalls)
+				cont.addPartial(comp.ToolCalls, frameOrdinal)
 				a.emitEvent(out, WarnEvent{
 					Message: fmt.Sprintf("continuing truncated tool-call arguments (%d/%d)", turn, cont.maxTurns),
 					Kind:    "continuation",
@@ -1246,6 +1279,7 @@ func (a *Agent) queryStreamWithSteering(ctx context.Context, input llm.Content, 
 			// Merge pending tool call continuations.
 			if comp.HasToolCalls() && cont.hasPending() {
 				seenToolCallHistory = true
+				mergedSources := cont.mergeSources(comp.ToolCalls, frameOrdinal)
 				merged := ensureSyntheticToolCallIDs(cont.mergeToolCalls(comp.ToolCalls))
 				continuationMergeDiagnostics = cont.mergeDiagnosticsForCalls(merged)
 				if !allToolArgsValid(merged) {
@@ -1275,7 +1309,7 @@ func (a *Agent) queryStreamWithSteering(ctx context.Context, input llm.Content, 
 						continue
 					}
 					// Still invalid JSON — keep accumulating.
-					cont.setAccumulated(merged)
+					cont.setAccumulated(merged, mergedSources)
 					a.emitEvent(out, WarnEvent{
 						Message: fmt.Sprintf("tool-call merge remained invalid; requesting continuation (%d/%d)", turn, cont.maxTurns),
 						Kind:    "continuation",
@@ -1302,6 +1336,7 @@ func (a *Agent) queryStreamWithSteering(ctx context.Context, input llm.Content, 
 					return
 				}
 				cont.clearPartialToolCalls(a.messages, msgIndex)
+				blockSources = unionFrameSources(mergedSources)
 				comp.ToolCalls = merged
 				currentAssistant = llm.CloneMessage(llm.Message{Role: llm.RoleAssistant, Content: comp.Content, ToolCalls: merged})
 				a.messages[msgIndex] = currentAssistant
@@ -1887,6 +1922,9 @@ func (a *Agent) queryStreamWithSteering(ctx context.Context, input llm.Content, 
 				// The block is closed and the steering is now in history.
 				pendingSteeringSource = frame.id
 			}
+			// Every accepted call now has its committed result: the next
+			// request answers them. A set beyond the bound stays unreported.
+			pendingContinuation, pendingContinuationGeneration = continuationFrameIDs(out.queryID, blockSources), assistantGeneration
 			if a.hasCompactor {
 				if err := a.checkAndCompact(ctx, frame.id, comp, out, additionalSinceCompletion()); err != nil {
 					emitCompactionErr(a.errEvent(err))
@@ -3092,6 +3130,10 @@ func applyEventCorrelation(envelope *EventEnvelope, correlations []eventCorrelat
 			envelope.RequestSteeringRelation = RequestSteeringAccepted
 			envelope.RequestSteeringSourceFrameID = correlation.steeringSource
 		}
+		if len(correlation.continuationSources) > 0 {
+			envelope.RequestContinuationRelation = RequestContinuationToolResults
+			envelope.RequestContinuationSourceFrameIDs = append([]string(nil), correlation.continuationSources...)
+		}
 		envelope.HostPublicationRevision = correlation.hostPublication
 		envelope.ToolBlockID, envelope.ToolCallOrdinal, envelope.ToolBlockCallCount = correlation.toolBlockID, correlation.toolCallOrdinal, correlation.blockCallCount
 	}
@@ -3500,9 +3542,12 @@ func (a *Agent) lastResultForSignatureIsRecycled(signature string) bool {
 	return false
 }
 
-func (a *Agent) destroyEphemeralMessages() {
+// destroyEphemeralMessages releases old ephemeral tool results and returns
+// how many it released.
+func (a *Agent) destroyEphemeralMessages() int {
 	a.mu.Lock()
 	defer a.mu.Unlock()
+	released := 0
 
 	if a.ephemeralByKey == nil {
 		a.ephemeralByKey = make(map[string][]int)
@@ -3563,6 +3608,7 @@ func (a *Agent) destroyEphemeralMessages() {
 				continue
 			}
 			m.Destroyed = true
+			released++
 			m.Content = llm.TextContent(ephemeralReleasedPlaceholder)
 			a.messages[i] = m
 		}
@@ -3572,6 +3618,7 @@ func (a *Agent) destroyEphemeralMessages() {
 		}
 		a.ephemeralByKey[key] = idxs
 	}
+	return released
 }
 
 // ephemeralGroupKeyLocked returns the grouping key for a tool result. Results
@@ -5666,7 +5713,10 @@ func autoInvalidTool() tools.Tool {
 
 // toolCallContinuation tracks partial tool calls across auto-continue boundaries.
 type toolCallContinuation struct {
-	partialCalls     []llm.ToolCall
+	partialCalls []llm.ToolCall
+	// partialSources[i] lists, ascending, the Frame ordinals whose truncated
+	// fragments partialCalls[i] merges.
+	partialSources   [][]int
 	mergeDiagnostics map[string][]string
 	turns            int
 	maxTurns         int
@@ -5727,6 +5777,7 @@ func (c *toolCallContinuation) reset() {
 		return
 	}
 	c.partialCalls = nil
+	c.partialSources = nil
 	c.mergeDiagnostics = nil
 	c.turns = 0
 }
@@ -5775,9 +5826,13 @@ func (a *Agent) discardContinuationToolCalls(cont *toolCallContinuation, current
 	return nil
 }
 
-func (c *toolCallContinuation) addPartial(calls []llm.ToolCall) {
+func (c *toolCallContinuation) addPartial(calls []llm.ToolCall, source int) {
 	if len(c.partialCalls) == 0 {
 		c.partialCalls = cloneToolCalls(calls)
+		c.partialSources = make([][]int, len(calls))
+		for i := range c.partialSources {
+			c.partialSources[i] = []int{source}
+		}
 	} else {
 		// Accumulate: merge by ID
 		for _, tc := range calls {
@@ -5786,6 +5841,7 @@ func (c *toolCallContinuation) addPartial(calls []llm.ToolCall) {
 				if sameStableToolCallID(p.ID, tc.ID) {
 					merged := mergeToolArgsWithDiagnostics(p.Function.Arguments, tc.Function.Arguments)
 					c.partialCalls[i].Function.Arguments = merged.arguments
+					c.partialSources[i] = addFrameSource(c.partialSources[i], source)
 					c.recordMergeDiagnostics(tc.ID, merged.diagnostics)
 					found = true
 					break
@@ -5793,13 +5849,33 @@ func (c *toolCallContinuation) addPartial(calls []llm.ToolCall) {
 			}
 			if !found {
 				c.partialCalls = append(c.partialCalls, tc)
+				c.partialSources = append(c.partialSources, []int{source})
 			}
 		}
 	}
 }
 
-func (c *toolCallContinuation) setAccumulated(calls []llm.ToolCall) {
+func (c *toolCallContinuation) setAccumulated(calls []llm.ToolCall, sources [][]int) {
 	c.partialCalls = cloneToolCalls(calls)
+	c.partialSources = sources
+}
+
+// mergeSources returns, per call of current, the Frame ordinals whose
+// fragments mergeToolCalls combines into it: the partial it matches, if any,
+// plus source (the Frame that produced current).
+func (c *toolCallContinuation) mergeSources(current []llm.ToolCall, source int) [][]int {
+	result := make([][]int, 0, len(current))
+	for _, tc := range current {
+		sources := []int{source}
+		for i, p := range c.partialCalls {
+			if sameStableToolCallID(p.ID, tc.ID) {
+				sources = addFrameSource(c.partialSources[i], source)
+				break
+			}
+		}
+		result = append(result, sources)
+	}
+	return result
 }
 
 func (c *toolCallContinuation) mergeToolCalls(current []llm.ToolCall) []llm.ToolCall {

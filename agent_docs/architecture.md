@@ -269,6 +269,28 @@ The pair is separate from the control, compaction and recovery pairs, which
 can appear on the same Frame. It is not a content source: a continuation's
 finalizing Frame is still not the sole source of merged tool-call content.
 
+### Tool-continuation provenance
+
+The optional Envelope `RequestContinuationRelation=tool_results_carried` and
+`RequestContinuationSourceFrameIDs` report that a Frame's request carries the
+committed results of a closed tool block to which no model response had been
+accepted yet, and name the Frames whose responses produced the answered tool
+calls: the Frame that finalized the block and every earlier Frame whose
+truncated tool-call fragments the driver merged into those calls (a fragment
+whose call ID the provider rotated was never merged and is not named). The
+set is recorded by the driver when the block closes, never inferred from the
+nearest Frame, a CallID or the model; it is ordered by Frame, bounded by
+`MaxRequestContinuationSources` (a larger set is left unreported, not
+truncated) and each envelope owns its copy. Every Frame built while those
+results await an accepted response carries it: retries reuse the Frame's
+value, and a Frame after steering or stream-idle recovery carries it together
+with that relation. It is cleared once a model response is accepted, and
+becomes unknown (empty) when a compaction rewrites history or an ephemeral
+tool result is released before the request is built. It carries only Frame
+IDs, never content, CallIDs or fingerprints, and it does not name every
+producer of the request's content (earlier partial outputs saved on
+steering or recovery, for example, keep their own relations).
+
 ### Host publication revision
 
 `ReplaceHistoryCheckedRevision` returns the `HistoryPublication` it made under
