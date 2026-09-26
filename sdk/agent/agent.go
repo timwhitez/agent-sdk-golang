@@ -3581,9 +3581,29 @@ func (a *Agent) destroyEphemeralMessagesAfter(anchor *llm.Message) (released int
 	if a.ephemeralScanFrom < 0 || a.ephemeralScanFrom > len(a.messages) {
 		a.resetEphemeralTrackingLocked()
 	}
+	released, afterAnchor = a.releaseEphemeral(a.messages, a.ephemeralByKey, a.ephemeralSigByCall, a.ephemeralScanFrom, anchor != nil, boundary)
+	a.ephemeralScanFrom = len(a.messages)
+	return released, afterAnchor
+}
 
-	for i := a.ephemeralScanFrom; i < len(a.messages); i++ {
-		m := a.messages[i]
+// releasedEphemeralHistory returns a copy of messages with the ephemeral keep
+// windows applied exactly as a fresh scan (the one that follows any history
+// installation, which resets tracking) would apply them. It reads only the
+// immutable tool map, so it needs no lock.
+func (a *Agent) releasedEphemeralHistory(messages []llm.Message) []llm.Message {
+	out := llm.CloneMessages(messages)
+	a.releaseEphemeral(out, make(map[string][]int), make(map[string]string), 0, false, -1)
+	return out
+}
+
+// releaseEphemeral scans messages[scanFrom:] into the tracking maps and
+// rewrites ephemeral tool results beyond their keep window in place. It
+// returns how many it released and, when anchored, whether one of them lies
+// after boundary (a negative boundary means the anchor was not found). The
+// caller owns the scan position: the whole slice has been scanned on return.
+func (a *Agent) releaseEphemeral(messages []llm.Message, byKey map[string][]int, sigByCall map[string]string, scanFrom int, anchored bool, boundary int) (released int, afterAnchor bool) {
+	for i := scanFrom; i < len(messages); i++ {
+		m := messages[i]
 		// Record argument signatures for every tool call so that tool results
 		// can be grouped by their concrete target rather than only by tool name.
 		if m.Role == llm.RoleAssistant {
@@ -3592,7 +3612,7 @@ func (a *Agent) destroyEphemeralMessagesAfter(anchor *llm.Message) (released int
 				if id == "" {
 					continue
 				}
-				a.ephemeralSigByCall[id] = normalizeToolSignature(tc.Function.Name, nil, tc.Function.Arguments)
+				sigByCall[id] = normalizeToolSignature(tc.Function.Name, nil, tc.Function.Arguments)
 			}
 			continue
 		}
@@ -3606,11 +3626,11 @@ func (a *Agent) destroyEphemeralMessagesAfter(anchor *llm.Message) (released int
 		if toolName == "" {
 			continue
 		}
-		a.ephemeralByKey[a.ephemeralGroupKeyLocked(m, toolName)] = append(a.ephemeralByKey[a.ephemeralGroupKeyLocked(m, toolName)], i)
+		key := ephemeralGroupKey(sigByCall, m, toolName)
+		byKey[key] = append(byKey[key], i)
 	}
-	a.ephemeralScanFrom = len(a.messages)
 
-	for key, idxs := range a.ephemeralByKey {
+	for key, idxs := range byKey {
 		keep := 1
 		if t, ok := a.toolMap[toolNameFromGroupKey(key)]; ok {
 			if t.EphemeralKeep > 0 {
@@ -3623,39 +3643,39 @@ func (a *Agent) destroyEphemeralMessagesAfter(anchor *llm.Message) (released int
 		for len(idxs) > keep {
 			i := idxs[0]
 			idxs = idxs[1:]
-			if i < 0 || i >= len(a.messages) {
+			if i < 0 || i >= len(messages) {
 				continue
 			}
-			m := a.messages[i]
+			m := messages[i]
 			if m.Role != llm.RoleTool || !m.Ephemeral || m.Destroyed {
 				continue
 			}
 			m.Destroyed = true
 			released++
-			if anchor != nil && (boundary < 0 || i > boundary) {
+			if anchored && (boundary < 0 || i > boundary) {
 				afterAnchor = true
 			}
 			m.Content = llm.TextContent(ephemeralReleasedPlaceholder)
-			a.messages[i] = m
+			messages[i] = m
 		}
 		if len(idxs) == 0 {
-			delete(a.ephemeralByKey, key)
+			delete(byKey, key)
 			continue
 		}
-		a.ephemeralByKey[key] = idxs
+		byKey[key] = idxs
 	}
 	return released, afterAnchor
 }
 
-// ephemeralGroupKeyLocked returns the grouping key for a tool result. Results
+// ephemeralGroupKey returns the grouping key for a tool result. Results
 // with the same tool name and argument signature (e.g. reading the same
 // path/offset/limit) share a key so redundant re-reads collapse to the newest
 // entry, while results targeting different arguments keep independent keep
 // windows and never evict one another. Falls back to the tool name alone when
 // the originating call's arguments are unknown.
-func (a *Agent) ephemeralGroupKeyLocked(m llm.Message, toolName string) string {
+func ephemeralGroupKey(sigByCall map[string]string, m llm.Message, toolName string) string {
 	if id := strings.TrimSpace(m.ToolCallID); id != "" {
-		if sig, ok := a.ephemeralSigByCall[id]; ok && sig != "" {
+		if sig, ok := sigByCall[id]; ok && sig != "" {
 			return toolName + "\x00" + sig
 		}
 	}
@@ -3663,7 +3683,7 @@ func (a *Agent) ephemeralGroupKeyLocked(m llm.Message, toolName string) string {
 }
 
 // toolNameFromGroupKey extracts the tool name from a group key produced by
-// ephemeralGroupKeyLocked.
+// ephemeralGroupKey.
 func toolNameFromGroupKey(key string) string {
 	if idx := strings.IndexByte(key, '\x00'); idx >= 0 {
 		return key[:idx]
@@ -4656,6 +4676,10 @@ func (a *Agent) applyPendingCompaction(out *eventOutput) (published bool) {
 			merged = repaired
 		}
 	}
+	// Apply the ephemeral keep windows now, exactly as the scan that follows
+	// installation would, so the checkpoint is the history that stays
+	// installed rather than one the next request rewrites inside its prefix.
+	merged = a.releasedEphemeralHistory(merged)
 	a.mu.Unlock()
 
 	if pairingRepaired {
@@ -4698,11 +4722,14 @@ func (a *Agent) applyPendingCompaction(out *eventOutput) (published bool) {
 		}
 		a.requeuePendingCompaction(pending)
 		a.compactionRetryPending.Store(true)
+		const reason = "history changed while checkpoint persistence was running"
 		if rollbackErr != nil {
-			a.warnf("compaction apply deferred because history changed while checkpoint persistence was running; ledger rollback failed: %v", rollbackErr)
+			a.warnf("compaction apply deferred because %s; ledger rollback failed: %v", reason, rollbackErr)
 		} else {
-			a.warnf("compaction apply deferred because history changed while checkpoint persistence was running; ledger state was rolled back and the unreferenced checkpoint can be garbage-collected")
+			a.warnf("compaction apply deferred because %s; ledger state was rolled back and the acknowledged checkpoint was not published", reason)
 		}
+		// The writer acknowledged a checkpoint that will never be installed.
+		a.settleCheckpoint(commit, false, reason)
 		return false
 	}
 	if commit.persisted {
@@ -4719,6 +4746,7 @@ func (a *Agent) applyPendingCompaction(out *eventOutput) (published bool) {
 	a.hostPublication = 0
 	a.mu.Unlock()
 
+	a.settleCheckpoint(commit, true, "")
 	a.emitCompactionWithAccounting(out, CompactionEvent{Result: commit.result, TriggerUsage: pending.triggerUsage})
 	return true
 }
@@ -4927,11 +4955,18 @@ func (a *Agent) CompactPipelineNow(ctx context.Context, req compaction.PipelineR
 	a.clearSatisfiedCompactionWork(decision)
 	newMsgs = a.withPreservedSystem(orig, newMsgs)
 	if res.Compacted {
+		// As in applyPendingCompaction: checkpoint the history the next
+		// request keeps, not one its ephemeral scan rewrites.
+		newMsgs = a.releasedEphemeralHistory(newMsgs)
 		res = a.reconcileCompactionTelemetry(res, orig, newMsgs, req.AdditionalTokens)
-		res, err = a.commitCompactionCheckpoint(ctx, newMsgs, res)
-		if err != nil {
-			return res, err
+		commit, commitErr := a.persistCompactionCheckpoint(ctx, newMsgs, res)
+		if commitErr != nil {
+			return commit.result, commitErr
 		}
+		if commit.persisted {
+			a.compactor.FinalizePendingLedger(&commit.transaction)
+		}
+		res = commit.result
 		a.mu.Lock()
 		a.messages = newMsgs
 		a.resetEphemeralTrackingLocked()
@@ -4942,6 +4977,7 @@ func (a *Agent) CompactPipelineNow(ctx context.Context, req compaction.PipelineR
 		// The SDK computed these system messages; the host did not publish them.
 		a.hostPublication = 0
 		a.mu.Unlock()
+		a.settleCheckpoint(commit, true, "")
 	}
 	return res, nil
 }
@@ -4953,6 +4989,36 @@ type pendingCheckpointCommit struct {
 	result      compaction.Result
 	transaction compaction.Result
 	persisted   bool
+	// writer acknowledged the checkpoint when persisted is true; its outcome
+	// is settled through it even if the configuration changed since.
+	writer compaction.CompactionCheckpointWriter
+}
+
+// settleCheckpoint reports the outcome of an acknowledged checkpoint to the
+// writer that acknowledged it. Callers must not hold a.mu.
+func (a *Agent) settleCheckpoint(commit pendingCheckpointCommit, published bool, reason string) {
+	if !commit.persisted || commit.writer == nil {
+		return
+	}
+	settler, ok := commit.writer.(compaction.CompactionCheckpointSettler)
+	if !ok {
+		return
+	}
+	outcome := compaction.CompactionCheckpointOutcome{
+		CheckpointID: commit.result.CheckpointID,
+		Published:    published,
+		Messages:     commit.result.CheckpointMessages,
+	}
+	if !published {
+		outcome.Reason = reason
+	}
+	if err := settler.SettleCompactionCheckpoint(context.Background(), outcome); err != nil {
+		state := "abandoned"
+		if published {
+			state = "published"
+		}
+		a.warnf("compaction checkpoint %s was %s but its writer could not settle it: %v", outcome.CheckpointID, state, err)
+	}
 }
 
 // persistCompactionCheckpoint performs all potentially blocking persistence
@@ -4983,9 +5049,10 @@ func (a *Agent) persistCompactionCheckpoint(ctx context.Context, messages []llm.
 		commit.result = failed
 		return commit, fmt.Errorf("compaction ledger persistence failed: %w", err)
 	}
+	writer := a.compactor.Config.CheckpointWriter
 	checkpoint, err := compaction.NewCompactionCheckpoint(messages, transaction)
 	if err == nil {
-		err = a.compactor.Config.CheckpointWriter.SaveCompactionCheckpoint(ctx, checkpoint)
+		err = writer.SaveCompactionCheckpoint(ctx, checkpoint)
 	}
 	if err != nil && compaction.CheckpointOutcomeIsUnknown(err) {
 		// The checkpoint may already be durable: rolling the ledger back or
@@ -5017,14 +5084,16 @@ func (a *Agent) persistCompactionCheckpoint(ctx context.Context, messages []llm.
 	commit.result = checkpoint.Result
 	commit.transaction = transaction
 	commit.persisted = true
+	commit.writer = writer
 	return commit, nil
 }
 
 // CommitCompactionCheckpoint durably records compacted provider history before
 // callers replace in-memory history. A persistence failure is fail-closed: the
 // returned result is not reported as compacted and the caller keeps old state.
-// This checkpoint-only API does not own subsequent history publication. Hosts
-// publishing a computed candidate should use CommitCompactionHistory instead.
+// This checkpoint-only API does not own subsequent history publication, so it
+// never reports a CompactionCheckpointOutcome: the caller owns the outcome.
+// Hosts publishing a computed candidate should use CommitCompactionHistory.
 func (a *Agent) CommitCompactionCheckpoint(ctx context.Context, messages []llm.Message, res compaction.Result) (compaction.Result, error) {
 	releaseCompactionRuntime, err := a.beginCompactionRuntimeUse(ctx)
 	if err != nil {

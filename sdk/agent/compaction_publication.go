@@ -40,6 +40,9 @@ func (a *Agent) beginManualCompaction(ctx context.Context) (func(), error) {
 // A successful writer acknowledgement is followed by publication even if ctx
 // was canceled in the meantime; this is not an automatic durable rollback.
 // Without a writer, publication is memory-only and no CheckpointID is invented.
+// A writer implementing compaction.CompactionCheckpointSettler is told the
+// checkpoint was published before this returns. The candidate is installed
+// verbatim; later ephemeral recycling inside it is ordinary history change.
 // This content check is not a host session/runtime revision or an external-store
 // transaction. Legacy checkpoint-only calls and external writers are not fenced.
 func (a *Agent) CommitCompactionHistory(ctx context.Context, expected, messages []llm.Message, res compaction.Result) (compaction.Result, error) {
@@ -101,5 +104,6 @@ func (a *Agent) CommitCompactionHistoryRevision(ctx context.Context, expected, m
 	if commit.persisted {
 		a.compactor.FinalizePendingLedger(&commit.transaction)
 	}
+	a.settleCheckpoint(commit, true, "")
 	return commit.result, publication, nil
 }
