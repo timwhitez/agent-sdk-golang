@@ -160,14 +160,30 @@ func toolChoiceRequest(choice llm.ToolChoice) llm.InvokeRequest {
 // path and returns the text, diagnostics (buffered only) and error.
 func invokeToolChoiceClient(t *testing.T, api string, stream bool, baseURL string, warn *warningRecorder, req llm.InvokeRequest) (string, []llm.Diagnostic, error) {
 	t.Helper()
+	return invokeCompatClient(t, api, stream, baseURL, warn, compatClientOptions{maxRetries: 1}, req)
+}
+
+// compatClientOptions configures the client under test. maxRetries 1 is the
+// production shape when an outer wrapper owns transient retries.
+type compatClientOptions struct {
+	maxRetries          int
+	reasoningEffort     string
+	extra, extraBody    map[string]any
+	maxCompletionTokens *int
+}
+
+func invokeCompatClient(t *testing.T, api string, stream bool, baseURL string, warn *warningRecorder, opts compatClientOptions, req llm.InvokeRequest) (string, []llm.Diagnostic, error) {
+	t.Helper()
 	var model interface {
 		Invoke(context.Context, llm.InvokeRequest) (*llm.Completion, error)
 		InvokeStream(context.Context, llm.InvokeRequest) (<-chan llm.StreamEvent, error)
 	}
 	if api == "chat" {
-		model = &ChatClient{BaseURL: baseURL, ModelName: "test-model", MaxRetries: 3, Warningf: warn.warnf}
+		model = &ChatClient{BaseURL: baseURL, ModelName: "test-model", MaxRetries: opts.maxRetries, Warningf: warn.warnf,
+			ReasoningEffort: opts.reasoningEffort, Extra: opts.extra, ExtraBody: opts.extraBody, MaxCompletionTokens: opts.maxCompletionTokens}
 	} else {
-		model = &ResponsesClient{BaseURL: baseURL, ModelName: "test-model", MaxRetries: 3, Warningf: warn.warnf}
+		model = &ResponsesClient{BaseURL: baseURL, ModelName: "test-model", MaxRetries: opts.maxRetries, Warningf: warn.warnf,
+			ReasoningEffort: opts.reasoningEffort, Extra: opts.extra, ExtraBody: opts.extraBody}
 	}
 	if !stream {
 		comp, err := model.Invoke(context.Background(), req)
@@ -225,55 +241,57 @@ func TestForcedToolChoiceRejectedRetriesOnceWithAuto(t *testing.T) {
 	t.Parallel()
 	for _, tc := range toolChoiceCases {
 		for _, choice := range []llm.ToolChoice{"required", "done"} {
-			t.Run(tc.name()+"_"+string(choice), func(t *testing.T) {
-				t.Parallel()
-				gw := &toolChoiceGateway{api: tc.api, reject: rejectForcedToolChoice}
-				server := httptest.NewServer(gw)
-				defer server.Close()
-				warn := &warningRecorder{}
+			for _, maxRetries := range []int{1, 3} {
+				t.Run(fmt.Sprintf("%s_%s_max%d", tc.name(), choice, maxRetries), func(t *testing.T) {
+					t.Parallel()
+					gw := &toolChoiceGateway{api: tc.api, reject: rejectForcedToolChoice}
+					server := httptest.NewServer(gw)
+					defer server.Close()
+					warn := &warningRecorder{}
 
-				text, diags, err := invokeToolChoiceClient(t, tc.api, tc.stream, server.URL, warn, toolChoiceRequest(choice))
-				if err != nil {
-					t.Fatalf("invoke: %v", err)
-				}
-				if text != "ok" {
-					t.Fatalf("text = %q, want ok", text)
-				}
-				bodies := gw.snapshot()
-				if len(bodies) != 2 {
-					t.Fatalf("requests = %d, want 2", len(bodies))
-				}
-				if !forcedWireToolChoice(bodies[0]) {
-					t.Fatalf("first request tool_choice = %#v, want forced", bodies[0]["tool_choice"])
-				}
-				switch tc.api {
-				case "chat":
-					if got := bodies[1]["tool_choice"]; got != "auto" {
-						t.Fatalf("retry tool_choice = %#v, want auto", got)
+					text, diags, err := invokeCompatClient(t, tc.api, tc.stream, server.URL, warn, compatClientOptions{maxRetries: maxRetries}, toolChoiceRequest(choice))
+					if err != nil {
+						t.Fatalf("invoke: %v", err)
 					}
-				default:
-					if got, ok := bodies[1]["tool_choice"]; ok {
-						t.Fatalf("retry tool_choice = %#v, want omitted (auto)", got)
+					if text != "ok" {
+						t.Fatalf("text = %q, want ok", text)
 					}
-				}
-				if !reflect.DeepEqual(withoutToolChoice(bodies[0]), withoutToolChoice(bodies[1])) {
-					t.Fatalf("retry changed more than tool_choice:\nfirst: %#v\nretry: %#v", bodies[0], bodies[1])
-				}
-				if got := warn.count(toolChoiceDowngradeWarning); got != 1 {
-					t.Fatalf("downgrade warnings = %d, want 1 (all: %q)", got, warn.msgs)
-				}
-				if !tc.stream {
-					found := 0
-					for _, d := range diags {
-						if d.Kind == "provider_compatibility_downgrade" && strings.Contains(d.Message, toolChoiceDowngradeWarning) {
-							found++
+					bodies := gw.snapshot()
+					if len(bodies) != 2 {
+						t.Fatalf("requests = %d, want 2", len(bodies))
+					}
+					if !forcedWireToolChoice(bodies[0]) {
+						t.Fatalf("first request tool_choice = %#v, want forced", bodies[0]["tool_choice"])
+					}
+					switch tc.api {
+					case "chat":
+						if got := bodies[1]["tool_choice"]; got != "auto" {
+							t.Fatalf("retry tool_choice = %#v, want auto", got)
+						}
+					default:
+						if got, ok := bodies[1]["tool_choice"]; ok {
+							t.Fatalf("retry tool_choice = %#v, want omitted (auto)", got)
 						}
 					}
-					if found != 1 {
-						t.Fatalf("downgrade diagnostics = %d, want 1 (%#v)", found, diags)
+					if !reflect.DeepEqual(withoutToolChoice(bodies[0]), withoutToolChoice(bodies[1])) {
+						t.Fatalf("retry changed more than tool_choice:\nfirst: %#v\nretry: %#v", bodies[0], bodies[1])
 					}
-				}
-			})
+					if got := warn.count(toolChoiceDowngradeWarning); got != 1 {
+						t.Fatalf("downgrade warnings = %d, want 1 (all: %q)", got, warn.msgs)
+					}
+					if !tc.stream {
+						found := 0
+						for _, d := range diags {
+							if d.Kind == "provider_compatibility_downgrade" && strings.Contains(d.Message, toolChoiceDowngradeWarning) {
+								found++
+							}
+						}
+						if found != 1 {
+							t.Fatalf("downgrade diagnostics = %d, want 1 (%#v)", found, diags)
+						}
+					}
+				})
+			}
 		}
 	}
 }
@@ -291,9 +309,9 @@ func TestForcedToolChoiceDowngradeIsNotSticky(t *testing.T) {
 			warn := &warningRecorder{}
 			var model llm.ChatModel
 			if api == "chat" {
-				model = &ChatClient{BaseURL: server.URL, ModelName: "test-model", MaxRetries: 3, Warningf: warn.warnf}
+				model = &ChatClient{BaseURL: server.URL, ModelName: "test-model", MaxRetries: 1, Warningf: warn.warnf}
 			} else {
-				model = &ResponsesClient{BaseURL: server.URL, ModelName: "test-model", MaxRetries: 3, Warningf: warn.warnf}
+				model = &ResponsesClient{BaseURL: server.URL, ModelName: "test-model", MaxRetries: 1, Warningf: warn.warnf}
 			}
 			for i := 0; i < 2; i++ {
 				if _, err := model.Invoke(context.Background(), toolChoiceRequest("required")); err != nil {

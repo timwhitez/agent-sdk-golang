@@ -97,6 +97,8 @@ func requireDoneGatewayBody(api string, stream bool, reply string, n int) string
 	}
 }
 
+// The clients use MaxRetries 1, the production shape when an outer wrapper
+// owns transient retries.
 // The RequireDone recovery forces tool_choice; a reasoning-model gateway that
 // rejects forced tool_choice must not end the run with a runtime error. The
 // client downgrades that request to auto, and the Agent either receives the
@@ -113,9 +115,9 @@ func TestAgentRequireDoneSurvivesForcedToolChoiceRejection(t *testing.T) {
 
 				var model llm.ChatModel
 				if api == "chat" {
-					model = &openai.ChatClient{BaseURL: server.URL, ModelName: "test-model", MaxRetries: 3, Warningf: func(string, ...any) {}}
+					model = &openai.ChatClient{BaseURL: server.URL, ModelName: "test-model", MaxRetries: 1, Warningf: func(string, ...any) {}}
 				} else {
-					model = &openai.ResponsesClient{BaseURL: server.URL, ModelName: "test-model", MaxRetries: 3, Warningf: func(string, ...any) {}}
+					model = &openai.ResponsesClient{BaseURL: server.URL, ModelName: "test-model", MaxRetries: 1, Warningf: func(string, ...any) {}}
 				}
 				var workCalls, doneCalls atomic.Int32
 				work := tools.Func[struct{}]("work", "fixture work", func(context.Context, struct{}, *tools.Container) (any, error) {

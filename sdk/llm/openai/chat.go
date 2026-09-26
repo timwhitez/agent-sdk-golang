@@ -115,6 +115,7 @@ func (c *ChatClient) Invoke(ctx context.Context, req llm.InvokeRequest) (*llm.Co
 	retry := resolveRetryPolicy(local.MaxRetries, local.RetryBaseDelay, local.RetryMaxDelay)
 	diagnostics := cacheDiagnostics
 
+	compatResends := 0
 	for attempt := 0; attempt < retry.maxRetries; attempt++ {
 		if err := ctx.Err(); err != nil {
 			return nil, err
@@ -191,7 +192,11 @@ func (c *ChatClient) Invoke(ctx context.Context, req llm.InvokeRequest) (*llm.Co
 					diagnostics = append(diagnostics, llm.Diagnostic{Kind: "provider_compatibility_downgrade", Message: downgradeToolChoiceChatMessage})
 				}
 			}
-			if compatChanged && attempt < retry.maxRetries-1 {
+			if compatChanged && compatResends < maxCompatibilityResends {
+				// A downgrade changes the request; it is not a transient retry
+				// and must not consume or depend on the retry budget.
+				compatResends++
+				attempt--
 				continue
 			}
 			if resp.StatusCode == 429 {
@@ -250,6 +255,7 @@ func (c *ChatClient) InvokeStream(ctx context.Context, req llm.InvokeRequest) (<
 		retry := resolveRetryPolicy(local.MaxRetries, local.RetryBaseDelay, local.RetryMaxDelay)
 		includeStreamOptions := true
 
+		compatResends := 0
 		for attempt := 0; attempt < retry.maxRetries; attempt++ {
 			if err := ctx.Err(); err != nil {
 				out <- llm.StreamErrorEvent{Err: err}
@@ -344,7 +350,11 @@ func (c *ChatClient) InvokeStream(ctx context.Context, req llm.InvokeRequest) (<
 						local.warnf("[WARN] %s", downgradeToolChoiceChatMessage)
 					}
 				}
-				if compatChanged && attempt < retry.maxRetries-1 {
+				if compatChanged && compatResends < maxCompatibilityResends {
+					// A downgrade changes the request; it is not a transient retry
+					// and must not consume or depend on the retry budget.
+					compatResends++
+					attempt--
 					continue
 				}
 
@@ -886,6 +896,14 @@ func looksLikeThinkingUnsupported(msg string) bool {
 	}
 	return false
 }
+
+// maxCompatibilityResends bounds compatibility-downgrade resends of one
+// request. Resends are separate from the transient retry budget (MaxRetries),
+// so a client configured with a single attempt, as when an outer wrapper owns
+// retries, still applies a downgrade. Every downgrade fires at most once
+// because it is gated on the rejected setting still being present; this cap is
+// only a defensive bound on that.
+const maxCompatibilityResends = 8
 
 // isForcedToolChoice reports whether choice forces a tool call on the wire:
 // "required" or a named function. Empty/"auto" and "none" are not forced.

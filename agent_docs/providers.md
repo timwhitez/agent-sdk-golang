@@ -90,6 +90,13 @@ stream normalization, and response metadata behavior.
   `provider_compatibility_downgrade` diagnostic. Chat and Responses, streaming
   and buffered, share this behavior; the downgrade is not sticky for the
   client. `InvokeRequest.DisableThinking` has no OpenAI wire mapping.
+- OpenAI compatibility downgrades (reasoning_effort, extra_body, thinking
+  extras, max_completion_tokens, stream_options, string input, legacy input,
+  forced tool_choice) are request changes, not transient retries: their
+  resends do not consume `MaxRetries`, so a client pinned to one attempt
+  behind an outer retry wrapper still applies them. Each downgrade fires at
+  most once per request because it is gated on the rejected setting still
+  being present.
 - Content serialization for chat requests is text-focused (`sdk/llm/openai/chat.go:791`)
 
 ## OpenAI Responses API
