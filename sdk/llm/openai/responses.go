@@ -59,9 +59,17 @@ type ResponsesClient struct {
 	Warningf func(format string, args ...any)
 }
 
-// downgradeToolChoiceResponsesMessage reports a forced tool_choice relaxed to
-// auto for one request after the provider rejected it.
-const downgradeToolChoiceResponsesMessage = "OpenAI Responses provider rejected forced tool_choice; retried with auto."
+// Compatibility-downgrade messages shared by the Responses buffered and
+// streaming paths. downgradeToolChoiceResponsesMessage reports a forced
+// tool_choice relaxed to auto for one request after the provider rejected it.
+const (
+	downgradeReasoningEffortResponsesMessage = "OpenAI Responses provider rejected reasoning_effort; retrying without reasoning_effort."
+	downgradeExtraBodyResponsesMessage       = "OpenAI Responses provider rejected extra request body settings; retrying without extra_body."
+	downgradeThinkingResponsesMessage        = "OpenAI Responses provider rejected thinking settings; retrying without thinking extras."
+	downgradeToolChoiceResponsesMessage      = "OpenAI Responses provider rejected forced tool_choice; retried with auto."
+	downgradeStringInputResponsesMessage     = "OpenAI Responses provider rejected content-array input; retrying with string input compatibility mode."
+	downgradeLegacyInputResponsesMessage     = "OpenAI Responses provider rejected Responses-style input; retrying with legacy chat-compatible input."
+)
 
 func (c *ResponsesClient) warnf(format string, args ...any) {
 	if c != nil && c.Warningf != nil {
@@ -160,28 +168,33 @@ func (c *ResponsesClient) Invoke(ctx context.Context, req llm.InvokeRequest) (*l
 				if strings.TrimSpace(local.ReasoningEffort) != "" && looksLikeReasoningUnsupported(msg) {
 					local.ReasoningEffort = ""
 					compatChanged = true
-					diagnostics = append(diagnostics, llm.Diagnostic{Kind: "provider_compatibility_downgrade", Message: "OpenAI Responses provider rejected reasoning_effort; retrying without reasoning_effort."})
+					local.warnf("[WARN] %s", downgradeReasoningEffortResponsesMessage)
+					diagnostics = append(diagnostics, llm.Diagnostic{Kind: "provider_compatibility_downgrade", Message: downgradeReasoningEffortResponsesMessage})
 				}
 				if local.ExtraBody != nil && looksLikeExtraBodyUnsupported(msg) {
 					local.ExtraBody = nil
 					compatChanged = true
-					diagnostics = append(diagnostics, llm.Diagnostic{Kind: "provider_compatibility_downgrade", Message: "OpenAI Responses provider rejected extra request body settings; retrying without extra_body."})
+					local.warnf("[WARN] %s", downgradeExtraBodyResponsesMessage)
+					diagnostics = append(diagnostics, llm.Diagnostic{Kind: "provider_compatibility_downgrade", Message: downgradeExtraBodyResponsesMessage})
 				}
 				if hasThinkingExtra(local.Extra, local.ExtraBody) && looksLikeThinkingUnsupported(msg) && dropThinkingExtra(local.Extra, local.ExtraBody) {
 					compatChanged = true
-					diagnostics = append(diagnostics, llm.Diagnostic{Kind: "provider_compatibility_downgrade", Message: "OpenAI Responses provider rejected thinking settings; retrying without thinking extras."})
+					local.warnf("[WARN] %s", downgradeThinkingResponsesMessage)
+					diagnostics = append(diagnostics, llm.Diagnostic{Kind: "provider_compatibility_downgrade", Message: downgradeThinkingResponsesMessage})
 				}
 				if !local.ForceStringInput && strings.Contains(msg, "MissingParameter") && strings.Contains(msg, "input.content") {
 					local.ForceStringInput = true
 					compatChanged = true
-					diagnostics = append(diagnostics, llm.Diagnostic{Kind: "provider_compatibility_downgrade", Message: "OpenAI Responses provider rejected content-array input; retrying with string input compatibility mode."})
+					local.warnf("[WARN] %s", downgradeStringInputResponsesMessage)
+					diagnostics = append(diagnostics, llm.Diagnostic{Kind: "provider_compatibility_downgrade", Message: downgradeStringInputResponsesMessage})
 				}
 				if autoCompat && compatStage == responsesCompatFull && looksLikeResponsesInputUnsupported(msg) {
 					compatStage = responsesCompatLegacy
 					compatChanged = true
-					diagnostics = append(diagnostics, llm.Diagnostic{Kind: "provider_compatibility_downgrade", Message: "OpenAI Responses provider rejected Responses-style input; retrying with legacy chat-compatible input."})
+					local.warnf("[WARN] %s", downgradeLegacyInputResponsesMessage)
+					diagnostics = append(diagnostics, llm.Diagnostic{Kind: "provider_compatibility_downgrade", Message: downgradeLegacyInputResponsesMessage})
 				}
-				if downgradeForcedToolChoice(&req, payload.ToolChoice, msg) {
+				if downgradeForcedToolChoice(&req, payload.ToolChoice, string(data)) {
 					compatChanged = true
 					local.warnf("[WARN] %s", downgradeToolChoiceResponsesMessage)
 					diagnostics = append(diagnostics, llm.Diagnostic{Kind: "provider_compatibility_downgrade", Message: downgradeToolChoiceResponsesMessage})
@@ -515,23 +528,28 @@ func (c *ResponsesClient) InvokeStream(ctx context.Context, req llm.InvokeReques
 					if strings.TrimSpace(local.ReasoningEffort) != "" && looksLikeReasoningUnsupported(msg) {
 						local.ReasoningEffort = ""
 						compatChanged = true
+						local.warnf("[WARN] %s", downgradeReasoningEffortResponsesMessage)
 					}
 					if local.ExtraBody != nil && looksLikeExtraBodyUnsupported(msg) {
 						local.ExtraBody = nil
 						compatChanged = true
+						local.warnf("[WARN] %s", downgradeExtraBodyResponsesMessage)
 					}
 					if hasThinkingExtra(local.Extra, local.ExtraBody) && looksLikeThinkingUnsupported(msg) && dropThinkingExtra(local.Extra, local.ExtraBody) {
 						compatChanged = true
+						local.warnf("[WARN] %s", downgradeThinkingResponsesMessage)
 					}
 					if !local.ForceStringInput && strings.Contains(msg, "MissingParameter") && strings.Contains(msg, "input.content") {
 						local.ForceStringInput = true
 						compatChanged = true
+						local.warnf("[WARN] %s", downgradeStringInputResponsesMessage)
 					}
 					if autoCompat && compatStage == responsesCompatFull && looksLikeResponsesInputUnsupported(msg) {
 						compatStage = responsesCompatLegacy
 						compatChanged = true
+						local.warnf("[WARN] %s", downgradeLegacyInputResponsesMessage)
 					}
-					if downgradeForcedToolChoice(&req, payload.ToolChoice, msg) {
+					if downgradeForcedToolChoice(&req, payload.ToolChoice, string(data)) {
 						compatChanged = true
 						local.warnf("[WARN] %s", downgradeToolChoiceResponsesMessage)
 					}

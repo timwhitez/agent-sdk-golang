@@ -170,23 +170,27 @@ func (c *ChatClient) Invoke(ctx context.Context, req llm.InvokeRequest) (*llm.Co
 				if strings.TrimSpace(local.ReasoningEffort) != "" && looksLikeReasoningUnsupported(msg) {
 					local.ReasoningEffort = ""
 					compatChanged = true
+					local.warnf("[WARN] %s", downgradeReasoningEffortMessage)
 					diagnostics = append(diagnostics, llm.Diagnostic{Kind: "provider_compatibility_downgrade", Message: downgradeReasoningEffortMessage})
 				}
 				if local.ExtraBody != nil && looksLikeExtraBodyUnsupported(msg) {
 					local.ExtraBody = nil
 					compatChanged = true
+					local.warnf("[WARN] %s", downgradeExtraBodyMessage)
 					diagnostics = append(diagnostics, llm.Diagnostic{Kind: "provider_compatibility_downgrade", Message: downgradeExtraBodyMessage})
 				}
 				if hasThinkingExtra(local.Extra, local.ExtraBody) && looksLikeThinkingUnsupported(msg) && dropThinkingExtra(local.Extra, local.ExtraBody) {
 					compatChanged = true
+					local.warnf("[WARN] %s", downgradeThinkingMessage)
 					diagnostics = append(diagnostics, llm.Diagnostic{Kind: "provider_compatibility_downgrade", Message: downgradeThinkingMessage})
 				}
 				if !local.UseLegacyMaxTokens && local.MaxCompletionTokens != nil && looksLikeMaxCompletionTokensUnsupported(msg) {
 					local.UseLegacyMaxTokens = true
 					compatChanged = true
+					local.warnf("[WARN] %s", downgradeMaxTokensMessage)
 					diagnostics = append(diagnostics, llm.Diagnostic{Kind: "provider_compatibility_downgrade", Message: downgradeMaxTokensMessage})
 				}
-				if downgradeForcedToolChoice(&req, payload.ToolChoice, msg) {
+				if downgradeForcedToolChoice(&req, payload.ToolChoice, string(data)) {
 					compatChanged = true
 					local.warnf("[WARN] %s", downgradeToolChoiceChatMessage)
 					diagnostics = append(diagnostics, llm.Diagnostic{Kind: "provider_compatibility_downgrade", Message: downgradeToolChoiceChatMessage})
@@ -345,7 +349,7 @@ func (c *ChatClient) InvokeStream(ctx context.Context, req llm.InvokeRequest) (<
 						compatChanged = true
 						local.warnf("[WARN] %s", downgradeStreamOptionsMessage)
 					}
-					if downgradeForcedToolChoice(&req, payload.ToolChoice, msg) {
+					if downgradeForcedToolChoice(&req, payload.ToolChoice, string(data)) {
 						compatChanged = true
 						local.warnf("[WARN] %s", downgradeToolChoiceChatMessage)
 					}
@@ -918,36 +922,231 @@ func isForcedToolChoice(choice llm.ToolChoice) bool {
 // downgradeForcedToolChoice relaxes one request's forced tool_choice to auto
 // when the provider explicitly rejected it (e.g. reasoning models whose
 // thinking mode only accepts auto). sent is the tool_choice actually
-// serialized for the rejected attempt; nil means none was sent. The change is
-// local to req, so it happens at most once per request and never becomes
-// sticky for the client.
-func downgradeForcedToolChoice(req *llm.InvokeRequest, sent any, msg string) bool {
-	if req == nil || sent == nil || !isForcedToolChoice(req.ToolChoice) || !looksLikeToolChoiceUnsupported(msg) {
+// serialized for the rejected attempt; nil means none was sent. body is the
+// raw provider error body. The change is local to req, so it happens at most
+// once per request and never becomes sticky for the client.
+//
+// A named choice that does not name a declared tool is a caller error, not a
+// provider capability gap, so it is never relaxed: relaxing it would hide the
+// mistake behind a silent auto.
+func downgradeForcedToolChoice(req *llm.InvokeRequest, sent any, body string) bool {
+	if req == nil || sent == nil || !isForcedToolChoice(req.ToolChoice) {
+		return false
+	}
+	name := string(req.ToolChoice)
+	sentName := ""
+	if name != "required" {
+		if !declaresTool(req.Tools, name) {
+			return false
+		}
+		sentName = name
+	}
+	if !looksLikeToolChoiceUnsupported(body, sentName) {
 		return false
 	}
 	req.ToolChoice = ""
 	return true
 }
 
-// looksLikeToolChoiceUnsupported reports whether a provider error names
-// tool_choice as the unsupported or invalid setting. A bare
-// "invalid_request_error" type does not count as naming it invalid.
-func looksLikeToolChoiceUnsupported(msg string) bool {
-	s := strings.ToLower(msg)
-	s = strings.ReplaceAll(s, "invalid_request_error", "")
-	if !strings.Contains(s, "tool_choice") {
+func declaresTool(tools []llm.ToolDefinition, name string) bool {
+	for _, tool := range tools {
+		if tool.Name == name {
+			return true
+		}
+	}
+	return false
+}
+
+// providerErrorFields is the subset of an OpenAI-style error body the
+// tool_choice detector reads. Unparseable bodies keep the raw text as message.
+type providerErrorFields struct {
+	message string
+	param   string
+	code    string
+}
+
+func parseProviderErrorFields(body string) providerErrorFields {
+	fields := providerErrorFields{message: body}
+	var envelope struct {
+		Error   json.RawMessage `json:"error"`
+		Message string          `json:"message"`
+		Param   any             `json:"param"`
+		Code    any             `json:"code"`
+	}
+	if json.Unmarshal([]byte(strings.TrimSpace(body)), &envelope) != nil {
+		return fields
+	}
+	msg, param, code := envelope.Message, envelope.Param, envelope.Code
+	if len(envelope.Error) > 0 {
+		var inner struct {
+			Message string `json:"message"`
+			Param   any    `json:"param"`
+			Code    any    `json:"code"`
+		}
+		var text string
+		switch {
+		case json.Unmarshal(envelope.Error, &inner) == nil:
+			msg, param, code = inner.Message, inner.Param, inner.Code
+		case json.Unmarshal(envelope.Error, &text) == nil:
+			msg, param, code = text, nil, nil
+		}
+	}
+	if strings.TrimSpace(msg) != "" {
+		fields.message = msg
+	}
+	if v, ok := param.(string); ok {
+		fields.param = strings.ToLower(strings.TrimSpace(v))
+	}
+	if v, ok := code.(string); ok {
+		fields.code = strings.ToLower(strings.TrimSpace(v))
+	}
+	return fields
+}
+
+// toolChoiceUnsupportedPhrases are capability refusals: the provider accepts
+// the value as a tool_choice but will not honour it. "Invalid" wording is
+// deliberately absent; it describes a malformed value from the caller, which
+// a silent auto would hide.
+var toolChoiceUnsupportedPhrases = [][]string{
+	{"unsupported"},
+	{"not", "supported"},
+	{"does", "not", "support"},
+	{"do", "not", "support"},
+	{"not", "support"},
+	{"doesnt", "support"},
+	{"dont", "support"},
+	{"cannot", "support"},
+}
+
+// Words allowed between a refusal phrase and a following "tool_choice"
+// ("does not support this tool_choice").
+var toolChoiceLeadingFillers = map[string]bool{
+	"this": true, "the": true, "a": true, "an": true, "that": true, "such": true, "any": true,
+	"forced": true, "specified": true, "requested": true, "given": true, "named": true,
+	"required": true, "function": true,
+}
+
+// Words allowed between "tool_choice" and a following refusal phrase
+// ("tool_choice 'required' is not supported"). auto and none are absent:
+// a forced request never sends them, so text naming them is about something
+// else. The detector also accepts the function name that was actually sent.
+var toolChoiceTrailingFillers = map[string]bool{
+	"value": true, "parameter": true, "param": true, "option": true, "setting": true,
+	"mode": true, "type": true, "is": true, "are": true, "was": true,
+	"required": true, "function": true,
+}
+
+// toolChoiceInvalidMarkers describe an invalid value rather than an
+// unsupported choice.
+var toolChoiceInvalidMarkers = []string{"invalid value", "invalid tool_choice", "tool_choice is invalid"}
+
+// looksLikeToolChoiceUnsupported reports whether a provider error body says
+// the forced tool_choice itself is unsupported. A structured error param
+// decides whose error it is: another param never matches, and tool_choice
+// matches only with a refusal in the code or message. Without a param the
+// refusal phrase must be adjacent to "tool_choice", so text that merely
+// mentions tool_choice ("parallel_tool_calls is not supported with
+// tool_choice required", "... tool_choice=auto") does not match. Invalid-value
+// rejections never match.
+//
+// sentName is the function name of a named forced choice that was sent (""
+// for "required"); it counts as a filler word, so "tool_choice 'done' is not
+// supported" matches only when done was the choice sent.
+func looksLikeToolChoiceUnsupported(body, sentName string) bool {
+	fields := parseProviderErrorFields(body)
+	msg := strings.ToLower(fields.message)
+	msg = strings.ReplaceAll(msg, "invalid_request_error", "")
+	if fields.code == "invalid_value" {
 		return false
 	}
-	for _, phrase := range []string{
-		"unsupported",
-		"not support", // "not supported", "does not support"
-		"doesn't support",
-		"invalid tool_choice",
-		"tool_choice is invalid",
-		"invalid value",
-		"invalid parameter",
-	} {
-		if strings.Contains(s, phrase) {
+	for _, marker := range toolChoiceInvalidMarkers {
+		if strings.Contains(msg, marker) {
+			return false
+		}
+	}
+	words := toolChoiceWords(msg)
+	sentWords := toolChoiceWords(strings.ToLower(sentName))
+	if fields.param != "" {
+		if fields.param != "tool_choice" {
+			return false
+		}
+		if strings.HasPrefix(fields.code, "unsupported") {
+			return true
+		}
+		for i := range words {
+			if phraseAt(words, i) {
+				return true
+			}
+		}
+		return false
+	}
+	for i, w := range words {
+		if w != "tool_choice" {
+			continue
+		}
+		// Refusal phrase, then fillers, then tool_choice.
+		for j := i - 1; j >= 0 && i-j <= 3; j-- {
+			if phraseEndingAt(words, j) {
+				return true
+			}
+			if !toolChoiceLeadingFillers[words[j]] {
+				break
+			}
+		}
+		// tool_choice, then fillers (or the sent name), then refusal phrase.
+		for j, fillers := i+1, 0; j < len(words) && fillers <= 3; fillers++ {
+			if phraseAt(words, j) {
+				return true
+			}
+			if len(sentWords) > 0 && phraseMatches(words, j, sentWords) {
+				j += len(sentWords)
+				continue
+			}
+			if !toolChoiceTrailingFillers[words[j]] {
+				break
+			}
+			j++
+		}
+	}
+	return false
+}
+
+// toolChoiceWords splits lowercase text into words, treating quotes and
+// punctuation as separators so "'tool_choice'" and "tool_choice=auto" yield
+// the bare word. Contractions fold first ("doesn't" becomes "doesnt").
+func toolChoiceWords(s string) []string {
+	s = strings.NewReplacer("n't", "nt", "n\u2019t", "nt").Replace(s)
+	return strings.FieldsFunc(s, func(r rune) bool {
+		return r != '_' && r != '-' && (r < 'a' || r > 'z') && (r < '0' || r > '9')
+	})
+}
+
+func phraseMatches(words []string, start int, phrase []string) bool {
+	if start < 0 || start+len(phrase) > len(words) {
+		return false
+	}
+	for k, p := range phrase {
+		if words[start+k] != p {
+			return false
+		}
+	}
+	return true
+}
+
+// phraseAt reports whether a refusal phrase starts at words[i].
+func phraseAt(words []string, i int) bool {
+	for _, phrase := range toolChoiceUnsupportedPhrases {
+		if phraseMatches(words, i, phrase) {
+			return true
+		}
+	}
+	return false
+}
+
+// phraseEndingAt reports whether a refusal phrase ends at words[j].
+func phraseEndingAt(words []string, j int) bool {
+	for _, phrase := range toolChoiceUnsupportedPhrases {
+		if phraseMatches(words, j-len(phrase)+1, phrase) {
 			return true
 		}
 	}
