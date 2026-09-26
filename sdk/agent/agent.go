@@ -2824,8 +2824,10 @@ func stopTimerDrain(t *time.Timer) {
 // nativeToolErrorOrigin names the path that produced a native error result,
 // in the precedence Project applies to its content: a root cancellation
 // replaces the result, the invalid-tool fallback answers an unknown name,
-// and only then is the handler's own error attributed to it (or to the
-// steering interruption that preceded it).
+// and only then is the error attributed to the handler, or to a steering
+// interruption that had already canceled the handler's context when it
+// returned. Steering that arrives after the handler returned (for example
+// while an earlier call of the same wave settles) does not relabel it.
 func nativeToolErrorOrigin(isError bool, outcome BlockOutcome, unknownTool bool) string {
 	switch {
 	case !isError:
@@ -2834,7 +2836,7 @@ func nativeToolErrorOrigin(isError bool, outcome BlockOutcome, unknownTool bool)
 		return ToolErrorOriginCanceled
 	case unknownTool:
 		return ToolErrorOriginUnknownTool
-	case outcome.Interrupted:
+	case outcome.Interrupted && outcome.stageDoneAtReturn:
 		return ToolErrorOriginInterrupted
 	default:
 		return ToolErrorOriginHandler

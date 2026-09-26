@@ -110,8 +110,10 @@ const (
 	// ToolErrorOriginCanceled: the Query's root context ended after the
 	// handler started; the result is the SDK's cancellation text.
 	ToolErrorOriginCanceled = "canceled"
-	// ToolErrorOriginInterrupted: accepted steering interrupted the handler,
-	// which then returned an error.
+	// ToolErrorOriginInterrupted: accepted steering had already canceled the
+	// handler's context when it returned an error. Steering that arrives
+	// after the handler returned leaves the handler label. The error may
+	// still be unrelated to the interruption.
 	ToolErrorOriginInterrupted = "interrupted"
 	// ToolErrorOriginSuppressed: the repeated-signature loop guard answered
 	// the call before execution.

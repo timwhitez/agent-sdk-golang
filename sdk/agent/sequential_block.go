@@ -68,6 +68,11 @@ type BlockOutcome struct {
 	Interrupted    bool
 	Panic          any
 	NotStarted     BlockStop
+	// stageDoneAtReturn records whether the handler's context had already
+	// ended when it returned (or panicked). Interrupted alone is read at
+	// settle and can include a steering request made after the handler had
+	// returned its own result.
+	stageDoneAtReturn bool
 }
 
 // SequentialBlockAdapter keeps host policy and presentation at their existing
@@ -302,7 +307,7 @@ func runSequentialBlock(root context.Context, state *toolBlockState, calls []llm
 		started := time.Now()
 		defer func() { o.Duration = time.Since(started) }()
 		defer scope.finish()
-		defer func() { o.Panic = recover() }()
+		defer func() { o.Panic, o.stageDoneAtReturn = recover(), ctx.Err() != nil }()
 		o.Content, o.Err = admission.Call.Execute(ctx, admission.Deps)
 		return o
 	}

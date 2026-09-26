@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"testing"
+	"time"
 
 	"github.com/timwhitez/agent-sdk-golang/sdk/llm"
 	"github.com/timwhitez/agent-sdk-golang/sdk/tools"
@@ -117,4 +118,97 @@ func onlyToolResult(t *testing.T, events []Event) ToolResultEvent {
 		t.Fatalf("tool results=%d want 1 (%#v)", len(results), results)
 	}
 	return results[0]
+}
+
+// Steering that arrives after a wave call returned its own error must not
+// relabel it: the call waits to settle behind an earlier, still running call,
+// and only that earlier call was interrupted.
+func TestToolResultErrorOriginLateSteeringKeepsHandler(t *testing.T) {
+	type args struct {
+		FilePath string `json:"file_path"`
+	}
+	slowStarted, fastReturned := make(chan struct{}), make(chan struct{})
+	read := tools.Func[args]("read", "read", func(ctx context.Context, a args, _ *tools.Container) (any, error) {
+		if a.FilePath == "slow.txt" {
+			close(slowStarted)
+			<-ctx.Done()
+			return nil, ctx.Err()
+		}
+		defer close(fastReturned)
+		return nil, errors.New("invalid argument")
+	})
+	ag, err := New(Config{LLM: &turnModel{turns: []*llm.Completion{readCalls("slow.txt", "fast.txt")}}, Tools: []tools.Tool{read}, Warningf: func(string, ...any) {},
+		ToolParallelism: &ToolParallelism{MaxWorkers: 2, Plan: readOnlyPlan}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	steering := make(chan SteeringMsg, 1)
+	stream := ag.QueryStreamEnvelopedWithSteering(context.Background(), llm.TextContent("go"), steering)
+	go func() {
+		<-slowStarted
+		<-fastReturned
+		// The fast call's handler has returned; give its worker time to
+		// leave Execute. A slow scheduler can only make this test fail
+		// (label interrupted), never pass wrongly.
+		time.Sleep(50 * time.Millisecond)
+		steering <- SteeringMsg{Content: "change of plan"}
+		ag.InterruptActiveStageForSteering()
+	}()
+	origins := map[string]string{}
+	for envelope := range stream {
+		if result, ok := envelope.Event.(ToolResultEvent); ok {
+			origins[result.ToolCallID] = result.ErrorOrigin
+		}
+	}
+	if origins["call-0"] != ToolErrorOriginInterrupted || origins["call-1"] != ToolErrorOriginHandler {
+		t.Fatalf("origins=%v, want call-0 interrupted and call-1 handler", origins)
+	}
+}
+
+// The precedence between the paths: a root cancellation outranks an unknown
+// tool, and an unknown tool outranks a steering interruption. A host-provided
+// "invalid" fallback that waits on its context puts both under test.
+func TestToolResultErrorOriginPrecedence(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		steer bool
+		want  string
+	}{
+		{name: "root cancel over unknown tool", want: ToolErrorOriginCanceled},
+		{name: "unknown tool over steering", steer: true, want: ToolErrorOriginUnknownTool},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			started := make(chan struct{})
+			invalid := tools.Tool{Name: "invalid", Handler: func(ctx context.Context, _ json.RawMessage, _ *tools.Container) (llm.Content, error) {
+				close(started)
+				<-ctx.Done()
+				return llm.TextContent("stopped"), ctx.Err()
+			}}
+			ag, err := New(Config{LLM: &stubModel{toolName: "invented_tool", toolArgs: `{}`, toolID: "call-1"}, Tools: []tools.Tool{invalid}, Warningf: func(string, ...any) {}})
+			if err != nil {
+				t.Fatal(err)
+			}
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			steering := make(chan SteeringMsg, 1)
+			stream := ag.QueryStreamEnvelopedWithSteering(ctx, llm.TextContent("go"), steering)
+			go func() {
+				<-started
+				if tc.steer {
+					steering <- SteeringMsg{Content: "change of plan"}
+					ag.InterruptActiveStageForSteering()
+				} else {
+					cancel()
+				}
+			}()
+			var events []Event
+			for envelope := range stream {
+				events = append(events, envelope.Event)
+			}
+			result := onlyToolResult(t, events)
+			if !result.IsError || result.ErrorOrigin != tc.want {
+				t.Fatalf("tool result is_error=%v origin=%q, want %q", result.IsError, result.ErrorOrigin, tc.want)
+			}
+		})
+	}
 }
