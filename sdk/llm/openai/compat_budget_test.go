@@ -4,6 +4,8 @@ import (
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"reflect"
+	"strings"
 	"testing"
 
 	"github.com/timwhitez/agent-sdk-golang/sdk/llm"
@@ -120,30 +122,36 @@ func TestCompatibilityDowngradesDoNotConsumeRetryBudget(t *testing.T) {
 				if got := len(gw.snapshot()); got != 2 {
 					t.Fatalf("requests = %d, want 2 (one compatibility resend)", got)
 				}
-				// Every settings downgrade is reported exactly once through
-				// the warning sink on every path, and buffered paths also
-				// carry exactly one diagnostic for it. The Responses input
-				// shape fallbacks (out of scope for #192) report only
-				// diagnostics, possibly two at once.
+				// Every downgrade is reported through the warning sink exactly
+				// once, and buffered paths carry one matching diagnostic per
+				// warning. The Responses input fallback applies both input
+				// downgrades (string and legacy) on the one rejection.
+				wantWarnings := 1
 				if dg.name == "input_content_string" {
-					if got := warn.count("[WARN] OpenAI"); got != 0 {
-						t.Fatalf("input fallback warnings = %d, want 0 (all: %q)", got, warn.msgs)
-					}
-					return
+					wantWarnings = 2
 				}
-				const wantWarnings = 1
-				if got := warn.count("[WARN] OpenAI"); got != wantWarnings {
-					t.Fatalf("downgrade warnings = %d, want %d (all: %q)", got, wantWarnings, warn.msgs)
+				warn.mu.Lock()
+				warnings := append([]string(nil), warn.msgs...)
+				warn.mu.Unlock()
+				if len(warnings) != wantWarnings {
+					t.Fatalf("downgrade warnings = %d, want %d (all: %q)", len(warnings), wantWarnings, warnings)
+				}
+				seen := map[string]bool{}
+				for _, w := range warnings {
+					if !strings.HasPrefix(w, "[WARN] OpenAI") || seen[w] {
+						t.Fatalf("unexpected or duplicate warning %q (all: %q)", w, warnings)
+					}
+					seen[w] = true
 				}
 				if !tc.stream {
-					found := 0
+					var got []string
 					for _, d := range diags {
 						if d.Kind == "provider_compatibility_downgrade" {
-							found++
+							got = append(got, "[WARN] "+d.Message)
 						}
 					}
-					if found != 1 {
-						t.Fatalf("downgrade diagnostics = %d, want 1 (%#v)", found, diags)
+					if !reflect.DeepEqual(got, warnings) {
+						t.Fatalf("diagnostics %q do not match warnings %q", got, warnings)
 					}
 				}
 			})

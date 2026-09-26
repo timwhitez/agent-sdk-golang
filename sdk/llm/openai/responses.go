@@ -67,6 +67,8 @@ const (
 	downgradeExtraBodyResponsesMessage       = "OpenAI Responses provider rejected extra request body settings; retrying without extra_body."
 	downgradeThinkingResponsesMessage        = "OpenAI Responses provider rejected thinking settings; retrying without thinking extras."
 	downgradeToolChoiceResponsesMessage      = "OpenAI Responses provider rejected forced tool_choice; retried with auto."
+	downgradeStringInputResponsesMessage     = "OpenAI Responses provider rejected content-array input; retrying with string input compatibility mode."
+	downgradeLegacyInputResponsesMessage     = "OpenAI Responses provider rejected Responses-style input; retrying with legacy chat-compatible input."
 )
 
 func (c *ResponsesClient) warnf(format string, args ...any) {
@@ -183,12 +185,14 @@ func (c *ResponsesClient) Invoke(ctx context.Context, req llm.InvokeRequest) (*l
 				if !local.ForceStringInput && strings.Contains(msg, "MissingParameter") && strings.Contains(msg, "input.content") {
 					local.ForceStringInput = true
 					compatChanged = true
-					diagnostics = append(diagnostics, llm.Diagnostic{Kind: "provider_compatibility_downgrade", Message: "OpenAI Responses provider rejected content-array input; retrying with string input compatibility mode."})
+					local.warnf("[WARN] %s", downgradeStringInputResponsesMessage)
+					diagnostics = append(diagnostics, llm.Diagnostic{Kind: "provider_compatibility_downgrade", Message: downgradeStringInputResponsesMessage})
 				}
 				if autoCompat && compatStage == responsesCompatFull && looksLikeResponsesInputUnsupported(msg) {
 					compatStage = responsesCompatLegacy
 					compatChanged = true
-					diagnostics = append(diagnostics, llm.Diagnostic{Kind: "provider_compatibility_downgrade", Message: "OpenAI Responses provider rejected Responses-style input; retrying with legacy chat-compatible input."})
+					local.warnf("[WARN] %s", downgradeLegacyInputResponsesMessage)
+					diagnostics = append(diagnostics, llm.Diagnostic{Kind: "provider_compatibility_downgrade", Message: downgradeLegacyInputResponsesMessage})
 				}
 				if downgradeForcedToolChoice(&req, payload.ToolChoice, string(data)) {
 					compatChanged = true
@@ -538,10 +542,12 @@ func (c *ResponsesClient) InvokeStream(ctx context.Context, req llm.InvokeReques
 					if !local.ForceStringInput && strings.Contains(msg, "MissingParameter") && strings.Contains(msg, "input.content") {
 						local.ForceStringInput = true
 						compatChanged = true
+						local.warnf("[WARN] %s", downgradeStringInputResponsesMessage)
 					}
 					if autoCompat && compatStage == responsesCompatFull && looksLikeResponsesInputUnsupported(msg) {
 						compatStage = responsesCompatLegacy
 						compatChanged = true
+						local.warnf("[WARN] %s", downgradeLegacyInputResponsesMessage)
 					}
 					if downgradeForcedToolChoice(&req, payload.ToolChoice, string(data)) {
 						compatChanged = true

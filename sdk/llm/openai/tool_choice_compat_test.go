@@ -39,50 +39,58 @@ func TestLooksLikeToolChoiceUnsupported(t *testing.T) {
 		name string
 		body string
 		want bool
+		sent string // function name of a named forced choice; "" for required
 	}{
 		// Positive: the refusal refers to tool_choice itself.
-		{"live_gateway_thinking_mode", gatewayToolChoiceRejection, true},
-		{"live_gateway_plain_text", "Thinking mode does not support this tool_choice (request_id: req-fixture)", true},
-		{"tool_choice_value_not_supported", `{"error":{"message":"tool_choice 'required' is not supported for this model"}}`, true},
-		{"quoted_tool_choice_does_not_support", `{"error":{"message":"Unsupported value: 'tool_choice' does not support 'required' with this model."}}`, true},
-		{"doesnt_support_forced_tool_choice", `{"error":{"message":"model doesn't support forced tool_choice"}}`, true},
-		{"unsupported_tool_choice", `{"error":{"message":"unsupported tool_choice for this model"}}`, true},
-		{"param_tool_choice_with_refusal_message", structuredToolChoiceRejection, true},
-		{"param_tool_choice_with_unsupported_code", `{"error":{"message":"The requested value cannot be used with this model.","param":"tool_choice","code":"unsupported_value"}}`, true},
-		{"top_level_param_tool_choice", `{"message":"Forced tool use is not supported by this model","param":"tool_choice"}`, true},
-		{"string_error_adjacent", `{"error":"this model does not support the tool_choice parameter"}`, true},
+		{"live_gateway_thinking_mode", gatewayToolChoiceRejection, true, ""},
+		{"live_gateway_plain_text", "Thinking mode does not support this tool_choice (request_id: req-fixture)", true, ""},
+		{"tool_choice_value_not_supported", `{"error":{"message":"tool_choice 'required' is not supported for this model"}}`, true, ""},
+		{"quoted_tool_choice_does_not_support", `{"error":{"message":"Unsupported value: 'tool_choice' does not support 'required' with this model."}}`, true, ""},
+		{"doesnt_support_forced_tool_choice", `{"error":{"message":"model doesn't support forced tool_choice"}}`, true, ""},
+		{"unsupported_tool_choice", `{"error":{"message":"unsupported tool_choice for this model"}}`, true, ""},
+		{"param_tool_choice_with_refusal_message", structuredToolChoiceRejection, true, ""},
+		{"param_tool_choice_with_unsupported_code", `{"error":{"message":"The requested value cannot be used with this model.","param":"tool_choice","code":"unsupported_value"}}`, true, ""},
+		{"top_level_param_tool_choice", `{"message":"Forced tool use is not supported by this model","param":"tool_choice"}`, true, ""},
+		{"string_error_adjacent", `{"error":"this model does not support the tool_choice parameter"}`, true, ""},
+
+		{"sent_name_quoted_before_refusal", `{"error":{"message":"tool_choice 'done' is not supported by this model"}}`, true, "done"},
+		{"sent_name_with_value_word", `{"error":{"message":"tool_choice value 'done' is not supported"}}`, true, "done"},
+
+		// Negative: a quoted name is a filler only when it is the name sent.
+		{"unrelated_name_quoted_before_refusal", `{"error":{"message":"tool_choice 'lookup' is not supported by this model"}}`, false, "done"},
+		{"name_quoted_when_required_sent", `{"error":{"message":"tool_choice 'done' is not supported by this model"}}`, false, ""},
 
 		// Negative: #192 reviewer probes.
-		{"invalid_value_param_tool_choice", invalidToolChoiceValueRejection, false},
-		{"invalid_value_without_param", `{"error":{"message":"Invalid value for tool_choice: 'requird' is not supported"}}`, false},
-		{"unknown_value_not_supported", `{"error":{"message":"tool_choice 'requird' is not supported"}}`, false},
-		{"invalid_value_code_with_refusal_text", `{"error":{"message":"'requird' is not supported","param":"tool_choice","code":"invalid_value"}}`, false},
-		{"invalid_value_text_with_refusal_text", `{"error":{"message":"Invalid value for tool_choice: value is not supported","param":"tool_choice"}}`, false},
-		{"parallel_tool_calls_mentions_tool_choice", parallelToolCallsRejection, false},
-		{"parallel_tool_calls_param", `{"error":{"message":"parallel_tool_calls is not supported with tool_choice required","param":"parallel_tool_calls"}}`, false},
-		{"temperature_mentions_tool_choice_auto", temperatureRejection, false},
-		{"temperature_param_with_adjacent_text", `{"error":{"message":"temperature does not support this tool_choice","param":"temperature"}}`, false},
-		{"temperature_plain_text", "temperature is unsupported when tool_choice=auto", false},
+		{"invalid_value_param_tool_choice", invalidToolChoiceValueRejection, false, ""},
+		{"invalid_value_without_param", `{"error":{"message":"Invalid value for tool_choice: 'requird' is not supported"}}`, false, ""},
+		{"unknown_value_not_supported", `{"error":{"message":"tool_choice 'requird' is not supported"}}`, false, ""},
+		{"invalid_value_code_with_refusal_text", `{"error":{"message":"'requird' is not supported","param":"tool_choice","code":"invalid_value"}}`, false, ""},
+		{"invalid_value_text_with_refusal_text", `{"error":{"message":"Invalid value for tool_choice: value is not supported","param":"tool_choice"}}`, false, ""},
+		{"parallel_tool_calls_mentions_tool_choice", parallelToolCallsRejection, false, ""},
+		{"parallel_tool_calls_param", `{"error":{"message":"parallel_tool_calls is not supported with tool_choice required","param":"parallel_tool_calls"}}`, false, ""},
+		{"temperature_mentions_tool_choice_auto", temperatureRejection, false, ""},
+		{"temperature_param_with_adjacent_text", `{"error":{"message":"temperature does not support this tool_choice","param":"temperature"}}`, false, ""},
+		{"temperature_plain_text", "temperature is unsupported when tool_choice=auto", false, ""},
 
 		// Negative: "invalid" wording describes a malformed value, not a
 		// capability gap; a silent auto would hide it.
-		{"invalid_tool_choice", `{"error":{"message":"Invalid tool_choice: function choice unavailable in reasoning mode"}}`, false},
-		{"invalid_parameter_tool_choice", `{"error":{"message":"Invalid parameter: tool_choice"}}`, false},
-		{"param_tool_choice_without_refusal", `{"error":{"message":"Function 'x' named in tool_choice was not found in tools.","param":"tool_choice"}}`, false},
-		{"param_tool_choice_function_name", `{"error":{"message":"not supported","param":"tool_choice.function.name"}}`, false},
+		{"invalid_tool_choice", `{"error":{"message":"Invalid tool_choice: function choice unavailable in reasoning mode"}}`, false, ""},
+		{"invalid_parameter_tool_choice", `{"error":{"message":"Invalid parameter: tool_choice"}}`, false, ""},
+		{"param_tool_choice_without_refusal", `{"error":{"message":"Function 'x' named in tool_choice was not found in tools.","param":"tool_choice"}}`, false, ""},
+		{"param_tool_choice_function_name", `{"error":{"message":"not supported","param":"tool_choice.function.name"}}`, false, ""},
 
 		// Negative: unrelated errors.
-		{"empty", "", false},
-		{"context_length", `{"error":{"code":"invalid_request_error","message":"This model's maximum context length is 8192 tokens","type":"invalid_request_error"}}`, false},
-		{"tool_choice_requires_tools", `{"error":{"code":"invalid_request_error","message":"tool_choice requires tools to be provided","type":"invalid_request_error"}}`, false},
-		{"thinking_temperature", `{"error":{"message":"Thinking mode does not support this temperature"}}`, false},
-		{"unknown_reasoning_effort", `{"error":{"message":"unknown field reasoning_effort"}}`, false},
-		{"invalid_input", `{"error":{"message":"Invalid value for 'input[2].content'"}}`, false},
-		{"invalid_tool_name", `{"error":{"message":"tools[0].function.name is invalid"}}`, false},
+		{"empty", "", false, ""},
+		{"context_length", `{"error":{"code":"invalid_request_error","message":"This model's maximum context length is 8192 tokens","type":"invalid_request_error"}}`, false, ""},
+		{"tool_choice_requires_tools", `{"error":{"code":"invalid_request_error","message":"tool_choice requires tools to be provided","type":"invalid_request_error"}}`, false, ""},
+		{"thinking_temperature", `{"error":{"message":"Thinking mode does not support this temperature"}}`, false, ""},
+		{"unknown_reasoning_effort", `{"error":{"message":"unknown field reasoning_effort"}}`, false, ""},
+		{"invalid_input", `{"error":{"message":"Invalid value for 'input[2].content'"}}`, false, ""},
+		{"invalid_tool_name", `{"error":{"message":"tools[0].function.name is invalid"}}`, false, ""},
 	}
 	for _, tc := range cases {
-		if got := looksLikeToolChoiceUnsupported(tc.body); got != tc.want {
-			t.Errorf("%s: looksLikeToolChoiceUnsupported(%q) = %v, want %v", tc.name, tc.body, got, tc.want)
+		if got := looksLikeToolChoiceUnsupported(tc.body, tc.sent); got != tc.want {
+			t.Errorf("%s: looksLikeToolChoiceUnsupported(%q, %q) = %v, want %v", tc.name, tc.body, tc.sent, got, tc.want)
 		}
 	}
 }
@@ -391,6 +399,8 @@ func TestToolChoiceDowngradeNegativeCases(t *testing.T) {
 		// A named choice that is not a declared tool is a caller error, even
 		// when the provider's text would otherwise match.
 		{name: "undeclared_named_choice_not_retried", choice: "requird", reject: always(gatewayToolChoiceRejection), requests: 1},
+		{name: "sent_name_in_refusal_downgrades_once", choice: "done", reject: always(`{"error":{"message":"tool_choice 'done' is not supported by this model"}}`), requests: 2},
+		{name: "other_name_in_refusal_not_retried", choice: "done", reject: always(`{"error":{"message":"tool_choice 'lookup' is not supported by this model"}}`), requests: 1},
 		{name: "declared_named_choice_downgrades_once", choice: "done", reject: always(gatewayToolChoiceRejection), requests: 2},
 	}
 	for _, tc := range toolChoiceCases {

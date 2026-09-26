@@ -934,10 +934,14 @@ func downgradeForcedToolChoice(req *llm.InvokeRequest, sent any, body string) bo
 		return false
 	}
 	name := string(req.ToolChoice)
-	if name != "required" && !declaresTool(req.Tools, name) {
-		return false
+	sentName := ""
+	if name != "required" {
+		if !declaresTool(req.Tools, name) {
+			return false
+		}
+		sentName = name
 	}
-	if !looksLikeToolChoiceUnsupported(body) {
+	if !looksLikeToolChoiceUnsupported(body, sentName) {
 		return false
 	}
 	req.ToolChoice = ""
@@ -1025,7 +1029,7 @@ var toolChoiceLeadingFillers = map[string]bool{
 // Words allowed between "tool_choice" and a following refusal phrase
 // ("tool_choice 'required' is not supported"). auto and none are absent:
 // a forced request never sends them, so text naming them is about something
-// else.
+// else. The detector also accepts the function name that was actually sent.
 var toolChoiceTrailingFillers = map[string]bool{
 	"value": true, "parameter": true, "param": true, "option": true, "setting": true,
 	"mode": true, "type": true, "is": true, "are": true, "was": true,
@@ -1044,7 +1048,11 @@ var toolChoiceInvalidMarkers = []string{"invalid value", "invalid tool_choice", 
 // mentions tool_choice ("parallel_tool_calls is not supported with
 // tool_choice required", "... tool_choice=auto") does not match. Invalid-value
 // rejections never match.
-func looksLikeToolChoiceUnsupported(body string) bool {
+//
+// sentName is the function name of a named forced choice that was sent (""
+// for "required"); it counts as a filler word, so "tool_choice 'done' is not
+// supported" matches only when done was the choice sent.
+func looksLikeToolChoiceUnsupported(body, sentName string) bool {
 	fields := parseProviderErrorFields(body)
 	msg := strings.ToLower(fields.message)
 	msg = strings.ReplaceAll(msg, "invalid_request_error", "")
@@ -1057,6 +1065,7 @@ func looksLikeToolChoiceUnsupported(body string) bool {
 		}
 	}
 	words := toolChoiceWords(msg)
+	sentWords := toolChoiceWords(strings.ToLower(sentName))
 	if fields.param != "" {
 		if fields.param != "tool_choice" {
 			return false
@@ -1084,14 +1093,19 @@ func looksLikeToolChoiceUnsupported(body string) bool {
 				break
 			}
 		}
-		// tool_choice, then fillers, then refusal phrase.
-		for j := i + 1; j < len(words) && j-i <= 3; j++ {
+		// tool_choice, then fillers (or the sent name), then refusal phrase.
+		for j, fillers := i+1, 0; j < len(words) && fillers <= 3; fillers++ {
 			if phraseAt(words, j) {
 				return true
+			}
+			if len(sentWords) > 0 && phraseMatches(words, j, sentWords) {
+				j += len(sentWords)
+				continue
 			}
 			if !toolChoiceTrailingFillers[words[j]] {
 				break
 			}
+			j++
 		}
 	}
 	return false
