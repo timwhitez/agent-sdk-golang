@@ -113,7 +113,8 @@ type EventEnvelope struct {
 	// set on every Frame built while those results await an accepted model
 	// response (a retry, or a Frame after steering or stream-idle recovery,
 	// reuses it) and cleared once a response is accepted, a compaction
-	// rewrites history or an ephemeral result is released. Empty means
+	// rewrites history or one of the block's own ephemeral results is
+	// released (releasing an older result keeps it). Empty means
 	// unreported, not that the request carries no earlier output. It holds
 	// Frame IDs only, never content, CallIDs or fingerprints; each envelope
 	// owns its copy.

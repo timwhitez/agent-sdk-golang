@@ -364,7 +364,7 @@ func TestToolContinuationWithoutEvidenceStaysEmpty(t *testing.T) {
 			t.Fatalf("main=%d summaries=%d", len(main), summaries)
 		}
 	})
-	t.Run("released ephemeral result", func(t *testing.T) {
+	t.Run("released ephemeral result of the block", func(t *testing.T) {
 		model := &steeringRelationModel{steps: []func() (*llm.Completion, error){
 			func() (*llm.Completion, error) {
 				return &llm.Completion{StopReason: "tool_calls", ToolCalls: []llm.ToolCall{
@@ -465,5 +465,53 @@ func TestContinuationFrameIDsBound(t *testing.T) {
 	}
 	if got := unionFrameSources([][]int{{1, 3}, {2, 3}, {3}}); len(got) != 3 || got[0] != 1 || got[1] != 2 || got[2] != 3 {
 		t.Fatalf("union=%v", got)
+	}
+}
+
+// Releasing an older ephemeral result, outside the pending block, keeps the
+// set: the boundary is the block's own assistant message, found by identity,
+// even after a host system publication shifted every index.
+func TestToolContinuationSurvivesReleaseOfOlderEphemeralResult(t *testing.T) {
+	readCall := func(id string) func() (*llm.Completion, error) {
+		return func() (*llm.Completion, error) {
+			return &llm.Completion{StopReason: "tool_calls", ToolCalls: []llm.ToolCall{{ID: id, Type: "function", Function: llm.FunctionCall{Name: "read", Arguments: `{}`}}}}, nil
+		}
+	}
+	model := &steeringRelationModel{steps: []func() (*llm.Completion, error){readCall("read-1"), readCall("read-2"), steeringFinal}}
+	var ag *Agent
+	var reads atomic.Int32
+	read := tools.Func[struct{}]("read", "fixture", func(context.Context, struct{}, *tools.Container) (any, error) {
+		if reads.Add(1) == 2 {
+			// A host publication inserts a system message at the front.
+			history := append([]llm.Message{llm.NewSystemMessage("host context")}, ag.Messages()...)
+			if err := ag.ReplaceHistoryChecked(history); err != nil {
+				t.Errorf("host publication: %v", err)
+			}
+		}
+		return "contents", nil
+	}).WithEphemeralKeep(1)
+	var err error
+	ag, err = New(Config{LLM: model, Tools: []tools.Tool{read}, Warningf: func(string, ...any) {}, QueryIDGenerator: func() string { return "lineage-query" }})
+	if err != nil {
+		t.Fatal(err)
+	}
+	observed := observeContinuation(t, ag.QueryStreamEnveloped(context.Background(), llm.TextContent("start")))
+	wantContinuation(t, observed, map[string]string{"lineage-query/frame/2": "lineage-query/frame/1", "lineage-query/frame/3": "lineage-query/frame/2"})
+	// Independent oracle: Frame 3's request carried read-1's result
+	// released, read-2's intact, and the host system message.
+	requests := model.recorded()
+	if len(requests) != 3 {
+		t.Fatalf("requests=%d", len(requests))
+	}
+	released := map[string]bool{}
+	hostContext := false
+	for _, message := range requests[2].Messages {
+		if message.Role == llm.RoleTool {
+			released[message.ToolCallID] = message.Destroyed
+		}
+		hostContext = hostContext || message.Role == llm.RoleSystem && message.Content.PlainText() == "host context"
+	}
+	if !released["read-1"] || released["read-2"] || !hostContext {
+		t.Fatalf("released=%v hostContext=%v", released, hostContext)
 	}
 }

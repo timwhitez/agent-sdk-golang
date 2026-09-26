@@ -736,6 +736,11 @@ func (a *Agent) queryStreamWithSteering(ctx context.Context, input llm.Content, 
 		// to: a rewrite since then makes the set unknown, never inferred.
 		var pendingContinuation []string
 		pendingContinuationGeneration := uint64(0)
+		// pendingContinuationAnchor is the SDK's own assistant message that
+		// carries the answered calls; the block's results follow it. It is
+		// located by identity, so host system publications that shift
+		// indices do not move the boundary.
+		var pendingContinuationAnchor *llm.Message
 		a.userInputEpoch.Add(1)
 		usageFallbackWarned := false
 		cont := newToolCallContinuation(defaultMaxContinuationTurns)
@@ -858,9 +863,10 @@ func (a *Agent) queryStreamWithSteering(ctx context.Context, input llm.Content, 
 			}
 
 			// Remove old ephemeral messages before the next LLM call. A
-			// released result may belong to the pending block, so the
-			// continuation set becomes unknown rather than overstated.
-			if a.destroyEphemeralMessages() > 0 {
+			// released result after the pending block's anchor may be one of
+			// its results, so the continuation set becomes unknown rather
+			// than overstated; releases of older results keep it.
+			if _, releasedInBlock := a.destroyEphemeralMessagesAfter(pendingContinuationAnchor); releasedInBlock {
 				pendingContinuation = nil
 			}
 
@@ -1925,6 +1931,8 @@ func (a *Agent) queryStreamWithSteering(ctx context.Context, input llm.Content, 
 			// Every accepted call now has its committed result: the next
 			// request answers them. A set beyond the bound stays unreported.
 			pendingContinuation, pendingContinuationGeneration = continuationFrameIDs(out.queryID, blockSources), assistantGeneration
+			anchor := llm.CloneMessage(currentAssistant)
+			pendingContinuationAnchor = &anchor
 			if a.hasCompactor {
 				if err := a.checkAndCompact(ctx, frame.id, comp, out, additionalSinceCompletion()); err != nil {
 					emitCompactionErr(a.errEvent(err))
@@ -3545,9 +3553,21 @@ func (a *Agent) lastResultForSignatureIsRecycled(signature string) bool {
 // destroyEphemeralMessages releases old ephemeral tool results and returns
 // how many it released.
 func (a *Agent) destroyEphemeralMessages() int {
+	released, _ := a.destroyEphemeralMessagesAfter(nil)
+	return released
+}
+
+// destroyEphemeralMessagesAfter is destroyEphemeralMessages that also reports,
+// under the same lock, whether a released message lies after anchor: the
+// last assistant message with anchor's identity. A missing anchor reports
+// true (the boundary is unknown); a nil anchor reports false.
+func (a *Agent) destroyEphemeralMessagesAfter(anchor *llm.Message) (released int, afterAnchor bool) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
-	released := 0
+	boundary := -1
+	if anchor != nil {
+		boundary = assistantAnchorIndex(a.messages, *anchor)
+	}
 
 	if a.ephemeralByKey == nil {
 		a.ephemeralByKey = make(map[string][]int)
@@ -3609,6 +3629,9 @@ func (a *Agent) destroyEphemeralMessages() int {
 			}
 			m.Destroyed = true
 			released++
+			if anchor != nil && (boundary < 0 || i > boundary) {
+				afterAnchor = true
+			}
 			m.Content = llm.TextContent(ephemeralReleasedPlaceholder)
 			a.messages[i] = m
 		}
@@ -3618,7 +3641,7 @@ func (a *Agent) destroyEphemeralMessages() int {
 		}
 		a.ephemeralByKey[key] = idxs
 	}
-	return released
+	return released, afterAnchor
 }
 
 // ephemeralGroupKeyLocked returns the grouping key for a tool result. Results

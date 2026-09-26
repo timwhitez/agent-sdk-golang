@@ -285,8 +285,11 @@ truncated) and each envelope owns its copy. Every Frame built while those
 results await an accepted response carries it: retries reuse the Frame's
 value, and a Frame after steering or stream-idle recovery carries it together
 with that relation. It is cleared once a model response is accepted, and
-becomes unknown (empty) when a compaction rewrites history or an ephemeral
-tool result is released before the request is built. It carries only Frame
+becomes unknown (empty) when a compaction rewrites history or one of the
+block's own ephemeral results is released before the request is built. The
+block is bounded by the SDK's own assistant message carrying the answered
+calls, located by identity at release time, so a host system publication that
+shifts indices does not move it; releasing an older result keeps the set. It carries only Frame
 IDs, never content, CallIDs or fingerprints, and it does not name every
 producer of the request's content (earlier partial outputs saved on
 steering or recovery, for example, keep their own relations).
