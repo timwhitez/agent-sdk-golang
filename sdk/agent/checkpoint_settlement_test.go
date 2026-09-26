@@ -5,6 +5,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/timwhitez/agent-sdk-golang/sdk/agent/compaction"
 	"github.com/timwhitez/agent-sdk-golang/sdk/llm"
@@ -18,6 +19,7 @@ type settlingWriter struct {
 	checkpoints []compaction.CompactionCheckpoint
 	outcomes    []compaction.CompactionCheckpointOutcome
 	onSave      func(int)
+	onSettle    func(compaction.CompactionCheckpointOutcome)
 }
 
 func (w *settlingWriter) SaveCompactionCheckpoint(_ context.Context, checkpoint compaction.CompactionCheckpoint) error {
@@ -33,8 +35,11 @@ func (w *settlingWriter) SaveCompactionCheckpoint(_ context.Context, checkpoint 
 
 func (w *settlingWriter) SettleCompactionCheckpoint(_ context.Context, outcome compaction.CompactionCheckpointOutcome) error {
 	w.mu.Lock()
-	defer w.mu.Unlock()
 	w.outcomes = append(w.outcomes, outcome)
+	w.mu.Unlock()
+	if w.onSettle != nil {
+		w.onSettle(outcome)
+	}
 	return nil
 }
 
@@ -78,7 +83,16 @@ func TestAcknowledgedCheckpointAbandonedAfterHistoryChangeIsSettled(t *testing.T
 	}
 
 	// The retry: the published outcome precedes the CompactionEvent and names
-	// exactly the installed prefix.
+	// exactly the installed prefix. The event stream is buffered, so a slow
+	// published settle is what tells settle-then-emit from emit-then-settle:
+	// the event must not be readable before that settle has returned.
+	var settled atomic.Bool
+	writer.onSettle = func(outcome compaction.CompactionCheckpointOutcome) {
+		if outcome.Published {
+			time.Sleep(100 * time.Millisecond)
+			settled.Store(true)
+		}
+	}
 	var sawEvent bool
 	for ev := range ag.QueryStream(context.Background(), llm.TextContent("next request")) {
 		event, ok := ev.(CompactionEvent)
@@ -86,6 +100,9 @@ func TestAcknowledgedCheckpointAbandonedAfterHistoryChangeIsSettled(t *testing.T
 			continue
 		}
 		sawEvent = true
+		if !settled.Load() {
+			t.Fatal("the CompactionEvent was readable before the published settle returned")
+		}
 		checkpoints, outcomes = writer.snapshot()
 		if len(checkpoints) != 2 || len(outcomes) != 2 {
 			t.Fatalf("at CompactionEvent: checkpoints=%d outcomes=%+v", len(checkpoints), outcomes)
