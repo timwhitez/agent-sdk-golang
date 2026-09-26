@@ -141,7 +141,12 @@ func (m *publishingRetryModel) Invoke(_ context.Context, req llm.InvokeRequest) 
 // Frame 1's retry still reports (and carries) the publication it was built
 // from. A rejected publication changes nothing.
 func TestHostPublicationRevisionMidQueryMovesNextFrameRetryKeepsOld(t *testing.T) {
-	echo := tools.Func[struct{}]("echo", "echo", func(context.Context, struct{}, *tools.Container) (any, error) { return "ok", nil })
+	var toolFrame tools.ToolExecutionFrame
+	var toolFrameKnown bool
+	echo := tools.Func[struct{}]("echo", "echo", func(ctx context.Context, _ struct{}, _ *tools.Container) (any, error) {
+		toolFrame, toolFrameKnown = tools.CurrentToolExecutionFrame(ctx)
+		return "ok", nil
+	})
 	model := &publishingRetryModel{publish: func(ag *Agent) (HistoryPublication, error) {
 		current := ag.Messages()
 		// A non-system change during the Query is rejected and records nothing.
@@ -171,16 +176,20 @@ func TestHostPublicationRevisionMidQueryMovesNextFrameRetryKeepsOld(t *testing.T
 	if mid.Revision <= admission.Revision || mid.Replaced != admission.Revision {
 		t.Fatalf("mid-query publication=%+v after %+v", mid, admission)
 	}
+	if !toolFrameKnown || frameSuffix(toolFrame.FrameID) != "1" || toolFrame.HostPublicationRevision != admission.Revision {
+		t.Fatalf("native tool saw Frame %+v known=%v, want Frame 1's original publication %d", toolFrame, toolFrameKnown, admission.Revision)
+	}
 	// Independent oracle: the provider saw the old prompt on both attempts of
 	// Frame 1 and the new prompt on Frame 2.
 	if len(systems) != 3 || systems[0] != "rules base" || systems[1] != "rules base" || systems[2] != "rules plan" {
 		t.Fatalf("provider system prompts=%q", systems)
 	}
-	sawRetry, sawSecond := false, false
+	sawRetry, sawSecond, sawToolFrame := false, false, false
 	for _, o := range observed {
 		switch frameSuffix(o.frame) {
 		case "1":
 			sawRetry = sawRetry || o.attempt == 2
+			sawToolFrame = sawToolFrame || o.frame == toolFrame.FrameID && o.attempt == 2
 			if o.publication != admission.Revision {
 				t.Fatalf("Frame 1 attempt %d reported %d, want its own publication %d", o.attempt, o.publication, admission.Revision)
 			}
@@ -193,8 +202,8 @@ func TestHostPublicationRevisionMidQueryMovesNextFrameRetryKeepsOld(t *testing.T
 			t.Fatalf("unexpected Frame %s", o.frame)
 		}
 	}
-	if !sawRetry || !sawSecond {
-		t.Fatalf("retry observed=%v second Frame observed=%v: %+v", sawRetry, sawSecond, observed)
+	if !sawRetry || !sawSecond || !sawToolFrame {
+		t.Fatalf("retry observed=%v second Frame observed=%v tool Frame observed=%v: %+v", sawRetry, sawSecond, sawToolFrame, observed)
 	}
 }
 

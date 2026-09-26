@@ -1751,7 +1751,10 @@ func (a *Agent) queryStreamWithSteering(ctx context.Context, input llm.Content, 
 					// Each call owns its metadata store: a nested agent running inside
 					// another tool's handler must not write into or drain the
 					// enclosing call's store, nor share one with its siblings.
-					ctxTool := tools.WithToolResultMetadataScope(tools.WithToolCallID(root, tc.ID))
+					ctxTool := tools.WithToolResultMetadataScope(tools.WithToolExecutionFrame(
+						tools.WithToolCallID(root, tc.ID),
+						tools.ToolExecutionFrame{FrameID: toolCorrelation.frameID, HostPublicationRevision: toolCorrelation.hostPublication},
+					))
 					ctxTool, finish := a.beginSteeringInterruptibleStage(ctxTool)
 					return BlockAdmission{Call: &prepared, Context: ctxTool, Deps: a.deps, Finish: finish}, nil
 				},
