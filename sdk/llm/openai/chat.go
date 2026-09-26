@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"math"
 	"net/http"
 	"net/url"
 	"sort"
@@ -1958,14 +1959,41 @@ func parseUsage(u map[string]any) *llm.Usage {
 
 	var cached *int
 	if det, ok := u["prompt_tokens_details"].(map[string]any); ok {
-		v := intFromAny(det["cached_tokens"])
-		if v > 0 {
-			cached = &v
-		}
+		cached = nonNegativeUsageCount(det["cached_tokens"])
 	}
 	usage := llm.NewProviderUsage(pt, ct, tt)
 	usage.PromptCachedTokens = cached
 	return usage
+}
+
+// A reported zero is evidence of a miss; an absent or malformed value is
+// unknown. intFromAny intentionally conflates them for legacy token totals.
+func nonNegativeUsageCount(value any) *int {
+	var n int64
+	switch v := value.(type) {
+	case int:
+		n = int64(v)
+	case int64:
+		n = v
+	case float64:
+		if v < 0 || v >= 1<<53 || v != math.Trunc(v) {
+			return nil
+		}
+		n = int64(v)
+	case json.Number:
+		var err error
+		n, err = v.Int64()
+		if err != nil {
+			return nil
+		}
+	default:
+		return nil
+	}
+	if n < 0 || n > int64(^uint(0)>>1) {
+		return nil
+	}
+	count := int(n)
+	return &count
 }
 
 func intFromAny(v any) int {
