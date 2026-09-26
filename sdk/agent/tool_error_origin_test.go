@@ -212,3 +212,33 @@ func TestToolResultErrorOriginPrecedence(t *testing.T) {
 		})
 	}
 }
+
+// A handler that panics after steering canceled its context is labeled
+// interrupted, like one that returns an error then.
+func TestToolResultErrorOriginPanicAfterSteering(t *testing.T) {
+	started := make(chan struct{})
+	tool := tools.Tool{Name: "work", Handler: func(ctx context.Context, _ json.RawMessage, _ *tools.Container) (llm.Content, error) {
+		close(started)
+		<-ctx.Done()
+		panic("handler bug on cancellation")
+	}}
+	ag, err := New(Config{LLM: &stubModel{toolName: "work", toolArgs: `{}`, toolID: "call-1"}, Tools: []tools.Tool{tool}, Warningf: func(string, ...any) {}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	steering := make(chan SteeringMsg, 1)
+	stream := ag.QueryStreamEnvelopedWithSteering(context.Background(), llm.TextContent("go"), steering)
+	go func() {
+		<-started
+		steering <- SteeringMsg{Content: "change of plan"}
+		ag.InterruptActiveStageForSteering()
+	}()
+	var events []Event
+	for envelope := range stream {
+		events = append(events, envelope.Event)
+	}
+	result := onlyToolResult(t, events)
+	if !result.IsError || result.ErrorOrigin != ToolErrorOriginInterrupted {
+		t.Fatalf("tool result is_error=%v origin=%q, want interrupted", result.IsError, result.ErrorOrigin)
+	}
+}

@@ -242,6 +242,9 @@ type Agent struct {
 	// compaction most recently published into history, consumed once by the
 	// next Frame. Guarded by mu; empty is unknown.
 	appliedCompactionSource string
+	// lastHostPublication is the Revision of the latest host publication on
+	// this Agent; unlike hostPublication it is never reset.
+	lastHostPublication uint64
 	// hostPublication is the HistoryPublication.Revision whose system
 	// messages the current history still carries without an SDK change to
 	// its system messages; zero is unknown. Guarded by mu.

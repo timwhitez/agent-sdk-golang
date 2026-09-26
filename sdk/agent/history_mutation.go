@@ -122,7 +122,23 @@ func (a *Agent) replaceHistoryChecked(messages []llm.Message, conditional bool, 
 func (a *Agent) recordHostPublicationLocked() HistoryPublication {
 	publication := HistoryPublication{Revision: hostPublicationRevisions.Add(1), Replaced: a.hostPublication}
 	a.hostPublication = publication.Revision
+	a.lastHostPublication = publication.Revision
 	return publication
+}
+
+// LastHostPublicationRevision returns the Revision of the latest successful
+// host history publication on this Agent (ReplaceHistoryChecked and its
+// variants, or CommitCompactionHistory), or zero if there was none. Unlike
+// EventEnvelope.HostPublicationRevision it is not reset when the SDK changes
+// the system messages itself, so a host can tell whether it published
+// anything between two reads.
+func (a *Agent) LastHostPublicationRevision() uint64 {
+	if a == nil {
+		return 0
+	}
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return a.lastHostPublication
 }
 
 // messagesAndHostPublication returns an owned history, the publication
