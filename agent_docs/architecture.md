@@ -308,3 +308,6 @@ publication made meanwhile applies from the next Frame. The SDK clears it
 configured SystemPrompt into an empty history, or installing an automatic,
 overflow, emergency-trim or `CompactPipelineNow` result. It names a
 publication, not its content, a session revision, the wire payload or delivery.
+`LastHostPublicationRevision` returns the latest host publication's revision
+(zero before any) and is never cleared by those SDK changes, so a host can
+tell whether it published anything between two reads.

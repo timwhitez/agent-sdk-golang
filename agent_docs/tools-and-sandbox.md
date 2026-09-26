@@ -53,6 +53,7 @@ are never retried, and the original execution error/result is preserved.
 - Before provider calls, agent exports non-hidden tool definitions (`sdk/agent/agent.go:232`)
 - For each tool call, agent normalizes args, enriches context with call ID and metadata store, then executes (`sdk/agent/agent.go:382`, `sdk/agent/agent.go:396`)
 - Tool output + metadata snapshot is emitted as `ToolResultEvent` and appended as a tool-role message (`sdk/agent/agent.go:408`, `sdk/agent/agent.go:445`)
+- An error `ToolResultEvent` carries `ErrorOrigin`, the SDK path that produced it: `unknown_tool` (the invalid-tool fallback answered a name the Agent does not offer), `handler` (the handler returned an error or panicked), `canceled` (the Query's root context ended after the handler started), `interrupted` (accepted steering had already canceled the handler's context when it returned; later steering does not relabel a returned result) or `suppressed` (the repeated-signature loop guard answered before execution). It is empty on success. It names a path, not a cause: a handler error may come from the tool, its arguments or the environment, and a host refines it only from facts it owns (`nativeToolErrorOrigin` in `sdk/agent/agent.go`)
 - Oversized tool output is bounded before history append/event emission by
   `MaxToolResultBytes` (default 50 KiB) and `MaxToolResultTokens` (default
   derived from the byte budget). `ArtifactOwnerProvider` (preferred for

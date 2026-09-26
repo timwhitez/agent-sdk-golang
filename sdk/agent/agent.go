@@ -242,6 +242,9 @@ type Agent struct {
 	// compaction most recently published into history, consumed once by the
 	// next Frame. Guarded by mu; empty is unknown.
 	appliedCompactionSource string
+	// lastHostPublication is the Revision of the latest host publication on
+	// this Agent; unlike hostPublication it is never reset.
+	lastHostPublication uint64
 	// hostPublication is the HistoryPublication.Revision whose system
 	// messages the current history still carries without an SDK change to
 	// its system messages; zero is unknown. Guarded by mu.
@@ -1629,6 +1632,7 @@ func (a *Agent) queryStreamWithSteering(ctx context.Context, input llm.Content, 
 							guardHistory := loopGuardSkippedToolResults(tc, c.resolvedName)
 							guardResult := projectToolResult(guardHistory[0], map[string]any{"loop_guard_suppressed": true}, "[ERROR] Tool call skipped by loop guard - Repeated identical tool call blocked before execution.")
 							guardResult.visible = guardResult.original
+							guardResult.errorOrigin = ToolErrorOriginSuppressed
 							c.postCommit = func() {
 								loopGuardStrikes++
 								c.appliedInterventionStrike = loopGuardStrikes
@@ -1804,7 +1808,9 @@ func (a *Agent) queryStreamWithSteering(ctx context.Context, input llm.Content, 
 					}
 					original := content.PlainText()
 					content, meta = a.applyToolResultTruncation(ctx, content, meta, c.resolvedName, tc.ID)
-					return blockTerminal(projectToolResult(llm.Message{Role: llm.RoleTool, ToolCallID: tc.ID, ToolName: c.resolvedName, Content: content, IsError: isError, Ephemeral: c.tool.EphemeralKeep > 0}, meta, original), reason), nil
+					projection := projectToolResult(llm.Message{Role: llm.RoleTool, ToolCallID: tc.ID, ToolName: c.resolvedName, Content: content, IsError: isError, Ephemeral: c.tool.EphemeralKeep > 0}, meta, original)
+					projection.errorOrigin = nativeToolErrorOrigin(isError, outcome, c.unknownToolFallback)
+					return blockTerminal(projection, reason), nil
 				},
 				Commit: func(terminals []BlockTerminal) error {
 					rows := make([]llm.Message, len(terminals))
@@ -2864,6 +2870,28 @@ func stopTimerDrain(t *time.Timer) {
 		case <-t.C:
 		default:
 		}
+	}
+}
+
+// nativeToolErrorOrigin names the path that produced a native error result,
+// in the precedence Project applies to its content: a root cancellation
+// replaces the result, the invalid-tool fallback answers an unknown name,
+// and only then is the error attributed to the handler, or to a steering
+// interruption that had already canceled the handler's context when it
+// returned. Steering that arrives after the handler returned (for example
+// while an earlier call of the same wave settles) does not relabel it.
+func nativeToolErrorOrigin(isError bool, outcome BlockOutcome, unknownTool bool) string {
+	switch {
+	case !isError:
+		return ""
+	case outcome.RootError != nil:
+		return ToolErrorOriginCanceled
+	case unknownTool:
+		return ToolErrorOriginUnknownTool
+	case outcome.Interrupted && outcome.stageDoneAtReturn:
+		return ToolErrorOriginInterrupted
+	default:
+		return ToolErrorOriginHandler
 	}
 }
 

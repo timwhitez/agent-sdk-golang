@@ -36,13 +36,15 @@ type BlockTerminal struct {
 	Metadata           map[string]any
 	Publish            bool
 	Reason             string
+	// errorOrigin is set only by the SDK's native projection.
+	errorOrigin string
 }
 
 func (t BlockTerminal) projection() toolResultProjection {
-	return toolResultProjection{history: t.History, visible: t.Visible, original: t.Original, metadata: t.Metadata, publish: t.Publish}
+	return toolResultProjection{history: t.History, visible: t.Visible, original: t.Original, metadata: t.Metadata, publish: t.Publish, errorOrigin: t.errorOrigin}
 }
 func blockTerminal(p toolResultProjection, reason string) BlockTerminal {
-	return BlockTerminal{History: p.history, Visible: p.visible, Original: p.original, Metadata: p.metadata, Publish: p.publish, Reason: reason}
+	return BlockTerminal{History: p.history, Visible: p.visible, Original: p.original, Metadata: p.metadata, Publish: p.publish, Reason: reason, errorOrigin: p.errorOrigin}
 }
 
 // BlockAdmission contains the complete prepared Handler. Finish releases the
@@ -66,6 +68,11 @@ type BlockOutcome struct {
 	Interrupted    bool
 	Panic          any
 	NotStarted     BlockStop
+	// stageDoneAtReturn records whether the handler's context had already
+	// ended when it returned (or panicked). Interrupted alone is read at
+	// settle and can include a steering request made after the handler had
+	// returned its own result.
+	stageDoneAtReturn bool
 }
 
 // SequentialBlockAdapter keeps host policy and presentation at their existing
@@ -300,7 +307,7 @@ func runSequentialBlock(root context.Context, state *toolBlockState, calls []llm
 		started := time.Now()
 		defer func() { o.Duration = time.Since(started) }()
 		defer scope.finish()
-		defer func() { o.Panic = recover() }()
+		defer func() { o.Panic, o.stageDoneAtReturn = recover(), ctx.Err() != nil }()
 		o.Content, o.Err = admission.Call.Execute(ctx, admission.Deps)
 		return o
 	}

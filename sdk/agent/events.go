@@ -91,7 +91,34 @@ type ToolResultEvent struct {
 	IsError          bool
 	ScreenshotBase64 string
 	Metadata         map[string]any
+	// ErrorOrigin says which SDK path produced an error result (one of the
+	// ToolErrorOrigin* labels); it is empty when IsError is false. It names
+	// the path, not a cause: a handler error may be the tool's, the
+	// arguments' or the environment's. Hosts refine it only from facts they
+	// own (for example a confirmation denial inside the handler).
+	ErrorOrigin string
 }
+
+// Tool error origins: the SDK path that produced an error tool result.
+const (
+	// ToolErrorOriginUnknownTool: the model named a tool the Agent does not
+	// offer; the SDK's invalid-tool fallback answered it.
+	ToolErrorOriginUnknownTool = "unknown_tool"
+	// ToolErrorOriginHandler: the resolved tool's handler returned an error
+	// or panicked.
+	ToolErrorOriginHandler = "handler"
+	// ToolErrorOriginCanceled: the Query's root context ended after the
+	// handler started; the result is the SDK's cancellation text.
+	ToolErrorOriginCanceled = "canceled"
+	// ToolErrorOriginInterrupted: accepted steering had already canceled the
+	// handler's context when it returned an error. Steering that arrives
+	// after the handler returned leaves the handler label. The error may
+	// still be unrelated to the interruption.
+	ToolErrorOriginInterrupted = "interrupted"
+	// ToolErrorOriginSuppressed: the repeated-signature loop guard answered
+	// the call before execution.
+	ToolErrorOriginSuppressed = "suppressed"
+)
 
 func (ToolResultEvent) isEvent() {}
 

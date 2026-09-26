@@ -232,6 +232,11 @@ func TestHostPublicationRevisionUnknownAfterSDKCompaction(t *testing.T) {
 	if !compacted || len(frames) != 3 {
 		t.Fatalf("compacted=%v frames=%v", compacted, frames)
 	}
+	// The SDK's own compaction resets the current publication to unknown but
+	// is not a host publication: the latest host publication stays.
+	if got := ag.LastHostPublicationRevision(); got != admission.Revision {
+		t.Fatalf("latest host publication after an SDK compaction=%d, want %d", got, admission.Revision)
+	}
 	for frame, publication := range frames {
 		want := uint64(0)
 		if frameSuffix(frame) == "1" {
@@ -247,6 +252,9 @@ func TestHostPublicationRevisionUnknownAfterSDKCompaction(t *testing.T) {
 	}
 	if republished.Replaced != 0 || republished.Revision <= admission.Revision {
 		t.Fatalf("publication after the compaction=%+v", republished)
+	}
+	if got := ag.LastHostPublicationRevision(); got != republished.Revision {
+		t.Fatalf("latest host publication=%d, want %d", got, republished.Revision)
 	}
 	model.mu.Lock()
 	model.steps = []func() (*llm.Completion, error){relationFinal}
@@ -327,5 +335,36 @@ func TestHostPublicationRevisionUnknownAfterCompactPipelineNow(t *testing.T) {
 		if o.publication != 0 {
 			t.Fatalf("Frame %s after an SDK-computed compaction reported %d", o.frame, o.publication)
 		}
+	}
+}
+
+// LastHostPublicationRevision is zero before any host publication and names
+// the latest one, including a rejected CAS leaving it unchanged.
+func TestLastHostPublicationRevisionTracksHostPublications(t *testing.T) {
+	ag, err := New(Config{LLM: plainAnswerModel{}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := ag.LastHostPublicationRevision(); got != 0 {
+		t.Fatalf("fresh Agent reported %d", got)
+	}
+	first, err := ag.ReplaceHistoryCheckedRevision([]llm.Message{llm.NewSystemMessage("one")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := ag.LastHostPublicationRevision(); got != first.Revision {
+		t.Fatalf("after the first publication=%d, want %d", got, first.Revision)
+	}
+	if _, err := ag.ReplaceHistoryCheckedIfRevision(first.Revision+1000, []llm.Message{llm.NewSystemMessage("stale")}); err == nil {
+		t.Fatal("stale CAS publication accepted")
+	}
+	if got := ag.LastHostPublicationRevision(); got != first.Revision {
+		t.Fatalf("a rejected publication moved the revision to %d", got)
+	}
+	if err := ag.ReplaceHistoryChecked([]llm.Message{llm.NewSystemMessage("two")}); err != nil {
+		t.Fatal(err)
+	}
+	if got := ag.LastHostPublicationRevision(); got <= first.Revision {
+		t.Fatalf("after the second publication=%d, want > %d", got, first.Revision)
 	}
 }
