@@ -1966,8 +1966,8 @@ func parseUsage(u map[string]any) *llm.Usage {
 	return usage
 }
 
-// A reported zero is evidence of a miss; an absent or malformed value is
-// unknown. intFromAny intentionally conflates them for legacy token totals.
+// A reported zero means no tokens were read from cache; an absent or malformed
+// value is unknown. intFromAny conflates them for legacy token totals.
 func nonNegativeUsageCount(value any) *int {
 	var n int64
 	switch v := value.(type) {
