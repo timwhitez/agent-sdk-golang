@@ -1477,12 +1477,8 @@ func responsesPromptBreakdown(u map[string]any) (cached *int, image *int) {
 	if details == nil {
 		return nil, nil
 	}
-	if v := intFromAny(details["cached_tokens"]); v > 0 {
-		cached = &v
-	}
-	if v := intFromAny(details["image_tokens"]); v > 0 {
-		image = &v
-	}
+	cached = nonNegativeUsageCount(details["cached_tokens"])
+	image = nonNegativeUsageCount(details["image_tokens"])
 	return cached, image
 }
 

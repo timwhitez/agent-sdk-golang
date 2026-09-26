@@ -1,10 +1,46 @@
 package openai
 
 import (
+	"encoding/json"
 	"testing"
 
 	"github.com/timwhitez/agent-sdk-golang/sdk/llm"
 )
+
+func TestCacheUsageZeroIsKnownAndMissingIsUnknown(t *testing.T) {
+	for _, tc := range []struct {
+		name, value string
+		known       bool
+		want        int
+	}{
+		{"zero", `0`, true, 0},
+		{"hit", `7`, true, 7},
+		{"omitted", ``, false, 0},
+		{"null", `null`, false, 0},
+		{"negative", `-1`, false, 0},
+		{"fraction", `0.5`, false, 0},
+		{"string", `"0"`, false, 0},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var raw map[string]any
+			details := `{}`
+			if tc.value != "" {
+				details = `{"cached_tokens":` + tc.value + `}`
+			}
+			body := `{"usage":{"prompt_tokens":42,"completion_tokens":3,"total_tokens":45,"prompt_tokens_details":` + details + `,"input_tokens_details":` + details + `}}`
+			if err := json.Unmarshal([]byte(body), &raw); err != nil {
+				t.Fatal(err)
+			}
+			chat := parseUsage(raw["usage"].(map[string]any))
+			responses := usageFromResponses(raw)
+			for name, usage := range map[string]*llm.Usage{"chat": chat, "responses": responses} {
+				if usage == nil || (usage.PromptCachedTokens != nil) != tc.known || tc.known && *usage.PromptCachedTokens != tc.want {
+					t.Fatalf("%s cached usage = %+v, known=%v want=%d", name, usage, tc.known, tc.want)
+				}
+			}
+		})
+	}
+}
 
 func TestParseResponsesInfersTotalTokensWhenGatewayOmitsIt(t *testing.T) {
 	comp, err := parseResponses([]byte(`{"id":"resp_123","status":"completed","output":[{"type":"message","content":[{"type":"output_text","text":"ok"}]}],"usage":{"input_tokens":11,"output_tokens":7}}`))
