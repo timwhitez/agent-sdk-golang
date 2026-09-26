@@ -8,7 +8,6 @@ import (
 	"log"
 	"net"
 	"os"
-	"reflect"
 	"slices"
 	"strings"
 	"sync"
@@ -3889,7 +3888,12 @@ func (a *Agent) compactSyncOverflow(ctx context.Context, sourceFrameID string, l
 		sourceFrameID: sourceFrameID,
 	}
 	a.pendingCompactionMu.Unlock()
-	a.applyPendingCompaction(out)
+	if !a.applyPendingCompaction(out) {
+		// The summary was requeued (history shrank, checkpoint failure) or
+		// discarded (history changed), so the live history still exceeds the
+		// window. Returning nil would let the caller send it anyway.
+		return errors.New("overflow compaction result was not published; the history still exceeds the context window")
+	}
 	return nil
 }
 
@@ -4573,7 +4577,7 @@ func (a *Agent) applyPendingCompaction(out *eventOutput) (published bool) {
 	a.mu.Lock()
 	source := llm.CloneMessages(a.messages)
 	currentLen := len(source)
-	merged, tailStart, ok := rebasePendingCompaction(pending, source)
+	merged, tailStart, ok := rebasePendingCompaction(pending, source, a.systemPrompt)
 	if !ok && currentLen < pending.snapshotLen {
 		a.mu.Unlock()
 		a.warnf("compaction apply skipped: history shrank (%d < %d); scheduling retry", currentLen, pending.snapshotLen)
@@ -4633,7 +4637,10 @@ func (a *Agent) applyPendingCompaction(out *eventOutput) (published bool) {
 	}
 
 	a.mu.Lock()
-	if !reflect.DeepEqual(a.messages, source) {
+	// The same JSON identity as the source check: source is a clone, and a
+	// clone may normalize fields (an empty ThoughtSig becomes nil) without
+	// changing the history the provider sees.
+	if !sameMessageIdentity(a.messages, source) {
 		a.mu.Unlock()
 		rollbackErr := error(nil)
 		if commit.persisted {
@@ -4672,14 +4679,35 @@ func (a *Agent) applyPendingCompaction(out *eventOutput) (published bool) {
 // messages (the change ReplaceHistoryChecked accepts during a query, such as a
 // refreshed host context message), the live system messages replace the
 // candidate's. Any other change makes the candidate stale (ok=false).
-// tailStart is the index in live where the kept tail begins.
-func rebasePendingCompaction(pending *pendingCompaction, live []llm.Message) (merged []llm.Message, tailStart int, ok bool) {
+// tailStart is the index in live where the kept tail begins. basePrompt is the
+// configured system prompt that withPreservedSystem injects when the source
+// had no system message; see injectedPromptSuperseded for when that injected
+// copy is not restored.
+func rebasePendingCompaction(pending *pendingCompaction, live []llm.Message, basePrompt string) (merged []llm.Message, tailStart int, ok bool) {
 	n := pending.snapshotLen
 	if len(pending.source) != n {
 		return nil, 0, false
 	}
+	injected := ""
+	if strings.TrimSpace(basePrompt) != "" {
+		injected = systemMessageSignature(llm.NewSystemMessage(basePrompt))
+	}
+	kept := map[string]struct{}{}
+	for _, m := range pending.source {
+		if m.Role == llm.RoleSystem {
+			kept[systemMessageSignature(m)] = struct{}{}
+		}
+	}
+	if _, fromSource := kept[injected]; fromSource {
+		// The prompt was in the source, so the candidate did not inject it.
+		injected = ""
+	}
 	if len(live) >= n && sameMessageIdentity(live[:n], pending.source) {
-		return append(llm.CloneMessages(pending.messages), llm.CloneMessages(live[n:])...), n, true
+		candidate := pending.messages
+		if injectedPromptSuperseded(injected, nil, live[n:]) {
+			candidate = withoutSystemSignature(candidate, injected)
+		}
+		return append(llm.CloneMessages(candidate), llm.CloneMessages(live[n:])...), n, true
 	}
 	body := nonSystemMessages(pending.source)
 	if len(body) == 0 {
@@ -4696,29 +4724,64 @@ func rebasePendingCompaction(pending *pendingCompaction, live []llm.Message) (me
 	if seen < len(body) || !sameMessageIdentity(nonSystemMessages(prefix), body) || !plainSystemMessages(prefix) || !plainSystemMessages(pending.source) {
 		return nil, 0, false
 	}
-	kept := map[string]struct{}{}
-	for _, m := range pending.source {
-		if m.Role == llm.RoleSystem {
-			kept[systemMessageSignature(m)] = struct{}{}
-		}
-	}
 	for _, m := range prefix {
 		if m.Role == llm.RoleSystem {
 			merged = append(merged, m)
 		}
 	}
-	// System messages the compaction itself added are not host state; keep them.
+	dropInjected := injectedPromptSuperseded(injected, prefix, live[tailStart:])
+	// System messages the compaction itself added are not host state; keep
+	// them, except a superseded injected base prompt.
 	for _, m := range pending.messages {
 		if m.Role != llm.RoleSystem {
 			continue
 		}
-		if _, fromSource := kept[systemMessageSignature(m)]; !fromSource {
-			merged = append(merged, m)
+		sig := systemMessageSignature(m)
+		if _, fromSource := kept[sig]; fromSource {
+			continue
 		}
+		if dropInjected && sig == injected {
+			continue
+		}
+		merged = append(merged, m)
 	}
 	merged = append(merged, nonSystemMessages(pending.messages)...)
 	merged = append(merged, live[tailStart:]...)
 	return llm.CloneMessages(merged), tailStart, true
+}
+
+// injectedPromptSuperseded reports whether the base prompt a candidate
+// injected (signature injected, empty when it injected none) must not be
+// restored: the live prefix now carries an unnamed system message (the host's
+// own base prompt) or the same prompt, or the kept tail already carries the
+// same prompt, which would otherwise be duplicated. A named host context
+// message (memory and the like) is not a base prompt and does not supersede it.
+func injectedPromptSuperseded(injected string, prefix, tail []llm.Message) bool {
+	if injected == "" {
+		return false
+	}
+	for _, m := range prefix {
+		if m.Role == llm.RoleSystem && (strings.TrimSpace(m.Name) == "" || systemMessageSignature(m) == injected) {
+			return true
+		}
+	}
+	for _, m := range tail {
+		if m.Role == llm.RoleSystem && systemMessageSignature(m) == injected {
+			return true
+		}
+	}
+	return false
+}
+
+func withoutSystemSignature(messages []llm.Message, sig string) []llm.Message {
+	out := make([]llm.Message, 0, len(messages))
+	for _, m := range messages {
+		if m.Role == llm.RoleSystem && systemMessageSignature(m) == sig {
+			continue
+		}
+		out = append(out, m)
+	}
+	return out
 }
 
 // sameMessageIdentity compares histories by the JSON identity that
