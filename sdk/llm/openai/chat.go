@@ -1576,15 +1576,13 @@ func hasProviderNeutralContentBlocks(content llm.Content) bool {
 }
 
 func openAIContentFallbackText(block llm.ContentBlock) string {
+	// Provider-owned reasoning must not become ordinary text when a history
+	// produced by another adapter is sent through Chat Completions.
+	kind := strings.ToLower(strings.TrimSpace(block.Type))
+	if kind == "thinking" || kind == "redacted_thinking" {
+		return ""
+	}
 	switch strings.TrimSpace(block.Type) {
-	case "thinking", "redacted_thinking":
-		if strings.TrimSpace(block.Thinking) != "" {
-			return block.Thinking
-		}
-		if strings.TrimSpace(block.Text) != "" {
-			return block.Text
-		}
-		return "[thinking content omitted]"
 	case "document":
 		if block.Source != nil && strings.TrimSpace(block.Source.MediaType) != "" {
 			return "[document: " + strings.TrimSpace(block.Source.MediaType) + "]"

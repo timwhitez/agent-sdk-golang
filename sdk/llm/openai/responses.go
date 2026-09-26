@@ -1799,6 +1799,11 @@ func responsesContentPlainText(content llm.Content) string {
 }
 
 func responsesContentFallbackText(block llm.ContentBlock) string {
+	// Reasoning is provider-owned state, never a fallback input_text block.
+	kind := strings.ToLower(strings.TrimSpace(block.Type))
+	if kind == "thinking" || kind == "redacted_thinking" {
+		return ""
+	}
 	switch strings.TrimSpace(block.Type) {
 	case "image_url":
 		if block.ImageURL != nil {
@@ -1810,14 +1815,6 @@ func responsesContentFallbackText(block llm.ContentBlock) string {
 			}
 		}
 		return ""
-	case "thinking", "redacted_thinking":
-		if strings.TrimSpace(block.Thinking) != "" {
-			return block.Thinking
-		}
-		if strings.TrimSpace(block.Text) != "" {
-			return block.Text
-		}
-		return "[thinking content omitted]"
 	case "document":
 		if block.Source != nil && strings.TrimSpace(block.Source.MediaType) != "" {
 			return "[document: " + strings.TrimSpace(block.Source.MediaType) + "]"
