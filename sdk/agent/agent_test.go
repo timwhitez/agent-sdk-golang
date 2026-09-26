@@ -929,7 +929,7 @@ func TestToolCallContinuationMergeUsesStableCallIDOnly(t *testing.T) {
 			Name:      "echo",
 			Arguments: `{"text":"hello`,
 		},
-	}})
+	}}, 1)
 
 	current := []llm.ToolCall{
 		{
@@ -971,7 +971,7 @@ func TestToolCallContinuationPreservesMergeDiagnosticsByCallID(t *testing.T) {
 			Name:      "echo",
 			Arguments: `{"payload":{"value":{"nested":1}}}`,
 		},
-	}})
+	}}, 1)
 
 	merged := cont.mergeToolCalls([]llm.ToolCall{{
 		ID:   "call_1",
@@ -1010,7 +1010,7 @@ func TestToolCallContinuationClearsPartialAfterIndexShift(t *testing.T) {
 	}}
 
 	cont := toolCallContinuation{}
-	cont.addPartial(partial) // cleanup follows reminder ownership, not cached indexes
+	cont.addPartial(partial, 1) // cleanup follows reminder ownership, not cached indexes
 
 	messages := []llm.Message{
 		{Role: llm.RoleSystem, Content: llm.TextContent("sys")},

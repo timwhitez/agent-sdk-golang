@@ -72,12 +72,13 @@ func (a *Agent) recordHostPublicationLocked() HistoryPublication {
 	return publication
 }
 
-// messagesAndHostPublication returns an owned history and the publication
-// whose system messages it carries (zero is unknown), read together.
-func (a *Agent) messagesAndHostPublication() ([]llm.Message, uint64) {
+// messagesAndHostPublication returns an owned history, the publication
+// whose system messages it carries (zero is unknown) and the compaction
+// generation that installed it, read together.
+func (a *Agent) messagesAndHostPublication() ([]llm.Message, uint64, uint64) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
-	return llm.CloneMessages(a.messages), a.hostPublication
+	return llm.CloneMessages(a.messages), a.hostPublication, a.compactionGeneration.Load()
 }
 
 // ClearHistoryChecked rejects destructive clearing during an active query.

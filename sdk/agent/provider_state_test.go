@@ -129,7 +129,7 @@ func TestToolContinuationCleanupClearsStaleProviderState(t *testing.T) {
 		messageorigin.ResponseTruncatedContinuationText,
 	)}
 	continuation := newToolCallContinuation(2)
-	continuation.addPartial([]llm.ToolCall{call})
+	continuation.addPartial([]llm.ToolCall{call}, 1)
 	continuation.clearPartialToolCalls(messages, 2)
 	if len(messages[0].ToolCalls) != 0 || providerStateCount(t, messages[0].Content) != 0 {
 		t.Fatalf("continuation cleanup retained stale state: %#v", messages[0])
