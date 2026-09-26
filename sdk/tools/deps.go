@@ -53,13 +53,29 @@ type ToolResultMetadata struct {
 	m  map[string]any
 }
 
-// WithToolResultMetadata attaches a mutable metadata store to the context.
-// Tools can call Set/Upsert helpers to record metadata for the current tool call.
+// WithToolResultMetadata attaches a mutable metadata store to the context
+// unless one is already attached, in which case ctx is returned unchanged and
+// callers share the existing store. Tools can call Set/Upsert helpers to
+// record metadata for the current tool call. Code that starts a new tool call
+// (including one nested inside another tool's handler) uses
+// WithToolResultMetadataScope instead, so the call owns its store.
 func WithToolResultMetadata(ctx context.Context) context.Context {
 	if ctx == nil {
 		return ctx
 	}
 	if _, ok := ctx.Value(toolResultMetaKey).(*ToolResultMetadata); ok {
+		return ctx
+	}
+	return context.WithValue(ctx, toolResultMetaKey, &ToolResultMetadata{m: map[string]any{}})
+}
+
+// WithToolResultMetadataScope attaches a fresh metadata store owned by one
+// tool call. An enclosing store (for example the outer tool call whose
+// handler runs a nested agent) is shadowed, not shared: the call's Set,
+// Upsert and Take act only on its own store, and the enclosing store is
+// neither written nor drained by it.
+func WithToolResultMetadataScope(ctx context.Context) context.Context {
+	if ctx == nil {
 		return ctx
 	}
 	return context.WithValue(ctx, toolResultMetaKey, &ToolResultMetadata{m: map[string]any{}})
