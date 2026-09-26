@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"sync/atomic"
 
 	"github.com/timwhitez/agent-sdk-golang/sdk/llm"
@@ -50,11 +51,63 @@ type HistoryPublication struct {
 // the host publishes again or the SDK changes the system messages itself
 // (a configured SystemPrompt insertion or a compaction/trim installation).
 func (a *Agent) ReplaceHistoryCheckedRevision(messages []llm.Message) (HistoryPublication, error) {
+	return a.replaceHistoryChecked(messages, false, 0)
+}
+
+// ErrHistoryPublicationConflict is matched (errors.Is) by every
+// *HistoryPublicationConflictError.
+var ErrHistoryPublicationConflict = errors.New("agent: host history publication changed since the expected revision")
+
+// HistoryPublicationConflictError reports that ReplaceHistoryCheckedIfRevision
+// found a different current publication than expected. No mutation was
+// applied. Current is zero when no host publication describes the history.
+type HistoryPublicationConflictError struct {
+	Expected uint64
+	Current  uint64
+}
+
+func (e *HistoryPublicationConflictError) Error() string {
+	return fmt.Sprintf("agent: host history publication conflict: expected revision %d, current %d", e.Expected, e.Current)
+}
+
+// Is makes errors.Is(err, ErrHistoryPublicationConflict) match.
+func (e *HistoryPublicationConflictError) Is(target error) bool {
+	return target == ErrHistoryPublicationConflict
+}
+
+// MessagesWithHostPublication returns an owned history and the
+// HistoryPublication.Revision whose system messages it carries, read under
+// one history lock. Zero is unknown: no host publication yet, or the SDK
+// changed the system messages itself since.
+func (a *Agent) MessagesWithHostPublication() ([]llm.Message, uint64) {
+	messages, revision, _ := a.messagesAndHostPublication()
+	return messages, revision
+}
+
+// ReplaceHistoryCheckedIfRevision is ReplaceHistoryCheckedRevision that
+// publishes only while expected is still the current publication, compared
+// under the same history lock as the replacement. On success the returned
+// Replaced equals expected. A different current publication, including an
+// unknown (zero) one, or a zero expected, returns a
+// *HistoryPublicationConflictError and applies nothing. The comparison
+// covers publications and SDK system-message changes only: messages the
+// SDK appends without changing system messages (a query's turns) do not move
+// the revision; the ReplaceHistoryChecked rules still apply to them.
+func (a *Agent) ReplaceHistoryCheckedIfRevision(expected uint64, messages []llm.Message) (HistoryPublication, error) {
+	return a.replaceHistoryChecked(messages, true, expected)
+}
+
+func (a *Agent) replaceHistoryChecked(messages []llm.Message, conditional bool, expected uint64) (HistoryPublication, error) {
 	a.mu.Lock()
 	owned := llm.CloneMessages(messages)
 	if a.manualCompactionActive || (a.turnActive.Load() && !activeHistoryReplacementSafe(a.messages, owned)) {
 		a.mu.Unlock()
 		return HistoryPublication{}, ErrActiveHistoryMutation
+	}
+	if conditional && (expected == 0 || a.hostPublication != expected) {
+		current := a.hostPublication
+		a.mu.Unlock()
+		return HistoryPublication{}, &HistoryPublicationConflictError{Expected: expected, Current: current}
 	}
 	a.messages = owned
 	publication := a.recordHostPublicationLocked()

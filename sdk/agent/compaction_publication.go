@@ -46,47 +46,58 @@ func (a *Agent) beginManualCompaction(ctx context.Context) (func(), error) {
 // This content check is not a host session/runtime revision or an external-store
 // transaction. Legacy checkpoint-only calls and external writers are not fenced.
 func (a *Agent) CommitCompactionHistory(ctx context.Context, expected, messages []llm.Message, res compaction.Result) (compaction.Result, error) {
+	result, _, err := a.CommitCompactionHistoryRevision(ctx, expected, messages, res)
+	return result, err
+}
+
+// CommitCompactionHistoryRevision is CommitCompactionHistory that also
+// returns the host publication which installed the candidate, recorded
+// under the same history lock. It is the zero value unless the candidate
+// was published (a nil error with a compacted result). Replaced names the
+// publication whose system messages the expected history carried (zero is
+// unknown); it says nothing about whether the candidate kept them.
+func (a *Agent) CommitCompactionHistoryRevision(ctx context.Context, expected, messages []llm.Message, res compaction.Result) (compaction.Result, HistoryPublication, error) {
 	failed := res
 	failed.Compacted, failed.CheckpointID, failed.CheckpointMessages = false, "", 0
 	releasePublication, err := a.beginManualCompaction(ctx)
 	if err != nil {
-		return failed, err
+		return failed, HistoryPublication{}, err
 	}
 	defer releasePublication()
 	if !res.Compacted {
-		return failed, nil
+		return failed, HistoryPublication{}, nil
 	}
 	source, candidate := llm.CloneMessages(expected), llm.CloneMessages(messages)
 	releaseRuntime, acquired := a.tryBeginCompactionRuntimeUse()
 	if !acquired {
-		return failed, ErrAgentBusy
+		return failed, HistoryPublication{}, ErrAgentBusy
 	}
 	defer releaseRuntime()
 	if !a.compactionInFlight.CompareAndSwap(false, true) {
-		return failed, ErrAgentBusy
+		return failed, HistoryPublication{}, ErrAgentBusy
 	}
 	defer a.releaseCompactionInFlight()
 	if a.hasPendingCompaction() {
-		return failed, ErrAgentBusy
+		return failed, HistoryPublication{}, ErrAgentBusy
 	}
 	a.mu.Lock()
 	matches := (len(a.messages) == 0 && len(source) == 0) || messageJSONEqual(a.messages, source)
 	a.mu.Unlock()
 	if !matches {
-		return failed, ErrStaleCompactionHistory
+		return failed, HistoryPublication{}, ErrStaleCompactionHistory
 	}
 	if ctx != nil && ctx.Err() != nil {
-		return failed, ctx.Err()
+		return failed, HistoryPublication{}, ctx.Err()
 	}
 	res.CheckpointID, res.CheckpointMessages = "", 0
 	commit, err := a.persistCompactionCheckpoint(ctx, candidate, res)
 	if err != nil {
-		return commit.result, err
+		return commit.result, HistoryPublication{}, err
 	}
 	a.mu.Lock()
 	a.messages = candidate
 	// The host computed this candidate, including its system messages.
-	a.recordHostPublicationLocked()
+	publication := a.recordHostPublicationLocked()
 	a.resetEphemeralTrackingLocked()
 	a.compactionGeneration.Add(1)
 	a.mu.Unlock()
@@ -94,5 +105,5 @@ func (a *Agent) CommitCompactionHistory(ctx context.Context, expected, messages 
 		a.compactor.FinalizePendingLedger(&commit.transaction)
 	}
 	a.settleCheckpoint(commit, true, "")
-	return commit.result, nil
+	return commit.result, publication, nil
 }
