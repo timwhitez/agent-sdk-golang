@@ -541,7 +541,7 @@ func TestRepeatToolSignatureGuardProviderHistoryCharacterization(t *testing.T) {
 			continue
 		}
 		wantMetadata := map[string]any{"loop_guard_suppressed": true}
-		if !result.IsError || result.Result != "[ERROR] Tool call skipped by loop guard - Repeated identical tool call blocked before execution." || !reflect.DeepEqual(result.Metadata, wantMetadata) {
+		if !result.IsError || result.ErrorOrigin != ToolErrorOriginSuppressed || result.Result != "[ERROR] Tool call skipped by loop guard - Repeated identical tool call blocked before execution." || !reflect.DeepEqual(result.Metadata, wantMetadata) {
 			t.Fatalf("blocked ToolResult event=%#v", result)
 		}
 		return
