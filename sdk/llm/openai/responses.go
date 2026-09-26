@@ -59,6 +59,10 @@ type ResponsesClient struct {
 	Warningf func(format string, args ...any)
 }
 
+// downgradeToolChoiceResponsesMessage reports a forced tool_choice relaxed to
+// auto for one request after the provider rejected it.
+const downgradeToolChoiceResponsesMessage = "OpenAI Responses provider rejected forced tool_choice; retried with auto."
+
 func (c *ResponsesClient) warnf(format string, args ...any) {
 	if c != nil && c.Warningf != nil {
 		c.Warningf(format, args...)
@@ -98,6 +102,7 @@ func (c *ResponsesClient) Invoke(ctx context.Context, req llm.InvokeRequest) (*l
 	autoCompat := shouldAutoCompat(req)
 	compatStage := responsesCompatFull
 
+	compatResends := 0
 	for attempt := 0; attempt < retry.maxRetries; attempt++ {
 		if err := ctx.Err(); err != nil {
 			return nil, err
@@ -166,7 +171,7 @@ func (c *ResponsesClient) Invoke(ctx context.Context, req llm.InvokeRequest) (*l
 					compatChanged = true
 					diagnostics = append(diagnostics, llm.Diagnostic{Kind: "provider_compatibility_downgrade", Message: "OpenAI Responses provider rejected thinking settings; retrying without thinking extras."})
 				}
-				if strings.Contains(msg, "MissingParameter") && strings.Contains(msg, "input.content") {
+				if !local.ForceStringInput && strings.Contains(msg, "MissingParameter") && strings.Contains(msg, "input.content") {
 					local.ForceStringInput = true
 					compatChanged = true
 					diagnostics = append(diagnostics, llm.Diagnostic{Kind: "provider_compatibility_downgrade", Message: "OpenAI Responses provider rejected content-array input; retrying with string input compatibility mode."})
@@ -176,8 +181,17 @@ func (c *ResponsesClient) Invoke(ctx context.Context, req llm.InvokeRequest) (*l
 					compatChanged = true
 					diagnostics = append(diagnostics, llm.Diagnostic{Kind: "provider_compatibility_downgrade", Message: "OpenAI Responses provider rejected Responses-style input; retrying with legacy chat-compatible input."})
 				}
+				if downgradeForcedToolChoice(&req, payload.ToolChoice, msg) {
+					compatChanged = true
+					local.warnf("[WARN] %s", downgradeToolChoiceResponsesMessage)
+					diagnostics = append(diagnostics, llm.Diagnostic{Kind: "provider_compatibility_downgrade", Message: downgradeToolChoiceResponsesMessage})
+				}
 			}
-			if compatChanged && attempt < retry.maxRetries-1 {
+			if compatChanged && compatResends < maxCompatibilityResends {
+				// A downgrade changes the request; it is not a transient retry
+				// and must not consume or depend on the retry budget.
+				compatResends++
+				attempt--
 				continue
 			}
 			if resp.StatusCode == 429 {
@@ -433,6 +447,7 @@ func (c *ResponsesClient) InvokeStream(ctx context.Context, req llm.InvokeReques
 		autoCompat := shouldAutoCompat(req)
 		compatStage := responsesCompatFull
 
+		compatResends := 0
 		for attempt := 0; attempt < retry.maxRetries; attempt++ {
 			if err := ctx.Err(); err != nil {
 				out <- llm.StreamErrorEvent{Err: err}
@@ -508,7 +523,7 @@ func (c *ResponsesClient) InvokeStream(ctx context.Context, req llm.InvokeReques
 					if hasThinkingExtra(local.Extra, local.ExtraBody) && looksLikeThinkingUnsupported(msg) && dropThinkingExtra(local.Extra, local.ExtraBody) {
 						compatChanged = true
 					}
-					if strings.Contains(msg, "MissingParameter") && strings.Contains(msg, "input.content") {
+					if !local.ForceStringInput && strings.Contains(msg, "MissingParameter") && strings.Contains(msg, "input.content") {
 						local.ForceStringInput = true
 						compatChanged = true
 					}
@@ -516,8 +531,16 @@ func (c *ResponsesClient) InvokeStream(ctx context.Context, req llm.InvokeReques
 						compatStage = responsesCompatLegacy
 						compatChanged = true
 					}
+					if downgradeForcedToolChoice(&req, payload.ToolChoice, msg) {
+						compatChanged = true
+						local.warnf("[WARN] %s", downgradeToolChoiceResponsesMessage)
+					}
 				}
-				if compatChanged && attempt < retry.maxRetries-1 {
+				if compatChanged && compatResends < maxCompatibilityResends {
+					// A downgrade changes the request; it is not a transient retry
+					// and must not consume or depend on the retry budget.
+					compatResends++
+					attempt--
 					continue
 				}
 
