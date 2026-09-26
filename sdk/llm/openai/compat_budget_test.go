@@ -109,7 +109,8 @@ func TestCompatibilityDowngradesDoNotConsumeRetryBudget(t *testing.T) {
 				if dg.name == "tool_choice" {
 					choice = "required"
 				}
-				text, _, err := invokeCompatClient(t, tc.api, tc.stream, server.URL, &warningRecorder{}, opts, toolChoiceRequest(choice))
+				warn := &warningRecorder{}
+				text, diags, err := invokeCompatClient(t, tc.api, tc.stream, server.URL, warn, opts, toolChoiceRequest(choice))
 				if err != nil {
 					t.Fatalf("invoke with MaxRetries 1: %v", err)
 				}
@@ -118,6 +119,32 @@ func TestCompatibilityDowngradesDoNotConsumeRetryBudget(t *testing.T) {
 				}
 				if got := len(gw.snapshot()); got != 2 {
 					t.Fatalf("requests = %d, want 2 (one compatibility resend)", got)
+				}
+				// Every settings downgrade is reported exactly once through
+				// the warning sink on every path, and buffered paths also
+				// carry exactly one diagnostic for it. The Responses input
+				// shape fallbacks (out of scope for #192) report only
+				// diagnostics, possibly two at once.
+				if dg.name == "input_content_string" {
+					if got := warn.count("[WARN] OpenAI"); got != 0 {
+						t.Fatalf("input fallback warnings = %d, want 0 (all: %q)", got, warn.msgs)
+					}
+					return
+				}
+				const wantWarnings = 1
+				if got := warn.count("[WARN] OpenAI"); got != wantWarnings {
+					t.Fatalf("downgrade warnings = %d, want %d (all: %q)", got, wantWarnings, warn.msgs)
+				}
+				if !tc.stream {
+					found := 0
+					for _, d := range diags {
+						if d.Kind == "provider_compatibility_downgrade" {
+							found++
+						}
+					}
+					if found != 1 {
+						t.Fatalf("downgrade diagnostics = %d, want 1 (%#v)", found, diags)
+					}
 				}
 			})
 		}

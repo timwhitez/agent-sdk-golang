@@ -23,33 +23,66 @@ const gatewayToolChoiceRejection = `{"error":{"code":"invalid_request_error","me
 
 const toolChoiceDowngradeWarning = "provider rejected forced tool_choice; retried with auto"
 
+// Reviewer probes from #192: errors that mention tool_choice but do not say
+// the forced choice itself is unsupported.
+const (
+	invalidToolChoiceValueRejection = `{"error":{"message":"Invalid value: 'requird'. Supported values are: 'none', 'auto', and 'required'.","type":"invalid_request_error","param":"tool_choice","code":"invalid_value"}}`
+	parallelToolCallsRejection      = `{"error":{"message":"parallel_tool_calls is not supported with tool_choice required","type":"invalid_request_error","param":null,"code":null}}`
+	temperatureRejection            = `{"error":{"message":"Unsupported value: 'temperature' does not support 0.2 with this model (request had tool_choice=auto).","type":"invalid_request_error","param":null,"code":"unsupported_value"}}`
+	// structuredToolChoiceRejection names tool_choice only through param.
+	structuredToolChoiceRejection = `{"error":{"message":"Forced tool calls are not supported in thinking mode.","type":"invalid_request_error","param":"tool_choice","code":null}}`
+)
+
 func TestLooksLikeToolChoiceUnsupported(t *testing.T) {
 	t.Parallel()
-	positive := []string{
-		gatewayToolChoiceRejection + " (POST http://127.0.0.1/v1/responses)",
-		`{"error":{"message":"tool_choice 'required' is not supported for this model"}}`,
-		`{"error":{"message":"Unsupported value: 'tool_choice' does not support 'required' with this model."}}`,
-		`{"error":{"message":"model doesn't support forced tool_choice"}}`,
-		`{"error":{"message":"Invalid tool_choice: function choice unavailable in reasoning mode"}}`,
-		`{"error":{"message":"Invalid parameter: tool_choice"}}`,
+	cases := []struct {
+		name string
+		body string
+		want bool
+	}{
+		// Positive: the refusal refers to tool_choice itself.
+		{"live_gateway_thinking_mode", gatewayToolChoiceRejection, true},
+		{"live_gateway_plain_text", "Thinking mode does not support this tool_choice (request_id: req-fixture)", true},
+		{"tool_choice_value_not_supported", `{"error":{"message":"tool_choice 'required' is not supported for this model"}}`, true},
+		{"quoted_tool_choice_does_not_support", `{"error":{"message":"Unsupported value: 'tool_choice' does not support 'required' with this model."}}`, true},
+		{"doesnt_support_forced_tool_choice", `{"error":{"message":"model doesn't support forced tool_choice"}}`, true},
+		{"unsupported_tool_choice", `{"error":{"message":"unsupported tool_choice for this model"}}`, true},
+		{"param_tool_choice_with_refusal_message", structuredToolChoiceRejection, true},
+		{"param_tool_choice_with_unsupported_code", `{"error":{"message":"The requested value cannot be used with this model.","param":"tool_choice","code":"unsupported_value"}}`, true},
+		{"top_level_param_tool_choice", `{"message":"Forced tool use is not supported by this model","param":"tool_choice"}`, true},
+		{"string_error_adjacent", `{"error":"this model does not support the tool_choice parameter"}`, true},
+
+		// Negative: #192 reviewer probes.
+		{"invalid_value_param_tool_choice", invalidToolChoiceValueRejection, false},
+		{"invalid_value_without_param", `{"error":{"message":"Invalid value for tool_choice: 'requird' is not supported"}}`, false},
+		{"unknown_value_not_supported", `{"error":{"message":"tool_choice 'requird' is not supported"}}`, false},
+		{"invalid_value_code_with_refusal_text", `{"error":{"message":"'requird' is not supported","param":"tool_choice","code":"invalid_value"}}`, false},
+		{"invalid_value_text_with_refusal_text", `{"error":{"message":"Invalid value for tool_choice: value is not supported","param":"tool_choice"}}`, false},
+		{"parallel_tool_calls_mentions_tool_choice", parallelToolCallsRejection, false},
+		{"parallel_tool_calls_param", `{"error":{"message":"parallel_tool_calls is not supported with tool_choice required","param":"parallel_tool_calls"}}`, false},
+		{"temperature_mentions_tool_choice_auto", temperatureRejection, false},
+		{"temperature_param_with_adjacent_text", `{"error":{"message":"temperature does not support this tool_choice","param":"temperature"}}`, false},
+		{"temperature_plain_text", "temperature is unsupported when tool_choice=auto", false},
+
+		// Negative: "invalid" wording describes a malformed value, not a
+		// capability gap; a silent auto would hide it.
+		{"invalid_tool_choice", `{"error":{"message":"Invalid tool_choice: function choice unavailable in reasoning mode"}}`, false},
+		{"invalid_parameter_tool_choice", `{"error":{"message":"Invalid parameter: tool_choice"}}`, false},
+		{"param_tool_choice_without_refusal", `{"error":{"message":"Function 'x' named in tool_choice was not found in tools.","param":"tool_choice"}}`, false},
+		{"param_tool_choice_function_name", `{"error":{"message":"not supported","param":"tool_choice.function.name"}}`, false},
+
+		// Negative: unrelated errors.
+		{"empty", "", false},
+		{"context_length", `{"error":{"code":"invalid_request_error","message":"This model's maximum context length is 8192 tokens","type":"invalid_request_error"}}`, false},
+		{"tool_choice_requires_tools", `{"error":{"code":"invalid_request_error","message":"tool_choice requires tools to be provided","type":"invalid_request_error"}}`, false},
+		{"thinking_temperature", `{"error":{"message":"Thinking mode does not support this temperature"}}`, false},
+		{"unknown_reasoning_effort", `{"error":{"message":"unknown field reasoning_effort"}}`, false},
+		{"invalid_input", `{"error":{"message":"Invalid value for 'input[2].content'"}}`, false},
+		{"invalid_tool_name", `{"error":{"message":"tools[0].function.name is invalid"}}`, false},
 	}
-	for _, msg := range positive {
-		if !looksLikeToolChoiceUnsupported(msg) {
-			t.Errorf("looksLikeToolChoiceUnsupported(%q) = false, want true", msg)
-		}
-	}
-	negative := []string{
-		"",
-		`{"error":{"code":"invalid_request_error","message":"This model's maximum context length is 8192 tokens","type":"invalid_request_error"}}`,
-		`{"error":{"code":"invalid_request_error","message":"tool_choice requires tools to be provided","type":"invalid_request_error"}}`,
-		`{"error":{"message":"Thinking mode does not support this temperature"}}`,
-		`{"error":{"message":"unknown field reasoning_effort"}}`,
-		`{"error":{"message":"Invalid value for 'input[2].content'"}}`,
-		`{"error":{"message":"tools[0].function.name is invalid"}}`,
-	}
-	for _, msg := range negative {
-		if looksLikeToolChoiceUnsupported(msg) {
-			t.Errorf("looksLikeToolChoiceUnsupported(%q) = true, want false", msg)
+	for _, tc := range cases {
+		if got := looksLikeToolChoiceUnsupported(tc.body); got != tc.want {
+			t.Errorf("%s: looksLikeToolChoiceUnsupported(%q) = %v, want %v", tc.name, tc.body, got, tc.want)
 		}
 	}
 }
@@ -351,6 +384,14 @@ func TestToolChoiceDowngradeNegativeCases(t *testing.T) {
 		{name: "explicit_auto_not_retried", choice: "auto", reject: always(gatewayToolChoiceRejection), requests: 1},
 		{name: "none_not_retried", choice: "none", reject: always(gatewayToolChoiceRejection), requests: 1},
 		{name: "one_downgrade_per_request", choice: "required", reject: always(gatewayToolChoiceRejection), requests: 2},
+		{name: "structured_param_downgrades_once", choice: "required", reject: always(structuredToolChoiceRejection), requests: 2},
+		{name: "invalid_value_not_retried", choice: "required", reject: always(invalidToolChoiceValueRejection), requests: 1},
+		{name: "parallel_tool_calls_not_retried", choice: "required", reject: always(parallelToolCallsRejection), requests: 1},
+		{name: "temperature_not_retried", choice: "required", reject: always(temperatureRejection), requests: 1},
+		// A named choice that is not a declared tool is a caller error, even
+		// when the provider's text would otherwise match.
+		{name: "undeclared_named_choice_not_retried", choice: "requird", reject: always(gatewayToolChoiceRejection), requests: 1},
+		{name: "declared_named_choice_downgrades_once", choice: "done", reject: always(gatewayToolChoiceRejection), requests: 2},
 	}
 	for _, tc := range toolChoiceCases {
 		for _, nc := range cases {
