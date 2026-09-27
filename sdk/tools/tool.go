@@ -968,14 +968,6 @@ func jsonValueType(value any) string {
 			return "integer"
 		}
 		return "number"
-	case json.Number:
-		if !strings.ContainsAny(string(v), ".eE") {
-			return "integer"
-		}
-		if f, err := v.Float64(); err == nil && f == math.Trunc(f) {
-			return "integer"
-		}
-		return "number"
 	default:
 		return ""
 	}
