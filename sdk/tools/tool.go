@@ -269,7 +269,9 @@ func repairJSONKeysBySchemaWithOptions(schema map[string]any, raw []byte, opts s
 		return nil, false, nil
 	}
 	var v any
-	if err := json.Unmarshal(raw, &v); err != nil {
+	dec := json.NewDecoder(bytes.NewReader(raw))
+	dec.UseNumber()
+	if err := dec.Decode(&v); err != nil || ensureDecoderEOF(dec) != nil {
 		return nil, false, nil
 	}
 	m, ok := v.(map[string]any)
