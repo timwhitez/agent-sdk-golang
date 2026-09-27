@@ -269,7 +269,9 @@ func repairJSONKeysBySchemaWithOptions(schema map[string]any, raw []byte, opts s
 		return nil, false, nil
 	}
 	var v any
-	if err := json.Unmarshal(raw, &v); err != nil {
+	dec := json.NewDecoder(bytes.NewReader(raw))
+	dec.UseNumber()
+	if err := dec.Decode(&v); err != nil || ensureDecoderEOF(dec) != nil {
 		return nil, false, nil
 	}
 	m, ok := v.(map[string]any)
@@ -963,6 +965,14 @@ func jsonValueType(value any) string {
 		return "boolean"
 	case float64:
 		if v == math.Trunc(v) {
+			return "integer"
+		}
+		return "number"
+	case json.Number:
+		if !strings.ContainsAny(string(v), ".eE") {
+			return "integer"
+		}
+		if f, err := v.Float64(); err == nil && f == math.Trunc(f) {
 			return "integer"
 		}
 		return "number"
