@@ -271,6 +271,12 @@ finalizing Frame is still not the sole source of merged tool-call content.
 
 ### Tool-continuation provenance
 
+Continuation argument merging preserves JSON numbers with `json.Number` through
+recursive object and array-by-index merges. Both inputs must contain exactly one
+complete JSON value; malformed or concatenated values retain the fragment fallback.
+Numbers remain JSON numbers, and the final typed tool decode still rejects overflow.
+
+
 The optional Envelope `RequestContinuationRelation=tool_results_carried` and
 `RequestContinuationSourceFrameIDs` report that a Frame's request carries the
 committed results of a closed tool block to which no model response had been

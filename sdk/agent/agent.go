@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"log"
 	"net"
 	"os"
@@ -6102,8 +6103,9 @@ func mergeToolArgsWithDiagnostics(old, new string) toolArgsMergeResult {
 		return toolArgsMergeResult{arguments: stitched}
 	}
 
-	var oldValue, newValue any
-	if json.Unmarshal([]byte(old), &oldValue) == nil && json.Unmarshal([]byte(new), &newValue) == nil {
+	oldValue, oldErr := decodeToolArgsJSON(old)
+	newValue, newErr := decodeToolArgsJSON(new)
+	if oldErr == nil && newErr == nil {
 		mergedValue, diagnostics := deepMergeJSONValue(oldValue, newValue, "$")
 		if marshaled, err := json.Marshal(mergedValue); err == nil {
 			return toolArgsMergeResult{arguments: string(marshaled), diagnostics: diagnostics}
@@ -6115,6 +6117,21 @@ func mergeToolArgsWithDiagnostics(old, new string) toolArgsMergeResult {
 	}
 
 	return toolArgsMergeResult{arguments: mergeArgsByOverlap(old, new)}
+}
+
+// decodeToolArgsJSON preserves numeric lexemes while accepting exactly one JSON value.
+func decodeToolArgsJSON(raw string) (any, error) {
+	decoder := json.NewDecoder(strings.NewReader(raw))
+	decoder.UseNumber()
+	var value any
+	if err := decoder.Decode(&value); err != nil {
+		return nil, err
+	}
+	var trailing any
+	if err := decoder.Decode(&trailing); err != io.EOF {
+		return nil, fmt.Errorf("tool arguments must contain one JSON value")
+	}
+	return value, nil
 }
 
 func stitchToolArgFragments(old, new string) (string, bool) {
@@ -6203,7 +6220,7 @@ func jsonValueKind(v any) string {
 		return "array"
 	case string:
 		return "string"
-	case float64:
+	case float64, json.Number:
 		return "number"
 	case bool:
 		return "boolean"
