@@ -7,9 +7,11 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/http/httptest"
 	"strings"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/timwhitez/agent-sdk-golang/sdk/llm"
 )
@@ -445,6 +447,71 @@ func TestIssue152ResponsesStreamLimit(t *testing.T) {
 	}
 	if got := requests.Load(); got != 1 {
 		t.Fatalf("HTTP requests = %d, want 1", got)
+	}
+}
+
+type countedHTTPBody struct {
+	io.ReadCloser
+	closes *atomic.Int32
+}
+
+func (b *countedHTTPBody) Close() error {
+	b.closes.Add(1)
+	return b.ReadCloser.Close()
+}
+
+// Keep the real HTTP response open after malformed fragments: the local
+// resource limit must close it without waiting for EOF or replaying the request.
+func TestIssue152ResponsesHTTPStreamLimitClosesOpenResponse(t *testing.T) {
+	var requests, closes atomic.Int32
+	release := make(chan struct{})
+	requestClosed := make(chan struct{})
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requests.Add(1)
+		defer close(requestClosed)
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = fmt.Fprint(w, `data: {"type":"response.output_text.delta","delta":"partial"}`+"\n\n")
+		_, _ = fmt.Fprint(w, strings.Repeat("data: {\"type\":\n\n", defaultSSEMaxDecodeAttempts))
+		w.(http.Flusher).Flush()
+		select {
+		case <-r.Context().Done():
+		case <-release:
+		}
+	}))
+	t.Cleanup(server.Close)
+	t.Cleanup(func() { close(release) })
+
+	httpClient := server.Client()
+	transport := httpClient.Transport
+	httpClient.Transport = roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		response, err := transport.RoundTrip(r)
+		if err == nil {
+			response.Body = &countedHTTPBody{ReadCloser: response.Body, closes: &closes}
+		}
+		return response, err
+	})
+	client := &ResponsesClient{HTTPClient: httpClient, BaseURL: server.URL, ModelName: "fixture", MaxRetries: 2}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	stream, err := client.InvokeStream(ctx, llm.InvokeRequest{Messages: []llm.Message{llm.NewUserMessage("hello")}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	events := collectOpenAIStream(stream)
+	assertSSELimitTerminal(t, events, "partial")
+	errors := 0
+	for _, event := range events {
+		if _, ok := event.(llm.StreamErrorEvent); ok {
+			errors++
+		}
+	}
+	if errors != 1 || requests.Load() != 1 || closes.Load() != 1 {
+		t.Fatalf("error terminals=%d HTTP requests=%d body closes=%d, want 1 each", errors, requests.Load(), closes.Load())
+	}
+	select {
+	case <-requestClosed:
+	case <-ctx.Done():
+		t.Fatal("resource-limited HTTP response stayed open until caller timeout")
 	}
 }
 
