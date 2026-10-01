@@ -803,6 +803,7 @@ func (c *Client) InvokeStream(ctx context.Context, req llm.InvokeRequest) (<-cha
 			blockToToolIndex := map[int]int{}
 			inputTokens := 0
 			outputTokens := 0
+			sawUsage := false
 			var promptCachedTokens *int
 			var promptCacheCreationTokens *int
 			stopReason := ""
@@ -816,6 +817,37 @@ func (c *Client) InvokeStream(ctx context.Context, req llm.InvokeRequest) (<-cha
 				}
 				responseID = id
 				return sendEvent(llm.StreamResponseEvent{ResponseID: id})
+			}
+			// Usage fields are cumulative observations, not increments. Publish them
+			// before terminal errors so interrupted attempts retain their known lower
+			// bound; a snapshot does not assert that the provider bill is complete.
+			updateUsage := func(u map[string]any) error {
+				for _, field := range []struct {
+					name string
+					dst  *int
+				}{{"input_tokens", &inputTokens}, {"output_tokens", &outputTokens}} {
+					if value := intPtrFromAny(u[field.name]); value != nil {
+						sawUsage = true
+						if *value > *field.dst {
+							*field.dst = *value
+						}
+					}
+				}
+				for _, field := range []struct {
+					name string
+					dst  **int
+				}{{"cache_read_input_tokens", &promptCachedTokens}, {"cache_creation_input_tokens", &promptCacheCreationTokens}} {
+					if value := intPtrFromAny(u[field.name]); value != nil {
+						sawUsage = true
+						if *field.dst == nil || *value > **field.dst {
+							*field.dst = value
+						}
+					}
+				}
+				if sawUsage && !sendEvent(llm.StreamUsageEvent{Usage: *normalizedAnthropicUsage(inputTokens, outputTokens, promptCachedTokens, promptCacheCreationTokens)}) {
+					return ctx.Err()
+				}
+				return nil
 			}
 			getToolIndex := func(blockIdx int) int {
 				if v, ok := blockToToolIndex[blockIdx]; ok {
@@ -847,13 +879,7 @@ func (c *Client) InvokeStream(ctx context.Context, req llm.InvokeRequest) (<-cha
 				case "message_start":
 					if msg, ok := root["message"].(map[string]any); ok {
 						if u, ok := msg["usage"].(map[string]any); ok {
-							inputTokens = intFromAny(u["input_tokens"])
-							if raw, ok := u["cache_read_input_tokens"]; ok {
-								promptCachedTokens = intPtrFromAny(raw)
-							}
-							if raw, ok := u["cache_creation_input_tokens"]; ok {
-								promptCacheCreationTokens = intPtrFromAny(raw)
-							}
+							return updateUsage(u)
 						}
 					}
 				case "message_delta":
@@ -863,28 +889,7 @@ func (c *Client) InvokeStream(ctx context.Context, req llm.InvokeRequest) (<-cha
 						}
 					}
 					if u, ok := root["usage"].(map[string]any); ok {
-						ot := intFromAny(u["output_tokens"])
-						if ot > outputTokens {
-							outputTokens = ot
-						}
-						// Anthropic may repeat prompt-side usage on message_delta.
-						// If message_start omitted or under-reported it (interrupted
-						// stream, gateway stripping the initial usage), use the delta
-						// values as a fallback so prompt tokens are not reported as
-						// zero (which would force a local estimate + warning).
-						if it := intFromAny(u["input_tokens"]); it > inputTokens {
-							inputTokens = it
-						}
-						if raw, ok := u["cache_read_input_tokens"]; ok {
-							if v := intPtrFromAny(raw); v != nil && (promptCachedTokens == nil || *v > *promptCachedTokens) {
-								promptCachedTokens = v
-							}
-						}
-						if raw, ok := u["cache_creation_input_tokens"]; ok {
-							if v := intPtrFromAny(raw); v != nil && (promptCacheCreationTokens == nil || *v > *promptCacheCreationTokens) {
-								promptCacheCreationTokens = v
-							}
-						}
+						return updateUsage(u)
 					}
 				case "content_block_start":
 					idx := intFromAny(root["index"])
@@ -944,7 +949,7 @@ func (c *Client) InvokeStream(ctx context.Context, req llm.InvokeRequest) (<-cha
 					}
 				case "message_stop":
 					sawMessageStop = true
-					if inputTokens > 0 || outputTokens > 0 || promptCachedTokens != nil || promptCacheCreationTokens != nil {
+					if sawUsage {
 						if !sendEvent(llm.StreamUsageEvent{Usage: *normalizedAnthropicUsage(inputTokens, outputTokens, promptCachedTokens, promptCacheCreationTokens)}) {
 							return ctx.Err()
 						}
@@ -1045,49 +1050,109 @@ func streamResponseIDFromEvent(eventType string, root map[string]any) string {
 	return ""
 }
 
+// Budgets apply to one logical event, including malformed fragments separated
+// by premature blank lines. Valid independent events reset both budgets.
+const (
+	defaultSSEMaxEventBytes     = 4 * 1024 * 1024
+	defaultSSEMaxDecodeAttempts = 16
+)
+
+type sseLimits struct {
+	maxEventBytes     int
+	maxDecodeAttempts int
+}
+
+const (
+	sseLimitEventBytes     = "event_bytes"
+	sseLimitDecodeAttempts = "decode_attempts"
+)
+
+// Local resource failures contain no payload or provider status and must not
+// be classified as retryable provider failures or context overflow.
+type sseResourceLimitError struct {
+	Reason string
+	Limit  int
+}
+
+func (e *sseResourceLimitError) Error() string {
+	return fmt.Sprintf("anthropic stream: local SSE parser resource budget reached (reason=%s, budget=%d); the response is incomplete", e.Reason, e.Limit)
+}
+
 func consumeSSE(r io.Reader, onData func(data string) error) error {
+	return consumeSSEWithLimits(r, onData, sseLimits{defaultSSEMaxEventBytes, defaultSSEMaxDecodeAttempts})
+}
+
+func consumeSSEWithLimits(r io.Reader, onData func(data string) error, limits sseLimits) error {
+	if limits.maxEventBytes <= 0 || limits.maxDecodeAttempts <= 0 {
+		return errors.New("anthropic stream: invalid SSE parser limits")
+	}
 	sc := bufio.NewScanner(r)
 	sc.Buffer(make([]byte, 0, 64*1024), 4*1024*1024)
-	dataLines := []string{}
-	pending := ""
-	flush := func(final bool) error {
-		if len(dataLines) == 0 {
-			if final && pending != "" {
-				return fmt.Errorf("anthropic stream: malformed SSE event payload")
+	var candidate strings.Builder
+	hasData, pending := false, false
+	attempts := 0
+	flush := func() error {
+		if !hasData {
+			return nil
+		}
+		hasData = false
+		// Preserve empty data-only heartbeats; they retain no fragment bytes.
+		if candidate.Len() == 0 {
+			return nil
+		}
+		attempts++
+		if !json.Valid([]byte(candidate.String())) {
+			pending = true
+			if attempts >= limits.maxDecodeAttempts {
+				return &sseResourceLimitError{Reason: sseLimitDecodeAttempts, Limit: limits.maxDecodeAttempts}
 			}
 			return nil
 		}
-		data := strings.Join(dataLines, "\n")
-		dataLines = nil
-		if pending != "" {
-			data = pending + "\n" + data
+		if err := onData(candidate.String()); err != nil {
+			return err
 		}
-		if !json.Valid([]byte(data)) {
-			pending = data
-			if final {
-				return fmt.Errorf("anthropic stream: malformed SSE event payload")
-			}
-			return nil
-		}
-		pending = ""
-		return onData(data)
+		candidate.Reset()
+		pending = false
+		attempts = 0
+		return nil
 	}
 	for sc.Scan() {
 		line := sc.Text()
 		if line == "" {
-			if err := flush(false); err != nil {
+			if err := flush(); err != nil {
 				return err
 			}
 			continue
 		}
 		if strings.HasPrefix(line, "data:") {
-			dataLines = append(dataLines, strings.TrimSpace(strings.TrimPrefix(line, "data:")))
+			payload := strings.TrimSpace(strings.TrimPrefix(line, "data:"))
+			separator := 0
+			if hasData || pending {
+				separator = 1
+			}
+			// Check the join and payload before retaining either. Subtraction
+			// avoids overflow from summing untrusted lengths.
+			remaining := limits.maxEventBytes - candidate.Len()
+			if separator > remaining || len(payload) > remaining-separator {
+				return &sseResourceLimitError{Reason: sseLimitEventBytes, Limit: limits.maxEventBytes}
+			}
+			if separator != 0 {
+				candidate.WriteByte('\n')
+			}
+			candidate.WriteString(payload)
+			hasData = true
 		}
 	}
 	if err := sc.Err(); err != nil {
 		return err
 	}
-	return flush(true)
+	if err := flush(); err != nil {
+		return err
+	}
+	if pending {
+		return errors.New("anthropic stream: malformed SSE event payload")
+	}
+	return nil
 }
 
 func consumeSSEWithBodyClose(body io.ReadCloser, onData func(data string) error) error {
