@@ -18,9 +18,40 @@ func strictSchemaCompatibility(schema map[string]any, path string, depth int) er
 	if depth >= 128 {
 		return fmt.Errorf("%s: schema nesting exceeds 128 levels", path)
 	}
-	for _, key := range []string{"$ref", "$defs", "definitions", "anyOf", "oneOf", "allOf"} {
-		if _, ok := schema[key]; ok {
-			return fmt.Errorf("%s.%s: schema composition is unsupported by strict normalization", path, key)
+	for _, key := range []string{"$defs", "definitions"} {
+		if definitions, ok := schema[key].(map[string]any); ok {
+			names := make([]string, 0, len(definitions))
+			for name := range definitions {
+				names = append(names, name)
+			}
+			sort.Strings(names)
+			for _, name := range names {
+				definition, ok := definitions[name].(map[string]any)
+				if !ok {
+					return fmt.Errorf("%s.%s.%s: unsupported definition schema", path, key, name)
+				}
+				if err := strictSchemaCompatibility(definition, path+"."+key+"."+name, depth+1); err != nil {
+					return err
+				}
+			}
+		}
+	}
+	constrained := false
+	if ref, ok := schema["$ref"].(string); ok && ref != "" {
+		constrained = true
+	}
+	for _, key := range []string{"anyOf", "oneOf", "allOf"} {
+		if branches, ok := schema[key].([]any); ok && len(branches) > 0 {
+			constrained = true
+			for i, branch := range branches {
+				child, ok := branch.(map[string]any)
+				if !ok {
+					return fmt.Errorf("%s.%s[%d]: unsupported branch schema", path, key, i)
+				}
+				if err := strictSchemaCompatibility(child, fmt.Sprintf("%s.%s[%d]", path, key, i), depth+1); err != nil {
+					return err
+				}
+			}
 		}
 	}
 	types := []string{}
@@ -36,15 +67,12 @@ func strictSchemaCompatibility(schema map[string]any, path string, depth int) er
 			}
 		}
 	}
-	if len(types) == 0 {
+	if len(types) == 0 && !constrained {
 		return fmt.Errorf("%s: unconstrained JSON values require non-strict mode", path)
 	}
 	if slices.Contains(types, "object") {
 		if allowed, ok := schema["additionalProperties"].(bool); !ok || allowed {
 			return fmt.Errorf("%s.additionalProperties: open objects require non-strict mode", path)
-		}
-		if len(types) > 1 {
-			return fmt.Errorf("%s.type: object unions are unsupported by strict normalization", path)
 		}
 		props, _ := schema["properties"].(map[string]any)
 		names := make([]string, 0, len(props))

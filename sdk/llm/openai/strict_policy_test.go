@@ -225,3 +225,67 @@ func TestCyclicToolSchemaPreservesAgentCloneError(t *testing.T) {
 		t.Fatalf("cyclic schema registration = %v", err)
 	}
 }
+
+func TestAlreadyStrictSchemasRetainWireCompatibility(t *testing.T) {
+	schemas := map[string]string{
+		"anyOf":           `{"type":"object","properties":{"value":{"anyOf":[{"type":"string"},{"type":"number"}]}},"required":["value"],"additionalProperties":false}`,
+		"definitions":     `{"type":"object","properties":{"value":{"$ref":"#/$defs/child"}},"required":["value"],"additionalProperties":false,"$defs":{"child":{"type":"object","properties":{"x":{"type":"string"}},"required":["x"],"additionalProperties":false}}}`,
+		"nullable_object": `{"type":"object","properties":{"value":{"type":["object","null"],"properties":{"x":{"type":"string"}},"required":["x"],"additionalProperties":false}},"required":["value"],"additionalProperties":false}`,
+	}
+	for _, provider := range []string{"chat", "responses"} {
+		for name, raw := range schemas {
+			t.Run(provider+"/"+name, func(t *testing.T) {
+				var schema map[string]any
+				if err := json.Unmarshal([]byte(raw), &schema); err != nil {
+					t.Fatal(err)
+				}
+				tool := tools.Tool{Name: name, Schema: schema}
+				if !tool.Definition().Strict || tool.Definition().StrictWarning != "" {
+					t.Fatalf("already strict schema auto policy = %#v", tool.Definition())
+				}
+				calls := 0
+				hc := &http.Client{Transport: strictRoundTrip(func(r *http.Request) (*http.Response, error) {
+					calls++
+					def := strictWireDefinitions(t, r, provider)[name]
+					if def["strict"] != true || !reflect.DeepEqual(schema, def["parameters"]) {
+						t.Fatalf("already strict schema changed: %#v", def)
+					}
+					return strictFixtureResponse(provider, r), nil
+				})}
+				_, err := strictFixtureClient(provider, hc).Invoke(context.Background(), llm.InvokeRequest{Tools: []llm.ToolDefinition{{Name: name, Parameters: schema, Strict: true}}})
+				if err != nil || calls != 1 {
+					t.Fatalf("already strict request: %v; calls=%d", err, calls)
+				}
+			})
+		}
+	}
+}
+
+func TestOpenSchemasInsideReferencesAndCompositionsStopBeforeHTTP(t *testing.T) {
+	schemas := map[string]string{
+		"anyOf":           `{"type":"object","properties":{"value":{"anyOf":[{"type":"string"},{"type":"object","additionalProperties":{"type":"string"}}]}},"required":["value"],"additionalProperties":false}`,
+		"definitions":     `{"type":"object","properties":{"value":{"$ref":"#/$defs/child"}},"required":["value"],"additionalProperties":false,"$defs":{"child":{"type":"object","additionalProperties":{"type":"string"}}}}`,
+		"nullable_object": `{"type":"object","properties":{"value":{"type":["object","null"],"additionalProperties":{"type":"string"}}},"required":["value"],"additionalProperties":false}`,
+	}
+	for _, provider := range []string{"chat", "responses"} {
+		for name, raw := range schemas {
+			t.Run(provider+"/"+name, func(t *testing.T) {
+				var schema map[string]any
+				if err := json.Unmarshal([]byte(raw), &schema); err != nil {
+					t.Fatal(err)
+				}
+				def := (tools.Tool{Name: name, Schema: schema}).Definition()
+				if def.Strict || !strings.Contains(def.StrictWarning, "additionalProperties") {
+					t.Fatalf("open schema policy = %#v", def)
+				}
+				calls := 0
+				hc := &http.Client{Transport: strictRoundTrip(func(*http.Request) (*http.Response, error) { calls++; return nil, fmt.Errorf("network must not run") })}
+				def.Strict = true
+				_, err := strictFixtureClient(provider, hc).Invoke(context.Background(), llm.InvokeRequest{Tools: []llm.ToolDefinition{def}})
+				if err == nil || !strings.Contains(err.Error(), name) || !strings.Contains(err.Error(), "additionalProperties") || calls != 0 {
+					t.Fatalf("open composed schema: %v; HTTP calls=%d", err, calls)
+				}
+			})
+		}
+	}
+}
