@@ -14,7 +14,7 @@ never reentered; their own adapter is responsible for aliases. Business handlers
 are never retried, and the original execution error/result is preserved.
 
 - `Tool` is the runtime unit: name, description, schema, handler, visibility (`Hidden`), and retention (`EphemeralKeep`) (`sdk/tools/tool.go:15`)
-- `Definition()` converts internal tools to strict provider tool definitions (`sdk/tools/tool.go:31`)
+- `Definition()` selects strict mode automatically: closed struct schemas use strict mode; maps, open objects and unconstrained `any` use non-strict mode without changing their allowed values. `WithStrict(true)` requires strict mode and OpenAI rejects incompatible schemas locally with the tool name and schema path. `WithStrict(false)` sends explicit `strict: false` on Chat Completions and Responses. Automatically selected non-strict definitions carry a schema-only `StrictWarning`; OpenAI request construction reports this hint via the existing warning sink (`Config.Warningf` in an Agent, provider `Warningf` for direct calls, default `log.Printf`), without argument values. This compatibility check detects shapes that strict mode would narrow; it is not a complete JSON Schema validator. Already strict compositions, references/definitions and nullable objects remain supported. Provider non-strict mode does not disable typed argument decoding or sandbox checks.
 - `Execute()` is the single execution path used by the agent (`sdk/tools/tool.go:40`)
 - Typed helper `Func` builds a `Tool` from typed args + handler and enforces strict decode (`sdk/tools/tool.go:701`)
 - `SchemaFor` derives conservative JSON schema from Go structs (`sdk/tools/schema.go:8`)

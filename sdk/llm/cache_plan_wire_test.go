@@ -91,6 +91,7 @@ func TestCachePlanAttachmentPreservesLegacyWireGolden(t *testing.T) {
 					}
 				}
 				// Fixed local wire golden: no remote endpoint is contacted.
+				// OpenAI strict:false is explicit independently of cache-plan attachment.
 				golden := cacheWireGoldens[fmt.Sprintf("%s/%v", provider, stream)]
 				if string(baseline) != golden {
 					t.Fatalf("wire golden mismatch: %s", baseline)
@@ -101,10 +102,10 @@ func TestCachePlanAttachmentPreservesLegacyWireGolden(t *testing.T) {
 }
 
 var cacheWireGoldens = map[string]string{
-	"chat/false":      `{"messages":[{"content":"system","role":"system"},{"content":"hello","role":"user"}],"model":"fixture","tool_choice":"auto","tools":[{"function":{"description":"fixture","name":"work","parameters":{"type":"object"}},"type":"function"}]}`,
-	"chat/true":       `{"messages":[{"content":"system","role":"system"},{"content":"hello","role":"user"}],"model":"fixture","stream":true,"stream_options":{"include_usage":true},"tool_choice":"auto","tools":[{"function":{"description":"fixture","name":"work","parameters":{"type":"object"}},"type":"function"}]}`,
-	"responses/false": `{"input":[{"type":"message","role":"user","content":[{"type":"input_text","text":"hello"}]}],"instructions":"system","model":"fixture","tools":[{"type":"function","name":"work","description":"fixture","parameters":{"type":"object"}}]}`,
-	"responses/true":  `{"input":[{"type":"message","role":"user","content":[{"type":"input_text","text":"hello"}]}],"instructions":"system","model":"fixture","stream":true,"tools":[{"type":"function","name":"work","description":"fixture","parameters":{"type":"object"}}]}`,
+	"chat/false":      `{"messages":[{"content":"system","role":"system"},{"content":"hello","role":"user"}],"model":"fixture","tool_choice":"auto","tools":[{"function":{"description":"fixture","name":"work","parameters":{"type":"object"},"strict":false},"type":"function"}]}`,
+	"chat/true":       `{"messages":[{"content":"system","role":"system"},{"content":"hello","role":"user"}],"model":"fixture","stream":true,"stream_options":{"include_usage":true},"tool_choice":"auto","tools":[{"function":{"description":"fixture","name":"work","parameters":{"type":"object"},"strict":false},"type":"function"}]}`,
+	"responses/false": `{"input":[{"type":"message","role":"user","content":[{"type":"input_text","text":"hello"}]}],"instructions":"system","model":"fixture","tools":[{"strict":false,"type":"function","name":"work","description":"fixture","parameters":{"type":"object"}}]}`,
+	"responses/true":  `{"input":[{"type":"message","role":"user","content":[{"type":"input_text","text":"hello"}]}],"instructions":"system","model":"fixture","stream":true,"tools":[{"strict":false,"type":"function","name":"work","description":"fixture","parameters":{"type":"object"}}]}`,
 	"anthropic/false": `{"model":"fixture","max_tokens":64,"system":[{"type":"text","text":"system","cache_control":{"type":"ephemeral"}}],"messages":[{"role":"user","content":[{"type":"text","text":"hello","cache_control":{"type":"ephemeral"}}]}],"tools":[{"name":"work","description":"fixture","input_schema":{"type":"object"},"cache_control":{"type":"ephemeral"}}],"tool_choice":{"type":"auto"}}`,
 	"anthropic/true":  `{"model":"fixture","max_tokens":64,"system":[{"type":"text","text":"system","cache_control":{"type":"ephemeral"}}],"messages":[{"role":"user","content":[{"type":"text","text":"hello","cache_control":{"type":"ephemeral"}}]}],"tools":[{"name":"work","description":"fixture","input_schema":{"type":"object"},"cache_control":{"type":"ephemeral"}}],"tool_choice":{"type":"auto"},"stream":true}`,
 }

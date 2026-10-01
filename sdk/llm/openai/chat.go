@@ -1345,7 +1345,7 @@ type toolFnDef struct {
 	Name        string         `json:"name"`
 	Description string         `json:"description,omitempty"`
 	Parameters  map[string]any `json:"parameters"`
-	Strict      bool           `json:"strict,omitempty"`
+	Strict      bool           `json:"strict"`
 }
 
 type toolParam struct {
@@ -1438,7 +1438,12 @@ func (c *ChatClient) buildRequest(req llm.InvokeRequest) (*chatRequest, error) {
 		for _, t := range req.Tools {
 			params := cloneMap(t.Parameters)
 			if t.Strict {
+				if err := llm.StrictSchemaCompatibility(params); err != nil {
+					return nil, fmt.Errorf("openai: tool %q requires strict parameters: %w", t.Name, err)
+				}
 				params = makeStrictSchema(params)
+			} else if t.StrictWarning != "" {
+				c.warnf("OpenAI tool %q uses non-strict parameters to preserve its schema: %s", t.Name, t.StrictWarning)
 			}
 			tools = append(tools, toolParam{
 				Type: "function",

@@ -27,6 +27,10 @@ type ToolDefinition struct {
 	Description string         `json:"description"`
 	Parameters  map[string]any `json:"parameters"`
 	Strict      bool           `json:"strict"`
+
+	// StrictWarning is a schema-only compatibility hint when a Tool automatically
+	// selects non-strict mode. It is never serialized to providers.
+	StrictWarning string `json:"-"`
 }
 
 type FunctionCall struct {

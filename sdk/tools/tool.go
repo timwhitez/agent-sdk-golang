@@ -24,6 +24,9 @@ type Tool struct {
 
 	Schema map[string]any
 
+	// strictMode is 0 (automatic), 1 (strict), or -1 (non-strict).
+	strictMode int
+
 	// Hidden excludes the tool from model-visible tool definitions.
 	Hidden bool
 
@@ -40,11 +43,21 @@ const (
 )
 
 func (t Tool) Definition() llm.ToolDefinition {
+	strict := t.strictMode > 0
+	warning := ""
+	if t.strictMode == 0 {
+		if reason := llm.StrictSchemaCompatibility(t.Schema); reason != nil {
+			warning = reason.Error()
+		} else {
+			strict = true
+		}
+	}
 	return llm.ToolDefinition{
-		Name:        t.Name,
-		Description: t.Description,
-		Parameters:  t.Schema,
-		Strict:      true,
+		Name:          t.Name,
+		Description:   t.Description,
+		Parameters:    t.Schema,
+		Strict:        strict,
+		StrictWarning: warning,
 	}
 }
 
@@ -1002,5 +1015,15 @@ func Func[Args any](name, description string, fn func(ctx context.Context, args 
 
 func (t Tool) WithEphemeralKeep(n int) Tool {
 	t.EphemeralKeep = n
+	return t
+}
+
+// WithStrict overrides automatic strict selection. OpenAI rejects an incompatible
+// explicit true before sending a request; false preserves the original schema.
+func (t Tool) WithStrict(strict bool) Tool {
+	t.strictMode = -1
+	if strict {
+		t.strictMode = 1
+	}
 	return t
 }
