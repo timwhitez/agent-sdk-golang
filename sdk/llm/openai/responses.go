@@ -287,6 +287,7 @@ type responsesInputItem struct {
 }
 
 type responsesTool struct {
+	Strict      bool           `json:"strict"`
 	Type        string         `json:"type"` // "function"
 	Name        string         `json:"name"`
 	Description string         `json:"description,omitempty"`
@@ -2055,9 +2056,14 @@ func (c *ResponsesClient) buildRequest(req llm.InvokeRequest) (*responsesRequest
 		for _, t := range req.Tools {
 			params := cloneMap(t.Parameters)
 			if t.Strict {
+				if err := llm.StrictSchemaCompatibility(params); err != nil {
+					return nil, fmt.Errorf("openai responses: tool %q requires strict parameters: %w", t.Name, err)
+				}
 				params = makeStrictSchema(params)
+			} else if t.StrictWarning != "" {
+				c.warnf("OpenAI tool %q uses non-strict parameters to preserve its schema: %s", t.Name, t.StrictWarning)
 			}
-			toolsList = append(toolsList, responsesTool{Type: "function", Name: t.Name, Description: t.Description, Parameters: params})
+			toolsList = append(toolsList, responsesTool{Type: "function", Name: t.Name, Description: t.Description, Parameters: params, Strict: t.Strict})
 		}
 	}
 
