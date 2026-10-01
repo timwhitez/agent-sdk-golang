@@ -343,8 +343,8 @@ func canonicalJSON(normalized json.RawMessage, raw string) string {
 	if len(data) == 0 {
 		data = json.RawMessage(strings.TrimSpace(raw))
 	}
-	var decoded any
-	if len(data) > 0 && json.Unmarshal(data, &decoded) == nil {
+	// Preserve numeric spelling: distinct targets must never share a lossy signature.
+	if decoded, err := decodeToolArgsJSON(string(data)); err == nil {
 		if encoded, err := json.Marshal(decoded); err == nil {
 			return string(encoded)
 		}
