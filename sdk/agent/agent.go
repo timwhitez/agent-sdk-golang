@@ -2342,6 +2342,13 @@ func (b *streamMetadataBuffer) add(ev llm.StreamEvent) bool {
 	case llm.StreamUsageEvent:
 		u := e.Usage
 		b.usage = &u
+		// Only the newest cumulative snapshot is needed before visible output.
+		for i, buffered := range b.events {
+			if _, ok := buffered.(llm.StreamUsageEvent); ok {
+				b.events[i] = ev
+				return true
+			}
+		}
 		b.events = append(b.events, ev)
 		return true
 	case llm.StreamResponseEvent:

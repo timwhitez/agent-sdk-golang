@@ -163,8 +163,20 @@ stream normalization, and response metadata behavior.
   thinking block indices, opaque `signature_delta` data, and redacted-thinking
   data so the agent can persist replayable signed blocks. It also emits response
   metadata from `message_start` plus `message_delta/message_stop` fallback IDs,
-  and emits usage on message completion.
-- SSE consumption now buffers malformed premature boundaries and surfaces malformed payload errors instead of silently dropping fragments (`sdk/llm/anthropic/client.go:757`)
+  and publishes cumulative observed usage after each message start/delta that
+  reports numeric usage, before any terminal error. Message completion retains
+  the final snapshot. On error, EOF, idle timeout, or cancellation the latest
+  delivered snapshot is a lower bound, not proof of a complete provider bill;
+  the Agent settles that snapshot once per invocation attempt. Missing usage
+  stays absent, and explicit cache zeros remain known zeros.
+- SSE consumption buffers malformed premature boundaries within local budgets:
+  4 MiB per logical event (including joined data lines and pending fragments),
+  and 16 JSON validation attempts per unconsumed fragment group. These defaults
+  retain the prior 4 MiB physical-line scale while bounding aggregate bytes and
+  repeated validation work. Successful independent events reset both budgets;
+  total stream size is unrestricted. Local budget failures close the HTTP body,
+  emit an error without Done, and carry fixed reason/limit diagnostics without
+  payload or a retryable provider status.
 - Non-positive numeric `Retry-After` values are ignored with a warning hook instead of failing silently (`sdk/llm/anthropic/client.go:422`)
 - Tool choice mapping aligns `required` with Anthropic `any`, supports `auto`/`none`, and forced named tool mode when thinking is disabled (`sdk/llm/anthropic/client.go:887`)
 - Tool-call ID normalization now logs both original and sanitized IDs when characters are rewritten for Anthropic compatibility (`sdk/llm/anthropic/client.go:521`)
