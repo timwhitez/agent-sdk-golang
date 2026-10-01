@@ -2314,13 +2314,7 @@ func normalizeToolSignature(name string, normalizedArgs json.RawMessage, rawArgs
 	if args == "" {
 		return name
 	}
-	var decoded any
-	if err := json.Unmarshal([]byte(args), &decoded); err == nil {
-		if canon, err := json.Marshal(decoded); err == nil {
-			args = string(canon)
-		}
-	}
-	return name + "|" + args
+	return name + "|" + canonicalJSON(nil, args)
 }
 
 func hasVisiblePartialCompletion(comp *llm.Completion) bool {
