@@ -34,7 +34,7 @@ We prioritize explicit control flow over hidden prompts or complex abstractions.
 - 📉 **Context Compaction**: Smart auto-summarization of conversation history when token limits are reached.
 - 🎮 **Real-time Steering**: Inject user feedback mid-flight during agent execution (boundary-aware).
 - 💾 **Session Management**: Restore and resume conversation history with ease.
-- 🛡 **Sandboxed Security**: Built-in safe tools for file reading, writing, editing, and command execution (requires explicit confirmation by default).
+- 🛡 **Sandboxed Security**: Built-in file and command tools. File operations validate sandbox paths; risky operations require a host-supplied confirmation policy (see [Sandbox confirmation](#sandbox-confirmation)).
 
 ## 📦 Installation
 
@@ -86,6 +86,48 @@ func main() {
 
 `Query` returns only the aggregated final answer. It still uses SSE underneath when the model implements `llm.StreamingChatModel`, but it does not show deltas as they arrive; use `QueryStream` for that.
 
+### Sandbox confirmation
+
+This is a library: your host supplies a `sandbox.Confirmer` with `Confirm(ctx context.Context, action, detail string) (bool, error)`, backed by its user interaction or permission policy. The SDK provides no CLI `-y` confirmation bypass; `examples/streaming` is a separate usage example without sandbox tools. The text-only quickstart above does not need sandbox dependencies.
+
+When adding `sandbox.Tools()`, register both the sandbox and your confirmer, then pass the container as `agent.Config.Deps`. This helper accepts your configured model, sandbox root and host policy:
+
+```go
+package example
+
+import (
+    "context"
+
+    "github.com/timwhitez/agent-sdk-golang/sdk/agent"
+    "github.com/timwhitez/agent-sdk-golang/sdk/llm"
+    "github.com/timwhitez/agent-sdk-golang/sdk/tools"
+    "github.com/timwhitez/agent-sdk-golang/sdk/tools/sandbox"
+)
+
+func NewSandboxAgent(model llm.ChatModel, root string, policy sandbox.Confirmer) (*agent.Agent, error) {
+    box, err := sandbox.New(root)
+    if err != nil {
+        return nil, err
+    }
+    deps := tools.NewContainer()
+    tools.Provide(deps, sandbox.Key, func(context.Context) (*sandbox.Sandbox, error) {
+        return box, nil
+    })
+    tools.Provide(deps, sandbox.ConfirmKey, func(context.Context) (sandbox.Confirmer, error) {
+        return policy, nil
+    })
+    return agent.New(agent.Config{LLM: model, Tools: sandbox.Tools(), Deps: deps})
+}
+```
+
+For confirmation-gated operations such as `bash`, `write` and `webfetch`, `(true, nil)` approves the action, `(false, nil)` denies it with `sandbox.ErrToolDenied`, and an error prevents execution. A missing confirmer, a confirmer dependency-provider error, or a provider returning a nil `Confirmer` interface fails closed with `sandbox.ErrMissingConfirmer`. Read/list/search do not require confirmation. The Agent sends tool failures back to the model; a final answer or `done` message containing that error does not mean the command ran. The sandbox validates file paths and sets the shell working directory; it does not provide OS-level process isolation.
+
+[`examples/confirmation/example_test.go`](examples/confirmation/example_test.go) is a runnable library example with a local fake model and a host-owned mock confirmer. It only approves one fixed harmless command in its own temporary directory. Its tests check approval, denial, missing dependency and confirmation error through the real Agent → sandbox → `done` path, including command effects and error results. No provider or credentials are used:
+
+```sh
+go test ./examples/confirmation -v -count=1
+```
+
 ## 🔄 Streaming
 
 Three levels, from lowest to highest:
@@ -112,6 +154,7 @@ Reading the outcome correctly:
 
 - `sdk/`: Core SDK implementation (agent, llm, tools, tokens).
 - `examples/streaming`: streaming usage for the three built-in protocols.
+- `examples/confirmation`: host-supplied sandbox confirmation with local fixtures.
 
 
 ## 🤝 Contributing
@@ -157,7 +200,7 @@ This project is licensed under the MIT License - see the [LICENSE](LICENSE) file
 - 📉 **上下文压缩**：当达到 Token 限制时，自动对历史记录进行摘要压缩。
 - 🎮 **实时干预 (Real-time Steering)**：在 Agent 执行过程中（工具调用边界）实时注入用户反馈，纠正行为。
 - 💾 **会话管理**：支持通过 `InitialMessages` 轻松恢复和继续历史会话。
-- 🛡 **安全沙盒**：内置安全的文件读写、编辑、搜索和命令执行工具（默认需要确认，CLI 可用 `-y` 开启全自动模式）。
+- 🛡 **安全沙盒**：内置文件与命令工具。文件操作校验沙盒路径；危险操作需要宿主提供确认策略（见 [沙盒确认](#沙盒确认)）。
 
 ## 📦 安装
 
@@ -207,6 +250,48 @@ func main() {
 
 `Query` 只返回聚合后的最终答案。模型实现 `llm.StreamingChatModel` 时它在底层仍使用 SSE，但不会实时展示增量；需要实时输出请使用 `QueryStream`。
 
+### 沙盒确认
+
+这是一个库：宿主需要实现 `sandbox.Confirmer` 的 `Confirm(ctx context.Context, action, detail string) (bool, error)`，接入自己的用户交互或权限策略。SDK 没有 CLI `-y` 确认跳过开关；`examples/streaming` 是一个独立的用法示例，没有安装沙盒工具。上面的纯文本快速开始不需要沙盒依赖。
+
+添加 `sandbox.Tools()` 时，需注册沙盒和确认器，并将容器传给 `agent.Config.Deps`。下面的函数接收已配置的模型、沙盒根目录和宿主确认策略：
+
+```go
+package example
+
+import (
+    "context"
+
+    "github.com/timwhitez/agent-sdk-golang/sdk/agent"
+    "github.com/timwhitez/agent-sdk-golang/sdk/llm"
+    "github.com/timwhitez/agent-sdk-golang/sdk/tools"
+    "github.com/timwhitez/agent-sdk-golang/sdk/tools/sandbox"
+)
+
+func NewSandboxAgent(model llm.ChatModel, root string, policy sandbox.Confirmer) (*agent.Agent, error) {
+    box, err := sandbox.New(root)
+    if err != nil {
+        return nil, err
+    }
+    deps := tools.NewContainer()
+    tools.Provide(deps, sandbox.Key, func(context.Context) (*sandbox.Sandbox, error) {
+        return box, nil
+    })
+    tools.Provide(deps, sandbox.ConfirmKey, func(context.Context) (sandbox.Confirmer, error) {
+        return policy, nil
+    })
+    return agent.New(agent.Config{LLM: model, Tools: sandbox.Tools(), Deps: deps})
+}
+```
+
+对于 `bash`、`write`、`webfetch` 等需要确认的操作，`(true, nil)` 表示批准，`(false, nil)` 会返回 `sandbox.ErrToolDenied`，返回 error 则阻止执行。缺少确认器、确认器依赖 provider 返回 error，或返回 nil `Confirmer` 接口时，会以 `sandbox.ErrMissingConfirmer` 拒绝执行。读文件、列目录、搜索不需要确认。Agent 会把工具失败结果交给模型；最终回答或 `done` 消息提到错误，不代表命令已经执行。沙盒校验文件路径并设置 shell 工作目录，不提供操作系统级的进程隔离。
+
+[`examples/confirmation/example_test.go`](examples/confirmation/example_test.go) 是可运行的库示例，使用本地 fake model 和宿主自有 mock 确认器，只批准自有临时目录中的一个固定无害命令。测试走真实 Agent → sandbox → `done` 路径，覆盖批准、拒绝、缺依赖和确认器错误，检查命令效果与错误结果，不使用 Provider 或凭据：
+
+```sh
+go test ./examples/confirmation -v -count=1
+```
+
 ## 🔄 流式调用
 
 三个层次，由低到高：
@@ -233,6 +318,7 @@ func main() {
 
 - `sdk/`：SDK 核心实现（agent/llm/tools/tokens）。
 - `examples/streaming`：三种内置协议的流式用法示例。
+- `examples/confirmation`：宿主提供沙盒确认策略的本地 fixture 示例。
 
 ## 📄 许可证
 
