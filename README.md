@@ -88,7 +88,7 @@ func main() {
 
 ### Sandbox confirmation
 
-This is a library: your host supplies a `sandbox.Confirmer` with `Confirm(context.Context, action, detail string) (bool, error)`, backed by its user interaction or permission policy. The SDK provides no CLI `-y` confirmation bypass; `examples/streaming` is a separate usage example without sandbox tools. The text-only quickstart above does not need sandbox dependencies.
+This is a library: your host supplies a `sandbox.Confirmer` with `Confirm(ctx context.Context, action, detail string) (bool, error)`, backed by its user interaction or permission policy. The SDK provides no CLI `-y` confirmation bypass; `examples/streaming` is a separate usage example without sandbox tools. The text-only quickstart above does not need sandbox dependencies.
 
 When adding `sandbox.Tools()`, register both the sandbox and your confirmer, then pass the container as `agent.Config.Deps`. This helper accepts your configured model, sandbox root and host policy:
 
@@ -120,7 +120,7 @@ func NewSandboxAgent(model llm.ChatModel, root string, policy sandbox.Confirmer)
 }
 ```
 
-For confirmation-gated operations such as `bash`, `write` and `webfetch`, `(true, nil)` approves the action, `(false, nil)` denies it with `sandbox.ErrToolDenied`, and an error prevents execution. A missing confirmer, a dependency-provider error, or a provider returning a nil `Confirmer` interface fails closed with `sandbox.ErrMissingConfirmer`. Read/list/search do not require confirmation. The Agent sends tool failures back to the model; a final answer or `done` message containing that error does not mean the command ran. The sandbox validates file paths and sets the shell working directory; it does not provide OS-level process isolation.
+For confirmation-gated operations such as `bash`, `write` and `webfetch`, `(true, nil)` approves the action, `(false, nil)` denies it with `sandbox.ErrToolDenied`, and an error prevents execution. A missing confirmer, a confirmer dependency-provider error, or a provider returning a nil `Confirmer` interface fails closed with `sandbox.ErrMissingConfirmer`. Read/list/search do not require confirmation. The Agent sends tool failures back to the model; a final answer or `done` message containing that error does not mean the command ran. The sandbox validates file paths and sets the shell working directory; it does not provide OS-level process isolation.
 
 [`examples/confirmation/example_test.go`](examples/confirmation/example_test.go) is a runnable library example with a local fake model and a host-owned mock confirmer. It only approves one fixed harmless command in its own temporary directory. Its tests check approval, denial, missing dependency and confirmation error through the real Agent → sandbox → `done` path, including command effects and error results. No provider or credentials are used:
 
@@ -252,7 +252,7 @@ func main() {
 
 ### 沙盒确认
 
-这是一个库：宿主需要实现 `sandbox.Confirmer` 的 `Confirm(context.Context, action, detail string) (bool, error)`，接入自己的用户交互或权限策略。SDK 没有 CLI `-y` 确认跳过开关；`examples/streaming` 是一个独立的用法示例，没有安装沙盒工具。上面的纯文本快速开始不需要沙盒依赖。
+这是一个库：宿主需要实现 `sandbox.Confirmer` 的 `Confirm(ctx context.Context, action, detail string) (bool, error)`，接入自己的用户交互或权限策略。SDK 没有 CLI `-y` 确认跳过开关；`examples/streaming` 是一个独立的用法示例，没有安装沙盒工具。上面的纯文本快速开始不需要沙盒依赖。
 
 添加 `sandbox.Tools()` 时，需注册沙盒和确认器，并将容器传给 `agent.Config.Deps`。下面的函数接收已配置的模型、沙盒根目录和宿主确认策略：
 
@@ -284,7 +284,7 @@ func NewSandboxAgent(model llm.ChatModel, root string, policy sandbox.Confirmer)
 }
 ```
 
-对于 `bash`、`write`、`webfetch` 等需要确认的操作，`(true, nil)` 表示批准，`(false, nil)` 会返回 `sandbox.ErrToolDenied`，返回 error 则阻止执行。缺少确认器、依赖 provider 返回 error，或返回 nil `Confirmer` 接口时，会以 `sandbox.ErrMissingConfirmer` 拒绝执行。读文件、列目录、搜索不需要确认。Agent 会把工具失败结果交给模型；最终回答或 `done` 消息提到错误，不代表命令已经执行。沙盒校验文件路径并设置 shell 工作目录，不提供操作系统级的进程隔离。
+对于 `bash`、`write`、`webfetch` 等需要确认的操作，`(true, nil)` 表示批准，`(false, nil)` 会返回 `sandbox.ErrToolDenied`，返回 error 则阻止执行。缺少确认器、确认器依赖 provider 返回 error，或返回 nil `Confirmer` 接口时，会以 `sandbox.ErrMissingConfirmer` 拒绝执行。读文件、列目录、搜索不需要确认。Agent 会把工具失败结果交给模型；最终回答或 `done` 消息提到错误，不代表命令已经执行。沙盒校验文件路径并设置 shell 工作目录，不提供操作系统级的进程隔离。
 
 [`examples/confirmation/example_test.go`](examples/confirmation/example_test.go) 是可运行的库示例，使用本地 fake model 和宿主自有 mock 确认器，只批准自有临时目录中的一个固定无害命令。测试走真实 Agent → sandbox → `done` 路径，覆盖批准、拒绝、缺依赖和确认器错误，检查命令效果与错误结果，不使用 Provider 或凭据：
 
