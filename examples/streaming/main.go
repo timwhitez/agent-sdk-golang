@@ -174,7 +174,7 @@ func consumeAgentOutput(next func() (agent.Event, string, bool), w, diag io.Writ
 		case agent.AutoContinueEvent:
 			continueText = e.Reason == "max_tokens"
 		case agent.TextDeltaEvent:
-			if e.Delta != "" && frameID != "" && frameID != textFrame {
+			if strings.TrimSpace(e.Delta) != "" && frameID != "" && frameID != textFrame {
 				// Distinct response text can follow a text-only reminder, with
 				// no tool event in between. FrameID is the existing producer
 				// identity; tool names or warning prose cannot prove a boundary.

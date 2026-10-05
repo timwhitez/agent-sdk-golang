@@ -572,12 +572,35 @@ func TestD06ReminderFramesDoNotRepeatCurrentAnswer(t *testing.T) {
 	}
 }
 
+func TestD06WhitespaceOnlyDoneFrameKeepsShownAnswer(t *testing.T) {
+	events := make(chan agent.EventEnvelope, 5)
+	for _, envelope := range []agent.EventEnvelope{
+		{FrameID: "q/frame/1", Event: agent.TextDeltaEvent{Delta: "Answer."}},
+		{FrameID: "q/frame/2", Event: agent.TextDeltaEvent{Delta: " "}},
+		{FrameID: "q/frame/2", Event: agent.ToolCallEvent{Tool: "done"}},
+		{FrameID: "q/frame/2", Event: agent.ToolResultEvent{Tool: "done"}},
+		{FrameID: "q/frame/2", Event: agent.FinalResponseEvent{Content: "Answer.\n\nSaved."}},
+	} {
+		events <- envelope
+	}
+	close(events)
+	var output, diag bytes.Buffer
+	if err := consumeAgentEnvelopes(events, &output, &diag); err != nil {
+		t.Fatal(err)
+	}
+	if strings.Count(output.String(), "Answer.") != 1 || strings.Count(output.String(), "Saved.") != 1 {
+		t.Fatalf("output=%q", output.String())
+	}
+}
+
 func TestD06AgentTruncatedTextAndDoneRendersOnce(t *testing.T) {
 	done := tools.Func[struct {
 		Message string `json:"message"`
 	}]("done", "complete", func(_ context.Context, args struct {
 		Message string `json:"message"`
-	}, _ *tools.Container) (any, error) { return nil, tools.TaskComplete(args.Message) })
+	}, _ *tools.Container) (any, error) {
+		return nil, tools.TaskComplete(args.Message)
+	})
 	a, err := agent.New(agent.Config{LLM: &scriptedStreamer{turns: [][]llm.StreamEvent{
 		{llm.StreamTextDeltaEvent{Delta: "The answer is "}, llm.StreamDoneEvent{StopReason: "max_tokens"}},
 		toolCallTurn("42.", "d1", "done", `{"message":"Report saved."}`),
