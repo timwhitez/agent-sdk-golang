@@ -178,3 +178,53 @@ func TestAgentContinuationLimit(t *testing.T) {
 		t.Fatalf("revised answer duplicated: %q", out.String())
 	}
 }
+
+func TestAgentAbandonedArgumentsReplacement(t *testing.T) {
+	for _, required := range []bool{false, true} {
+		done := tools.Func[struct {
+			Message string `json:"message"`
+		}]("done", "complete", func(_ context.Context, args struct {
+			Message string `json:"message"`
+		}, _ *tools.Container) (any, error) {
+			return nil, tools.TaskComplete(args.Message)
+		})
+		first := toolCallTurn("ABANDONED", "partial", "done", `{"message":"`)
+		first[len(first)-1] = llm.StreamDoneEvent{StopReason: "max_tokens"}
+		model := &scriptedStreamer{turns: [][]llm.StreamEvent{
+			first,
+			{llm.StreamTextDeltaEvent{Delta: "REPLACEMENT"}, llm.StreamDoneEvent{StopReason: "stop"}},
+			toolCallTurn("", "d1", "done", `{"message":"Saved."}`),
+		}}
+		a, err := agent.New(agent.Config{LLM: model, Tools: []tools.Tool{done}, RequireDoneTool: required, Warningf: func(string, ...any) {}})
+		if err != nil {
+			t.Fatal(err)
+		}
+		var out, diag bytes.Buffer
+		err = consumeAgentEnvelopes(a.QueryStreamEnveloped(context.Background(), llm.TextContent("fixture")), &out, &diag)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if strings.Count(out.String(), "REPLACEMENT") != 1 || strings.Count(out.String(), "Saved.") != 1 {
+			t.Fatalf("required=%t output=%q", required, out.String())
+		}
+	}
+}
+
+func TestAgentGenericCompletionPayload(t *testing.T) {
+	for _, payload := range []string{"Answer.", "Saved."} {
+		finish := tools.Func[struct{}]("finish", "complete", func(context.Context, struct{}, *tools.Container) (any, error) {
+			return nil, tools.TaskComplete(payload)
+		})
+		a, err := agent.New(agent.Config{LLM: &scriptedStreamer{turns: [][]llm.StreamEvent{toolCallTurn("Answer.", "f1", "finish", `{}`)}}, Tools: []tools.Tool{finish}, Warningf: func(string, ...any) {}})
+		if err != nil {
+			t.Fatal(err)
+		}
+		var out, diag bytes.Buffer
+		if err := consumeAgentEnvelopes(a.QueryStreamEnveloped(context.Background(), llm.TextContent("fixture")), &out, &diag); err != nil {
+			t.Fatal(err)
+		}
+		if strings.Count(out.String(), "Answer.") != 1 || strings.Count(out.String(), payload) != 1 {
+			t.Fatalf("payload=%q output=%q", payload, out.String())
+		}
+	}
+}

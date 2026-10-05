@@ -525,10 +525,10 @@ func TestD06FinalAnswerAgainstShownTurn(t *testing.T) {
 		{"same text once", []agent.Event{agent.TextDeltaEvent{Delta: "Hel"}, agent.TextDeltaEvent{Delta: "lo"}, agent.FinalResponseEvent{Content: "Hello"}}, "Hello\n"},
 		{"empty deltas", []agent.Event{agent.TextDeltaEvent{Delta: ""}, agent.FinalResponseEvent{Content: "Hello"}}, "Hello\n"},
 		{"lost delta recovered from final", []agent.Event{agent.TextDeltaEvent{Delta: "Hel"}, agent.FinalResponseEvent{Content: "Hello", DroppedEvents: 1}}, "Hel\n" + finalMarker + "Hello\n"},
-		{"earlier turn text is not the answer", []agent.Event{
+		{"identical final text already visible before tool", []agent.Event{
 			agent.TextDeltaEvent{Delta: "Hello"}, agent.ToolCallEvent{Tool: "check"}, agent.ToolResultEvent{Tool: "check"},
 			agent.FinalResponseEvent{Content: "Hello"},
-		}, "Hello\n" + finalMarker + "Hello\n"},
+		}, "Hello\n"},
 		{"multiple turns, last turn streamed the answer", []agent.Event{
 			agent.TextDeltaEvent{Delta: "Step 1."}, agent.ToolCallEvent{Tool: "a"}, agent.ToolResultEvent{Tool: "a"},
 			agent.TextDeltaEvent{Delta: "Step 2."}, agent.ToolCallEvent{Tool: "b"}, agent.ToolResultEvent{Tool: "b"},

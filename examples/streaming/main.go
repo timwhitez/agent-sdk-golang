@@ -139,10 +139,9 @@ func consumeAgentEnvelopes(events <-chan agent.EventEnvelope, w, diag io.Writer)
 
 func consumeAgentOutput(next func() (agent.EventEnvelope, bool), w, diag io.Writer) error {
 	// turn is the text streamed by the current model turn. A tool call or tool
-	// result ends the turn. The example's explicit done tool can retain that
-	// text in its final snapshot. Print the answer unless already shown
-	// exactly that text; an empty turn, a lost delta or a final answer that
-	// comes from a tool (such as done) all print it.
+	// result ends the turn. A completion tool can retain that text in its
+	// final snapshot. Reconcile the complete text already shown at the end
+	// of the turn; partial or lost answer text still prints the snapshot.
 	var turn strings.Builder
 	shownBeforeDone := ""
 	shownBeforeTool := ""
@@ -243,11 +242,18 @@ func consumeAgentOutput(next func() (agent.EventEnvelope, bool), w, diag io.Writ
 			if shownText == "" {
 				shownText = strings.TrimSpace(shownBeforeDone)
 			}
-			shown := shownText == strings.TrimSpace(content)
+			if shownText == "" {
+				shownText = strings.TrimSpace(shownBeforeTool)
+			}
+			finalText := strings.TrimSpace(content)
+			shown := finalText != "" && strings.HasSuffix(shownText, finalText)
 			// A retained answer followed by a completion paragraph extends text
 			// already shown. Print only the new paragraph.
-			if shownText != "" && strings.HasPrefix(strings.TrimSpace(content), shownText+"\n\n") {
-				content = strings.TrimPrefix(strings.TrimSpace(content), shownText+"\n\n")
+			for boundary := strings.LastIndex(finalText, "\n\n"); boundary > 0; boundary = strings.LastIndex(finalText[:boundary], "\n\n") {
+				if strings.HasSuffix(shownText, finalText[:boundary]) {
+					content = finalText[boundary+2:]
+					break
+				}
 			}
 			if err := endLine(); err != nil {
 				return err
