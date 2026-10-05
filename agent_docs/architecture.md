@@ -333,6 +333,11 @@ Streaming consumers reconcile or replace their displayed answer, rather than
 append the full snapshot to already-rendered deltas. The streaming example and
 Goode TUI display only a newly appended completion paragraph.
 
+These renderers use the existing enveloped text Frame IDs to distinguish
+text-only reminder responses, which need not have a tool event between them.
+Explicit max-token text continuations keep their accumulated text; this display
+state adds no event sequence, history writer or execution authority.
+
 ### Original native handler failure evidence
 
 `ToolResultEvent.HandlerFailed` records independent original error/panic evidence

@@ -549,3 +549,47 @@ func TestD06FinalAnswerAgainstShownTurn(t *testing.T) {
 		t.Fatal("critical drop accepted")
 	}
 }
+
+func TestD06ReminderFramesDoNotRepeatCurrentAnswer(t *testing.T) {
+	events := make(chan agent.EventEnvelope, 6)
+	for _, envelope := range []agent.EventEnvelope{
+		{FrameID: "q/frame/1", Event: agent.TextDeltaEvent{Delta: "Earlier answer."}},
+		{FrameID: "q/frame/2", Event: agent.TextDeltaEvent{Delta: "Revised "}},
+		{FrameID: "q/frame/2", Event: agent.TextDeltaEvent{Delta: "answer."}},
+		{FrameID: "q/frame/2", Event: agent.ToolCallEvent{Tool: "done"}},
+		{FrameID: "q/frame/2", Event: agent.ToolResultEvent{Tool: "done"}},
+		{FrameID: "q/frame/2", Event: agent.FinalResponseEvent{Content: "Revised answer.\n\nReport saved."}},
+	} {
+		events <- envelope
+	}
+	close(events)
+	var output, diag bytes.Buffer
+	if err := consumeAgentEnvelopes(events, &output, &diag); err != nil {
+		t.Fatal(err)
+	}
+	if got, want := output.String(), "Earlier answer.\nRevised answer.\n"+finalMarker+"Report saved.\n"; got != want {
+		t.Fatalf("output=%q want %q", got, want)
+	}
+}
+
+func TestD06AgentTruncatedTextAndDoneRendersOnce(t *testing.T) {
+	done := tools.Func[struct {
+		Message string `json:"message"`
+	}]("done", "complete", func(_ context.Context, args struct {
+		Message string `json:"message"`
+	}, _ *tools.Container) (any, error) { return nil, tools.TaskComplete(args.Message) })
+	a, err := agent.New(agent.Config{LLM: &scriptedStreamer{turns: [][]llm.StreamEvent{
+		{llm.StreamTextDeltaEvent{Delta: "The answer is "}, llm.StreamDoneEvent{StopReason: "max_tokens"}},
+		toolCallTurn("42.", "d1", "done", `{"message":"Report saved."}`),
+	}}, Tools: []tools.Tool{done}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var output, diag bytes.Buffer
+	if err := consumeAgentEnvelopes(a.QueryStreamEnveloped(context.Background(), llm.TextContent("answer")), &output, &diag); err != nil {
+		t.Fatal(err)
+	}
+	if got, want := output.String(), "The answer is 42.\n"+finalMarker+"Report saved.\n"; got != want {
+		t.Fatalf("output=%q want %q", got, want)
+	}
+}
