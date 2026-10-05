@@ -43,6 +43,9 @@ func TestToolResultErrorOriginNamesTheProducingPath(t *testing.T) {
 				t.Fatal(err)
 			}
 			result := onlyToolResult(t, collectEvents(ag.QueryStream(context.Background(), llm.TextContent("go"))))
+			if result.HandlerFailed != (tc.name == "handler error" || tc.name == "handler panic") {
+				t.Fatalf("original failure evidence=%v case=%s", result.HandlerFailed, tc.name)
+			}
 			if result.IsError != tc.isError || result.ErrorOrigin != tc.want {
 				t.Fatalf("tool result is_error=%v origin=%q, want %v/%q", result.IsError, result.ErrorOrigin, tc.isError, tc.want)
 			}

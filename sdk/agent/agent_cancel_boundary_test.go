@@ -2,6 +2,7 @@ package agent
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"strings"
 	"sync"
@@ -244,6 +245,8 @@ func TestRunningToolCancellationOutcomeCharacterization(t *testing.T) {
 	}{
 		{name: "handler success"},
 		{name: "handler error", toolErr: errors.New("handler failed after side effect")},
+		{name: "pure canceled", toolErr: context.Canceled},
+		{name: "joined independent", toolErr: errors.Join(errors.New("owned failure"), context.Canceled)},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			ctx, cancel := context.WithCancel(context.Background())
@@ -277,6 +280,17 @@ func TestRunningToolCancellationOutcomeCharacterization(t *testing.T) {
 				t.Fatalf("closed canceled block required repair: changed=%t unexpected=%t", changed, unexpected)
 			}
 			assertRunningCancellationEvents(t, events, runningResult)
+			wantFailure := test.name == "handler error" || test.name == "joined independent"
+			for _, e := range events {
+				if r, ok := e.(ToolResultEvent); ok {
+					data, _ := json.Marshal(r)
+					var fields map[string]any
+					_ = json.Unmarshal(data, &fields)
+					if got, _ := fields["HandlerFailed"].(bool); got != wantFailure {
+						t.Fatalf("original handler failure evidence=%v want=%v: %s", got, wantFailure, data)
+					}
+				}
+			}
 
 			next := collectEvents(ag.QueryStream(context.Background(), llm.TextContent("next")))
 			if model.calls.Load() != 2 || finalText(next) != "next turn" {

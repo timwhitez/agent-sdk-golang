@@ -12,7 +12,8 @@ type toolResultProjection struct {
 	metadata map[string]any
 	publish  bool
 	// errorOrigin is the ToolErrorOrigin* label of an error result.
-	errorOrigin string
+	errorOrigin   string
+	handlerFailed bool
 }
 
 func projectToolResult(history llm.Message, metadata map[string]any, original string) toolResultProjection {
@@ -28,5 +29,5 @@ func historyOnlyResults(messages []llm.Message) []toolResultProjection {
 }
 
 func (p toolResultProjection) event() ToolResultEvent {
-	return ToolResultEvent{Tool: p.history.ToolName, ToolCallID: p.history.ToolCallID, IsError: p.history.IsError, Result: p.visible, Metadata: p.metadata, ErrorOrigin: p.errorOrigin}
+	return ToolResultEvent{Tool: p.history.ToolName, ToolCallID: p.history.ToolCallID, IsError: p.history.IsError, Result: p.visible, Metadata: p.metadata, ErrorOrigin: p.errorOrigin, HandlerFailed: p.handlerFailed}
 }

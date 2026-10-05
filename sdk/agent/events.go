@@ -97,6 +97,12 @@ type ToolResultEvent struct {
 	// arguments' or the environment's. Hosts refine it only from facts they
 	// own (for example a confirmation denial inside the handler).
 	ErrorOrigin string
+	// HandlerFailed records a started native handler's independent error or
+	// panic before root cancellation projects its terminal result. Pure wrapped
+	// cancellation/deadline and TaskComplete control leaves are excluded; a
+	// joined independent branch still counts. Unknown-tool fallbacks are excluded.
+	// It is independent of IsError/ErrorOrigin and false is not proof of success.
+	HandlerFailed bool
 }
 
 // Tool error origins: the SDK path that produced an error tool result.
