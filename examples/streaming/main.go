@@ -124,12 +124,30 @@ const finalMarker = "[final answer]\n"
 // showed exactly that text. Errors, partial answers, critically dropped
 // events and a stream without a final response are all failures.
 func consumeAgentEvents(events <-chan agent.Event, w, diag io.Writer) error {
+	return consumeAgentOutput(func() (agent.Event, string, bool) {
+		event, ok := <-events
+		return event, "", ok
+	}, w, diag)
+}
+
+func consumeAgentEnvelopes(events <-chan agent.EventEnvelope, w, diag io.Writer) error {
+	return consumeAgentOutput(func() (agent.Event, string, bool) {
+		envelope, ok := <-events
+		return envelope.Event, envelope.FrameID, ok
+	}, w, diag)
+}
+
+func consumeAgentOutput(next func() (agent.Event, string, bool), w, diag io.Writer) error {
 	// turn is the text streamed by the current model turn. A tool call or tool
-	// result ends the turn: text streamed before a tool is progress, not the
-	// answer. The final answer is printed unless this turn already showed
+	// result ends the turn. The example's explicit done tool can retain that
+	// text in its final snapshot. Print the answer unless already shown
 	// exactly that text; an empty turn, a lost delta or a final answer that
 	// comes from a tool (such as done) all print it.
 	var turn strings.Builder
+	shownBeforeDone := ""
+	shownBeforeTool := ""
+	textFrame := ""
+	continueText := false
 	printed, atLineStart := false, true
 	write := func(text string) error {
 		if text == "" {
@@ -147,14 +165,53 @@ func consumeAgentEvents(events <-chan agent.Event, w, diag io.Writer) error {
 		}
 		return write("\n")
 	}
-	for event := range events {
+	for {
+		event, frameID, ok := next()
+		if !ok {
+			break
+		}
 		switch e := event.(type) {
+		case agent.AutoContinueEvent:
+			continueText = e.Reason == "max_tokens"
 		case agent.TextDeltaEvent:
+			if strings.TrimSpace(e.Delta) != "" && frameID != "" && frameID != textFrame {
+				// Distinct response text can follow a text-only reminder, with
+				// no tool event in between. FrameID is the existing producer
+				// identity; tool names or warning prose cannot prove a boundary.
+				if !continueText {
+					if err := endLine(); err != nil {
+						return err
+					}
+					turn.Reset()
+				}
+				textFrame = frameID
+			}
+			if strings.TrimSpace(e.Delta) != "" {
+				continueText = false
+				shownBeforeDone = ""
+				shownBeforeTool = ""
+			}
 			turn.WriteString(e.Delta)
 			if err := write(e.Delta); err != nil {
 				return err
 			}
-		case agent.ToolCallEvent, agent.ToolResultEvent:
+		case agent.ToolCallEvent:
+			if strings.TrimSpace(turn.String()) != "" {
+				shownBeforeTool = turn.String()
+			}
+			if e.Tool == "done" {
+				shownBeforeDone = shownBeforeTool
+			} else {
+				shownBeforeDone = ""
+			}
+			turn.Reset()
+			if err := endLine(); err != nil {
+				return err
+			}
+		case agent.ToolResultEvent:
+			if e.Tool != "done" || e.IsError {
+				shownBeforeDone = ""
+			}
 			turn.Reset()
 			if err := endLine(); err != nil {
 				return err
@@ -162,17 +219,27 @@ func consumeAgentEvents(events <-chan agent.Event, w, diag io.Writer) error {
 		case agent.ErrorEvent:
 			return fmt.Errorf("agent error (%s): %s", e.Kind, e.Message)
 		case agent.FinalResponseEvent:
-			shown := strings.TrimSpace(turn.String()) == strings.TrimSpace(e.Content)
+			content := e.Content
+			shownText := strings.TrimSpace(turn.String())
+			if shownText == "" {
+				shownText = strings.TrimSpace(shownBeforeDone)
+			}
+			shown := shownText == strings.TrimSpace(content)
+			// A retained answer followed by a completion paragraph extends text
+			// already shown. Print only the new paragraph.
+			if shownText != "" && strings.HasPrefix(strings.TrimSpace(content), shownText+"\n\n") {
+				content = strings.TrimPrefix(strings.TrimSpace(content), shownText+"\n\n")
+			}
 			if err := endLine(); err != nil {
 				return err
 			}
-			if !shown && e.Content != "" {
+			if !shown && content != "" {
 				if printed {
 					if err := write(finalMarker); err != nil {
 						return err
 					}
 				}
-				if err := write(e.Content); err != nil {
+				if err := write(content); err != nil {
 					return err
 				}
 				if err := endLine(); err != nil {
@@ -206,7 +273,7 @@ func streamAgent(ctx context.Context, model llm.ChatModel, prompt string, w, dia
 	if err != nil {
 		return err
 	}
-	err = consumeAgentEvents(a.QueryStream(ctx, llm.TextContent(prompt)), w, diag)
+	err = consumeAgentEnvelopes(a.QueryStreamEnveloped(ctx, llm.TextContent(prompt)), w, diag)
 	if ctxErr := ctx.Err(); err != nil && ctxErr != nil {
 		return ctxErr
 	}

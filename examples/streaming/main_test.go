@@ -460,6 +460,18 @@ func TestD06AgentPrintsDifferentFinalAfterProgress(t *testing.T) {
 			want: "Inspecting files...\n" + finalMarker + "Verified answer.\n",
 		},
 		{
+			name:  "answer and distinct done payload in same response",
+			tools: []tools.Tool{done},
+			turns: [][]llm.StreamEvent{toolCallTurn("The answer is 42.", "d1", "done", `{"message":"Report saved."}`)},
+			want:  "The answer is 42.\n" + finalMarker + "Report saved.\n",
+		},
+		{
+			name:  "same response identical done payload once",
+			tools: []tools.Tool{done},
+			turns: [][]llm.StreamEvent{toolCallTurn("The answer is 42.", "d1", "done", `{"message":"The answer is 42."}`)},
+			want:  "The answer is 42.\n",
+		},
+		{
 			name:  "streamed final answer is not repeated",
 			tools: []tools.Tool{check},
 			turns: [][]llm.StreamEvent{
@@ -504,6 +516,12 @@ func TestD06FinalAnswerAgainstShownTurn(t *testing.T) {
 		want   string
 	}{
 		{"done final without deltas", []agent.Event{agent.ToolCallEvent{Tool: "done"}, agent.FinalResponseEvent{Content: "Answer."}}, "Answer.\n"},
+		{"answer then sibling tools and done", []agent.Event{
+			agent.TextDeltaEvent{Delta: "The answer is 42."},
+			agent.ToolCallEvent{Tool: "read"}, agent.ToolResultEvent{Tool: "read"},
+			agent.ToolCallEvent{Tool: "done"}, agent.ToolResultEvent{Tool: "done"},
+			agent.FinalResponseEvent{Content: "The answer is 42.\n\nReport saved."},
+		}, "The answer is 42.\n" + finalMarker + "Report saved.\n"},
 		{"same text once", []agent.Event{agent.TextDeltaEvent{Delta: "Hel"}, agent.TextDeltaEvent{Delta: "lo"}, agent.FinalResponseEvent{Content: "Hello"}}, "Hello\n"},
 		{"empty deltas", []agent.Event{agent.TextDeltaEvent{Delta: ""}, agent.FinalResponseEvent{Content: "Hello"}}, "Hello\n"},
 		{"lost delta recovered from final", []agent.Event{agent.TextDeltaEvent{Delta: "Hel"}, agent.FinalResponseEvent{Content: "Hello", DroppedEvents: 1}}, "Hel\n" + finalMarker + "Hello\n"},
@@ -529,5 +547,102 @@ func TestD06FinalAnswerAgainstShownTurn(t *testing.T) {
 	}
 	if _, err := run(agent.TextDeltaEvent{Delta: "x"}, agent.FinalResponseEvent{Content: "x", DroppedEvents: 3, DroppedCriticalEvents: 1}); err == nil {
 		t.Fatal("critical drop accepted")
+	}
+}
+
+func TestD06ReminderFramesDoNotRepeatCurrentAnswer(t *testing.T) {
+	events := make(chan agent.EventEnvelope, 6)
+	for _, envelope := range []agent.EventEnvelope{
+		{FrameID: "q/frame/1", Event: agent.TextDeltaEvent{Delta: "Earlier answer."}},
+		{FrameID: "q/frame/2", Event: agent.TextDeltaEvent{Delta: "Revised "}},
+		{FrameID: "q/frame/2", Event: agent.TextDeltaEvent{Delta: "answer."}},
+		{FrameID: "q/frame/2", Event: agent.ToolCallEvent{Tool: "done"}},
+		{FrameID: "q/frame/2", Event: agent.ToolResultEvent{Tool: "done"}},
+		{FrameID: "q/frame/2", Event: agent.FinalResponseEvent{Content: "Revised answer.\n\nReport saved."}},
+	} {
+		events <- envelope
+	}
+	close(events)
+	var output, diag bytes.Buffer
+	if err := consumeAgentEnvelopes(events, &output, &diag); err != nil {
+		t.Fatal(err)
+	}
+	if got, want := output.String(), "Earlier answer.\nRevised answer.\n"+finalMarker+"Report saved.\n"; got != want {
+		t.Fatalf("output=%q want %q", got, want)
+	}
+}
+
+func TestD06WhitespaceOnlyDoneFrameKeepsShownAnswer(t *testing.T) {
+	events := make(chan agent.EventEnvelope, 5)
+	for _, envelope := range []agent.EventEnvelope{
+		{FrameID: "q/frame/1", Event: agent.TextDeltaEvent{Delta: "Answer."}},
+		{FrameID: "q/frame/2", Event: agent.TextDeltaEvent{Delta: " "}},
+		{FrameID: "q/frame/2", Event: agent.ToolCallEvent{Tool: "done"}},
+		{FrameID: "q/frame/2", Event: agent.ToolResultEvent{Tool: "done"}},
+		{FrameID: "q/frame/2", Event: agent.FinalResponseEvent{Content: "Answer.\n\nSaved."}},
+	} {
+		events <- envelope
+	}
+	close(events)
+	var output, diag bytes.Buffer
+	if err := consumeAgentEnvelopes(events, &output, &diag); err != nil {
+		t.Fatal(err)
+	}
+	if strings.Count(output.String(), "Answer.") != 1 || strings.Count(output.String(), "Saved.") != 1 {
+		t.Fatalf("output=%q", output.String())
+	}
+}
+
+func TestD06AgentTruncatedTextAndDoneRendersOnce(t *testing.T) {
+	done := tools.Func[struct {
+		Message string `json:"message"`
+	}]("done", "complete", func(_ context.Context, args struct {
+		Message string `json:"message"`
+	}, _ *tools.Container) (any, error) {
+		return nil, tools.TaskComplete(args.Message)
+	})
+	a, err := agent.New(agent.Config{LLM: &scriptedStreamer{turns: [][]llm.StreamEvent{
+		{llm.StreamTextDeltaEvent{Delta: "The answer is "}, llm.StreamDoneEvent{StopReason: "max_tokens"}},
+		toolCallTurn("42.", "d1", "done", `{"message":"Report saved."}`),
+	}}, Tools: []tools.Tool{done}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var output, diag bytes.Buffer
+	if err := consumeAgentEnvelopes(a.QueryStreamEnveloped(context.Background(), llm.TextContent("answer")), &output, &diag); err != nil {
+		t.Fatal(err)
+	}
+	if got, want := output.String(), "The answer is 42.\n"+finalMarker+"Report saved.\n"; got != want {
+		t.Fatalf("output=%q want %q", got, want)
+	}
+}
+
+func TestD06AgentContinuationLeadingWhitespaceRendersOnce(t *testing.T) {
+	for _, leading := range []string{" ", "\n"} {
+		t.Run(fmt.Sprintf("leading_%q", leading), func(t *testing.T) {
+			done := tools.Func[struct {
+				Message string `json:"message"`
+			}]("done", "complete", func(_ context.Context, args struct {
+				Message string `json:"message"`
+			}, _ *tools.Container) (any, error) {
+				return nil, tools.TaskComplete(args.Message)
+			})
+			a, err := agent.New(agent.Config{LLM: &scriptedStreamer{turns: [][]llm.StreamEvent{
+				{llm.StreamTextDeltaEvent{Delta: "First paragraph."}, llm.StreamDoneEvent{StopReason: "max_tokens"}},
+				{llm.StreamTextDeltaEvent{Delta: leading}, llm.StreamTextDeltaEvent{Delta: "Second paragraph."},
+					llm.StreamToolCallDeltaEvent{Index: 0, ID: "d1", NameDelta: "done", ArgumentsDelta: `{"message":"Saved."}`},
+					llm.StreamDoneEvent{StopReason: "tool_calls"}},
+			}}, Tools: []tools.Tool{done}})
+			if err != nil {
+				t.Fatal(err)
+			}
+			var output, diag bytes.Buffer
+			if err := consumeAgentEnvelopes(a.QueryStreamEnveloped(context.Background(), llm.TextContent("answer")), &output, &diag); err != nil {
+				t.Fatal(err)
+			}
+			if got, want := output.String(), "First paragraph."+leading+"Second paragraph.\n"+finalMarker+"Saved.\n"; got != want {
+				t.Fatalf("output=%q want %q", got, want)
+			}
+		})
 	}
 }
