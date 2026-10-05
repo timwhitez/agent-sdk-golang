@@ -194,6 +194,7 @@ type eventOutput struct {
 	// envelopes that were not delivered; the receipt reports them at close.
 	dropped         atomic.Uint64
 	droppedCritical atomic.Uint64
+	handlerFailures atomic.Uint64
 	receipt         *QueryStreamReceipt
 }
 
@@ -220,6 +221,11 @@ type QueryStreamSummary struct {
 	// at the final answer, they cover the whole stream.
 	DroppedEvents         uint64
 	DroppedCriticalEvents uint64
+	// HandlerFailures counts native started handler outcomes with independent
+	// error/panic evidence, including results whose publication was dropped or
+	// whose canceled terminal replaced the original error. This is per Query,
+	// not a delivery acknowledgment or an execution/success attestation.
+	HandlerFailures uint64
 }
 
 // Summary returns the stream's final summary. ok may become true just
@@ -377,6 +383,7 @@ func (o *eventOutput) close() {
 			LastSequence:          o.sequence.Load(),
 			DroppedEvents:         o.dropped.Load(),
 			DroppedCriticalEvents: o.droppedCritical.Load(),
+			HandlerFailures:       o.handlerFailures.Load(),
 		})
 	}
 	if o.enveloped != nil {

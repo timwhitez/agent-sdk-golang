@@ -317,3 +317,17 @@ publication, not its content, a session revision, the wire payload or delivery.
 `LastHostPublicationRevision` returns the latest host publication's revision
 (zero before any) and is never cleared by those SDK changes, so a host can
 tell whether it published anything between two reads.
+
+### Original native handler failure evidence
+
+`ToolResultEvent.HandlerFailed` records independent original error/panic evidence
+from a started native handler, separately from `IsError` and `ErrorOrigin`.
+Root cancellation still projects the same canceled history/body/origin. Pure
+wrapped cancellation/deadline and TaskComplete control leaves do not count;
+joined independent branches and panics do. Unknown-tool fallbacks do not count.
+`QueryStreamReceipt.Summary().HandlerFailures` counts these native outcomes for
+that Query even when result publication is dropped. Hosts consult it after
+stream closure; it does not guarantee delivery or identify missing tool results.
+False/zero is not an execution or success attestation. SDK results remain
+recoverable tool outcomes during ordinary continuation; hosts own cleanup exit
+policy. No original error body is added to this evidence or diagnostics.

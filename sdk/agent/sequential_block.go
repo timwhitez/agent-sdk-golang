@@ -37,14 +37,15 @@ type BlockTerminal struct {
 	Publish            bool
 	Reason             string
 	// errorOrigin is set only by the SDK's native projection.
-	errorOrigin string
+	errorOrigin   string
+	handlerFailed bool
 }
 
 func (t BlockTerminal) projection() toolResultProjection {
-	return toolResultProjection{history: t.History, visible: t.Visible, original: t.Original, metadata: t.Metadata, publish: t.Publish, errorOrigin: t.errorOrigin}
+	return toolResultProjection{history: t.History, visible: t.Visible, original: t.Original, metadata: t.Metadata, publish: t.Publish, errorOrigin: t.errorOrigin, handlerFailed: t.handlerFailed}
 }
 func blockTerminal(p toolResultProjection, reason string) BlockTerminal {
-	return BlockTerminal{History: p.history, Visible: p.visible, Original: p.original, Metadata: p.metadata, Publish: p.publish, Reason: reason, errorOrigin: p.errorOrigin}
+	return BlockTerminal{History: p.history, Visible: p.visible, Original: p.original, Metadata: p.metadata, Publish: p.publish, Reason: reason, errorOrigin: p.errorOrigin, handlerFailed: p.handlerFailed}
 }
 
 // BlockAdmission contains the complete prepared Handler. Finish releases the
