@@ -865,6 +865,8 @@ func (a *Agent) queryStreamWithSteering(ctx context.Context, input llm.Content, 
 				requireDoneControlSource = ""
 				pendingRequireDoneFinalText = ""
 				pendingRequireDoneFinalResponseID = ""
+				pendingTextContinuation = ""
+				previousResponseTruncated = false
 			}
 
 			// Remove old ephemeral messages before the next LLM call. A
@@ -1179,9 +1181,13 @@ func (a *Agent) queryStreamWithSteering(ctx context.Context, input llm.Content, 
 			if comp.Thinking != "" {
 				a.emitEvent(out, ThinkingEvent{Content: comp.Thinking}, correlation)
 			}
+			responseText := comp.PlainText()
+			if comp.StopReason == "max_tokens" || pendingTextContinuation != "" || cont.hasPending() {
+				responseText = continuationText(comp.Content)
+			}
 			if !streamedText {
-				if txt := comp.PlainText(); txt != "" {
-					a.emitEvent(out, TextEvent{Content: txt}, correlation)
+				if responseText != "" {
+					a.emitEvent(out, TextEvent{Content: responseText}, correlation)
 				}
 			}
 
@@ -1233,9 +1239,9 @@ func (a *Agent) queryStreamWithSteering(ctx context.Context, input llm.Content, 
 				return a.compactor.EstimateMessages([]llm.Message{message})
 			}
 
-			// Keep text from a truncated text continuation only for completion
-			// of this response. Ordinary tool blocks still clear pending text.
-			completedResponseText := pendingTextContinuation + comp.PlainText()
+			// Text belongs to the explicit truncation episode until its response
+			// or argument continuation completes. Ordinary tool blocks clear it.
+			completedResponseText := pendingTextContinuation + responseText
 			if comp.HasToolCalls() {
 				pendingTextContinuation = ""
 			}
@@ -1270,6 +1276,7 @@ func (a *Agent) queryStreamWithSteering(ctx context.Context, input llm.Content, 
 					continue
 				}
 				cont.addPartial(comp.ToolCalls, frameOrdinal)
+				pendingTextContinuation = completedResponseText
 				a.emitEvent(out, WarnEvent{
 					Message: fmt.Sprintf("continuing truncated tool-call arguments (%d/%d)", turn, cont.maxTurns),
 					Kind:    "continuation",
@@ -1324,6 +1331,7 @@ func (a *Agent) queryStreamWithSteering(ctx context.Context, input llm.Content, 
 					}
 					// Still invalid JSON — keep accumulating.
 					cont.setAccumulated(merged, mergedSources)
+					pendingTextContinuation = completedResponseText
 					a.emitEvent(out, WarnEvent{
 						Message: fmt.Sprintf("tool-call merge remained invalid; requesting continuation (%d/%d)", turn, cont.maxTurns),
 						Kind:    "continuation",
@@ -1372,6 +1380,7 @@ func (a *Agent) queryStreamWithSteering(ctx context.Context, input llm.Content, 
 				// request only remains sendable because the outbound repair
 				// masks the malformed history.
 				if !comp.HasToolCalls() && cont.hasPending() {
+					pendingTextContinuation = ""
 					a.mu.Lock()
 					cont.discardPartialToolCalls(a.messages)
 					a.mu.Unlock()
@@ -1380,7 +1389,7 @@ func (a *Agent) queryStreamWithSteering(ctx context.Context, input llm.Content, 
 			}
 			// Stopping condition.
 			if !comp.HasToolCalls() {
-				plainText := comp.PlainText()
+				plainText := responseText
 				combinedText := pendingTextContinuation + plainText
 				clearPendingTextContinuation := func() {
 					pendingTextContinuation = ""
