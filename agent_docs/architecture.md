@@ -338,6 +338,15 @@ text-only reminder responses, which need not have a tool event between them.
 Explicit max-token text continuations keep their accumulated text; this display
 state adds no event sequence, history writer or execution authority.
 
+Continuation aggregation preserves whitespace-only visible fragments and text
+accompanying accepted tool-argument continuations. Abandoned or steered prefixes
+are cleared. Public `Content.PlainText` meaningful-content classification stays
+unchanged. Renderers consume whitespace continuation Frames and clear the
+continuation fact after steering or a continuation limit. Newly applied
+require-done control provenance also distinguishes an empty completed response
+from a still-active continuation; repeated provenance for the same control does
+not interrupt subsequent max-token continuations.
+
 ### Original native handler failure evidence
 
 `ToolResultEvent.HandlerFailed` records independent original error/panic evidence

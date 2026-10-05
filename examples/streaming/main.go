@@ -124,29 +124,29 @@ const finalMarker = "[final answer]\n"
 // showed exactly that text. Errors, partial answers, critically dropped
 // events and a stream without a final response are all failures.
 func consumeAgentEvents(events <-chan agent.Event, w, diag io.Writer) error {
-	return consumeAgentOutput(func() (agent.Event, string, bool) {
+	return consumeAgentOutput(func() (agent.EventEnvelope, bool) {
 		event, ok := <-events
-		return event, "", ok
+		return agent.EventEnvelope{Event: event}, ok
 	}, w, diag)
 }
 
 func consumeAgentEnvelopes(events <-chan agent.EventEnvelope, w, diag io.Writer) error {
-	return consumeAgentOutput(func() (agent.Event, string, bool) {
+	return consumeAgentOutput(func() (agent.EventEnvelope, bool) {
 		envelope, ok := <-events
-		return envelope.Event, envelope.FrameID, ok
+		return envelope, ok
 	}, w, diag)
 }
 
-func consumeAgentOutput(next func() (agent.Event, string, bool), w, diag io.Writer) error {
+func consumeAgentOutput(next func() (agent.EventEnvelope, bool), w, diag io.Writer) error {
 	// turn is the text streamed by the current model turn. A tool call or tool
-	// result ends the turn. The example's explicit done tool can retain that
-	// text in its final snapshot. Print the answer unless already shown
-	// exactly that text; an empty turn, a lost delta or a final answer that
-	// comes from a tool (such as done) all print it.
+	// result ends the turn. A completion tool can retain that text in its
+	// final snapshot. Reconcile the complete text already shown at the end
+	// of the turn; partial or lost answer text still prints the snapshot.
 	var turn strings.Builder
 	shownBeforeDone := ""
 	shownBeforeTool := ""
 	textFrame := ""
+	controlSource := ""
 	continueText := false
 	printed, atLineStart := false, true
 	write := func(text string) error {
@@ -166,15 +166,30 @@ func consumeAgentOutput(next func() (agent.Event, string, bool), w, diag io.Writ
 		return write("\n")
 	}
 	for {
-		event, frameID, ok := next()
+		envelope, ok := next()
 		if !ok {
 			break
 		}
+		// A newly applied require-done control follows a completed response,
+		// including one with no text events. Existing positive provenance is
+		// enough to consume the old display continuation once per source.
+		if source := envelope.RequestControlSourceFrameID; source != "" && envelope.RequestControlRelation == agent.RequestControlRequireDoneDisableThinking && source != controlSource {
+			continueText = false
+			controlSource = source
+		}
+		event, frameID := envelope.Event, envelope.FrameID
 		switch e := event.(type) {
 		case agent.AutoContinueEvent:
 			continueText = e.Reason == "max_tokens"
+		case agent.SteeringReceivedEvent:
+			continueText = false
+		case agent.WarnEvent:
+			if e.Kind == "continuation_limit" || e.Kind == "early_stop" {
+				continueText = false
+			}
 		case agent.TextDeltaEvent:
-			if strings.TrimSpace(e.Delta) != "" && frameID != "" && frameID != textFrame {
+			continuedFragment := continueText && e.Delta != ""
+			if (strings.TrimSpace(e.Delta) != "" || continuedFragment) && frameID != "" && frameID != textFrame {
 				// Distinct response text can follow a text-only reminder, with
 				// no tool event in between. FrameID is the existing producer
 				// identity; tool names or warning prose cannot prove a boundary.
@@ -185,6 +200,9 @@ func consumeAgentOutput(next func() (agent.Event, string, bool), w, diag io.Writ
 					turn.Reset()
 				}
 				textFrame = frameID
+			}
+			if continuedFragment {
+				continueText = false
 			}
 			if strings.TrimSpace(e.Delta) != "" {
 				continueText = false
@@ -224,11 +242,18 @@ func consumeAgentOutput(next func() (agent.Event, string, bool), w, diag io.Writ
 			if shownText == "" {
 				shownText = strings.TrimSpace(shownBeforeDone)
 			}
-			shown := shownText == strings.TrimSpace(content)
+			if shownText == "" {
+				shownText = strings.TrimSpace(shownBeforeTool)
+			}
+			finalText := strings.TrimSpace(content)
+			shown := finalText != "" && strings.HasSuffix(shownText, finalText)
 			// A retained answer followed by a completion paragraph extends text
 			// already shown. Print only the new paragraph.
-			if shownText != "" && strings.HasPrefix(strings.TrimSpace(content), shownText+"\n\n") {
-				content = strings.TrimPrefix(strings.TrimSpace(content), shownText+"\n\n")
+			for boundary := strings.LastIndex(finalText, "\n\n"); boundary > 0; boundary = strings.LastIndex(finalText[:boundary], "\n\n") {
+				if strings.HasSuffix(shownText, finalText[:boundary]) {
+					content = finalText[boundary+2:]
+					break
+				}
 			}
 			if err := endLine(); err != nil {
 				return err
