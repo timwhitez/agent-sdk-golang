@@ -1410,6 +1410,10 @@ func (a *Agent) queryStreamWithSteering(ctx context.Context, input llm.Content, 
 							pendingRequireDoneFinalText = txt
 							pendingRequireDoneFinalResponseID = responseID
 						}
+						// The completed answer now owns the consumed truncation
+						// prefix. A later done-only response must not mistake that
+						// prefix for new current-response text.
+						clearPendingTextContinuation()
 						earlyStopReminderSent = true
 						a.emitEvent(out, WarnEvent{
 							Message: "detected text-only stop after tool usage; prompting explicit done-tool completion",
@@ -1456,6 +1460,7 @@ func (a *Agent) queryStreamWithSteering(ctx context.Context, input llm.Content, 
 						pendingRequireDoneFinalText = txt
 						pendingRequireDoneFinalResponseID = responseID
 					}
+					clearPendingTextContinuation()
 					requireDoneReminders++
 					if !requireDoneReminderLogged {
 						a.warnf("warning: RequireDoneTool is true but model stopped with text-only after tool usage; prompting done-tool reminder")

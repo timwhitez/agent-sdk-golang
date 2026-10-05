@@ -114,7 +114,9 @@ func TestDoneAnswerUsesCurrentTextAndRetainsContinuation(t *testing.T) {
 		Message string `json:"message"`
 	}]("done", "complete", func(_ context.Context, args struct {
 		Message string `json:"message"`
-	}, _ *tools.Container) (any, error) { return nil, tools.TaskComplete(args.Message) })
+	}, _ *tools.Container) (any, error) {
+		return nil, tools.TaskComplete(args.Message)
+	})
 	for _, tc := range []struct {
 		name     string
 		turns    []*llm.Completion
@@ -147,6 +149,43 @@ func TestDoneAnswerUsesCurrentTextAndRetainsContinuation(t *testing.T) {
 			for _, ev := range collectEvents(ag.QueryStream(context.Background(), llm.TextContent("answer"))) {
 				if final, ok := ev.(FinalResponseEvent); ok {
 					if final.Content != tc.want || final.ResponseID != tc.id {
+						t.Fatalf("final=%#v", final)
+					}
+					return
+				}
+				if failure, ok := ev.(ErrorEvent); ok {
+					t.Fatalf("failure=%#v", failure)
+				}
+			}
+			t.Fatal("no final event")
+		})
+	}
+}
+
+func TestDoneReminderConsumesCompletedTextContinuation(t *testing.T) {
+	echo := tools.Tool{Name: "echo", Handler: func(context.Context, json.RawMessage, *tools.Container) (llm.Content, error) {
+		return llm.TextContent("ok"), nil
+	}}
+	done := tools.Func[struct {
+		Message string `json:"message"`
+	}]("done", "complete", func(_ context.Context, args struct {
+		Message string `json:"message"`
+	}, _ *tools.Container) (any, error) { return nil, tools.TaskComplete(args.Message) })
+	for _, required := range []bool{false, true} {
+		t.Run(testBoolName(required, "required"), func(t *testing.T) {
+			model := &turnModel{turns: []*llm.Completion{
+				{ToolCalls: []llm.ToolCall{{ID: "e1", Function: llm.FunctionCall{Name: "echo", Arguments: `{}`}}}},
+				{Content: llm.TextContent("The answer is "), StopReason: "max_tokens", ResponseID: "resp-part"},
+				{Content: llm.TextContent("42."), ResponseID: "resp-full-answer"},
+				{ResponseID: "resp-done-only", ToolCalls: []llm.ToolCall{{ID: "d1", Function: llm.FunctionCall{Name: "done", Arguments: `{"message":"Report saved."}`}}}},
+			}}
+			ag, err := New(Config{LLM: model, Tools: []tools.Tool{echo, done}, RequireDoneTool: required})
+			if err != nil {
+				t.Fatal(err)
+			}
+			for _, ev := range collectEvents(ag.QueryStream(context.Background(), llm.TextContent("answer"))) {
+				if final, ok := ev.(FinalResponseEvent); ok {
+					if final.Content != "The answer is 42.\n\nReport saved." || final.ResponseID != "resp-full-answer" {
 						t.Fatalf("final=%#v", final)
 					}
 					return
