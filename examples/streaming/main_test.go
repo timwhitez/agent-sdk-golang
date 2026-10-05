@@ -616,3 +616,33 @@ func TestD06AgentTruncatedTextAndDoneRendersOnce(t *testing.T) {
 		t.Fatalf("output=%q want %q", got, want)
 	}
 }
+
+func TestD06AgentContinuationLeadingWhitespaceRendersOnce(t *testing.T) {
+	for _, leading := range []string{" ", "\n"} {
+		t.Run(fmt.Sprintf("leading_%q", leading), func(t *testing.T) {
+			done := tools.Func[struct {
+				Message string `json:"message"`
+			}]("done", "complete", func(_ context.Context, args struct {
+				Message string `json:"message"`
+			}, _ *tools.Container) (any, error) {
+				return nil, tools.TaskComplete(args.Message)
+			})
+			a, err := agent.New(agent.Config{LLM: &scriptedStreamer{turns: [][]llm.StreamEvent{
+				{llm.StreamTextDeltaEvent{Delta: "First paragraph."}, llm.StreamDoneEvent{StopReason: "max_tokens"}},
+				{llm.StreamTextDeltaEvent{Delta: leading}, llm.StreamTextDeltaEvent{Delta: "Second paragraph."},
+					llm.StreamToolCallDeltaEvent{Index: 0, ID: "d1", NameDelta: "done", ArgumentsDelta: `{"message":"Saved."}`},
+					llm.StreamDoneEvent{StopReason: "tool_calls"}},
+			}}, Tools: []tools.Tool{done}})
+			if err != nil {
+				t.Fatal(err)
+			}
+			var output, diag bytes.Buffer
+			if err := consumeAgentEnvelopes(a.QueryStreamEnveloped(context.Background(), llm.TextContent("answer")), &output, &diag); err != nil {
+				t.Fatal(err)
+			}
+			if got, want := output.String(), "First paragraph."+leading+"Second paragraph.\n"+finalMarker+"Saved.\n"; got != want {
+				t.Fatalf("output=%q want %q", got, want)
+			}
+		})
+	}
+}

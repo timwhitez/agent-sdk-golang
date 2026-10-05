@@ -186,17 +186,17 @@ func consumeAgentOutput(next func() (agent.Event, string, bool), w, diag io.Writ
 				}
 				textFrame = frameID
 			}
-			if e.Delta != "" {
+			if strings.TrimSpace(e.Delta) != "" {
 				continueText = false
+				shownBeforeDone = ""
+				shownBeforeTool = ""
 			}
-			shownBeforeDone = ""
-			shownBeforeTool = ""
 			turn.WriteString(e.Delta)
 			if err := write(e.Delta); err != nil {
 				return err
 			}
 		case agent.ToolCallEvent:
-			if turn.Len() > 0 {
+			if strings.TrimSpace(turn.String()) != "" {
 				shownBeforeTool = turn.String()
 			}
 			if e.Tool == "done" {
