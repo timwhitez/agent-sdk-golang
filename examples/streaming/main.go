@@ -125,11 +125,12 @@ const finalMarker = "[final answer]\n"
 // events and a stream without a final response are all failures.
 func consumeAgentEvents(events <-chan agent.Event, w, diag io.Writer) error {
 	// turn is the text streamed by the current model turn. A tool call or tool
-	// result ends the turn: text streamed before a tool is progress, not the
-	// answer. The final answer is printed unless this turn already showed
+	// result ends the turn. The example's explicit done tool can retain that
+	// text in its final snapshot. Print the answer unless already shown
 	// exactly that text; an empty turn, a lost delta or a final answer that
 	// comes from a tool (such as done) all print it.
 	var turn strings.Builder
+	shownBeforeDone := ""
 	printed, atLineStart := false, true
 	write := func(text string) error {
 		if text == "" {
@@ -150,11 +151,25 @@ func consumeAgentEvents(events <-chan agent.Event, w, diag io.Writer) error {
 	for event := range events {
 		switch e := event.(type) {
 		case agent.TextDeltaEvent:
+			shownBeforeDone = ""
 			turn.WriteString(e.Delta)
 			if err := write(e.Delta); err != nil {
 				return err
 			}
-		case agent.ToolCallEvent, agent.ToolResultEvent:
+		case agent.ToolCallEvent:
+			if e.Tool == "done" {
+				shownBeforeDone = turn.String()
+			} else {
+				shownBeforeDone = ""
+			}
+			turn.Reset()
+			if err := endLine(); err != nil {
+				return err
+			}
+		case agent.ToolResultEvent:
+			if e.Tool != "done" || e.IsError {
+				shownBeforeDone = ""
+			}
 			turn.Reset()
 			if err := endLine(); err != nil {
 				return err
@@ -162,17 +177,27 @@ func consumeAgentEvents(events <-chan agent.Event, w, diag io.Writer) error {
 		case agent.ErrorEvent:
 			return fmt.Errorf("agent error (%s): %s", e.Kind, e.Message)
 		case agent.FinalResponseEvent:
-			shown := strings.TrimSpace(turn.String()) == strings.TrimSpace(e.Content)
+			content := e.Content
+			shownText := strings.TrimSpace(turn.String())
+			if shownText == "" {
+				shownText = strings.TrimSpace(shownBeforeDone)
+			}
+			shown := shownText == strings.TrimSpace(content)
+			// A retained answer followed by a completion paragraph extends text
+			// already shown. Print only the new paragraph.
+			if shownText != "" && strings.HasPrefix(strings.TrimSpace(content), shownText+"\n\n") {
+				content = strings.TrimPrefix(strings.TrimSpace(content), shownText+"\n\n")
+			}
 			if err := endLine(); err != nil {
 				return err
 			}
-			if !shown && e.Content != "" {
+			if !shown && content != "" {
 				if printed {
 					if err := write(finalMarker); err != nil {
 						return err
 					}
 				}
-				if err := write(e.Content); err != nil {
+				if err := write(content); err != nil {
 					return err
 				}
 				if err := endLine(); err != nil {

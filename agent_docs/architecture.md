@@ -318,6 +318,21 @@ publication, not its content, a session revision, the wire payload or delivery.
 (zero before any) and is never cleared by those SDK changes, so a host can
 tell whether it published anything between two reads.
 
+### Final answers after task completion
+
+`FinalResponseEvent.Content` is an authoritative answer snapshot; `Query` returns
+that snapshot. When a handler returns `TaskComplete`, it retains visible text
+from the same model response, or the preceding done-reminder answer if the
+completion response has no text. A distinct completion payload follows after
+a blank line; equal trimmed text appears once. No acknowledgement heuristics
+discard completion prose. Current response text takes precedence over an older
+reminder answer. A reminder answer retains its original response ID; otherwise
+the completion response ID is used. History keeps the original assistant and
+tool messages; this snapshot is not an extra history message or text delta.
+Streaming consumers reconcile or replace their displayed answer, rather than
+append the full snapshot to already-rendered deltas. The streaming example and
+Goode TUI display only a newly appended completion paragraph.
+
 ### Original native handler failure evidence
 
 `ToolResultEvent.HandlerFailed` records independent original error/panic evidence

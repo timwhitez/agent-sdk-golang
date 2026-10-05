@@ -129,6 +129,11 @@ const (
 func (ToolResultEvent) isEvent() {}
 
 type FinalResponseEvent struct {
+	// Content is the authoritative answer snapshot, not an additional delta.
+	// TaskComplete retains text from its model response (or the preceding
+	// done-reminder answer) plus a distinct completion payload, separated by
+	// a blank line. Exact duplicates appear once. Renderers should reconcile
+	// this snapshot with text already shown rather than append it blindly.
 	Content    string
 	ResponseID string
 	// Status is "complete" for normal terminal answers and "partial" when the

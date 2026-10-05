@@ -460,6 +460,18 @@ func TestD06AgentPrintsDifferentFinalAfterProgress(t *testing.T) {
 			want: "Inspecting files...\n" + finalMarker + "Verified answer.\n",
 		},
 		{
+			name:  "answer and distinct done payload in same response",
+			tools: []tools.Tool{done},
+			turns: [][]llm.StreamEvent{toolCallTurn("The answer is 42.", "d1", "done", `{"message":"Report saved."}`)},
+			want:  "The answer is 42.\n" + finalMarker + "Report saved.\n",
+		},
+		{
+			name:  "same response identical done payload once",
+			tools: []tools.Tool{done},
+			turns: [][]llm.StreamEvent{toolCallTurn("The answer is 42.", "d1", "done", `{"message":"The answer is 42."}`)},
+			want:  "The answer is 42.\n",
+		},
+		{
 			name:  "streamed final answer is not repeated",
 			tools: []tools.Tool{check},
 			turns: [][]llm.StreamEvent{

@@ -209,6 +209,7 @@ type Agent struct {
 	toolChoice              llm.ToolChoice
 	requireDone             bool
 	warningf                func(format string, args ...any)
+	schemaWarnings          schemaWarningGate
 	hasCompactor            bool
 
 	compactionAdmissionObserved func()
@@ -1232,6 +1233,9 @@ func (a *Agent) queryStreamWithSteering(ctx context.Context, input llm.Content, 
 				return a.compactor.EstimateMessages([]llm.Message{message})
 			}
 
+			// Keep text from a truncated text continuation only for completion
+			// of this response. Ordinary tool blocks still clear pending text.
+			completedResponseText := pendingTextContinuation + comp.PlainText()
 			if comp.HasToolCalls() {
 				pendingTextContinuation = ""
 			}
@@ -1402,6 +1406,10 @@ func (a *Agent) queryStreamWithSteering(ctx context.Context, input llm.Content, 
 					// Generic early-stop reminder: once tools have been called in this run,
 					// ask for an explicit done tool completion before ending.
 					if hasDoneTool && seenToolCallHistory && !earlyStopReminderSent {
+						if txt := strings.TrimSpace(combinedText); txt != "" {
+							pendingRequireDoneFinalText = txt
+							pendingRequireDoneFinalResponseID = responseID
+						}
 						earlyStopReminderSent = true
 						a.emitEvent(out, WarnEvent{
 							Message: "detected text-only stop after tool usage; prompting explicit done-tool completion",
@@ -1917,14 +1925,15 @@ func (a *Agent) queryStreamWithSteering(ctx context.Context, input llm.Content, 
 				if a.hasCompactor {
 					_ = a.checkAndCompact(ctx, frame.id, comp, out, additionalSinceCompletion())
 				}
-				finalContent := strings.TrimSpace(completedMessage)
+				answer := strings.TrimSpace(completedResponseText)
 				finalResponseID := responseID
-				if preserved := strings.TrimSpace(pendingRequireDoneFinalText); preserved != "" {
-					finalContent = preserved
+				if answer == "" {
+					answer = strings.TrimSpace(pendingRequireDoneFinalText)
 					if preservedResponseID := strings.TrimSpace(pendingRequireDoneFinalResponseID); preservedResponseID != "" {
 						finalResponseID = preservedResponseID
 					}
 				}
+				finalContent := completedAnswer(answer, completedMessage)
 				requireDoneRecoveryDisableThinkingActive = false
 				requireDoneControlSource = ""
 				if !finishToolBlock() {
@@ -2436,7 +2445,7 @@ func (a *Agent) invokeModelCompletionWithSteering(ctx context.Context, model llm
 	if ctx == nil {
 		ctx = context.Background()
 	}
-	ctx = llm.WithWarningSink(ctx, a.warnf)
+	ctx = a.schemaWarnings.bind(ctx, req, a.warnf)
 	// Last line of defense for the tool_use/tool_result pairing invariant. Any
 	// loop-level defect that leaves a tool_use without its result (or an orphan
 	// result) would otherwise become an unrecoverable provider 400 that replays

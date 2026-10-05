@@ -398,7 +398,7 @@ func TestEarlyStopReminderRunsWithoutTodoDependency(t *testing.T) {
 	if earlyStopWarn != 1 {
 		t.Fatalf("expected one early_stop warning, got %d", earlyStopWarn)
 	}
-	if strings.TrimSpace(final) != "done after reminder" {
+	if strings.TrimSpace(final) != "looks done\n\ndone after reminder" {
 		t.Fatalf("unexpected final response: %q", final)
 	}
 	if finalStatus != "complete" {
@@ -447,7 +447,7 @@ func TestRequireDoneReminderPreservesPriorAnswerOnDoneToolCompletion(t *testing.
 			finalResponseID = e.ResponseID
 		}
 	}
-	if strings.TrimSpace(final) != "looks done" {
+	if strings.TrimSpace(final) != "looks done\n\ndone after reminder" {
 		t.Fatalf("expected preserved prior answer, got %q", final)
 	}
 	if finalResponseID != "resp-looks-done" {

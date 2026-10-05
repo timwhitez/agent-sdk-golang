@@ -1,5 +1,14 @@
 # Providers and Streaming
 
+Agent-owned schema diagnostics retain the first unchanged OpenAI non-strict
+tool warning per tool name, schema and reason. Retention is bounded in memory
+for the Agent's lifetime; eviction or a newly built Agent can show it again.
+Changed declarations and unrelated provider warnings remain visible. Agents
+sharing a provider keep independent warning ownership. Direct client calls
+continue to warn per request; host adapters can still aggregate diagnostics.
+Non-strict mode preserves valid open JSON inputs rather than closing their
+schemas for display convenience.
+
 This document explains provider implementations, compatibility fallbacks,
 stream normalization, and response metadata behavior.
 
