@@ -131,6 +131,7 @@ func consumeAgentEvents(events <-chan agent.Event, w, diag io.Writer) error {
 	// comes from a tool (such as done) all print it.
 	var turn strings.Builder
 	shownBeforeDone := ""
+	shownBeforeTool := ""
 	printed, atLineStart := false, true
 	write := func(text string) error {
 		if text == "" {
@@ -152,13 +153,17 @@ func consumeAgentEvents(events <-chan agent.Event, w, diag io.Writer) error {
 		switch e := event.(type) {
 		case agent.TextDeltaEvent:
 			shownBeforeDone = ""
+			shownBeforeTool = ""
 			turn.WriteString(e.Delta)
 			if err := write(e.Delta); err != nil {
 				return err
 			}
 		case agent.ToolCallEvent:
+			if turn.Len() > 0 {
+				shownBeforeTool = turn.String()
+			}
 			if e.Tool == "done" {
-				shownBeforeDone = turn.String()
+				shownBeforeDone = shownBeforeTool
 			} else {
 				shownBeforeDone = ""
 			}

@@ -516,6 +516,12 @@ func TestD06FinalAnswerAgainstShownTurn(t *testing.T) {
 		want   string
 	}{
 		{"done final without deltas", []agent.Event{agent.ToolCallEvent{Tool: "done"}, agent.FinalResponseEvent{Content: "Answer."}}, "Answer.\n"},
+		{"answer then sibling tools and done", []agent.Event{
+			agent.TextDeltaEvent{Delta: "The answer is 42."},
+			agent.ToolCallEvent{Tool: "read"}, agent.ToolResultEvent{Tool: "read"},
+			agent.ToolCallEvent{Tool: "done"}, agent.ToolResultEvent{Tool: "done"},
+			agent.FinalResponseEvent{Content: "The answer is 42.\n\nReport saved."},
+		}, "The answer is 42.\n" + finalMarker + "Report saved.\n"},
 		{"same text once", []agent.Event{agent.TextDeltaEvent{Delta: "Hel"}, agent.TextDeltaEvent{Delta: "lo"}, agent.FinalResponseEvent{Content: "Hello"}}, "Hello\n"},
 		{"empty deltas", []agent.Event{agent.TextDeltaEvent{Delta: ""}, agent.FinalResponseEvent{Content: "Hello"}}, "Hello\n"},
 		{"lost delta recovered from final", []agent.Event{agent.TextDeltaEvent{Delta: "Hel"}, agent.FinalResponseEvent{Content: "Hello", DroppedEvents: 1}}, "Hel\n" + finalMarker + "Hello\n"},
