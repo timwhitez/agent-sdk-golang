@@ -82,7 +82,15 @@ type OutputChunk struct {
 	Stream     string
 }
 
+// Run rejects an ended context after argument validation and immediately before
+// starting the command. These checks are not atomic with OS process creation;
+// cancellation after Start uses the existing bounded process-tree termination.
 func Run(ctx context.Context, opts Options) (Result, error) {
+	return run(ctx, opts, nil, (*exec.Cmd).Start)
+}
+
+// run keeps preparation and Start injectable per call for deterministic tests.
+func run(ctx context.Context, opts Options, beforeStart func(context.Context), start func(*exec.Cmd) error) (Result, error) {
 	res := Result{ExitCode: -1}
 	if opts.Program == "" {
 		return res, fmt.Errorf("missing program")
@@ -99,6 +107,10 @@ func Run(ctx context.Context, opts Options) (Result, error) {
 	if opts.KillWaitGrace <= 0 {
 		opts.KillWaitGrace = DefaultKillWaitGrace
 	}
+	if err := ctx.Err(); err != nil {
+		res.TimedOut = errors.Is(err, context.DeadlineExceeded)
+		return res, err
+	}
 
 	runCtx := ctx
 	cancel := func() {}
@@ -106,6 +118,10 @@ func Run(ctx context.Context, opts Options) (Result, error) {
 		runCtx, cancel = context.WithTimeout(ctx, opts.Timeout)
 	}
 	defer cancel()
+	if err := runCtx.Err(); err != nil {
+		res.TimedOut = errors.Is(err, context.DeadlineExceeded)
+		return res, err
+	}
 
 	cmd := exec.Command(opts.Program, opts.Args...)
 	cmd.Dir = opts.Dir
@@ -121,9 +137,23 @@ func Run(ctx context.Context, opts Options) (Result, error) {
 	}
 	cmd.Stdout = processStreamWriter{stream: "stdout", combined: collector, canonical: canonical.stdout}
 	cmd.Stderr = processStreamWriter{stream: "stderr", combined: collector, canonical: canonical.stderr}
-
-	if err := cmd.Start(); err != nil {
+	abortBeforeStart := func(cause error) {
 		collector.Close()
+		// Writers currently Begin on their first write. Abort also covers any
+		// writer acquired by future preparation; unexecuted output is never committed.
+		canonical.abortIncomplete(context.WithoutCancel(ctx), cause)
+	}
+
+	if beforeStart != nil {
+		beforeStart(runCtx)
+	}
+	if err := runCtx.Err(); err != nil {
+		abortBeforeStart(err)
+		res.TimedOut = errors.Is(err, context.DeadlineExceeded)
+		return res, err
+	}
+	if err := start(cmd); err != nil {
+		abortBeforeStart(err)
 		return res, err
 	}
 	processGroup, err := attachProcessGroup(cmd.Process)
