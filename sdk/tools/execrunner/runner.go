@@ -86,11 +86,11 @@ type OutputChunk struct {
 // starting the command. These checks are not atomic with OS process creation;
 // cancellation after Start uses the existing bounded process-tree termination.
 func Run(ctx context.Context, opts Options) (Result, error) {
-	return run(ctx, opts, nil, (*exec.Cmd).Start)
+	return run(ctx, opts, context.WithTimeout, nil, (*exec.Cmd).Start)
 }
 
-// run keeps preparation and Start injectable per call for deterministic tests.
-func run(ctx context.Context, opts Options, beforeStart func(context.Context), start func(*exec.Cmd) error) (Result, error) {
+// run keeps timeout creation, preparation and Start injectable per call for deterministic tests.
+func run(ctx context.Context, opts Options, withTimeout func(context.Context, time.Duration) (context.Context, context.CancelFunc), beforeStart func(context.Context), start func(*exec.Cmd) error) (Result, error) {
 	res := Result{ExitCode: -1}
 	if opts.Program == "" {
 		return res, fmt.Errorf("missing program")
@@ -115,7 +115,7 @@ func run(ctx context.Context, opts Options, beforeStart func(context.Context), s
 	runCtx := ctx
 	cancel := func() {}
 	if opts.Timeout > 0 {
-		runCtx, cancel = context.WithTimeout(ctx, opts.Timeout)
+		runCtx, cancel = withTimeout(ctx, opts.Timeout)
 	}
 	defer cancel()
 	if err := runCtx.Err(); err != nil {

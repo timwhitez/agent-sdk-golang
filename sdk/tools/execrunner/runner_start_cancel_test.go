@@ -21,6 +21,11 @@ func (c cancelOnDeadlineContext) Deadline() (time.Time, bool) {
 	return c.Context.Deadline()
 }
 
+// controlledTimeoutContext reports the cause supplied by the preparation hook.
+type controlledTimeoutContext struct{ context.Context }
+
+func (c controlledTimeoutContext) Err() error { return context.Cause(c.Context) }
+
 func TestRunRejectsCancellationBeforeStart(t *testing.T) {
 	for _, stage := range []string{"already_canceled", "expired_deadline", "timeout_context_canceled", "preparation_canceled", "preparation_timeout"} {
 		for _, canonical := range []bool{false, true} {
@@ -49,9 +54,16 @@ func TestRunRejectsCancellationBeforeStart(t *testing.T) {
 					opts.ArtifactStreamSink = sink
 					opts.ArtifactResolverCapability = canonicalRunnerCapability()
 				}
+				withTimeout := context.WithTimeout
+				var expire context.CancelCauseFunc
 				if stage == "preparation_timeout" {
-					opts.Timeout = time.Millisecond
+					opts.Timeout = time.Hour
 					wantErr = context.DeadlineExceeded
+					withTimeout = func(parent context.Context, _ time.Duration) (context.Context, context.CancelFunc) {
+						timeoutCtx, cancel := context.WithCancelCause(parent)
+						expire = cancel
+						return controlledTimeoutContext{timeoutCtx}, func() { cancel(context.Canceled) }
+					}
 				}
 				if stage == "timeout_context_canceled" {
 					// WithTimeout consults Deadline after the entry check. Cancel
@@ -59,13 +71,17 @@ func TestRunRejectsCancellationBeforeStart(t *testing.T) {
 					ctx = cancelOnDeadlineContext{Context: ctx, cancel: cancel}
 					opts.Timeout = time.Hour
 				}
-				res, err := run(ctx, opts, func(runCtx context.Context) {
+				res, err := run(ctx, opts, withTimeout, func(runCtx context.Context) {
 					preparations++
 					switch stage {
 					case "preparation_canceled":
 						cancel()
 					case "preparation_timeout":
-						// Wait on the actual timeout, never guess scheduling with sleep.
+						if err := runCtx.Err(); err != nil {
+							t.Fatalf("timeout ended before preparation: %v", err)
+						}
+						// End only here, after preparation and before Start, regardless of scheduling.
+						expire(context.DeadlineExceeded)
 						<-runCtx.Done()
 					}
 				}, func(*exec.Cmd) error {
