@@ -179,6 +179,14 @@ are never retried, and the original execution error/result is preserved.
   directly for a new confirmation; embedded URL userinfo is rejected without
   echoing credential values (`sdk/tools/sandbox/sandbox_webfetch.go`).
 - Shell command confirmation and timeout-guarded execution (`sdk/tools/sandbox/sandbox.go:558`, `sdk/tools/sandbox/sandbox.go:572`)
+- Execrunner checks parent cancellation after argument validation, checks its
+  timeout context before preparation, and checks again immediately before Start.
+  Pre-start cancellation returns the checked context error with `ExitCode=-1`,
+  `TimedOut=true` only for deadline expiry, and no output, artifacts or callbacks.
+  Unstarted resources are closed/aborted rather than committed. The checks are
+  not atomic with OS Start and cannot roll back effects of a started process;
+  started commands retain bounded process-tree termination and incomplete-stream
+  handling (`sdk/tools/execrunner/runner.go`).
 - Write/edit/multiedit/apply_patch confirmations with diff context (`sdk/tools/sandbox/sandbox.go:887`, `sdk/tools/sandbox/sandbox.go:938`, `sdk/tools/sandbox/sandbox.go:1006`, `sdk/tools/sandbox/sandbox.go:1083`)
 
 ## Safety and Fallback Behaviors
