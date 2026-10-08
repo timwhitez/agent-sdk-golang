@@ -133,6 +133,7 @@ func CloneUsage(u *Usage) *Usage {
 	}
 	out := *u
 	out.PromptCachedTokens = cloneIntPtr(u.PromptCachedTokens)
+	out.CompletionReasoningTokens = cloneIntPtr(u.CompletionReasoningTokens)
 	out.PromptCacheCreationTokens = cloneIntPtr(u.PromptCacheCreationTokens)
 	out.PromptImageTokens = cloneIntPtr(u.PromptImageTokens)
 	out.PromptUncachedTokens = cloneIntPtr(u.PromptUncachedTokens)

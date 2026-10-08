@@ -1491,6 +1491,9 @@ func normalizedResponsesUsage(u map[string]any) *llm.Usage {
 	tt := intFromAny(u["total_tokens"])
 	usage := llm.NewProviderUsage(pt, ct, tt)
 	usage.PromptCachedTokens, usage.PromptImageTokens = responsesPromptBreakdown(u)
+	if details, ok := u["output_tokens_details"].(map[string]any); ok {
+		usage.CompletionReasoningTokens = nonNegativeUsageCount(details["reasoning_tokens"])
+	}
 	return usage
 }
 

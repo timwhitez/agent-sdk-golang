@@ -151,6 +151,7 @@ type Usage struct {
 	CompletionTokens int `json:"completion_tokens"`
 	TotalTokens      int `json:"total_tokens"`
 
+	CompletionReasoningTokens *int `json:"completion_reasoning_tokens,omitempty"`
 	PromptCachedTokens        *int `json:"prompt_cached_tokens,omitempty"`
 	PromptCacheCreationTokens *int `json:"prompt_cache_creation_tokens,omitempty"`
 	PromptImageTokens         *int `json:"prompt_image_tokens,omitempty"`

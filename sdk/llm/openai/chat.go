@@ -1966,6 +1966,9 @@ func parseUsage(u map[string]any) *llm.Usage {
 	}
 	usage := llm.NewProviderUsage(pt, ct, tt)
 	usage.PromptCachedTokens = cached
+	if details, ok := u["completion_tokens_details"].(map[string]any); ok {
+		usage.CompletionReasoningTokens = nonNegativeUsageCount(details["reasoning_tokens"])
+	}
 	return usage
 }
 
