@@ -50,9 +50,12 @@ type ChatClient struct {
 	// Reasoning effort for reasoning-capable models (best-effort).
 	ReasoningEffort string
 
-	MaxRetries           int
-	RetryBaseDelay       time.Duration
-	RetryMaxDelay        time.Duration
+	MaxRetries     int
+	RetryBaseDelay time.Duration
+	RetryMaxDelay  time.Duration
+	// RetryAfterMaxDelay bounds server-hint waiting (default 60s). A hint beyond
+	// this or the context deadline stops automatic retry instead of being capped.
+	RetryAfterMaxDelay   time.Duration
 	RetryableStatusCodes map[int]struct{}
 
 	// If true, include "parallel_tool_calls" when tools are provided.
@@ -210,7 +213,9 @@ func (c *ChatClient) Invoke(ctx context.Context, req llm.InvokeRequest) (*llm.Co
 				lastErr = &llm.ProviderError{Provider: local.Provider(), StatusCode: resp.StatusCode, Message: msg, RetryAfter: retryAfter, Reason: openAIErrorReason(data)}
 			}
 			if local.isRetryableStatus(resp.StatusCode) && attempt < retry.maxRetries-1 {
-				local.sleepBackoff(ctx, attempt, retry.baseDelay, retry.maxDelay, retryAfter)
+				if waitErr := local.sleepBackoff(ctx, attempt, retry.baseDelay, retry.maxDelay, retryAfter, lastErr); waitErr != nil {
+					return nil, waitErr
+				}
 				continue
 			}
 			return nil, lastErr
@@ -221,7 +226,9 @@ func (c *ChatClient) Invoke(ctx context.Context, req llm.InvokeRequest) (*llm.Co
 		}
 		lastErr = err
 		if attempt < retry.maxRetries-1 && isRetryableNetErr(err) {
-			local.sleepBackoff(ctx, attempt, retry.baseDelay, retry.maxDelay, 0)
+			if waitErr := local.sleepBackoff(ctx, attempt, retry.baseDelay, retry.maxDelay, 0, err); waitErr != nil {
+				return nil, waitErr
+			}
 			continue
 		}
 		return nil, err
@@ -300,7 +307,10 @@ func (c *ChatClient) InvokeStream(ctx context.Context, req llm.InvokeRequest) (<
 					return
 				}
 				if attempt < retry.maxRetries-1 && isRetryableNetErr(err) {
-					local.sleepBackoff(ctx, attempt, retry.baseDelay, retry.maxDelay, 0)
+					if waitErr := local.sleepBackoff(ctx, attempt, retry.baseDelay, retry.maxDelay, 0, err); waitErr != nil {
+						out <- llm.StreamErrorEvent{Err: waitErr}
+						return
+					}
 					continue
 				}
 				out <- llm.StreamErrorEvent{Err: err}
@@ -370,7 +380,10 @@ func (c *ChatClient) InvokeStream(ctx context.Context, req llm.InvokeRequest) (<
 					lastErr = &llm.ProviderError{Provider: local.Provider(), StatusCode: resp.StatusCode, Message: msg, RetryAfter: retryAfter, Reason: openAIErrorReason(data)}
 				}
 				if local.isRetryableStatus(resp.StatusCode) && attempt < retry.maxRetries-1 {
-					local.sleepBackoff(ctx, attempt, retry.baseDelay, retry.maxDelay, retryAfter)
+					if waitErr := local.sleepBackoff(ctx, attempt, retry.baseDelay, retry.maxDelay, retryAfter, lastErr); waitErr != nil {
+						out <- llm.StreamErrorEvent{Err: waitErr}
+						return
+					}
 					continue
 				}
 				out <- llm.StreamErrorEvent{Err: lastErr}
@@ -836,8 +849,8 @@ func defaultRetryableStatus(code int) bool {
 	}
 }
 
-func (c *ChatClient) sleepBackoff(ctx context.Context, attempt int, baseDelay, maxDelay time.Duration, retryAfter time.Duration) {
-	sleepRetryBackoff(ctx, attempt, baseDelay, maxDelay, retryAfter)
+func (c *ChatClient) sleepBackoff(ctx context.Context, attempt int, baseDelay, maxDelay time.Duration, retryAfter time.Duration, cause error) error {
+	return sleepRetryBackoff(ctx, attempt, baseDelay, maxDelay, retryAfter, c.RetryAfterMaxDelay, cause)
 }
 
 func exponentialBackoffDelay(attempt int, baseDelay, maxDelay time.Duration) time.Duration {
@@ -1314,10 +1327,16 @@ func parseRetryAfterSeconds(v string) (time.Duration, bool) {
 		}
 	}
 	secs, err := strconv.ParseFloat(v, 64)
-	if err != nil {
+	if err != nil && !math.IsInf(secs, 1) {
 		return 0, false
 	}
-	return time.Duration(secs * float64(time.Second)), true
+	if secs >= float64(math.MaxInt64)/float64(time.Second) {
+		return time.Duration(math.MaxInt64), true
+	}
+	if secs <= 0 {
+		return 0, true
+	}
+	return time.Duration(math.Ceil(secs * float64(time.Second))), true
 }
 
 func isRetryableNetErr(err error) bool {

@@ -44,9 +44,12 @@ type ResponsesClient struct {
 
 	ReasoningEffort string
 
-	MaxRetries           int
-	RetryBaseDelay       time.Duration
-	RetryMaxDelay        time.Duration
+	MaxRetries     int
+	RetryBaseDelay time.Duration
+	RetryMaxDelay  time.Duration
+	// RetryAfterMaxDelay bounds server-hint waiting (default 60s). A hint beyond
+	// this or the context deadline stops automatic retry instead of being capped.
+	RetryAfterMaxDelay   time.Duration
 	RetryableStatusCodes map[int]struct{}
 
 	// ForceStringInput enables a compatibility mode where `input[].content` is sent as a plain string
@@ -213,7 +216,9 @@ func (c *ResponsesClient) Invoke(ctx context.Context, req llm.InvokeRequest) (*l
 				lastErr = &llm.ProviderError{Provider: local.Provider(), StatusCode: resp.StatusCode, Message: msg, RetryAfter: retryAfter, Reason: openAIErrorReason(data)}
 			}
 			if local.isRetryableStatus(resp.StatusCode) && attempt < retry.maxRetries-1 {
-				local.sleepBackoff(ctx, attempt, retry.baseDelay, retry.maxDelay, retryAfter)
+				if waitErr := local.sleepBackoff(ctx, attempt, retry.baseDelay, retry.maxDelay, retryAfter, lastErr); waitErr != nil {
+					return nil, waitErr
+				}
 				continue
 			}
 			return nil, lastErr
@@ -224,7 +229,9 @@ func (c *ResponsesClient) Invoke(ctx context.Context, req llm.InvokeRequest) (*l
 		}
 		lastErr = err
 		if attempt < retry.maxRetries-1 && isRetryableNetErr(err) {
-			local.sleepBackoff(ctx, attempt, retry.baseDelay, retry.maxDelay, 0)
+			if waitErr := local.sleepBackoff(ctx, attempt, retry.baseDelay, retry.maxDelay, 0, err); waitErr != nil {
+				return nil, waitErr
+			}
 			continue
 		}
 		return nil, err
@@ -258,8 +265,8 @@ func (c *ResponsesClient) isRetryableStatus(code int) bool {
 	return ok
 }
 
-func (c *ResponsesClient) sleepBackoff(ctx context.Context, attempt int, baseDelay, maxDelay time.Duration, retryAfter time.Duration) {
-	sleepRetryBackoff(ctx, attempt, baseDelay, maxDelay, retryAfter)
+func (c *ResponsesClient) sleepBackoff(ctx context.Context, attempt int, baseDelay, maxDelay time.Duration, retryAfter time.Duration, cause error) error {
+	return sleepRetryBackoff(ctx, attempt, baseDelay, maxDelay, retryAfter, c.RetryAfterMaxDelay, cause)
 }
 
 // ---- request mapping (best-effort) ----
@@ -502,7 +509,10 @@ func (c *ResponsesClient) InvokeStream(ctx context.Context, req llm.InvokeReques
 					return
 				}
 				if attempt < retry.maxRetries-1 && isRetryableNetErr(err) {
-					local.sleepBackoff(ctx, attempt, retry.baseDelay, retry.maxDelay, 0)
+					if waitErr := local.sleepBackoff(ctx, attempt, retry.baseDelay, retry.maxDelay, 0, err); waitErr != nil {
+						out <- llm.StreamErrorEvent{Err: waitErr}
+						return
+					}
 					continue
 				}
 				out <- llm.StreamErrorEvent{Err: err}
@@ -570,7 +580,10 @@ func (c *ResponsesClient) InvokeStream(ctx context.Context, req llm.InvokeReques
 					lastErr = &llm.ProviderError{Provider: local.Provider(), StatusCode: resp.StatusCode, Message: msg, RetryAfter: retryAfter, Reason: openAIErrorReason(data)}
 				}
 				if local.isRetryableStatus(resp.StatusCode) && attempt < retry.maxRetries-1 {
-					local.sleepBackoff(ctx, attempt, retry.baseDelay, retry.maxDelay, retryAfter)
+					if waitErr := local.sleepBackoff(ctx, attempt, retry.baseDelay, retry.maxDelay, retryAfter, lastErr); waitErr != nil {
+						out <- llm.StreamErrorEvent{Err: waitErr}
+						return
+					}
 					continue
 				}
 				out <- llm.StreamErrorEvent{Err: lastErr}

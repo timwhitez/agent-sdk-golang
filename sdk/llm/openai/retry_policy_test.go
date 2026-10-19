@@ -35,8 +35,8 @@ func TestResolveRetryDelayHonorsRetryAfterAndCap(t *testing.T) {
 	if got := resolveRetryDelay(3, time.Second, 60*time.Second, 20*time.Second); got != 20*time.Second {
 		t.Fatalf("expected retry-after 20s, got %v", got)
 	}
-	if got := resolveRetryDelay(3, time.Second, 60*time.Second, 90*time.Second); got != 60*time.Second {
-		t.Fatalf("expected max delay 60s, got %v", got)
+	if got := resolveRetryDelay(3, time.Second, 60*time.Second, 90*time.Second); got != 90*time.Second {
+		t.Fatalf("expected uncapped server floor 90s, got %v", got)
 	}
 }
 
