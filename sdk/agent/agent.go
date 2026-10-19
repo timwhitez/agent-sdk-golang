@@ -1070,6 +1070,7 @@ func (a *Agent) queryStreamWithSteering(ctx context.Context, input llm.Content, 
 					}
 				}
 
+				terminalOrigin := EventOriginProvider
 				// Typed provider context overflow: the request was rejected before
 				// any output, so it had no effect. Compact once for this real user
 				// input and send a new logical request (a new Frame). A second
@@ -1089,6 +1090,14 @@ func (a *Agent) queryStreamWithSteering(ctx context.Context, input llm.Content, 
 								Message: "provider rejected the request as exceeding the context window; compacted history once and retrying with a new request",
 							}, correlation.withInterventionKind(InterventionContextOverflowRecovery, InterventionResultHistoryCompacted, overflowRecoveries))
 							continue
+						}
+						if llm.IsRetryStop(recoveryErr) {
+							// The summary owns this terminal failure. Keep the main
+							// rejection as a diagnostic, without replacing its stop
+							// cause/floor with the original context-overflow error.
+							a.warnf("warning: provider context overflow preceded stopped recovery: %v", err)
+							err = recoveryErr
+							terminalOrigin = EventOriginCompaction
 						}
 						if recoveryErr != nil && ctx.Err() == nil {
 							a.warnf("warning: context overflow recovery failed: %v", recoveryErr)
@@ -1117,7 +1126,7 @@ func (a *Agent) queryStreamWithSteering(ctx context.Context, input llm.Content, 
 				// before the terminal error or the tokens never reach the
 				// accounting journal, which silently under-counts the ledger.
 				a.emitPartialUsage(out, comp, invocation.completionCorrelation())
-				origin := EventOriginProvider
+				origin := terminalOrigin
 				if ctx.Err() != nil {
 					origin = EventOriginSDKDriver
 				}
