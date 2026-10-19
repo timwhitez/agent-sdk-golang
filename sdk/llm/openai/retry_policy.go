@@ -4,7 +4,10 @@ import (
 	"context"
 	cryptorand "crypto/rand"
 	"encoding/binary"
+	"math"
 	"time"
+
+	"github.com/timwhitez/agent-sdk-golang/sdk/llm"
 )
 
 const (
@@ -42,24 +45,44 @@ func resolveRetryDelay(attempt int, baseDelay, maxDelay time.Duration, retryAfte
 	d := exponentialBackoffDelay(attempt, baseDelay, maxDelay)
 	if retryAfter > d {
 		d = retryAfter
-		if d > maxDelay {
-			d = maxDelay
-		}
 	}
 	// Keep a bounded 10% jitter so many clients avoid synchronized retries.
 	jitter := time.Duration(randomBackoffFraction() * float64(d) * 0.1)
+	if jitter > time.Duration(math.MaxInt64)-d {
+		return time.Duration(math.MaxInt64)
+	}
 	return d + jitter
 }
 
-func sleepRetryBackoff(ctx context.Context, attempt int, baseDelay, maxDelay, retryAfter time.Duration) {
+// maxHintWait is separate from the local exponential backoff ceiling.
+func sleepRetryBackoff(ctx context.Context, attempt int, baseDelay, maxDelay, retryAfter, maxHintWait time.Duration, cause error) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if maxHintWait <= 0 {
+		maxHintWait = defaultRetryMaxDelay
+	}
+	bounded := llm.BoundRetryAfter(ctx, cause, maxHintWait)
+	if llm.IsRetryStop(bounded) {
+		return bounded
+	}
 	d := resolveRetryDelay(attempt, baseDelay, maxDelay, retryAfter)
+	if retryAfter > 0 {
+		// Jitter may consume spare waiting capacity, but never lower the floor.
+		if d > maxHintWait {
+			d = maxHintWait
+		}
+		if deadline, ok := ctx.Deadline(); ok && d >= time.Until(deadline) {
+			return &llm.RetryStopError{RetryAfter: retryAfter, Reason: "deadline", Cause: cause}
+		}
+	}
 	t := time.NewTimer(d)
 	defer t.Stop()
 	select {
 	case <-ctx.Done():
-		return
+		return ctx.Err()
 	case <-t.C:
-		return
+		return nil
 	}
 }
 

@@ -597,6 +597,10 @@ func (a *Agent) Query(ctx context.Context, text string) (string, error) {
 			final = f.Content
 		}
 		if e, ok := ev.(ErrorEvent); ok {
+			if e.RetryStop != nil {
+				lastErr = e.RetryStop
+				continue
+			}
 			// Preserve provider/status info in the error string.
 			if e.StatusCode != 0 {
 				lastErr = fmt.Errorf("%s error (%d): %s", e.Provider, e.StatusCode, e.Message)
@@ -1066,12 +1070,13 @@ func (a *Agent) queryStreamWithSteering(ctx context.Context, input llm.Content, 
 					}
 				}
 
+				terminalOrigin := EventOriginProvider
 				// Typed provider context overflow: the request was rejected before
 				// any output, so it had no effect. Compact once for this real user
 				// input and send a new logical request (a new Frame). A second
 				// overflow in the same epoch, an unchanged history, partial
 				// output or a pending continuation ends the turn as before.
-				if llm.IsContextOverflow(err) && !a.overflowRecoveryDisabled && !cont.hasPending() && completionIsEmpty(comp) {
+				if !llm.IsRetryStop(err) && llm.IsContextOverflow(err) && !a.overflowRecoveryDisabled && !cont.hasPending() && completionIsEmpty(comp) {
 					epoch := a.userInputEpoch.Load()
 					if overflowRecoveryEpoch != epoch {
 						overflowRecoveryEpoch = epoch
@@ -1085,6 +1090,14 @@ func (a *Agent) queryStreamWithSteering(ctx context.Context, input llm.Content, 
 								Message: "provider rejected the request as exceeding the context window; compacted history once and retrying with a new request",
 							}, correlation.withInterventionKind(InterventionContextOverflowRecovery, InterventionResultHistoryCompacted, overflowRecoveries))
 							continue
+						}
+						if llm.IsRetryStop(recoveryErr) {
+							// The summary owns this terminal failure. Keep the main
+							// rejection as a diagnostic, without replacing its stop
+							// cause/floor with the original context-overflow error.
+							a.warnf("warning: provider context overflow preceded stopped recovery: %v", err)
+							err = recoveryErr
+							terminalOrigin = EventOriginCompaction
 						}
 						if recoveryErr != nil && ctx.Err() == nil {
 							a.warnf("warning: context overflow recovery failed: %v", recoveryErr)
@@ -1113,7 +1126,7 @@ func (a *Agent) queryStreamWithSteering(ctx context.Context, input llm.Content, 
 				// before the terminal error or the tokens never reach the
 				// accounting journal, which silently under-counts the ledger.
 				a.emitPartialUsage(out, comp, invocation.completionCorrelation())
-				origin := EventOriginProvider
+				origin := terminalOrigin
 				if ctx.Err() != nil {
 					origin = EventOriginSDKDriver
 				}
@@ -2774,6 +2787,13 @@ func (a *Agent) invokeModelCompletionWithRetryAndSteering(ctx context.Context, m
 			break
 		}
 		delay, retry := a.transientInvokeRetryDelay(err, comp, streamedText, attempt)
+		if retry {
+			bounded := llm.BoundRetryAfter(ctx, err, maxInvokeRetryDelay)
+			if llm.IsRetryStop(bounded) {
+				lastErr = bounded
+				break
+			}
+		}
 		if !retry {
 			break
 		}
@@ -2811,7 +2831,7 @@ func (a *Agent) invokeModelCompletionWithRetryAndSteering(ctx context.Context, m
 }
 
 func (a *Agent) transientInvokeRetryDelay(err error, partial *llm.Completion, streamedText bool, attempt int) (time.Duration, bool) {
-	if err == nil {
+	if err == nil || llm.IsRetryStop(err) {
 		return 0, false
 	}
 	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
@@ -2859,9 +2879,6 @@ func (a *Agent) transientInvokeRetryDelay(err error, partial *llm.Completion, st
 	}
 
 	if retryAfter > 0 {
-		if retryAfter > maxInvokeRetryDelay {
-			return maxInvokeRetryDelay, true
-		}
 		return retryAfter, true
 	}
 	if a == nil || a.invokeRetryBackoff <= 0 {
@@ -3867,6 +3884,10 @@ func (a *Agent) runCompactionAsync(ctx context.Context, sourceFrameID string, sn
 	// goroutine never re-reads admission state such as the failure streak.
 	newMsgs, res, err := a.compactWithRetry(compactCtx, snapshot, decision.pipelineRequest(decisionUsage))
 	if err != nil {
+		if llm.IsRetryStop(err) {
+			a.warnf("automatic compaction stopped: %v", err)
+			return
+		}
 		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
 			return
 		}
@@ -3970,6 +3991,9 @@ func (a *Agent) compactSyncOverflow(ctx context.Context, sourceFrameID string, l
 	allowSummary, plannedAttempts := a.overflowSummaryPlan()
 	newMsgs, res, err := a.compactOverflowWithPlan(ctx, messages, decisionUsage, allowSummary, plannedAttempts)
 	if err != nil {
+		if llm.IsRetryStop(err) {
+			return err
+		}
 		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
 			return err
 		}
@@ -4536,8 +4560,12 @@ func (a *Agent) compactOverflowWithPlan(ctx context.Context, messages []llm.Mess
 		if err == nil {
 			return pipelineMsgs, pipelineRes, nil
 		}
+		err = llm.BoundRetryAfter(ctx, err, 5*time.Second)
 		lastErr = err
 		lastRes = pipelineRes
+		if llm.IsRetryStop(err) {
+			return messages, lastRes, err
+		}
 		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) || ctx.Err() != nil {
 			if ctxErr := ctx.Err(); ctxErr != nil {
 				return messages, lastRes, ctxErr
@@ -4548,6 +4576,9 @@ func (a *Agent) compactOverflowWithPlan(ctx context.Context, messages []llm.Mess
 			break
 		}
 		delay := a.compactionRetryDelay(attempt)
+		if hint := llm.RetryAfterForError(err); hint > delay {
+			delay = hint
+		}
 		a.warnf("overflow summary compaction failed (attempt %d/%d): %v", attempt, attempts, err)
 		if delay <= 0 {
 			continue
@@ -5427,8 +5458,12 @@ func (a *Agent) compactWithRetry(ctx context.Context, messages []llm.Message, re
 		if err == nil {
 			return newMsgs, res, nil
 		}
+		err = llm.BoundRetryAfter(ctx, err, 5*time.Second)
 		lastErr = err
 		lastRes = res
+		if llm.IsRetryStop(err) {
+			return messages, lastRes, err
+		}
 		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) || ctx.Err() != nil {
 			if ctxErr := ctx.Err(); ctxErr != nil {
 				return messages, lastRes, ctxErr
@@ -5439,6 +5474,9 @@ func (a *Agent) compactWithRetry(ctx context.Context, messages []llm.Message, re
 			break
 		}
 		delay := a.compactionRetryDelay(attempt)
+		if hint := llm.RetryAfterForError(err); hint > delay {
+			delay = hint
+		}
 		a.warnf("compaction failed (attempt %d/%d): %v", attempt, attempts, err)
 		if delay <= 0 {
 			continue
@@ -5708,6 +5746,10 @@ func errEventForModel(err error, model llm.ChatModel) ErrorEvent {
 	}
 	if err == nil {
 		return ErrorEvent{Provider: prov, Message: "<nil>", Kind: "unknown"}
+	}
+	var stop *llm.RetryStopError
+	if errors.As(err, &stop) && stop != nil {
+		return ErrorEvent{Provider: prov, Message: stop.Error(), RetryAfterMS: retryAfterMillis(stop.RetryAfter), Kind: "retry_stopped", RetryStop: stop}
 	}
 	var rl *llm.RateLimitError
 	if errors.As(err, &rl) {

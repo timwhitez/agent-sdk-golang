@@ -1,5 +1,42 @@
 # Providers and Streaming
 
+## Retry-After floor and terminal stop
+
+OpenAI Chat and Responses (buffered and streaming) treat a valid parsed
+Retry-After as the earliest next automatic send for the failed invocation.
+`RetryMaxDelay` caps local exponential backoff. The separate
+`RetryAfterMaxDelay` permits server-hint waiting up to 60 seconds by default;
+configure it explicitly for another finite limit. Hints that exceed that wait
+or the current context deadline return `llm.RetryStopError`, retaining the
+original parsed `RetryAfter`, `Reason` (`wait_limit` or `deadline`) and provider
+cause. A fitting hint is never shortened; nonnegative jitter stays within the
+allowed hint wait. No-hint backoff and attempt counts keep their existing policy.
+This is a new strict-floor contract replacing the former hint-cap policy.
+
+The SDK Agent checks the same terminal marker before error classification. If
+it owns another retry of an unwrapped provider error, its existing 2-second
+finite wait permits the whole hint or returns a typed stop. Summary retry
+owners use their 5-second finite envelope and also preserve the stop instead
+of retrying or selecting the overflow emergency-trim fallback. A provider with
+one attempt delegates ordinary error/hint handling to the actual outer owner.
+
+Every host retry owner must check `llm.IsRetryStop(err)` before unwrapping the
+cause or using status/text/network classification; the cause deliberately
+remains available through `errors.As`/`errors.Is`. Do not turn a stop into an
+immediate automatic retry. `Agent.Query` preserves the typed stop. Native
+`ErrorEvent.RetryStop` preserves it on streams; serialized events omit that
+native error and expose `Kind="retry_stopped"` plus `RetryAfterMS`. Transport
+IDs, history, request/attempt accounting and public provider error classes are
+otherwise unchanged. This is invocation-local retry policy, not a new global
+endpoint scheduler or authorization for future model calls.
+
+Numeric and HTTP-date hints keep their existing accepted formats. Positive
+numeric values beyond duration range saturate to the largest duration before
+the finite wait check, so overflow cannot become an immediate retry. Invalid
+tokens such as unit-bearing `1m` keep the no-usable-hint behavior. Cancellation
+remains bounded by context. Authentication refusal, visible stream output and
+unknown tool side effects retain their existing no-replay boundaries.
+
 Agent-owned schema diagnostics retain the first unchanged OpenAI non-strict
 tool warning per tool name, schema and reason. Retention is bounded in memory
 for the Agent's lifetime; eviction or a newly built Agent can show it again.

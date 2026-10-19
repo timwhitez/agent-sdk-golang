@@ -32,6 +32,9 @@ func (ThinkingDeltaEvent) isEvent() {}
 // ErrorEvent is emitted when the agent hits a fatal error (e.g. provider API error).
 // The stream will end after emitting this event.
 type ErrorEvent struct {
+	// RetryStop preserves the native typed terminal error through Query/streams.
+	// Serialized events expose Kind="retry_stopped" and RetryAfterMS instead.
+	RetryStop    *llm.RetryStopError `json:"-"`
 	Provider     string
 	StatusCode   int
 	Message      string
