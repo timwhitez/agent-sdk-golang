@@ -47,7 +47,12 @@ The parser publishes the original structured HTTP cause before entering internal
 backoff, so child cancellation cannot replace it with a no-hint context error.
 Re-delivery or native-stop wrapping of the same parsed cause never restarts its
 original absolute not-before. Receipt facts may include a transient internal
-retry error even when the eventual stream succeeds.
+retry error even when the eventual stream succeeds. `Error` preserves a native
+stop first, otherwise the latest observed error; cancellation cannot replace an
+already parsed provider error. `RetryAfterCause` independently identifies the
+historical maximum absolute floor. A later permanent HTTP error remains in
+`Error` even when the earlier 429 supplied that floor; hosts must classify this
+latest outcome before admitting another attempt.
 After source closure they finish the bounded in-memory receipt before closing
 the public channel. Public channel closure alone cannot prove a no-hint outcome.
 Hosts read the receipt after bounded producer finalization; incomplete/reused

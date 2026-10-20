@@ -18,6 +18,7 @@ type StreamOutcome struct {
 	started, complete, reused bool
 	visible                   bool
 	err, terminal             error
+	hintCause                 error
 	retryAfter                time.Duration
 	notBefore                 time.Time
 	lastHintCause             error
@@ -26,14 +27,17 @@ type StreamOutcome struct {
 
 // StreamOutcomeSnapshot is a bounded receipt, independent of event delivery.
 // Complete is true only after the original producer closes, with one owner.
-// Error preserves a native retry stop first, otherwise the largest parsed
-// Retry-After cause, otherwise an ordinary error. Treat native causes as private
-// provider errors, with the same diagnostic policy as InvokeStream errors.
-// It may retain an earlier transient cause after a successful internal retry;
-// neither this field nor Complete defines stream success.
+// Error preserves a native retry stop first, otherwise the latest observed error.
+// Cancellation never replaces an already observed provider error. The historical
+// maximum absolute Retry-After floor and its original cause are separate facts;
+// a later permanent error must remain available to a host's retry classifier.
+// Errors may describe an earlier transient failure after a successful internal
+// retry; neither Error nor Complete defines stream success. All causes retain
+// the same private diagnostic policy as InvokeStream errors.
 type StreamOutcomeSnapshot struct {
 	Started, Complete, Visible bool
 	Error                      error
+	RetryAfterCause            error
 	RetryAfter                 time.Duration
 	RetryAfterNotBefore        time.Time
 }
@@ -86,6 +90,9 @@ func (r *StreamOutcomeRecorder) Observe(event StreamEvent) {
 		if IsRetryStop(err) && o.terminal == nil {
 			o.terminal = err
 		}
+		if o.err == nil || (!errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded)) {
+			o.err = err
+		}
 		hint := RetryAfterForError(err)
 		if hint > 0 {
 			at := time.Now().Add(hint)
@@ -98,10 +105,8 @@ func (r *StreamOutcomeRecorder) Observe(event StreamEvent) {
 				o.lastHintCause, o.lastHintNotBefore = origin, at
 			}
 			if at.After(o.notBefore) {
-				o.notBefore, o.retryAfter, o.err = at, hint, err
+				o.notBefore, o.retryAfter, o.hintCause = at, hint, err
 			}
-		} else if o.err == nil {
-			o.err = err
 		}
 	case StreamTextDeltaEvent:
 		o.visible = o.visible || e.Delta != ""
@@ -150,5 +155,5 @@ func (o *StreamOutcome) Snapshot() StreamOutcomeSnapshot {
 	if o.terminal != nil {
 		err = o.terminal
 	}
-	return StreamOutcomeSnapshot{Started: o.started, Complete: o.complete && !o.reused, Visible: o.visible, Error: err, RetryAfter: o.retryAfter, RetryAfterNotBefore: o.notBefore}
+	return StreamOutcomeSnapshot{Started: o.started, Complete: o.complete && !o.reused, Visible: o.visible, Error: err, RetryAfterCause: o.hintCause, RetryAfter: o.retryAfter, RetryAfterNotBefore: o.notBefore}
 }

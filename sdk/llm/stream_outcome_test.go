@@ -97,10 +97,26 @@ func TestStreamOutcomeFinalPermanentErrorKeepsHistoricalFloor(t *testing.T) {
 				if !got.Complete || got.Error != final || IsRetryStop(got.Error) {
 					t.Fatalf("final permanent error hidden by historical error or cancellation: %+v", got)
 				}
-				if got.RetryAfter != original.RetryAfter || got.RetryAfterNotBefore != original.RetryAfterNotBefore {
+				if got.RetryAfterCause != original.RetryAfterCause || (hinted && got.RetryAfterCause != first) || got.RetryAfter != original.RetryAfter || got.RetryAfterNotBefore != original.RetryAfterNotBefore {
 					t.Fatal("final error erased or restarted historical floor")
 				}
 			})
 		}
+	}
+}
+
+func TestStreamOutcomeLatestErrorAndMaximumFloorAreIndependent(t *testing.T) {
+	ctx, outcome := WithStreamOutcome(context.Background())
+	producer := BeginStreamOutcome(ctx)
+	long := &RateLimitError{RetryAfter: time.Hour}
+	producer.Observe(StreamErrorEvent{Err: long})
+	original := outcome.Snapshot()
+	short := &ProviderError{StatusCode: 503, RetryAfter: time.Second}
+	producer.Observe(StreamErrorEvent{Err: short})
+	producer.Observe(StreamErrorEvent{Err: context.DeadlineExceeded})
+	producer.Finish()
+	got := outcome.Snapshot()
+	if got.Error != short || got.RetryAfterCause != long || got.RetryAfter != time.Hour || got.RetryAfterNotBefore != original.RetryAfterNotBefore {
+		t.Fatalf("latest error and maximum original floor conflated: %+v", got)
 	}
 }
