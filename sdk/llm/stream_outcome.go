@@ -2,6 +2,7 @@ package llm
 
 import (
 	"context"
+	"errors"
 	"strings"
 	"sync"
 	"time"
@@ -19,6 +20,8 @@ type StreamOutcome struct {
 	err, terminal             error
 	retryAfter                time.Duration
 	notBefore                 time.Time
+	lastHintCause             error
+	lastHintNotBefore         time.Time
 }
 
 // StreamOutcomeSnapshot is a bounded receipt, independent of event delivery.
@@ -26,6 +29,8 @@ type StreamOutcome struct {
 // Error preserves a native retry stop first, otherwise the largest parsed
 // Retry-After cause, otherwise an ordinary error. Treat native causes as private
 // provider errors, with the same diagnostic policy as InvokeStream errors.
+// It may retain an earlier transient cause after a successful internal retry;
+// neither this field nor Complete defines stream success.
 type StreamOutcomeSnapshot struct {
 	Started, Complete, Visible bool
 	Error                      error
@@ -40,7 +45,9 @@ func WithStreamOutcome(ctx context.Context) (context.Context, *StreamOutcome) {
 	return context.WithValue(ctx, streamOutcomeKey{}, o), o
 }
 
-// StreamOutcomeRecorder is owned by a provider's original forwarding producer.
+// StreamOutcomeRecorder belongs to one accepted provider stream. Its parser
+// and forwarder may publish concurrently; only the original forwarder finishes
+// the receipt after source closure.
 type StreamOutcomeRecorder struct{ outcome *StreamOutcome }
 
 // BeginStreamOutcome claims the optional host scope. Custom/legacy callers
@@ -82,6 +89,14 @@ func (r *StreamOutcomeRecorder) Observe(event StreamEvent) {
 		hint := RetryAfterForError(err)
 		if hint > 0 {
 			at := time.Now().Add(hint)
+			origin := retryAfterCauseIdentity(err)
+			if origin != nil && origin == o.lastHintCause {
+				// Delivery/native-stop wrapping of this same parsed provider cause
+				// must not restart its absolute floor after waiting/cancellation.
+				at = o.lastHintNotBefore
+			} else {
+				o.lastHintCause, o.lastHintNotBefore = origin, at
+			}
 			if at.After(o.notBefore) {
 				o.notBefore, o.retryAfter, o.err = at, hint, err
 			}
@@ -95,6 +110,21 @@ func (r *StreamOutcomeRecorder) Observe(event StreamEvent) {
 	case StreamToolCallDeltaEvent:
 		o.visible = o.visible || strings.TrimSpace(e.ID) != "" || e.NameDelta != "" || e.ArgumentsDelta != ""
 	}
+}
+
+// Positive parsed hints come from these native pointer error types, including
+// through RetryStopError wrapping. No arbitrary error-interface comparison or
+// unbounded per-error map is needed to retain the current parser observation.
+func retryAfterCauseIdentity(err error) error {
+	var rate *RateLimitError
+	if errors.As(err, &rate) && rate != nil {
+		return rate
+	}
+	var provider *ProviderError
+	if errors.As(err, &provider) && provider != nil {
+		return provider
+	}
+	return nil
 }
 
 // Finish publishes after source closure, before downstream channel closure.

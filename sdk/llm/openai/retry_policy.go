@@ -18,6 +18,9 @@ const (
 
 var backoffRandRead = cryptorand.Read
 
+type retryBackoffTestHookKey struct{}
+type retryBackoffTestHooks struct{ waiting func(error, time.Duration) }
+
 type retryPolicy struct {
 	maxRetries int
 	baseDelay  time.Duration
@@ -78,6 +81,9 @@ func sleepRetryBackoff(ctx context.Context, attempt int, baseDelay, maxDelay, re
 	}
 	t := time.NewTimer(d)
 	defer t.Stop()
+	if hook, _ := ctx.Value(retryBackoffTestHookKey{}).(*retryBackoffTestHooks); hook != nil && hook.waiting != nil {
+		hook.waiting(cause, d)
+	}
 	select {
 	case <-ctx.Done():
 		return ctx.Err()

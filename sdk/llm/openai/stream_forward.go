@@ -18,9 +18,8 @@ type streamForwardTestHooks struct {
 // cancellation it preserves backpressure. After cancellation it drains and
 // drops internal events until the provider producer closes, guaranteeing that
 // a producer blocked on its bounded queue can exit and release the HTTP body.
-func forwardOpenAIStreamEvents(ctx context.Context, dst chan<- llm.StreamEvent, src <-chan llm.StreamEvent) {
+func forwardOpenAIStreamEvents(ctx context.Context, dst chan<- llm.StreamEvent, src <-chan llm.StreamEvent, outcome *llm.StreamOutcomeRecorder) {
 	defer close(dst)
-	outcome := llm.BeginStreamOutcome(ctx)
 	defer outcome.Finish()
 	hooks, _ := ctx.Value(streamForwardTestHookKey{}).(*streamForwardTestHooks)
 	dropping := false

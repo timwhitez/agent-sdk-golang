@@ -14,11 +14,12 @@ func TestStreamOutcomeRetainsNativeStopAndAbsoluteFloor(t *testing.T) {
 	cause := &RateLimitError{Provider: "fixture", RetryAfter: time.Second}
 	before := time.Now()
 	producer.Observe(StreamErrorEvent{Err: cause})
+	originalFloor := outcome.Snapshot().RetryAfterNotBefore
 	stop := &RetryStopError{RetryAfter: time.Second, Reason: "wait_limit", Cause: cause}
 	producer.Observe(StreamErrorEvent{Err: stop})
 	producer.Observe(StreamErrorEvent{Err: context.Canceled})
 	producer.Observe(StreamUsageEvent{})
-	if got := outcome.Snapshot(); !got.Started || got.Complete || got.Visible || !errors.Is(got.Error, cause) || !IsRetryStop(got.Error) || got.RetryAfter != time.Second || got.RetryAfterNotBefore.Before(before.Add(time.Second)) {
+	if got := outcome.Snapshot(); !got.Started || got.Complete || got.Visible || !errors.Is(got.Error, cause) || !IsRetryStop(got.Error) || got.RetryAfter != time.Second || got.RetryAfterNotBefore.Before(before.Add(time.Second)) || got.RetryAfterNotBefore != originalFloor {
 		t.Fatalf("lost in-flight native evidence: %+v", got)
 	}
 	producer.Finish()

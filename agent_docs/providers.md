@@ -43,6 +43,11 @@ An explicit `llm.WithStreamOutcome` context owns one concrete `InvokeStream`,
 including on retries of the same model. OpenAI Chat/Responses record actual
 parsed errors, the largest absolute Retry-After not-before time, native terminal
 stop and produced visible-output facts before cancelable forwarding or dropping.
+The parser publishes the original structured HTTP cause before entering internal
+backoff, so child cancellation cannot replace it with a no-hint context error.
+Re-delivery or native-stop wrapping of the same parsed cause never restarts its
+original absolute not-before. Receipt facts may include a transient internal
+retry error even when the eventual stream succeeds.
 After source closure they finish the bounded in-memory receipt before closing
 the public channel. Public channel closure alone cannot prove a no-hint outcome.
 Hosts read the receipt after bounded producer finalization; incomplete/reused

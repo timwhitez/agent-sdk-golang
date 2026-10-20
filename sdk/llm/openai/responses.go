@@ -453,9 +453,10 @@ func (c *ResponsesClient) InvokeStream(ctx context.Context, req llm.InvokeReques
 	// Keep provider production separate from caller delivery. If a caller stops
 	// consuming, cancellation switches the forwarding goroutine to drain-and-drop
 	// mode so the producer can finish and close the response body.
+	outcome := llm.BeginStreamOutcome(ctx)
 	out := make(chan llm.StreamEvent, 128)
 	forwarded := make(chan llm.StreamEvent, 128)
-	go forwardOpenAIStreamEvents(ctx, forwarded, out)
+	go forwardOpenAIStreamEvents(ctx, forwarded, out, outcome)
 	go func() {
 		defer close(out)
 
@@ -579,6 +580,8 @@ func (c *ResponsesClient) InvokeStream(ctx context.Context, req llm.InvokeReques
 				} else {
 					lastErr = &llm.ProviderError{Provider: local.Provider(), StatusCode: resp.StatusCode, Message: msg, RetryAfter: retryAfter, Reason: openAIErrorReason(data)}
 				}
+				// Preserve this parsed cause before backoff can replace it with cancellation.
+				outcome.Observe(llm.StreamErrorEvent{Err: lastErr})
 				if local.isRetryableStatus(resp.StatusCode) && attempt < retry.maxRetries-1 {
 					if waitErr := local.sleepBackoff(ctx, attempt, retry.baseDelay, retry.maxDelay, retryAfter, lastErr); waitErr != nil {
 						out <- llm.StreamErrorEvent{Err: waitErr}
