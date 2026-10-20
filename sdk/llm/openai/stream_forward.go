@@ -26,6 +26,9 @@ func forwardOpenAIStreamEvents(ctx context.Context, dst chan<- llm.StreamEvent, 
 	for event := range src {
 		// Publication precedes both cancellation selection and drain-and-drop.
 		outcome.Observe(event)
+		if e, ok := event.(llm.StreamErrorEvent); ok {
+			outcome.RecordFinalError(e.AsError())
+		}
 		if hooks != nil && hooks.beforeDelivery != nil {
 			hooks.beforeDelivery(event, dst)
 		}

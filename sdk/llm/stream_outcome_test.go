@@ -120,3 +120,25 @@ func TestStreamOutcomeLatestErrorAndMaximumFloorAreIndependent(t *testing.T) {
 		t.Fatalf("latest error and maximum original floor conflated: %+v", got)
 	}
 }
+
+func TestStreamOutcomeFinalErrorIsSeparateFromHistoricalObservation(t *testing.T) {
+	ctx, outcome := WithStreamOutcome(context.Background())
+	p := BeginStreamOutcome(ctx)
+	historical := &ProviderError{StatusCode: 403}
+	p.Observe(StreamErrorEvent{Err: historical})
+	if outcome.Snapshot().FinalError != nil {
+		t.Fatal("historical retry error claimed final failure")
+	}
+	final := &ProviderError{StatusCode: 401}
+	p.Observe(StreamErrorEvent{Err: final})
+	p.RecordFinalError(final)
+	p.RecordFinalError(context.Canceled)
+	stop := &RetryStopError{Cause: final, Reason: "fixture"}
+	p.RecordFinalError(stop)
+	p.RecordFinalError(historical)
+	p.Finish()
+	p.RecordFinalError(final)
+	if got := outcome.Snapshot(); !got.Complete || got.FinalError != stop || got.Error != stop {
+		t.Fatalf("terminal evidence lost precedence or changed after closure: %+v", got)
+	}
+}

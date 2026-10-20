@@ -52,7 +52,11 @@ stop first, otherwise the latest observed error; cancellation cannot replace an
 already parsed provider error. `RetryAfterCause` independently identifies the
 historical maximum absolute floor. A later permanent HTTP error remains in
 `Error` even when the earlier 429 supplied that floor; hosts must classify this
-latest outcome before admitting another attempt.
+latest outcome before admitting another attempt. `FinalError` is independently
+published only for an actual terminal producer error before public delivery;
+historical parse observations from an internally recovered request do not set it.
+A nil `FinalError` alone is not a stream-success certificate. Hosts retain their
+own retry classification and budget policy for the actual final error.
 After source closure they finish the bounded in-memory receipt before closing
 the public channel. Public channel closure alone cannot prove a no-hint outcome.
 Hosts read the receipt after bounded producer finalization; incomplete/reused

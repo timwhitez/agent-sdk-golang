@@ -18,6 +18,7 @@ type StreamOutcome struct {
 	started, complete, reused bool
 	visible                   bool
 	err, terminal             error
+	finalError                error
 	hintCause                 error
 	retryAfter                time.Duration
 	notBefore                 time.Time
@@ -32,11 +33,13 @@ type StreamOutcome struct {
 // maximum absolute Retry-After floor and its original cause are separate facts;
 // a later permanent error must remain available to a host's retry classifier.
 // Errors may describe an earlier transient failure after a successful internal
-// retry; neither Error nor Complete defines stream success. All causes retain
+// retry. FinalError records only an actual terminal producer error; nil alone
+// does not define success, and Complete only certifies producer closure. All causes retain
 // the same private diagnostic policy as InvokeStream errors.
 type StreamOutcomeSnapshot struct {
 	Started, Complete, Visible bool
 	Error                      error
+	FinalError                 error
 	RetryAfterCause            error
 	RetryAfter                 time.Duration
 	RetryAfterNotBefore        time.Time
@@ -117,6 +120,25 @@ func (r *StreamOutcomeRecorder) Observe(event StreamEvent) {
 	}
 }
 
+// RecordFinalError records an actual terminal producer error before its public
+// delivery. Do not call it for an internal retry's historical parse observation.
+// A successful recovered stream leaves FinalError nil. Native stops stay sticky.
+func (r *StreamOutcomeRecorder) RecordFinalError(err error) {
+	if r == nil || r.outcome == nil || err == nil {
+		return
+	}
+	r.Observe(StreamErrorEvent{Err: err})
+	o := r.outcome
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	if o.complete || IsRetryStop(o.finalError) {
+		return
+	}
+	if o.finalError == nil || IsRetryStop(err) || (!errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded)) {
+		o.finalError = err
+	}
+}
+
 // Positive parsed hints come from these native pointer error types, including
 // through RetryStopError wrapping. No arbitrary error-interface comparison or
 // unbounded per-error map is needed to retain the current parser observation.
@@ -155,5 +177,5 @@ func (o *StreamOutcome) Snapshot() StreamOutcomeSnapshot {
 	if o.terminal != nil {
 		err = o.terminal
 	}
-	return StreamOutcomeSnapshot{Started: o.started, Complete: o.complete && !o.reused, Visible: o.visible, Error: err, RetryAfterCause: o.hintCause, RetryAfter: o.retryAfter, RetryAfterNotBefore: o.notBefore}
+	return StreamOutcomeSnapshot{Started: o.started, Complete: o.complete && !o.reused, Visible: o.visible, Error: err, FinalError: o.finalError, RetryAfterCause: o.hintCause, RetryAfter: o.retryAfter, RetryAfterNotBefore: o.notBefore}
 }
