@@ -37,6 +37,24 @@ tokens such as unit-bearing `1m` keep the no-usable-hint behavior. Cancellation
 remains bounded by context. Authentication refusal, visible stream output and
 unknown tool side effects retain their existing no-replay boundaries.
 
+### Producer outcome across canceled stream delivery
+
+An explicit `llm.WithStreamOutcome` context owns one concrete `InvokeStream`,
+including on retries of the same model. OpenAI Chat/Responses record actual
+parsed errors, the largest absolute Retry-After not-before time, native terminal
+stop and produced visible-output facts before cancelable forwarding or dropping.
+After source closure they finish the bounded in-memory receipt before closing
+the public channel. Public channel closure alone cannot prove a no-hint outcome.
+Hosts read the receipt after bounded producer finalization; incomplete/reused
+scopes do not certify completion. A completed ordinary no-hint timeout retains
+its existing retry policy. No error is reconstructed from warning text, and
+native provider causes retain their existing private diagnostic policy.
+
+This optional receipt does not change stream events, JSON, retry budgets or
+drain-on-cancellation behavior. Use a new scope for every concrete call; there
+is no model/global/durable state. Legacy custom providers retain their existing
+delivery guarantees until they implement `BeginStreamOutcome`/Observe/Finish.
+
 Agent-owned schema diagnostics retain the first unchanged OpenAI non-strict
 tool warning per tool name, schema and reason. Retention is bounded in memory
 for the Agent's lifetime; eviction or a newly built Agent can show it again.
