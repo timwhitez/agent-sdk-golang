@@ -31,11 +31,15 @@ const (
 )
 
 const (
-	RequireDoneReminderText       = "Task completion must use the done tool. If work remains, call the next relevant tool now and continue. If the task is complete, call done with a concise completion message. Do not respond with text-only planning or completion claims."
-	legacyRequireDoneReminderText = "Task completion must use the done tool. If the task is complete, call done with a concise completion message. Do not end with text-only completion claims."
-	DefaultLoopGuardText          = "You are repeating the same tool call with identical arguments. Stop repeating, reuse prior results, adjust arguments, or call done if the task is complete."
-	EarlyStopReminderText         = "You already used tools in this run. Before stopping, verify the task is complete and call done with a concise completion message."
-	StreamIdleRecoveryText        = "The previous response stream stalled before completion. Continue from the current conversation state. Do not repeat completed tool calls unless needed. If you were mid-analysis or mid-sentence, continue exactly where you left off. If enough information is already available, complete the task."
+	RequireDoneReminderText = "Task completion must use the done tool. If work remains, call the next relevant tool now and continue. If the task is complete, call done with your final answer for the user: the actual result (the answer, summary, findings, or what changed and how it was verified), not a list of the steps you took. Do not respond with text-only planning or completion claims."
+	// Earlier reminder texts stay recognized for persisted histories without
+	// an internal message name.
+	legacyRequireDoneReminderText   = "Task completion must use the done tool. If the task is complete, call done with a concise completion message. Do not end with text-only completion claims."
+	legacyRequireDoneReminderTextV2 = "Task completion must use the done tool. If work remains, call the next relevant tool now and continue. If the task is complete, call done with a concise completion message. Do not respond with text-only planning or completion claims."
+	legacyEarlyStopReminderText     = "You already used tools in this run. Before stopping, verify the task is complete and call done with a concise completion message."
+	DefaultLoopGuardText            = "You are repeating the same tool call with identical arguments. Stop repeating, reuse prior results, adjust arguments, or call done if the task is complete."
+	EarlyStopReminderText           = "You already used tools in this run. Before stopping, verify the task is complete and call done with your final answer for the user: the actual result, not a list of the steps you took."
+	StreamIdleRecoveryText          = "The previous response stream stalled before completion. Continue from the current conversation state. Do not repeat completed tool calls unless needed. If you were mid-analysis or mid-sentence, continue exactly where you left off. If enough information is already available, complete the task."
 
 	ResponseTruncatedContinuationText = "Your response was truncated. Please continue exactly where you left off."
 	ToolCallContinuationLimitText     = "Your tool-call arguments were repeatedly truncated. Split the work into smaller tool calls and continue."
@@ -48,6 +52,8 @@ var legacyEvidenceRecoveryPattern = regexp.MustCompile(`^No-progress recovery: (
 var legacyExactInternalUserText = map[string]struct{}{
 	RequireDoneReminderText:           {},
 	legacyRequireDoneReminderText:     {},
+	legacyRequireDoneReminderTextV2:   {},
+	legacyEarlyStopReminderText:       {},
 	DefaultLoopGuardText:              {},
 	EarlyStopReminderText:             {},
 	StreamIdleRecoveryText:            {},
