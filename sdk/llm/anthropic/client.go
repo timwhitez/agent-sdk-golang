@@ -583,10 +583,13 @@ type contentBlockParam struct {
 	Content   any    `json:"content,omitempty"`
 	IsError   bool   `json:"is_error,omitempty"`
 
-	// thinking
-	Thinking  string `json:"thinking,omitempty"`
-	Signature string `json:"signature,omitempty"`
-	Data      string `json:"data,omitempty"`
+	// thinking. A pointer so a thinking block always carries the field: with
+	// adaptive thinking the provider returns an empty thinking text plus a
+	// signature, and replaying the block without "thinking" is rejected
+	// ("thinking: Field required").
+	Thinking  *string `json:"thinking,omitempty"`
+	Signature string  `json:"signature,omitempty"`
+	Data      string  `json:"data,omitempty"`
 
 	CacheCtrl *cacheControl `json:"cache_control,omitempty"`
 }
@@ -1718,7 +1721,8 @@ func toAnthropicBlock(b llm.ContentBlock, inheritCache bool) contentBlockParam {
 			blk.Text = "(unsupported image content omitted: missing image_url)"
 		}
 	case "thinking":
-		blk.Thinking = b.Thinking
+		thinking := b.Thinking
+		blk.Thinking = &thinking
 		blk.Signature = b.Signature
 	case "redacted_thinking":
 		blk.Data = b.Data
