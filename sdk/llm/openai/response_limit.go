@@ -54,7 +54,7 @@ func readResponseBodyLimited(body io.ReadCloser, endpoint string) ([]byte, error
 	}
 	if int64(len(data)) > limit {
 		return nil, &oversizedResponseBodyError{
-			Endpoint: endpoint,
+			Endpoint: openAIDiagnosticEndpoint(endpoint),
 			Read:     int64(len(data)),
 			Limit:    limit,
 		}

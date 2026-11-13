@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"log"
 	"net/http"
 	"strconv"
@@ -132,6 +133,7 @@ func (c *ResponsesClient) Invoke(ctx context.Context, req llm.InvokeRequest) (*l
 		}
 
 		httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(body))
+		err = sanitizeOpenAIHTTPError(err)
 		if err != nil {
 			return nil, err
 		}
@@ -162,8 +164,8 @@ func (c *ResponsesClient) Invoke(ctx context.Context, req llm.InvokeRequest) (*l
 			if msg == "" {
 				msg = resp.Status
 			}
-			// Include endpoint to make debugging (base-url/path) easier.
-			msg = fmt.Sprintf("%s (POST %s)", msg, endpoint)
+			// Include only the origin; endpoint paths and credentials may be secret.
+			msg = fmt.Sprintf("%s (POST %s)", msg, openAIDiagnosticEndpoint(endpoint))
 
 			// Automatic downgrade: some gateways reject reasoning/settings; apply all compatible changes before retrying.
 			compatChanged := false
@@ -492,6 +494,7 @@ func (c *ResponsesClient) InvokeStream(ctx context.Context, req llm.InvokeReques
 			}
 
 			httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(body))
+			err = sanitizeOpenAIHTTPError(err)
 			if err != nil {
 				out <- llm.StreamErrorEvent{Err: err}
 				return
@@ -532,7 +535,7 @@ func (c *ResponsesClient) InvokeStream(ctx context.Context, req llm.InvokeReques
 				if msg == "" {
 					msg = resp.Status
 				}
-				msg = fmt.Sprintf("%s (POST %s)", msg, endpoint)
+				msg = fmt.Sprintf("%s (POST %s)", msg, openAIDiagnosticEndpoint(endpoint))
 
 				// Automatic downgrade: apply all compatible request changes before retrying.
 				compatChanged := false
@@ -916,7 +919,7 @@ func (c *ResponsesClient) InvokeStream(ctx context.Context, req llm.InvokeReques
 					return errSSEDone
 				}
 				var root map[string]any
-				if err := json.Unmarshal([]byte(data), &root); err != nil {
+				if err := decodeResponsesObject([]byte(data), &root); err != nil {
 					return fmt.Errorf("openai responses stream: decode error: %w", err)
 				}
 				emitResponseID(responsesStreamResponseID(root))
@@ -1256,7 +1259,7 @@ func (c *ResponsesClient) InvokeStream(ctx context.Context, req llm.InvokeReques
 			if !sawCompleted {
 				out <- llm.StreamErrorEvent{Err: &llm.ProviderError{
 					Provider: local.Provider(),
-					Message:  fmt.Sprintf("stream ended before response.completed or [DONE]; response is incomplete (model=%q endpoint=%s)", local.ModelName, endpoint),
+					Message:  fmt.Sprintf("stream ended before response.completed or [DONE]; response is incomplete (model=%q endpoint=%s)", local.ModelName, openAIDiagnosticEndpoint(endpoint)),
 				}}
 				return
 			}
@@ -2186,7 +2189,7 @@ func parseResponses(data []byte) (*llm.Completion, error) {
 
 func parseResponsesForProvider(provider string, data []byte) (*llm.Completion, error) {
 	var root map[string]any
-	if err := json.Unmarshal(data, &root); err != nil {
+	if err := decodeResponsesObject(data, &root); err != nil {
 		return nil, &llm.ProviderError{
 			Provider: provider,
 			Message:  "Responses response root must be a non-null JSON object: " + err.Error(),
@@ -2341,4 +2344,17 @@ func responsesToolCallIdentifiers(item map[string]any) (itemID, callID string) {
 		callID = itemID
 	}
 	return itemID, callID
+}
+
+// Preserve number lexemes in gateway object-form tool arguments.
+func decodeResponsesObject(data []byte, out *map[string]any) error {
+	decoder := json.NewDecoder(bytes.NewReader(data))
+	decoder.UseNumber()
+	if err := decoder.Decode(out); err != nil {
+		return err
+	}
+	if err := decoder.Decode(new(any)); err != io.EOF {
+		return fmt.Errorf("Responses payload must contain one JSON value")
+	}
+	return nil
 }

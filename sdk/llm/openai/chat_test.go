@@ -633,8 +633,8 @@ func TestChatStreamDecodeError(t *testing.T) {
 	if !strings.Contains(errMsg, "model=\"test-model\"") {
 		t.Fatalf("expected model context, got %q", errMsg)
 	}
-	if !strings.Contains(errMsg, "https://example.com/v1/chat/completions") {
-		t.Fatalf("expected endpoint context, got %q", errMsg)
+	if !strings.Contains(errMsg, "https://example.com:443") {
+		t.Fatalf("expected sanitized endpoint origin, got %q", errMsg)
 	}
 }
 

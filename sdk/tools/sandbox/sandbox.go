@@ -289,6 +289,11 @@ func (s *Sandbox) AllowExternalDirectory(path string) (string, bool, error) {
 	if err != nil {
 		return "", false, err
 	}
+	return s.allowNormalizedExternalRoot(normalized)
+}
+
+// allowNormalizedExternalRoot preserves an already validated confirmation target.
+func (s *Sandbox) allowNormalizedExternalRoot(normalized string) (string, bool, error) {
 	if isWithinRoot(normalized, s.RootDir) {
 		return normalized, false, nil
 	}

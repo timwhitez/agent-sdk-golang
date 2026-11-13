@@ -134,6 +134,7 @@ func (c *ChatClient) Invoke(ctx context.Context, req llm.InvokeRequest) (*llm.Co
 		}
 
 		httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(body))
+		err = sanitizeOpenAIHTTPError(err)
 		if err != nil {
 			return nil, err
 		}
@@ -165,8 +166,8 @@ func (c *ChatClient) Invoke(ctx context.Context, req llm.InvokeRequest) (*llm.Co
 			if msg == "" {
 				msg = resp.Status
 			}
-			// Include endpoint to make debugging (base-url/path) easier.
-			msg = fmt.Sprintf("%s (POST %s)", msg, endpoint)
+			// Include only the origin; endpoint paths and credentials may be secret.
+			msg = fmt.Sprintf("%s (POST %s)", msg, openAIDiagnosticEndpoint(endpoint))
 
 			// Automatic downgrade: some OpenAI-compatible providers/models reject reasoning or extra request settings.
 			compatChanged := false
@@ -290,6 +291,7 @@ func (c *ChatClient) InvokeStream(ctx context.Context, req llm.InvokeRequest) (<
 			}
 
 			httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(body))
+			err = sanitizeOpenAIHTTPError(err)
 			if err != nil {
 				out <- llm.StreamErrorEvent{Err: err}
 				return
@@ -330,7 +332,7 @@ func (c *ChatClient) InvokeStream(ctx context.Context, req llm.InvokeRequest) (<
 				if msg == "" {
 					msg = resp.Status
 				}
-				msg = fmt.Sprintf("%s (POST %s)", msg, endpoint)
+				msg = fmt.Sprintf("%s (POST %s)", msg, openAIDiagnosticEndpoint(endpoint))
 
 				// Automatic downgrade: disable unsupported request settings in one retry step.
 				// Every downgrade is reported through the warning sink so a silently
@@ -466,7 +468,7 @@ func (c *ChatClient) InvokeStream(ctx context.Context, req llm.InvokeRequest) (<
 				}
 				var r chatCompletionStreamResponse
 				if err := json.Unmarshal([]byte(data), &r); err != nil {
-					return fmt.Errorf("openai chat stream: decode error (provider=openai status=%d model=%q url=%s): %w", resp.StatusCode, local.ModelName, endpoint, err)
+					return fmt.Errorf("openai chat stream: decode error (provider=openai status=%d model=%q url=%s): %w", resp.StatusCode, local.ModelName, openAIDiagnosticEndpoint(endpoint), err)
 				}
 				if r.Error != nil && strings.TrimSpace(r.Error.Message) != "" {
 					return fmt.Errorf("openai stream error: %s", r.Error.Message)
@@ -527,7 +529,7 @@ func (c *ChatClient) InvokeStream(ctx context.Context, req llm.InvokeRequest) (<
 			}
 			out <- llm.StreamErrorEvent{Err: &llm.ProviderError{
 				Provider: local.Provider(),
-				Message:  fmt.Sprintf("stream ended before [DONE]; response is incomplete (model=%q endpoint=%s)", local.ModelName, endpoint),
+				Message:  fmt.Sprintf("stream ended before [DONE]; response is incomplete (model=%q endpoint=%s)", local.ModelName, openAIDiagnosticEndpoint(endpoint)),
 			}}
 			return
 		}
@@ -1424,7 +1426,9 @@ func (r chatRequest) MarshalJSON() ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
-	if err := json.Unmarshal(b, &base); err != nil {
+	decoder := json.NewDecoder(bytes.NewReader(b))
+	decoder.UseNumber()
+	if err := decoder.Decode(&base); err != nil {
 		return nil, err
 	}
 	for k, v := range r.Extra {
@@ -1718,6 +1722,12 @@ func makeStrictProperty(prop map[string]any, wasRequired bool) map[string]any {
 		p = anyJSONSchema()
 	}
 	if !wasRequired {
+		// Type alone cannot admit null when another constraint excludes it.
+		for _, key := range []string{"enum", "const", "$ref", "anyOf", "oneOf", "allOf", "not", "if"} {
+			if _, constrained := p[key]; constrained {
+				return map[string]any{"anyOf": []any{p, map[string]any{"type": "null"}}}
+			}
+		}
 		// allow null
 		if t, ok := p["type"].(string); ok {
 			p["type"] = []any{t, "null"}
