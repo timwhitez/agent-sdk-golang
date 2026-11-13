@@ -198,3 +198,11 @@ func redirectSafeOpenAIHTTPClient(base *http.Client) *http.Client {
 	}
 	return &cloned
 }
+
+func openAIDiagnosticEndpoint(endpoint string) string {
+	parsed, err := url.Parse(endpoint)
+	if err != nil {
+		return "(redacted URL)"
+	}
+	return openAIOriginLabel(parsed)
+}

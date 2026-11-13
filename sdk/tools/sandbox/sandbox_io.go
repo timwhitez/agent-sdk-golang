@@ -182,6 +182,9 @@ func openFileNoFollow(path string) (*os.File, os.FileInfo, error) {
 	if info.Mode()&os.ModeSymlink != 0 {
 		return nil, nil, &SecurityError{Message: fmt.Sprintf("symlink target denied: %q", path)}
 	}
+	if !info.Mode().IsRegular() && !info.IsDir() {
+		return nil, nil, &SecurityError{Message: fmt.Sprintf("unsupported special file denied: %q", path)}
+	}
 	f, err := os.Open(path)
 	if err != nil {
 		return nil, nil, err

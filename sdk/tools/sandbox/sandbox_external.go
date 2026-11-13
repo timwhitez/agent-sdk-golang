@@ -3,6 +3,7 @@ package sandbox
 import (
 	"context"
 	"fmt"
+	"os"
 	"strings"
 
 	"github.com/timwhitez/agent-sdk-golang/sdk/tools"
@@ -36,6 +37,14 @@ func externalDirectoryTool() tools.Tool {
 			return fmt.Sprintf("External path already allowed: %s", normalized), nil
 		}
 
+		approvedInfo, err := os.Lstat(normalized)
+		if err != nil {
+			return "", err
+		}
+		if !approvedInfo.IsDir() && !approvedInfo.Mode().IsRegular() {
+			return "", fmt.Errorf("external path changed before confirmation")
+		}
+
 		conf := getConfirmer(deps, ctx)
 		meta := attachToolCallMeta(ctx, map[string]any{
 			"category":      "external_directory",
@@ -54,7 +63,21 @@ func externalDirectoryTool() tools.Tool {
 			return denied.PlainText(), denyErr
 		}
 
-		finalPath, added, err := s.AllowExternalDirectory(normalized)
+		if err := ctx.Err(); err != nil {
+			return "", err
+		}
+		currentPath, err := s.normalizeExternalRoot(normalized)
+		if err != nil {
+			return "", err
+		}
+		currentInfo, err := os.Lstat(normalized)
+		if err != nil {
+			return "", err
+		}
+		if !pathsEqual(currentPath, normalized) || !os.SameFile(approvedInfo, currentInfo) {
+			return "", &SecurityError{Message: "external path changed during confirmation; retry approval"}
+		}
+		finalPath, added, err := s.allowNormalizedExternalRoot(normalized)
 		if err != nil {
 			return "", err
 		}
