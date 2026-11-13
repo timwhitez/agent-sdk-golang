@@ -2023,7 +2023,11 @@ func nonNegativeUsageCount(value any) *int {
 		var err error
 		n, err = v.Int64()
 		if err != nil {
-			return nil
+			f, floatErr := v.Float64()
+			if floatErr != nil {
+				return nil
+			}
+			return nonNegativeUsageCount(f)
 		}
 	default:
 		return nil
@@ -2044,8 +2048,11 @@ func intFromAny(v any) int {
 	case int64:
 		return int(x)
 	case json.Number:
-		i, _ := x.Int64()
-		return int(i)
+		if i, err := x.Int64(); err == nil {
+			return int(i)
+		}
+		f, _ := x.Float64()
+		return int(f)
 	default:
 		return 0
 	}

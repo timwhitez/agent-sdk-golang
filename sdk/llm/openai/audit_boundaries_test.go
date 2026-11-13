@@ -169,6 +169,9 @@ func TestEndpointDiagnosticsExcludeSecrets(t *testing.T) {
 					payload = "data: {\n\n"
 				}
 				hc := &http.Client{Transport: boundaryTransport(func(r *http.Request) (*http.Response, error) {
+					if mode == "invalid_url" {
+						t.Fatal("invalid URL reached transport")
+					}
 					if !strings.Contains(r.URL.String(), "SYNTHETIC_PASSWORD") {
 						t.Error("actual endpoint mutated")
 					}
@@ -178,9 +181,9 @@ func TestEndpointDiagnosticsExcludeSecrets(t *testing.T) {
 				if mode == "invalid_url" {
 					switch c := client.(type) {
 					case *ChatClient:
-						c.BaseURL += "%zz"
+						c.BaseURL = strings.Replace(c.BaseURL, "/private-", "/%zz-private-", 1)
 					case *ResponsesClient:
-						c.BaseURL += "%zz"
+						c.BaseURL = strings.Replace(c.BaseURL, "/private-", "/%zz-private-", 1)
 					}
 				}
 				var got error
@@ -220,6 +223,56 @@ func TestResponsesNumericDecoderRejectsTrailingDocuments(t *testing.T) {
 	for _, raw := range []string{`{"output":[]} {"output":[]}`, `{"output":[]} garbage`} {
 		if _, err := parseResponses([]byte(raw)); err == nil {
 			t.Fatalf("accepted trailing document: %s", raw)
+		}
+	}
+}
+
+func TestResponsesIntegralNumericNotation(t *testing.T) {
+	for _, stream := range []bool{false, true} {
+		for _, index := range []string{"7.0", "7e0"} {
+			t.Run(map[bool]string{false: "buffered", true: "stream"}[stream]+"/"+index, func(t *testing.T) {
+				response := `{"id":"r","status":"completed","output":[],"usage":{"input_tokens":1e2,"output_tokens":7.0,"total_tokens":107.0,"input_tokens_details":{"cached_tokens":6e0,"image_tokens":2.0}}}`
+				body := response
+				if stream {
+					body = `data: {"type":"response.output_item.added","output_index":` + index + `,"item":{"type":"function_call","call_id":"call","name":"fixture","arguments":{"id":9007199254740993}}}` + "\n\ndata: " + `{"type":"response.completed","response":` + response + `}` + "\n\n"
+				}
+				hc := &http.Client{Transport: boundaryTransport(func(*http.Request) (*http.Response, error) { return boundaryResponse(body, 200), nil })}
+				client := boundaryClient("responses", hc)
+				var usage *llm.Usage
+				if stream {
+					events, err := client.InvokeStream(context.Background(), llm.InvokeRequest{})
+					if err != nil {
+						t.Fatal(err)
+					}
+					seen := false
+					for ev := range events {
+						switch e := ev.(type) {
+						case llm.StreamToolCallDeltaEvent:
+							seen = true
+							if e.Index != 7 {
+								t.Errorf("index=%d want7", e.Index)
+							}
+						case llm.StreamUsageEvent:
+							copy := e.Usage
+							usage = &copy
+						case llm.StreamErrorEvent:
+							t.Fatal(e.AsError())
+						}
+					}
+					if !seen {
+						t.Fatal("missing tool delta")
+					}
+				} else {
+					res, err := client.Invoke(context.Background(), llm.InvokeRequest{})
+					if err != nil {
+						t.Fatal(err)
+					}
+					usage = res.Usage
+				}
+				if usage == nil || usage.PromptTokens != 100 || usage.CompletionTokens != 7 || usage.TotalTokens != 107 || usage.PromptCachedTokens == nil || *usage.PromptCachedTokens != 6 || usage.PromptImageTokens == nil || *usage.PromptImageTokens != 2 {
+					t.Fatalf("numeric notation lost: %+v", usage)
+				}
+			})
 		}
 	}
 }

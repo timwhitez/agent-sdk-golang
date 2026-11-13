@@ -611,11 +611,11 @@ func (c *ResponsesClient) InvokeStream(ctx context.Context, req llm.InvokeReques
 				case int64:
 					return int(x), true
 				case json.Number:
-					i, err := x.Int64()
-					if err != nil {
-						return 0, false
+					if i, err := x.Int64(); err == nil {
+						return int(i), true
 					}
-					return int(i), true
+					f, err := x.Float64()
+					return int(f), err == nil
 				default:
 					return 0, false
 				}
