@@ -2,7 +2,6 @@ package agent
 
 import (
 	"bytes"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"log"
@@ -36,6 +35,9 @@ func TestPruneToolResultDumpIndex_RejectsOversizedIndexWithActionableDiagnostic(
 func TestReclaimToolResultDumpOrphans_OversizedIndexFallsBackToMTimeCleanup(t *testing.T) {
 	const dumpTTL = time.Minute
 	dir := t.TempDir()
+	if err := os.Chmod(dir, 0700); err != nil {
+		t.Fatal(err)
+	}
 	now := time.Unix(1700000000, 0).UTC()
 
 	expiredDump := filepath.Join(dir, "agent-tool-result-expired.txt")
@@ -63,6 +65,9 @@ func TestReclaimToolResultDumpOrphans_OversizedIndexFallsBackToMTimeCleanup(t *t
 func TestReclaimToolResultDumpOrphans_ScanCapPreventsFullGlobMaterializationWithActionableWarning(t *testing.T) {
 	const dumpTTL = time.Minute
 	dir := t.TempDir()
+	if err := os.Chmod(dir, 0700); err != nil {
+		t.Fatal(err)
+	}
 	now := time.Unix(1700000000, 0).UTC()
 
 	dumpPaths := make([]string, 0, 6)
@@ -171,98 +176,4 @@ func assertToolResultDumpIndexTooLargeDiagnostic(t *testing.T, err error, path s
 	if !strings.Contains(msg, "error_kind=tool_result_dump_index_too_large") {
 		t.Fatalf("expected machine-readable error kind, got %q", msg)
 	}
-}
-
-func TestPruneToolResultDumpIndex_RetainsEntryWhenRemoveFails(t *testing.T) {
-	// Bug fix #1: Verify that when os.Remove fails (e.g., permission denied),
-	// the entry is retained in the index for retry in the next cleanup cycle.
-	//
-	// Testing strategy: We'll test the behavior by using a non-existent directory
-	// path that will definitely fail os.Remove with an error other than ErrNotExist.
-	// Actually, os.Remove on a non-empty directory fails with a different error.
-	// But we need a file, not a directory.
-	//
-	// Better approach: Create the test to verify the code logic directly.
-	// We'll use a file in /proc or /sys which typically can't be deleted.
-
-	// Try to use a file in /proc that we can read but not delete
-	procFile := "/proc/version"
-	if _, err := os.Stat(procFile); err != nil {
-		t.Skipf("Cannot access %s for testing: %v", procFile, err)
-	}
-
-	dir := t.TempDir()
-	indexPath := filepath.Join(dir, "agent-tool-result-index-test.json")
-
-	now := time.Now().UTC()
-	expiresAt := now.Add(-time.Minute) // Already expired
-
-	// Write an index with an expired entry pointing to a file we can't delete
-	idx := toolResultDumpIndexFile{
-		Version:   toolResultDumpIndexVersion,
-		SessionID: "test-session",
-		UpdatedAt: now.UTC().Format(time.RFC3339),
-		Dumps: []toolResultDumpIndexEntry{
-			{
-				Path:      procFile,
-				CreatedAt: now.Add(-time.Hour).UTC().Format(time.RFC3339),
-				ExpiresAt: expiresAt.UTC().Format(time.RFC3339),
-			},
-		},
-	}
-	b, err := jsonMarshal(idx)
-	if err != nil {
-		t.Fatalf("marshal index: %v", err)
-	}
-	if err := os.WriteFile(indexPath, b, 0o600); err != nil {
-		t.Fatalf("write index: %v", err)
-	}
-
-	// Capture log output to verify warning is logged
-	var logBuf bytes.Buffer
-	prevWriter := log.Writer()
-	prevFlags := log.Flags()
-	prevPrefix := log.Prefix()
-	log.SetOutput(&logBuf)
-	log.SetFlags(0)
-	log.SetPrefix("")
-	defer func() {
-		log.SetOutput(prevWriter)
-		log.SetFlags(prevFlags)
-		log.SetPrefix(prevPrefix)
-	}()
-
-	// Prune should fail to remove the /proc file but keep the entry in the index
-	_, kept, changed, err := pruneToolResultDumpIndex(indexPath, now, time.Minute)
-	if err != nil {
-		t.Fatalf("prune index: %v", err)
-	}
-
-	// The entry should be kept in the index despite the failed removal
-	if len(kept) == 0 {
-		t.Fatal("expected entry to be kept in index when os.Remove fails")
-	}
-	if _, ok := kept[procFile]; !ok {
-		t.Fatalf("expected proc file path %q to be in kept entries", procFile)
-	}
-	// Verify the kept entry has correct expiration time
-	entry := kept[procFile]
-	if !entry.ExpiresAt.Before(now) || entry.ExpiresAt.Sub(expiresAt) > time.Second {
-		t.Errorf("kept entry has unexpected ExpiresAt: %v (expected around %v)", entry.ExpiresAt, expiresAt)
-	}
-
-	// Verify warning was logged
-	logged := logBuf.String()
-	if !strings.Contains(logged, "failed to cleanup expired tool result dump") {
-		t.Errorf("expected warning about failed cleanup, got: %s", logged)
-	}
-
-	// changed should be false because the entry is retained
-	if changed {
-		t.Error("changed should be false when entry is retained due to failed removal")
-	}
-}
-
-func jsonMarshal(v any) ([]byte, error) {
-	return json.Marshal(v)
 }

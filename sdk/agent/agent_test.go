@@ -767,6 +767,9 @@ func TestToolResultDumpMetadata_IncludesLifecycleFields(t *testing.T) {
 		}
 		return dumpPath, nil
 	}
+	if err := os.Chmod(tempDir, 0700); err != nil {
+		t.Fatal(err)
+	}
 	toolResultDumpDir = func() string { return tempDir }
 	toolResultDumpNow = func() time.Time { return fixedNow }
 	t.Cleanup(func() {
@@ -1109,6 +1112,9 @@ func TestToolResultDumpCleanup_ReclaimsOrphansFromPreviousProcess(t *testing.T) 
 
 	oldDumpDir := toolResultDumpDir
 	oldDumpNow := toolResultDumpNow
+	if err := os.Chmod(artifactDir, 0700); err != nil {
+		t.Fatal(err)
+	}
 	toolResultDumpDir = func() string { return artifactDir }
 	toolResultDumpNow = func() time.Time { return fixedNow }
 	t.Cleanup(func() {

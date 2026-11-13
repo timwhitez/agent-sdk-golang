@@ -70,6 +70,9 @@ func applyPatchTool() tools.Tool {
 		if !ok {
 			return denyToolResult(ctx, "apply_patch", "user denied request")
 		}
+		if err := ctx.Err(); err != nil {
+			return llm.TextContent(err.Error()), err
+		}
 		res, err := applyPatchToSandbox(s, a.Patch)
 		if err != nil {
 			msg := strings.TrimSpace(err.Error())
@@ -101,6 +104,7 @@ type patchHunk struct {
 	newStart       int
 	newLen         int
 	hasLineNumbers bool
+	endOfFile      bool
 }
 
 // parsePatchOpsForPreview parses patch operations for preview during confirmation.
@@ -254,14 +258,16 @@ func parsePatchOps(lines []string) ([]patchOp, error) {
 					}
 					i++
 					h := []string{}
+					endOfFile := false
 					for i < len(lines) {
 						ll := lines[i]
 						llt := strings.TrimSpace(ll)
-						if strings.HasPrefix(llt, "@@") || strings.HasPrefix(llt, "*** ") {
+						if ll == "*** End of File" {
+							endOfFile = true
+							i++
 							break
 						}
-						if ll == "*** End of File" {
-							i++
+						if strings.HasPrefix(llt, "@@") || strings.HasPrefix(llt, "*** ") {
 							break
 						}
 						if ll == "" {
@@ -285,6 +291,7 @@ func parsePatchOps(lines []string) ([]patchOp, error) {
 						newStart:       newStart,
 						newLen:         newLen,
 						hasLineNumbers: ok,
+						endOfFile:      endOfFile,
 					})
 					continue
 				}
@@ -804,6 +811,9 @@ func applyHunksToContent(relPath string, raw string, hunks []patchHunk) (string,
 		matchIdx := -1
 		if h.hasLineNumbers {
 			expected := h.oldStart - 1 + offset
+			if h.oldLen == 0 {
+				expected++
+			}
 			if expected < 0 {
 				expected = 0
 			}
@@ -815,8 +825,18 @@ func applyHunksToContent(relPath string, raw string, hunks []patchHunk) (string,
 				matchIdx = expected
 			}
 		}
+		if h.endOfFile && matchIdx+len(oldLines) != len(lines) {
+			matchIdx = -1
+		}
 		if matchIdx == -1 {
 			matches := findHunkMatches(lines, oldLines)
+			if h.endOfFile {
+				matches = nil
+				end := len(lines) - len(oldLines)
+				if linesMatch(lines, end, oldLines) {
+					matches = []int{end}
+				}
+			}
 			if len(matches) == 0 {
 				return "", fmt.Errorf("hunk %d failed to apply to %s (context not found)", hunkNumber, relPath)
 			}

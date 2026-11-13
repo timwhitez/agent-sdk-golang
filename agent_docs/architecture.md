@@ -360,3 +360,13 @@ stream closure; it does not guarantee delivery or identify missing tool results.
 False/zero is not an execution or success attestation. SDK results remain
 recoverable tool outcomes during ordinary continuation; hosts own cleanup exit
 policy. No original error body is added to this evidence or diagnostics.
+
+### Tool-result dump directory trust
+
+Legacy temporary tool-result dumps require a private directory owned by the
+current effective user, with a canonical parent and no directory-leaf symlink. Startup cleanup ignores
+symlink indexes and entries outside that directory or without a dump filename.
+Existing directories with group/other permissions are rejected, not chmodded.
+On non-Unix platforms ownership verification is unavailable, so legacy dump
+creation and cleanup fail closed with a diagnostic; host artifact sinks are
+unaffected.

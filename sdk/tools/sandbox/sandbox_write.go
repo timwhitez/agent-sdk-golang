@@ -150,6 +150,9 @@ func writeTool() tools.Tool {
 		if !ok {
 			return denyToolResult(ctx, "write", "user denied request")
 		}
+		if err := ctx.Err(); err != nil {
+			return llm.TextContent(err.Error()), err
+		}
 		resolvedPath, err := s.revalidatePathForAccess(p)
 		if err != nil {
 			msg := formatErrorDiagnosticFromErr("Security error", err, "Use a file path inside the sandbox root and retry.")
@@ -244,6 +247,9 @@ func editTool() tools.Tool {
 		}
 		if !ok {
 			return denyToolResult(ctx, "edit", "user denied request")
+		}
+		if err := ctx.Err(); err != nil {
+			return llm.TextContent(err.Error()), err
 		}
 		resolvedPath, err := s.revalidatePathForAccess(p)
 		if err != nil {
@@ -372,6 +378,9 @@ func multieditTool() tools.Tool {
 		}
 		if !ok {
 			return denyToolResult(ctx, "multiedit", "user denied request")
+		}
+		if err := ctx.Err(); err != nil {
+			return llm.TextContent(err.Error()), err
 		}
 		resolvedPath, err := s.revalidatePathForAccess(p)
 		if err != nil {
