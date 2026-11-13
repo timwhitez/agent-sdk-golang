@@ -79,6 +79,17 @@ func resolveToolResultDumpDir() (string, error) {
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return "", err
 	}
+	parent, err := filepath.EvalSymlinks(filepath.Dir(dir))
+	if err != nil {
+		return "", err
+	}
+	dir, err = filepath.Abs(filepath.Join(parent, filepath.Base(dir)))
+	if err != nil {
+		return "", err
+	}
+	if err := validateToolResultDumpDir(dir); err != nil {
+		return "", err
+	}
 	return dir, nil
 }
 
@@ -216,6 +227,9 @@ func reclaimToolResultDumpOrphansWithWarning(dir string, now time.Time, ttl time
 	if warnf == nil {
 		warnf = func(string, ...any) {}
 	}
+	if err := validateToolResultDumpDir(dir); err != nil {
+		return err
+	}
 	scanResult, err := scanToolResultDumpPaths(dir, toolResultDumpOrphanScanCap, toolResultDumpOrphanScanBatch)
 	if err != nil {
 		return fmt.Errorf("scan dump directory: %w", err)
@@ -308,7 +322,7 @@ func scanToolResultDumpPaths(dir string, scanCap, batchSize int) (toolResultDump
 				break
 			}
 			result.scannedEntries++
-			if entry.IsDir() {
+			if !entry.Type().IsRegular() {
 				continue
 			}
 			name := entry.Name()
@@ -358,7 +372,7 @@ func pruneToolResultDumpIndexWithWarning(indexPath string, now time.Time, ttl ti
 	changed := false
 	for _, raw := range idx.Dumps {
 		path := strings.TrimSpace(raw.Path)
-		if path == "" {
+		if !validToolResultDumpPath(filepath.Dir(indexPath), path) {
 			changed = true
 			continue
 		}
@@ -416,9 +430,12 @@ func readToolResultDumpIndex(path string) (toolResultDumpIndexFile, error) {
 }
 
 func readToolResultDumpIndexBytes(path string, maxSize int64) ([]byte, error) {
-	info, err := os.Stat(path)
+	info, err := os.Lstat(path)
 	if err != nil {
 		return nil, err
+	}
+	if !info.Mode().IsRegular() {
+		return nil, fmt.Errorf("dump index must be a regular file")
 	}
 	if info.Mode().IsRegular() && info.Size() > maxSize {
 		return nil, &toolResultDumpIndexTooLargeError{path: path, size: info.Size(), max: maxSize}
@@ -579,4 +596,42 @@ func writeFileAtomic(path string, data []byte, mode os.FileMode) error {
 		}
 	}
 	return nil
+}
+
+func validateToolResultDumpDir(dir string) error {
+	info, err := os.Lstat(dir)
+	if err != nil {
+		return err
+	}
+	if !info.IsDir() || info.Mode().Perm()&0077 != 0 {
+		return fmt.Errorf("tool result dump directory must be a private directory")
+	}
+	canonical, err := filepath.EvalSymlinks(dir)
+	if err != nil {
+		return err
+	}
+	absolute, err := filepath.Abs(dir)
+	if err != nil {
+		return err
+	}
+	canonical, err = filepath.Abs(canonical)
+	if err != nil {
+		return err
+	}
+	if canonical != absolute {
+		return fmt.Errorf("tool result dump directory must not contain symlinks")
+	}
+	return validateToolResultDumpOwner(info)
+}
+
+func validToolResultDumpPath(dir, path string) bool {
+	if path == "" || path != filepath.Clean(path) || filepath.Dir(path) != filepath.Clean(dir) {
+		return false
+	}
+	matched, _ := filepath.Match(toolResultDumpPattern, filepath.Base(path))
+	if !matched {
+		return false
+	}
+	info, err := os.Lstat(path)
+	return errors.Is(err, os.ErrNotExist) || (err == nil && info.Mode().IsRegular())
 }

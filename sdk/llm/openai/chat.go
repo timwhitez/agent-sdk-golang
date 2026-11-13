@@ -1643,6 +1643,34 @@ func cloneMap(in map[string]any) map[string]any {
 // - additionalProperties=false
 func makeStrictSchema(schema map[string]any) map[string]any {
 	s := cloneMap(schema)
+	for _, key := range []string{"$defs", "definitions"} {
+		if definitions, ok := s[key].(map[string]any); ok {
+			out := cloneMap(definitions)
+			for name, value := range definitions {
+				if child, ok := value.(map[string]any); ok {
+					out[name] = makeStrictSchema(child)
+				}
+			}
+			s[key] = out
+		}
+	}
+	for _, key := range []string{"anyOf", "oneOf", "allOf"} {
+		if branches, ok := s[key].([]any); ok {
+			out := append([]any(nil), branches...)
+			for i, value := range branches {
+				if child, ok := value.(map[string]any); ok {
+					out[i] = makeStrictSchema(child)
+				}
+			}
+			s[key] = out
+		}
+	}
+	if items, ok := s["items"].(map[string]any); ok {
+		s["items"] = makeStrictArrayItemSchema(items)
+	}
+	if additional, ok := s["additionalProperties"].(map[string]any); ok {
+		s["additionalProperties"] = makeStrictAdditionalPropertiesSchema(additional)
+	}
 	props, _ := s["properties"].(map[string]any)
 	if props == nil {
 		return s
@@ -1685,19 +1713,9 @@ func makeStrictSchema(schema map[string]any) map[string]any {
 }
 
 func makeStrictProperty(prop map[string]any, wasRequired bool) map[string]any {
-	p := cloneMap(prop)
+	p := makeStrictSchema(prop)
 	if len(p) == 0 {
 		p = anyJSONSchema()
-	}
-	// recurse nested objects
-	if t, _ := p["type"].(string); t == "object" {
-		p = makeStrictSchema(p)
-	}
-	if items, ok := p["items"].(map[string]any); ok {
-		p["items"] = makeStrictArrayItemSchema(items)
-	}
-	if additional, ok := p["additionalProperties"].(map[string]any); ok {
-		p["additionalProperties"] = makeStrictAdditionalPropertiesSchema(additional)
 	}
 	if !wasRequired {
 		// allow null
@@ -1715,43 +1733,29 @@ func makeStrictProperty(prop map[string]any, wasRequired bool) map[string]any {
 			p["type"] = append(types, "null")
 			return p
 		}
-		// fallback
-		p["nullable"] = true
+		if types, ok := p["type"].([]string); ok {
+			for _, typ := range types {
+				if typ == "null" {
+					return p
+				}
+			}
+			p["type"] = append(append([]string(nil), types...), "null")
+			return p
+		}
+		return map[string]any{"anyOf": []any{p, map[string]any{"type": "null"}}}
 	}
 	return p
 }
 
 func makeStrictArrayItemSchema(item map[string]any) map[string]any {
-	out := cloneMap(item)
-	if len(out) == 0 {
+	if len(item) == 0 {
 		return anyJSONSchema()
 	}
-	if t, _ := out["type"].(string); t == "object" {
-		out = makeStrictSchema(out)
-	}
-	if items, ok := out["items"].(map[string]any); ok {
-		out["items"] = makeStrictArrayItemSchema(items)
-	}
-	if additional, ok := out["additionalProperties"].(map[string]any); ok {
-		out["additionalProperties"] = makeStrictAdditionalPropertiesSchema(additional)
-	}
-	return out
+	return makeStrictSchema(item)
 }
 
 func makeStrictAdditionalPropertiesSchema(schema map[string]any) map[string]any {
-	out := cloneMap(schema)
-	if len(out) == 0 {
-		return anyJSONSchema()
-	}
-	if t, _ := out["type"].(string); t == "object" {
-		out = makeStrictSchema(out)
-	}
-	if items, ok := out["items"].(map[string]any); ok {
-		out["items"] = makeStrictArrayItemSchema(items)
-	}
-	if additional, ok := out["additionalProperties"].(map[string]any); ok {
-		out["additionalProperties"] = makeStrictAdditionalPropertiesSchema(additional)
-	}
+	out := makeStrictSchema(schema)
 	if _, ok := out["type"]; !ok {
 		if _, hasProperties := out["properties"]; !hasProperties {
 			if _, hasItems := out["items"]; !hasItems {

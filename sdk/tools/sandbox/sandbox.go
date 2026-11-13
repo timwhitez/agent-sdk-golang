@@ -29,7 +29,8 @@ type Sandbox struct {
 	mu    sync.Mutex
 	Todos []TodoItem
 
-	allowedRoots []string
+	allowedRoots   []string
+	configuredRoot string
 }
 
 type validatedSandboxPath struct {
@@ -124,7 +125,11 @@ func New(root string) (*Sandbox, error) {
 		return nil, err
 	}
 	abs = filepath.Clean(abs)
-	return &Sandbox{RootDir: abs, WorkingDir: abs}, nil
+	resolved, err := evalSymlinksForPath(abs)
+	if err != nil {
+		return nil, err
+	}
+	return &Sandbox{RootDir: resolved, WorkingDir: abs, configuredRoot: abs}, nil
 }
 
 func (s *Sandbox) Resolve(path string) (string, error) {
@@ -165,7 +170,7 @@ func (s *Sandbox) resolveForAccess(path string) (validatedSandboxPath, error) {
 	if err != nil {
 		return validatedSandboxPath{}, err
 	}
-	if !s.isAllowedPath(abs) {
+	if !s.isAllowedPath(abs) && (s.configuredRoot == "" || !isWithinRoot(abs, s.configuredRoot)) {
 		return validatedSandboxPath{}, &SecurityError{Message: fmt.Sprintf("path escapes sandbox: %q -> %q", path, abs)}
 	}
 	resolved, err := evalSymlinksForPath(abs)
