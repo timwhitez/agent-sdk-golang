@@ -104,3 +104,21 @@ func TestReplaceHistoryTakesOwnership(t *testing.T) {
 	mutateHistoryMessage(&replacement[0])
 	assertOriginalHistoryMessage(t, agent.Messages()[0])
 }
+
+// #250: the Query input is owned by the Agent once QueryStream returns.
+func TestQueryStreamTakesOwnershipOfInput(t *testing.T) {
+	ag, err := New(Config{LLM: historyCloneModel{}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	input := llm.Content{Blocks: []llm.ContentBlock{{Type: "text", Text: "original"}}}
+	events := ag.QueryStream(context.Background(), input)
+	input.Blocks[0].Text = "mutated by caller" // concurrent with the turn: -race flags aliasing
+	for range events {
+	}
+	for _, m := range ag.Messages() {
+		if m.Role == llm.RoleUser && m.Content.PlainText() != "original" {
+			t.Fatalf("history user message aliases caller memory: %q", m.Content.PlainText())
+		}
+	}
+}

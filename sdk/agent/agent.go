@@ -670,6 +670,9 @@ func (a *Agent) queryStreamWithSteering(ctx context.Context, input llm.Content, 
 	// Reserve synchronously when possible so an update made after this call
 	// cannot overtake an already admitted turn. A pending replacement is
 	// waited inside the goroutine so QueryStream remains non-blocking.
+	// Own the input before the turn goroutine starts: the caller may reuse
+	// its buffer as soon as this call returns.
+	input = llm.CloneContent(input)
 	runtimeRelease, runtimeAcquired := a.tryBeginCompactionRuntimeUse()
 	unregisterTurn := a.registerTurnCancellation(out, ctx)
 	go func(releaseCompactionRuntime func(), acquired bool) {
@@ -1749,6 +1752,7 @@ func (a *Agent) queryStreamWithSteering(ctx context.Context, input llm.Content, 
 						ToolCallID:  tc.ID,
 						DisplayName: c.resolvedName,
 					}, toolCorrelation)
+					c.announced = true
 					if c.evidenceTool {
 						decision := progressLedger.preflight(c.evidenceReq, a.compactionGeneration.Load())
 						if decision.suppress {
@@ -1817,7 +1821,18 @@ func (a *Agent) queryStreamWithSteering(ctx context.Context, input llm.Content, 
 						if outcome.NotStarted == BlockSteering {
 							text = toolSkippedBySteeringText
 						}
-						return blockTerminal(historyOnlyResults(skippedToolResults([]llm.ToolCall{tc}, text))[0], string(outcome.NotStarted)), nil
+						skipped := skippedToolResults([]llm.ToolCall{tc}, text)[0]
+						if !c.announced {
+							return blockTerminal(historyOnlyResults([]llm.Message{skipped})[0], string(outcome.NotStarted)), nil
+						}
+						// Admit already published StepStart+ToolCall, so the host
+						// must also see this call's terminal result (#242).
+						skipped.ToolName = c.resolvedName
+						projection := projectToolResult(skipped, nil, skipped.Content.PlainText())
+						if skipped.IsError {
+							projection.errorOrigin = ToolErrorOriginCanceled
+						}
+						return blockTerminal(projection, string(outcome.NotStarted)), nil
 					}
 					content, toolErr, meta := outcome.Content, outcome.Err, outcome.Metadata
 					if outcome.RootError != nil {
@@ -2168,7 +2183,11 @@ func (a *structuredThinkingBlockAccumulator) apply(d llm.StreamThinkingDeltaEven
 	}
 }
 
-func (a *structuredThinkingBlockAccumulator) finalize() []llm.ContentBlock {
+// finalize returns the replayable thinking blocks. An interrupted stream
+// (complete=false) drops thinking blocks whose signature never arrived:
+// providers reject unsigned thinking on replay, and the visible text stays in
+// Completion.Thinking (#241).
+func (a *structuredThinkingBlockAccumulator) finalize(complete bool) []llm.ContentBlock {
 	if a == nil || len(a.order) == 0 {
 		return nil
 	}
@@ -2182,7 +2201,7 @@ func (a *structuredThinkingBlockAccumulator) finalize() []llm.ContentBlock {
 		case "thinking":
 			thinking := builder.thinking.String()
 			signature := builder.signature.String()
-			if thinking == "" && signature == "" {
+			if (thinking == "" && signature == "") || (!complete && signature == "") {
 				continue
 			}
 			blocks = append(blocks, llm.ContentBlock{Type: "thinking", Thinking: thinking, Signature: signature})
@@ -2531,9 +2550,9 @@ func (a *Agent) invokeModelCompletionWithSteering(ctx context.Context, model llm
 		streamedText := false
 		emittedVisible := false
 		metadata := &streamMetadataBuffer{}
-		partialCompletion := func() (*llm.Completion, error) {
+		partialCompletion := func(complete bool) (*llm.Completion, error) {
 			textContent := text.String()
-			structuredThinking := thinkingBlocks.finalize()
+			structuredThinking := thinkingBlocks.finalize(complete)
 			content := llm.TextContent(textContent)
 			if len(structuredThinking) > 0 {
 				blocks := append([]llm.ContentBlock(nil), structuredThinking...)
@@ -2572,7 +2591,7 @@ func (a *Agent) invokeModelCompletionWithSteering(ctx context.Context, model llm
 			return completion, nil
 		}
 		finishPartial := func(fallbackErr error) (*llm.Completion, bool, error) {
-			comp, stateErr := partialCompletion()
+			comp, stateErr := partialCompletion(fallbackErr == nil)
 			if stateErr != nil {
 				fallbackErr = stateErr
 			}
@@ -2710,7 +2729,7 @@ func (a *Agent) invokeModelCompletionWithSteering(ctx context.Context, model llm
 					// Return partial completion with special error.
 					// Cancel and drain the provider stream so streaming goroutines do not remain
 					// blocked writing into an abandoned channel after steering interrupts the turn.
-					comp, stateErr := partialCompletion()
+					comp, stateErr := partialCompletion(false)
 					finishStage()
 					drainStreamAsync(ch)
 					if stateErr != nil {
@@ -6469,4 +6488,6 @@ type nativeToolCall struct {
 	// wave call that had to consume its planned final arguments.
 	prepared      tools.PreparedCall
 	requiredFinal bool
+	// announced: Admit published StepStart+ToolCall for this call.
+	announced bool
 }
