@@ -50,7 +50,7 @@ func (ErrorEvent) isEvent() {}
 // WarnEvent is emitted for non-fatal runtime warnings where the agent can continue.
 type WarnEvent struct {
 	Message  string
-	Kind     string // "loop_guard"|"continuation"|"continuation_limit"|"early_stop"|"runtime"
+	Kind     string // includes "provider_retry" and "rate_limit_retry" for non-terminal model retries
 	Metadata map[string]any
 }
 
