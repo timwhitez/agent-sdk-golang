@@ -74,6 +74,7 @@ type ResponsesClient struct {
 const (
 	downgradeReasoningEffortResponsesMessage = "OpenAI Responses provider rejected reasoning_effort; retrying without reasoning_effort."
 	downgradeExtraBodyResponsesMessage       = "OpenAI Responses provider rejected extra request body settings; retrying without extra_body."
+	downgradePromptCacheKeyResponsesMessage  = "OpenAI Responses provider rejected prompt_cache_key; retrying without prompt_cache_key."
 	downgradeThinkingResponsesMessage        = "OpenAI Responses provider rejected thinking settings; retrying without thinking extras."
 	downgradeToolChoiceResponsesMessage      = "OpenAI Responses provider rejected forced tool_choice; retried with auto."
 	downgradeStringInputResponsesMessage     = "OpenAI Responses provider rejected content-array input; retrying with string input compatibility mode."
@@ -198,7 +199,13 @@ func (c *ResponsesClient) Invoke(ctx context.Context, req llm.InvokeRequest) (*l
 					local.warnf("[WARN] %s", downgradeStringInputResponsesMessage)
 					diagnostics = append(diagnostics, llm.Diagnostic{Kind: "provider_compatibility_downgrade", Message: downgradeStringInputResponsesMessage})
 				}
-				if autoCompat && compatStage == responsesCompatFull && looksLikeResponsesInputUnsupported(msg) {
+				cacheKeyDropped := downgradePromptCacheKey(&req, payload.PromptCacheKey, msg)
+				if cacheKeyDropped {
+					compatChanged = true
+					local.warnf("[WARN] %s", downgradePromptCacheKeyResponsesMessage)
+					diagnostics = append(diagnostics, llm.Diagnostic{Kind: "provider_compatibility_downgrade", Message: downgradePromptCacheKeyResponsesMessage})
+				}
+				if !cacheKeyDropped && autoCompat && compatStage == responsesCompatFull && looksLikeResponsesInputUnsupported(msg) {
 					compatStage = responsesCompatLegacy
 					compatChanged = true
 					local.warnf("[WARN] %s", downgradeLegacyInputResponsesMessage)
@@ -425,6 +432,20 @@ func applyResponsesCompat(req llm.InvokeRequest, stage responsesCompatStage) llm
 	return out
 }
 
+// downgradePromptCacheKey clears the prompt cache key when it was sent and the
+// provider error names it. It clones the options so the caller's value is
+// never mutated; once cleared, payload.PromptCacheKey is empty, so this fires
+// at most once per call.
+func downgradePromptCacheKey(req *llm.InvokeRequest, sent, msg string) bool {
+	if sent == "" || req.Responses == nil || !strings.Contains(strings.ToLower(msg), "prompt_cache_key") {
+		return false
+	}
+	opts := *req.Responses
+	opts.PromptCacheKey = ""
+	req.Responses = &opts
+	return true
+}
+
 func looksLikeResponsesInputUnsupported(msg string) bool {
 	s := strings.ToLower(msg)
 	if strings.Contains(s, "instructions") || strings.Contains(s, "responseitem") || strings.Contains(s, "response_item") {
@@ -564,7 +585,12 @@ func (c *ResponsesClient) InvokeStream(ctx context.Context, req llm.InvokeReques
 						compatChanged = true
 						local.warnf("[WARN] %s", downgradeStringInputResponsesMessage)
 					}
-					if autoCompat && compatStage == responsesCompatFull && looksLikeResponsesInputUnsupported(msg) {
+					cacheKeyDropped := downgradePromptCacheKey(&req, payload.PromptCacheKey, msg)
+					if cacheKeyDropped {
+						compatChanged = true
+						local.warnf("[WARN] %s", downgradePromptCacheKeyResponsesMessage)
+					}
+					if !cacheKeyDropped && autoCompat && compatStage == responsesCompatFull && looksLikeResponsesInputUnsupported(msg) {
 						compatStage = responsesCompatLegacy
 						compatChanged = true
 						local.warnf("[WARN] %s", downgradeLegacyInputResponsesMessage)
