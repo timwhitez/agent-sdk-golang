@@ -82,3 +82,23 @@ func TestGrepTraversalBudgetStopsOnNonMatchingGlob(t *testing.T) {
 		t.Fatalf("expected traversal-budget warning, got %q err=%v", res.PlainText(), err)
 	}
 }
+
+func TestEditRejectsEmptyOrIdenticalOldString(t *testing.T) {
+	deps := fakeGitRepo(t)
+	s, _ := tools.Get(deps, context.Background(), Key)
+	path := filepath.Join(s.RootDir, "abc.txt")
+	if err := os.WriteFile(path, []byte("abc"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	for _, args := range []string{
+		`{"file_path":"abc.txt","old_string":"","new_string":"X","replace_all":true}`,
+		`{"file_path":"abc.txt","old_string":"b","new_string":"b"}`,
+	} {
+		if _, err := editTool().Execute(context.Background(), args, deps); err == nil {
+			t.Fatalf("expected error for %s", args)
+		}
+		if got, _ := os.ReadFile(path); string(got) != "abc" {
+			t.Fatalf("file changed: %q", got)
+		}
+	}
+}
