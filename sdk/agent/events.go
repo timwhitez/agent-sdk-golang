@@ -39,7 +39,7 @@ type ErrorEvent struct {
 	StatusCode   int
 	Message      string
 	RetryAfterMS int64
-	Kind         string // "rate_limit"|"provider"|"network"|"timeout"|"canceled"|"auth"|"permission"|"invalid_request"|"invalid_tool_call_block"|"decode"|"max_iterations"|"loop_guard"|"doom_loop"|"unknown"
+	Kind         string // "rate_limit"|"provider"|"network"|"timeout"|"canceled"|"auth"|"permission"|"invalid_request"|"invalid_tool_call_block"|"decode"|"max_iterations"|"loop_guard"|"doom_loop"|"fixed_prompt_exceeds_window"|"unknown"
 	// StallRecoveries records how many automatic stream-idle recoveries were
 	// applied earlier in the same turn before this terminal error surfaced.
 	StallRecoveries int

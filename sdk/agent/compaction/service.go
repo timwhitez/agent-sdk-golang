@@ -377,7 +377,8 @@ func (s *Service) compactSummary(ctx context.Context, model llm.ChatModel, messa
 	}
 	sum, validationErr := validateSummaryOutput(comp.PlainText(), material)
 	if validationErr != nil {
-		return s.rejectSummary(messages, comp.Usage, originalTokens, ledgerWarnings, checkpointWarnings, validationErr)
+		warning := "[WARN] Compaction summary rejected by quality gate: " + validationErr.Error() + " - original history and ledger were preserved"
+		return s.rejectSummary(messages, comp.Usage, originalTokens, ledgerWarnings, checkpointWarnings, warning, fmt.Errorf("compaction: summary quality gate rejected: %w", validationErr))
 	}
 
 	if summaryCharCount(sum) >= s.Config.MinSummaryCharsForToolContext {
@@ -386,6 +387,17 @@ func (s *Service) compactSummary(ctx context.Context, model llm.ChatModel, messa
 		if toolCtx != "" {
 			sum += "\n\n" + toolCtx
 		}
+	}
+	// Keep recent user messages for immediate context.
+	recent := SelectRecentUserMessages(messages, keepCount)
+	// The checkpoint marker is a fixed-length hash, so a provisional one sizes
+	// the result before anything (snapshot, ledger) is persisted. A summary
+	// that does not shrink the history is rejected without an error: retrying
+	// the same material would only pay for another summary call.
+	provisional := newCompactionSummaryMessage(withSummaryCheckpoint(sum, nextLedgerSummary(ledger.Summary, messages, sum, "")))
+	if newTokens := s.approximateMessageTokens(append([]llm.Message{provisional}, recent...)); newTokens >= originalTokens {
+		warning := fmt.Sprintf("[WARN] Compaction summary not smaller than history (%d -> %d estimated tokens) - original history and ledger were preserved", originalTokens, newTokens)
+		return s.rejectSummary(messages, comp.Usage, originalTokens, ledgerWarnings, checkpointWarnings, warning, nil)
 	}
 	sourceSnapshot, sourceSnapshotWarning := s.persistSummarySourceSnapshot(ctx, messages)
 	if sourceSnapshotWarning != "" {
@@ -396,9 +408,6 @@ func (s *Service) compactSummary(ctx context.Context, model llm.ChatModel, messa
 	// Prefix and bind the summary to its ledger coverage so future incremental
 	// rounds can prove the exact summary/coverage boundary before using a delta.
 	prefixed := withSummaryCheckpoint(sum, nextSummary)
-
-	// Keep recent user messages for immediate context.
-	recent := SelectRecentUserMessages(messages, keepCount)
 
 	newMessages = make([]llm.Message, 0, 1+len(recent))
 	newMessages = append(newMessages, newCompactionSummaryMessage(prefixed))
@@ -436,8 +445,9 @@ func (s *Service) compactSummary(ctx context.Context, model llm.ChatModel, messa
 	return newMessages, res, nil
 }
 
-func (s *Service) rejectSummary(messages []llm.Message, usage *llm.Usage, originalTokens int, ledgerWarnings, checkpointWarnings []string, validationErr error) ([]llm.Message, Result, error) {
-	warning := "[WARN] Compaction summary rejected by quality gate: " + validationErr.Error() + " - original history and ledger were preserved"
+// rejectSummary returns the original history unchanged with err: nothing was
+// persisted, so history, snapshot and ledger keep their authority.
+func (s *Service) rejectSummary(messages []llm.Message, usage *llm.Usage, originalTokens int, ledgerWarnings, checkpointWarnings []string, warning string, err error) ([]llm.Message, Result, error) {
 	s.warningf("%s", warning)
 	return messages, Result{
 		Compacted:        false,
@@ -449,7 +459,7 @@ func (s *Service) rejectSummary(messages []llm.Message, usage *llm.Usage, origin
 		TokenCountSource: TokenCountSourceEstimate,
 		LedgerPath:       strings.TrimSpace(s.Config.LedgerPath),
 		Warnings:         append(append(append([]string(nil), ledgerWarnings...), checkpointWarnings...), warning),
-	}, fmt.Errorf("compaction: summary quality gate rejected: %w", validationErr)
+	}, err
 }
 
 // summaryQualityWarning returns one measurable diagnostic when a generated

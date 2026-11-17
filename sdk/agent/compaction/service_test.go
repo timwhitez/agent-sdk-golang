@@ -418,7 +418,7 @@ func TestCompactionQualityGateAllowsCredentialLikeSecurityMaterial(t *testing.T)
 	material := `Cookie: user="adm\\073n" Authorization: Bearer lab-fixture-token`
 	model := mockCompactModel{response: structuredTestSummary("Verification Already Run and Still Required", material)}
 	svc := NewService(&Config{Enabled: true})
-	got, res, err := svc.Compact(context.Background(), model, []llm.Message{llm.NewUserMessage("implement the change")})
+	got, res, err := svc.Compact(context.Background(), model, bulkyHistory(llm.NewUserMessage("implement the change")))
 	if err != nil {
 		t.Fatalf("Compact rejected credential-like task material: %v", err)
 	}
@@ -445,6 +445,12 @@ func TestRejectedSummaryDoesNotMutateHistoryOrLedger(t *testing.T) {
 	if store.ledger.Summary != nil {
 		t.Fatalf("rejected summary mutated ledger: %#v", store.ledger.Summary)
 	}
+}
+
+// bulkyHistory prepends earlier assistant output large enough that a
+// structured summary actually shrinks the fixture history.
+func bulkyHistory(messages ...llm.Message) []llm.Message {
+	return append([]llm.Message{llm.NewAssistantMessage(strings.Repeat("earlier working notes ", 400), nil)}, messages...)
 }
 
 func structuredTestSummary(replaceSection, replacement string) string {
@@ -1059,13 +1065,13 @@ func TestCompact_KeepsRecentUsersAndPrefix(t *testing.T) {
 		KeepRecentUserMessages: 2,
 	})
 
-	messages := []llm.Message{
+	messages := bulkyHistory(
 		llm.NewUserMessage("old question"),
-		{Role: llm.RoleAssistant, Content: llm.TextContent("old answer")},
+		llm.Message{Role: llm.RoleAssistant, Content: llm.TextContent("old answer")},
 		llm.NewUserMessage("recent question 1"),
-		{Role: llm.RoleAssistant, Content: llm.TextContent("recent answer 1")},
+		llm.Message{Role: llm.RoleAssistant, Content: llm.TextContent("recent answer 1")},
 		llm.NewUserMessage("recent question 2"),
-	}
+	)
 
 	newMsgs, res, err := svc.Compact(context.Background(), model, messages)
 	if err != nil {
@@ -1103,11 +1109,11 @@ func TestCompact_PopulatesSummaryTelemetry(t *testing.T) {
 		KeepRecentUserMessages: 1,
 	})
 
-	_, res, err := svc.Compact(context.Background(), model, []llm.Message{
+	_, res, err := svc.Compact(context.Background(), model, bulkyHistory(
 		llm.NewUserMessage("old question"),
 		llm.NewAssistantMessage("old answer", nil),
 		llm.NewUserMessage("recent question"),
-	})
+	))
 	if err != nil {
 		t.Fatalf("Compact: %v", err)
 	}
@@ -1197,12 +1203,12 @@ func TestCompact_AppendsToolContext(t *testing.T) {
 		MinSummaryCharsForToolContext: 1,
 	})
 
-	messages := []llm.Message{
+	messages := bulkyHistory(
 		llm.NewUserMessage("question"),
-		{Role: llm.RoleAssistant, Content: llm.TextContent("calling tool")},
-		{Role: llm.RoleTool, ToolName: "read_file", Content: llm.TextContent("file contents here")},
+		llm.Message{Role: llm.RoleAssistant, Content: llm.TextContent("calling tool")},
+		llm.Message{Role: llm.RoleTool, ToolName: "read_file", Content: llm.TextContent("file contents here")},
 		llm.NewUserMessage("follow up"),
-	}
+	)
 
 	newMsgs, res, err := svc.Compact(context.Background(), model, messages)
 	if err != nil {
@@ -1234,8 +1240,8 @@ func TestCompact_SkipsToolContextForShortSummary(t *testing.T) {
 
 	messages := []llm.Message{
 		llm.NewUserMessage("question"),
-		{Role: llm.RoleAssistant, Content: llm.TextContent("calling tool")},
-		{Role: llm.RoleTool, ToolName: "read_file", Content: llm.TextContent("file contents here")},
+		llm.Message{Role: llm.RoleAssistant, Content: llm.TextContent("calling tool")},
+		llm.Message{Role: llm.RoleTool, ToolName: "read_file", Content: llm.TextContent("file contents here")},
 	}
 
 	newMsgs, _, err := svc.Compact(context.Background(), model, messages)

@@ -3,6 +3,7 @@ package compaction
 import (
 	"context"
 	"errors"
+	"reflect"
 	"strings"
 	"testing"
 	"unicode/utf8"
@@ -39,11 +40,11 @@ func TestCompactUsesPreviousSummaryAndDeltaOnSecondSummary(t *testing.T) {
 		SummaryPrompt:          "summarize now",
 		KeepRecentUserMessages: 1,
 	})
-	initialMessages := []llm.Message{
+	initialMessages := bulkyHistory(
 		llm.NewUserMessage("covered old user request"),
 		llm.NewAssistantMessage("covered old assistant answer", nil),
 		llm.NewUserMessage("latest one"),
-	}
+	)
 
 	first, firstRes, err := svc.Compact(context.Background(), model, initialMessages)
 	if err != nil {
@@ -148,11 +149,11 @@ func TestIncrementalSummaryRejectsLedgerHashMismatch(t *testing.T) {
 		LedgerStore:            store,
 		KeepRecentUserMessages: 1,
 	})
-	first, _, err := svc.Compact(context.Background(), model, []llm.Message{
+	first, _, err := svc.Compact(context.Background(), model, bulkyHistory(
 		llm.NewUserMessage("covered request"),
 		llm.NewAssistantMessage("covered answer", nil),
 		llm.NewUserMessage("latest retained request"),
-	})
+	))
 	if err != nil {
 		t.Fatalf("initial Compact: %v", err)
 	}
@@ -183,11 +184,11 @@ func TestIncrementalSummaryRejectsCoverageMismatch(t *testing.T) {
 		LedgerStore:            store,
 		KeepRecentUserMessages: 1,
 	})
-	first, _, err := svc.Compact(context.Background(), model, []llm.Message{
+	first, _, err := svc.Compact(context.Background(), model, bulkyHistory(
 		llm.NewUserMessage("covered request"),
 		llm.NewAssistantMessage("covered answer", nil),
 		llm.NewUserMessage("latest retained request"),
-	})
+	))
 	if err != nil {
 		t.Fatalf("initial Compact: %v", err)
 	}
@@ -219,11 +220,11 @@ func TestIncrementalSummaryUsesStableCoveredEndIdentity(t *testing.T) {
 		LedgerStore:            store,
 		KeepRecentUserMessages: 1,
 	})
-	first, _, err := svc.Compact(context.Background(), model, []llm.Message{
+	first, _, err := svc.Compact(context.Background(), model, bulkyHistory(
 		llm.NewUserMessage("covered request"),
 		llm.NewAssistantMessage("covered answer", nil),
 		llm.NewUserMessage("latest retained request"),
-	})
+	))
 	if err != nil {
 		t.Fatalf("initial Compact: %v", err)
 	}
@@ -265,10 +266,10 @@ func TestCompactionSourceSnapshotRecordedOnlyWhenPersisted(t *testing.T) {
 				return ArtifactResult{Path: ".goode/truncated/summary-source.md"}, nil
 			}),
 		})
-		_, res, err := svc.Compact(context.Background(), mockCompactModel{response: structuredTestSummary("Completed Work", "snapshot summary")}, []llm.Message{
+		_, res, err := svc.Compact(context.Background(), mockCompactModel{response: structuredTestSummary("Completed Work", "snapshot summary")}, bulkyHistory(
 			llm.NewUserMessage("preserve source evidence"),
 			llm.NewAssistantMessage("verified source state", nil),
-		})
+		))
 		if err != nil {
 			t.Fatalf("Compact: %v", err)
 		}
@@ -293,9 +294,9 @@ func TestCompactionSourceSnapshotRecordedOnlyWhenPersisted(t *testing.T) {
 				return ArtifactResult{}, errors.New("snapshot disk full")
 			}),
 		})
-		_, res, err := svc.Compact(context.Background(), mockCompactModel{response: structuredTestSummary("Completed Work", "snapshot failure summary")}, []llm.Message{
+		_, res, err := svc.Compact(context.Background(), mockCompactModel{response: structuredTestSummary("Completed Work", "snapshot failure summary")}, bulkyHistory(
 			llm.NewUserMessage("preserve source evidence"),
-		})
+		))
 		if err != nil {
 			t.Fatalf("Compact: %v", err)
 		}
@@ -327,5 +328,37 @@ func TestSummaryDeltaTruncationPreservesChinesePath(t *testing.T) {
 	}
 	if !strings.Contains(got, path) {
 		t.Fatalf("summary delta lost exact Chinese path %q: %q", path, got)
+	}
+}
+
+// A summary that does not shrink the history is rejected without an error and
+// without persisting anything: history, source snapshot and ledger keep their
+// authority (#257).
+func TestCompactRejectsSummaryNotSmallerThanHistory(t *testing.T) {
+	store := &memoryLedgerStore{ledger: NewLedger("sess-not-smaller")}
+	writes := 0
+	svc := NewService(&Config{
+		Enabled:     true,
+		SessionID:   "sess-not-smaller",
+		LedgerStore: store,
+		SummarySourceWriter: ArtifactWriterFunc(func(context.Context, ArtifactRequest) (ArtifactResult, error) {
+			writes++
+			return ArtifactResult{Path: ".goode/truncated/summary-source.md"}, nil
+		}),
+	})
+	history := []llm.Message{
+		llm.NewUserMessage("rename helper foo to bar in util.go"),
+		llm.NewAssistantMessage("Done: foo is now bar in util.go.", nil),
+	}
+	before := llm.CloneMessages(history)
+	got, res, err := svc.Compact(context.Background(), mockCompactModel{response: structuredTestSummary("Completed Work", "rename done")}, history)
+	if err != nil {
+		t.Fatalf("Compact: %v", err)
+	}
+	if res.Compacted || res.NewTokens != res.OriginalTokens || !containsWarningText(res.Warnings, "not smaller than history") {
+		t.Fatalf("result = %#v, want uncompacted with a not-smaller warning", res)
+	}
+	if !reflect.DeepEqual(got, before) || store.ledger.Summary != nil || writes != 0 {
+		t.Fatalf("rejected summary changed state: history=%#v ledger=%#v snapshot writes=%d", got, store.ledger.Summary, writes)
 	}
 }

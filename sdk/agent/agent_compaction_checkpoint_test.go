@@ -52,7 +52,7 @@ func TestCompactionCheckpointWriterFailurePreservesHistory(t *testing.T) {
 	original := []llm.Message{
 		llm.NewSystemMessage("system"),
 		llm.NewUserMessage("keep this original history"),
-		llm.NewAssistantMessage("original assistant state", nil),
+		compactableAnswer("original assistant state"),
 	}
 	writes := 0
 	ledgerStore := &checkpointLedgerStore{}
@@ -94,7 +94,7 @@ func TestSummaryLedgerDefersUntilCheckpointCommit(t *testing.T) {
 	original := []llm.Message{
 		llm.NewSystemMessage("system"),
 		llm.NewUserMessage("compact this history"),
-		llm.NewAssistantMessage("old assistant state", nil),
+		compactableAnswer("old assistant state"),
 	}
 	ledgerStore := &checkpointLedgerStore{}
 	writes := 0
@@ -140,7 +140,7 @@ func TestCompactionLedgerCommitFailureSkipsRuntimeCheckpoint(t *testing.T) {
 	original := []llm.Message{
 		llm.NewSystemMessage("system"),
 		llm.NewUserMessage("compact this history"),
-		llm.NewAssistantMessage("old assistant state", nil),
+		compactableAnswer("old assistant state"),
 	}
 	ledgerStore := &checkpointLedgerStore{failSaveAt: map[int]error{1: errors.New("ledger disk full")}}
 	writes := 0
@@ -184,7 +184,7 @@ func TestCompactionLedgerRollbackFailureIsVisible(t *testing.T) {
 	original := []llm.Message{
 		llm.NewSystemMessage("system"),
 		llm.NewUserMessage("compact this history"),
-		llm.NewAssistantMessage("old assistant state", nil),
+		compactableAnswer("old assistant state"),
 	}
 	ledgerStore := &checkpointLedgerStore{failSaveAt: map[int]error{2: errors.New("rollback disk full")}}
 	writes := 0
@@ -298,7 +298,7 @@ func TestSuccessfulFullRebuildRefreshesStaleDeferredLedger(t *testing.T) {
 	}
 	original := []llm.Message{
 		llm.NewUserMessage("covered request"),
-		llm.NewAssistantMessage("covered answer", nil),
+		compactableAnswer("covered answer"),
 		llm.NewUserMessage("latest retained request"),
 	}
 
@@ -352,7 +352,7 @@ func TestCompactionCheckpointWriterRunsBeforeHistoryReplacement(t *testing.T) {
 	original := []llm.Message{
 		llm.NewSystemMessage("system"),
 		llm.NewUserMessage("compact this history"),
-		llm.NewAssistantMessage("old assistant state", nil),
+		compactableAnswer("old assistant state"),
 	}
 	var persisted compaction.CompactionCheckpoint
 	ag, err := New(Config{
@@ -388,7 +388,7 @@ func TestAutomaticCompactionCheckpointFailurePreservesHistory(t *testing.T) {
 	original := []llm.Message{
 		llm.NewSystemMessage("system"),
 		llm.NewUserMessage("active request"),
-		llm.NewAssistantMessage("active assistant state", nil),
+		compactableAnswer("active assistant state"),
 	}
 	writes := 0
 	ag, err := New(Config{

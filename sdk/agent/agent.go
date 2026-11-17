@@ -227,6 +227,10 @@ type Agent struct {
 
 	compactor *compaction.Service
 
+	// overflowCompaction binds the latest overflow compaction to its user
+	// input and source Frame; see fixedPromptExceedsWindow.
+	overflowCompaction overflowCompactionMark
+
 	// compactionRuntimeMu protects installation of compactor/hasCompactor.
 	// Complete operations hold a lifecycle use; a queued replacement is a
 	// barrier for later top-level operations while retained child work may
@@ -3847,6 +3851,9 @@ func (a *Agent) checkAndCompactWithGrowth(ctx context.Context, sourceFrameID str
 		return ctx.Err()
 	}
 	a.applyPendingCompaction(out)
+	if err := a.fixedPromptExceedsWindow(sourceFrameID, last.Usage); err != nil {
+		return err
+	}
 	decisionUsage := a.effectiveCompactionUsageWithGrowth(last.Usage, currentHistoryGrowth, pendingHistoryGrowth)
 	decision := a.automaticCompactionDecision(ctx, decisionUsage)
 	if decision.targetWatermark == "overflow" {
@@ -3935,6 +3942,10 @@ func (a *Agent) runCompactionAsync(ctx context.Context, sourceFrameID string, sn
 	}
 	a.clearSatisfiedCompactionWork(decision)
 	if !res.Compacted {
+		// A summary rejected for not shrinking the history is ineffective too.
+		if decision.recordsOutcome() && decision.allowSummary {
+			a.noteSummaryEffect(decision.inputEpoch, res)
+		}
 		return
 	}
 	if decision.recordsOutcome() {
@@ -4043,6 +4054,7 @@ func (a *Agent) compactSyncOverflow(ctx context.Context, sourceFrameID string, l
 		}
 		return nil
 	}
+	a.noteOverflowCompaction(sourceFrameID, res.NewTokens)
 	if !res.Compacted {
 		if !allowSummary {
 			// The summary tier was suppressed by the failure cooldown and the
@@ -4199,9 +4211,12 @@ func (a *Agent) automaticSummarySuppressed(epoch uint64, usage *llm.Usage) bool 
 // history under the summary threshold. A summary that did not suppresses the
 // automatic summary tier for the rest of its user input: repeating it would
 // pay for another summary of the same material. An effective summary clears
-// the suppression. Overflow and manual compaction are never suppressed.
+// the suppression. Overflow and manual compaction are never suppressed; an
+// overflow compaction that does not help is stopped by fixedPromptExceedsWindow.
+// res may be uncompacted: a summary rejected for not shrinking the history
+// reports Watermark "summarize" and counts as ineffective.
 func (a *Agent) noteSummaryEffect(epoch uint64, res compaction.Result) {
-	if a == nil || a.compactor == nil || !slices.Contains(res.TiersApplied, "summarize") {
+	if a == nil || a.compactor == nil || (!slices.Contains(res.TiersApplied, "summarize") && res.Watermark != "summarize") {
 		return
 	}
 	threshold := a.compactor.ThresholdTokens()
@@ -5278,6 +5293,8 @@ func (a *Agent) shouldAttemptCompactionUsage(ctx context.Context, usage *llm.Usa
 	if a.compactor.IsOverflow(usage) {
 		// Overflow is a hard boundary: the next request cannot be sent without
 		// reducing history, so it is never suppressed by the failure cooldown.
+		// It ends the turn instead when the provider reports that the request
+		// after an overflow compaction still did not fit (fixedPromptExceedsWindow).
 		return true
 	}
 	if a.compactionInCooldown() {
@@ -5705,6 +5722,10 @@ func classifyGenericErrorKind(err error) string {
 			return "timeout"
 		}
 		return "network"
+	}
+	var fixedErr *fixedPromptExceedsWindowError
+	if errors.As(err, &fixedErr) {
+		return "fixed_prompt_exceeds_window"
 	}
 	var syntaxErr *json.SyntaxError
 	if errors.As(err, &syntaxErr) {

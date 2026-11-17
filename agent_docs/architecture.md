@@ -153,6 +153,23 @@ the old runtime is in use clears it when that use ends. Overflow compaction
 and manual/preflight entries are never suppressed. A failed summary continues
 to use the separate failure streak and cooldown.
 
+A summary that passes the quality gate but does not make the history smaller
+(estimated tokens of the summary plus kept recent user input at or above the
+original) is rejected on every entry: the original history is returned with
+`Compacted: false`, a warning and a nil error (so the same compaction does not
+retry the summary call), and neither the source snapshot nor the ledger is
+written. On the automatic path it counts as an ineffective summary.
+
+Overflow compaction cannot shrink the system prompt and tool definitions that
+the provider also counts. After an overflow compaction run, the first
+compaction decision driven by a later Frame of the same user input checks that
+Frame's provider-reported prompt tokens: if they are still at or above the
+overflow limit, the turn ends with an `ErrorEvent` of Kind
+`fixed_prompt_exceeds_window` instead of compacting or trimming again. Only
+provider usage stops the turn (local estimates do not count images); the
+message gives the compacted-history estimate, the derived fixed share and the
+limit. A new user input allows one more overflow compaction.
+
 An automatic or overflow compaction result is published only onto the
 history it was computed from. Messages appended meanwhile (steering, tool
 results, reminders, a new host context message) are kept after it. If the

@@ -339,6 +339,7 @@ func newOrderedPipelineService(t *testing.T, sequence *[]string, microcompact bo
 			return ArtifactResult{Path: ".goode/truncated/" + name + ".txt"}, nil
 		}),
 		ProtectedRecentMessages: 1,
+		KeepRecentUserMessages:  1,
 	})
 }
 

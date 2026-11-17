@@ -48,7 +48,7 @@ func outcomeAgent(t *testing.T, writer *outcomeWriter, store *checkpointLedgerSt
 	if cfg != nil {
 		cfg(c)
 	}
-	ag, err := New(Config{LLM: &countingCompactionModel{}, InitialMessages: []llm.Message{llm.NewUserMessage("source"), llm.NewAssistantMessage("answer", nil)}, Compaction: c, Warningf: func(string, ...any) {}})
+	ag, err := New(Config{LLM: &countingCompactionModel{}, InitialMessages: []llm.Message{llm.NewUserMessage("source"), compactableAnswer("answer")}, Compaction: c, Warningf: func(string, ...any) {}})
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -3,6 +3,8 @@ package agent
 import (
 	"fmt"
 	"strings"
+
+	"github.com/timwhitez/agent-sdk-golang/sdk/llm"
 )
 
 func validCompactionSummary(body string) string {
@@ -27,4 +29,11 @@ func validCompactionSummary(body string) string {
 	}
 	b.WriteString("</summary>")
 	return b.String()
+}
+
+// compactableAnswer is an assistant message long enough that a structured
+// summary shrinks a fixture history holding it; a summary that does not
+// shrink the history is rejected.
+func compactableAnswer(text string) llm.Message {
+	return llm.NewAssistantMessage(text+strings.Repeat(" detail", 2000), nil)
 }
