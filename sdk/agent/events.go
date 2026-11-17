@@ -49,8 +49,18 @@ func (ErrorEvent) isEvent() {}
 
 // WarnEvent is emitted for non-fatal runtime warnings where the agent can continue.
 type WarnEvent struct {
-	Message  string
-	Kind     string // includes "provider_retry" and "rate_limit_retry" for non-terminal model retries
+	Message string
+	// Kind classifies the warning. The Agent emits "loop_guard",
+	// "continuation", "continuation_limit", "early_stop",
+	// "require_done_safety", "no_progress_recovery", "stream_idle_recovery",
+	// "context_overflow_recovery", "provider_usage_prompt_tokens_missing",
+	// "thinking_only_observed", "tool_pairing_repaired",
+	// "compaction_decision_estimate_mixed", "compaction_emergency_trim",
+	// "compaction_wait_timeout", and "provider_retry"/"rate_limit_retry" for
+	// non-terminal model retries. Provider completion diagnostics are
+	// forwarded with their own llm.Diagnostic.Kind (for example
+	// "provider_compatibility_downgrade"), or "provider_diagnostic" when empty.
+	Kind     string
 	Metadata map[string]any
 }
 
@@ -117,7 +127,9 @@ const (
 	// or panicked.
 	ToolErrorOriginHandler = "handler"
 	// ToolErrorOriginCanceled: the Query's root context ended after the
-	// handler started; the result is the SDK's cancellation text.
+	// handler started, or after the call was announced (StepStart+ToolCall)
+	// but before its handler started; the result is the SDK's cancellation
+	// text.
 	ToolErrorOriginCanceled = "canceled"
 	// ToolErrorOriginInterrupted: accepted steering had already canceled the
 	// handler's context when it returned an error. Steering that arrives

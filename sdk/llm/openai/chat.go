@@ -50,6 +50,11 @@ type ChatClient struct {
 	// Reasoning effort for reasoning-capable models (best-effort).
 	ReasoningEffort string
 
+	// MaxRetries is the maximum number of transient-failure attempts per
+	// request, counting the first one (despite the name): MaxRetries=N sends
+	// at most N requests for retryable statuses or network errors, so 1
+	// disables automatic retry. Values <= 0 use the default of 10 attempts.
+	// Compatibility downgrade resends do not consume this budget.
 	MaxRetries     int
 	RetryBaseDelay time.Duration
 	RetryMaxDelay  time.Duration

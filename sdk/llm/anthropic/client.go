@@ -50,6 +50,14 @@ type Client struct {
 	ThinkingEffort       string
 
 	// Retry policy.
+	//
+	// MaxRetries is the maximum number of transient-failure attempts per
+	// request, counting the first one (despite the name): MaxRetries=N sends
+	// at most N requests for retryable statuses or network errors, so 1
+	// disables automatic retry. Values <= 0 use the default of 10 attempts.
+	// Compatibility downgrade resends (unsupported thinking/beta fields)
+	// count against this budget, except that one may still be sent after
+	// the last attempt.
 	MaxRetries           int
 	RetryBaseDelay       time.Duration
 	RetryMaxDelay        time.Duration
@@ -115,6 +123,8 @@ func (c *Client) Invoke(ctx context.Context, req llm.InvokeRequest) (*llm.Comple
 	usedFinalDowngradeRetry := false
 	diagnostics := cacheDiagnostics
 
+	// maxRetries is an attempt budget (see Client.MaxRetries); the +1 slot is
+	// reserved for allowDowngradeRetry's final compatibility resend.
 	for attempt := 0; attempt < maxRetries+1; attempt++ {
 		if err := ctx.Err(); err != nil {
 			return nil, err
