@@ -5,6 +5,7 @@ package execrunner
 import (
 	"context"
 	"errors"
+	"os"
 	"os/exec"
 	"strings"
 	"testing"
@@ -94,5 +95,41 @@ func TestRunTimeoutWithEscapedChildHoldingPipeKeepsKillWaitContract(t *testing.T
 	}
 	if len(res.OutputArtifacts) != 0 || len(sink.manifests) != 0 {
 		t.Fatalf("open stream was committed as complete: %#v", res.OutputArtifacts)
+	}
+}
+
+// Output the process already wrote must not be dropped because the consumer is
+// slower than PipeDrainGrace.
+func TestRunSlowConsumerDoesNotLoseOutputToPipeDrain(t *testing.T) {
+	res, err := Run(context.Background(), Options{
+		Program:        "sh",
+		Args:           []string{"-c", "echo a; sleep 0.2; echo b"},
+		Timeout:        10 * time.Second,
+		PipeDrainGrace: 300 * time.Millisecond,
+		OnOutputChunk:  func(OutputChunk) { time.Sleep(time.Second) },
+	})
+	if err != nil || res.PipeDrainTimedOut || !strings.Contains(res.Output, "a") || !strings.Contains(res.Output, "b") || strings.Contains(res.Output, "background process") {
+		t.Fatalf("Run() err=%v drain=%v output=%q, want both lines and no drain timeout", err, res.PipeDrainTimedOut, res.Output)
+	}
+}
+
+func TestRunClosesPipesWhenContextEndsBeforeStart(t *testing.T) {
+	count := func() int {
+		entries, err := os.ReadDir("/proc/self/fd")
+		if err != nil {
+			t.Skip("/proc/self/fd is unavailable")
+		}
+		return len(entries)
+	}
+	before := count()
+	for i := 0; i < 5; i++ {
+		ctx, cancel := context.WithCancel(context.Background())
+		_, err := run(ctx, Options{Program: "true"}, context.WithTimeout, func(context.Context) { cancel() }, (*exec.Cmd).Start)
+		if err == nil {
+			t.Fatal("expected cancellation error")
+		}
+	}
+	if after := count(); after > before {
+		t.Fatalf("leaked %d fds across cancelled starts", after-before)
 	}
 }

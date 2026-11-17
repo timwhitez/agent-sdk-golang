@@ -10,6 +10,7 @@ import (
 	"os/exec"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 	"unicode/utf8"
 
@@ -176,6 +177,7 @@ func run(ctx context.Context, opts Options, withTimeout func(context.Context, ti
 		}
 	}
 	abortBeforeStart := func(cause error) {
+		closePumpFiles()
 		collector.Close()
 		// Writers currently Begin on their first write. Abort also covers any
 		// writer acquired by future preparation; unexecuted output is never committed.
@@ -195,7 +197,6 @@ func run(ctx context.Context, opts Options, withTimeout func(context.Context, ti
 		st.closeWriteEnd() // the child owns its copy; EOF needs ours closed
 	}
 	if startErr != nil {
-		closePumpFiles()
 		abortBeforeStart(startErr)
 		return res, startErr
 	}
@@ -240,11 +241,7 @@ func run(ctx context.Context, opts Options, withTimeout func(context.Context, ti
 	case <-exited:
 		// The foreground process is gone. A descendant may still hold the output
 		// pipes; give the streams PipeDrainGrace to reach EOF, then stop reading.
-		drain := time.NewTimer(opts.PipeDrainGrace)
-		select {
-		case <-waitCh:
-			drain.Stop()
-		case <-drain.C:
+		if !waitForPumpsIdle(streams, waitCh, opts.PipeDrainGrace) {
 			pipeDrainTimedOut = true
 			closePumpFiles()
 			<-waitCh
@@ -575,6 +572,43 @@ func truncateAtRuneBoundary(text string, maxBytes int) string {
 type outputPump struct {
 	writer io.Writer
 	r, w   *os.File
+	// readStart is the UnixNano time the pump entered a blocking Read, or 0 while
+	// it is inside writer.Write. done is set once the pump has returned.
+	readStart atomic.Int64
+	done      atomic.Bool
+}
+
+const pipeDrainTick = 10 * time.Millisecond
+
+// waitForPumpsIdle waits until waitCh closes (all streams reached EOF) and
+// returns true, or returns false once the pumps have spent grace in total
+// blocked in Read with nothing arriving. Time a pump spends inside a slow
+// writer.Write does not count, so output the process already wrote is never
+// dropped because the consumer is slow.
+func waitForPumpsIdle(streams []*outputPump, waitCh <-chan struct{}, grace time.Duration) bool {
+	ticker := time.NewTicker(pipeDrainTick)
+	defer ticker.Stop()
+	last := time.Now()
+	var idle time.Duration
+	for idle < grace {
+		select {
+		case <-waitCh:
+			return true
+		case now := <-ticker.C:
+			allIdle := true
+			for _, st := range streams {
+				// A Read that has just started may be about to return buffered data.
+				if rs := st.readStart.Load(); !st.done.Load() && (rs == 0 || now.UnixNano()-rs < int64(pipeDrainTick)) {
+					allIdle = false
+				}
+			}
+			if allIdle {
+				idle += now.Sub(last)
+			}
+			last = now
+		}
+	}
+	return false
 }
 
 func (p *outputPump) open() (err error) {
@@ -596,5 +630,19 @@ func (p *outputPump) closeFiles() {
 }
 
 func (p *outputPump) pump() {
-	_, _ = io.Copy(p.writer, p.r)
+	defer p.done.Store(true)
+	buf := make([]byte, 32*1024)
+	for {
+		p.readStart.Store(time.Now().UnixNano())
+		n, err := p.r.Read(buf)
+		p.readStart.Store(0)
+		if n > 0 {
+			if _, werr := p.writer.Write(buf[:n]); werr != nil {
+				return
+			}
+		}
+		if err != nil {
+			return
+		}
+	}
 }
