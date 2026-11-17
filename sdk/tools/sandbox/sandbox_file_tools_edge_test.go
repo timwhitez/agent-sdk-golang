@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 
@@ -102,3 +103,67 @@ func TestEditRejectsEmptyOrIdenticalOldString(t *testing.T) {
 		}
 	}
 }
+
+func TestWriteToolsFailClosedWhenIntermediateDirBecomesSymlink(t *testing.T) {
+	if runtime.GOOS != "linux" {
+		t.Skip("dirfd-anchored writes are Linux-only")
+	}
+	for _, tc := range []struct{ name, args string }{
+		{"write", `{"file_path":"a/b/c.txt","content":"after\n"}`},
+		{"edit", `{"file_path":"a/b/c.txt","old_string":"before","new_string":"after"}`},
+		{"multiedit", `{"file_path":"a/b/c.txt","edits":[{"old_string":"before","new_string":"after"}]}`},
+		{"apply_patch", `{"patch":"*** Begin Patch\n*** Update File: a/b/c.txt\n@@\n-before\n+after\n*** End Patch"}`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			root, outside := t.TempDir(), t.TempDir()
+			if err := os.MkdirAll(filepath.Join(root, "a", "b"), 0o755); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.MkdirAll(filepath.Join(outside, "b"), 0o755); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(filepath.Join(root, "a", "b", "c.txt"), []byte("before\n"), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			s, err := New(root)
+			if err != nil {
+				t.Fatal(err)
+			}
+			deps := tools.NewContainer()
+			tools.Provide(deps, Key, func(context.Context) (*Sandbox, error) { return s, nil })
+			tools.Provide(deps, ConfirmKey, func(context.Context) (Confirmer, error) { return allowAllConfirmer{}, nil })
+
+			// Swap root/a for a symlink after validation, before the write opens its directory.
+			beforeWriteAnchor = func(string) {
+				beforeWriteAnchor = func(string) {}
+				if err := os.Rename(filepath.Join(root, "a"), filepath.Join(root, "a-real")); err != nil {
+					t.Error(err)
+				}
+				if err := os.Symlink(outside, filepath.Join(root, "a")); err != nil {
+					t.Error(err)
+				}
+			}
+			t.Cleanup(func() { beforeWriteAnchor = func(string) {} })
+
+			var execErr error
+			for _, tool := range Tools() {
+				if tool.Name == tc.name {
+					_, execErr = tool.Execute(context.Background(), tc.args, deps)
+				}
+			}
+			if execErr == nil {
+				t.Fatal("expected the write to fail closed")
+			}
+			if entries, _ := os.ReadDir(filepath.Join(outside, "b")); len(entries) != 0 {
+				t.Fatalf("write escaped the sandbox: %v", entries)
+			}
+			if got, _ := os.ReadFile(filepath.Join(root, "a-real", "b", "c.txt")); string(got) != "before\n" {
+				t.Fatalf("original changed: %q", got)
+			}
+		})
+	}
+}
+
+type allowAllConfirmer struct{}
+
+func (allowAllConfirmer) Confirm(context.Context, string, string) (bool, error) { return true, nil }

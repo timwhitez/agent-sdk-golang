@@ -13,14 +13,25 @@ import (
 // File I/O Helpers
 // ============================================================================
 
-// writeFileTempFactory is a var for testing temp file creation.
-var writeFileTempFactory = func(dir, pattern string) (*os.File, error) {
-	return os.CreateTemp(dir, pattern)
-}
-
 // writeFileBytes is a var for testing write operations.
 var writeFileBytes = func(f *os.File, data []byte) (int, error) {
 	return f.Write(data)
+}
+
+// beforeWriteAnchor is a test hook that runs after the caller revalidated path
+// and before the destination directory is opened.
+var beforeWriteAnchor = func(path string) {}
+
+// atomicDir is the destination directory of an atomic write. On Linux it is
+// pinned by a directory fd opened component-by-component without following
+// symlinks, so a path component replaced after revalidation cannot redirect the
+// write; other platforms fall back to path-based checks (see sandbox_io_dir_other.go).
+type atomicDir interface {
+	lstat(name string) (os.FileInfo, error)
+	createTemp() (*os.File, string, error)
+	rename(tmpName, name string) error
+	remove(name string)
+	close()
 }
 
 // writeFilePreserveMode writes data to path while preserving the existing file
@@ -28,11 +39,20 @@ var writeFileBytes = func(f *os.File, data []byte) (int, error) {
 // with temp file and rename. Ownership of an existing file is preserved on a
 // best-effort basis: rename does not inherit the previous owner, so the temp
 // file is chowned back before the swap when the process is privileged enough.
+// path must already be symlink-resolved; a symlink on any component fails closed.
 func writeFilePreserveMode(path string, data []byte, defaultMode os.FileMode) error {
+	beforeWriteAnchor(path)
+	dir, name := filepath.Dir(path), filepath.Base(path)
+	ad, err := openAtomicDir(dir)
+	if err != nil {
+		return err
+	}
+	defer ad.close()
+
 	mode := defaultMode
 	preserveOwner := false
 	var ownerUID, ownerGID int
-	if info, err := os.Lstat(path); err == nil {
+	if info, err := ad.lstat(name); err == nil {
 		if info.Mode()&os.ModeSymlink != 0 {
 			return &SecurityError{Message: fmt.Sprintf("symlink target denied: %q", path)}
 		}
@@ -42,31 +62,13 @@ func writeFilePreserveMode(path string, data []byte, defaultMode os.FileMode) er
 		return err
 	}
 
-	dir := filepath.Dir(path)
-	if info, err := os.Lstat(dir); err == nil && info.Mode()&os.ModeSymlink != 0 {
-		return &SecurityError{Message: fmt.Sprintf("symlink target denied: %q", dir)}
-	} else if err != nil && !os.IsNotExist(err) {
-		return err
-	}
-	if err := mkdirAllInheritMode(dir); err != nil {
-		return err
-	}
-	if err := ensureWriteDirNoFollow(dir); err != nil {
-		return err
-	}
-
-	tmp, err := writeFileTempFactory(dir, ".tmp-*")
+	tmp, tmpName, err := ad.createTemp()
 	if err != nil {
 		return err
 	}
-	tmpName := tmp.Name()
 	cleanup := func() {
 		_ = tmp.Close()
-		_ = os.Remove(tmpName)
-	}
-	if err := ensureWriteDirNoFollow(dir); err != nil {
-		cleanup()
-		return err
+		ad.remove(tmpName)
 	}
 
 	n, err := writeFileBytes(tmp, data)
@@ -93,15 +95,11 @@ func writeFilePreserveMode(path string, data []byte, defaultMode os.FileMode) er
 		_ = tmp.Chown(ownerUID, ownerGID)
 	}
 	if err := tmp.Close(); err != nil {
-		_ = os.Remove(tmpName)
+		ad.remove(tmpName)
 		return err
 	}
-	if err := ensureWriteDirNoFollow(dir); err != nil {
-		_ = os.Remove(tmpName)
-		return err
-	}
-	if err := os.Rename(tmpName, path); err != nil {
-		_ = os.Remove(tmpName)
+	if err := ad.rename(tmpName, name); err != nil {
+		ad.remove(tmpName)
 		return err
 	}
 	return nil
