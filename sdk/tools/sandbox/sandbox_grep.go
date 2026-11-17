@@ -146,7 +146,8 @@ func grepTool() tools.Tool {
 		stopped := false
 		scanCap := grepScanBudget
 		scannedCandidates := 0
-		visitedFiles := 0
+		visitedEntries := 0
+		traversalStopped := false
 		skippedDirs := []string{}
 		recordPermissionDenied := func(path string) {
 			displayPath := resultPathForDisplay(s, path)
@@ -185,20 +186,26 @@ func grepTool() tools.Tool {
 					skippedDirs = append(skippedDirs, resultPathForDisplay(s, path))
 					return filepath.SkipDir
 				}
-				return nil
-			}
-			if stopped {
+				if pathsEqual(filepath.Clean(path), filepath.Clean(base)) {
+					return nil
+				}
+			} else if stopped {
 				return errGrepStop
 			}
-			matchPath := resultPathForMatch(s, base, path)
-			displayPath := resultPathForDisplay(s, path)
-			if visitedFiles >= grepTraversalBudget {
+			// Directories count too, so a tree of empty directories is bounded.
+			if visitedEntries >= grepTraversalBudget {
 				scanTruncated = true
 				stopped = true
+				traversalStopped = true
 				scanCap = grepTraversalBudget
 				return errGrepStop
 			}
-			visitedFiles++
+			visitedEntries++
+			if d.IsDir() {
+				return nil
+			}
+			matchPath := resultPathForMatch(s, base, path)
+			displayPath := resultPathForDisplay(s, path)
 			if globFilter != "" {
 				if !doublestar.MatchUnvalidated(globFilter, matchPath) {
 					return nil
@@ -348,8 +355,12 @@ func grepTool() tools.Tool {
 		scanWarning := grepScanWarning(scanFailures)
 		capWarning := ""
 		if scanTruncated {
+			scanned, unit := scannedCandidates, "file candidate(s)"
+			if traversalStopped {
+				scanned, unit = visitedEntries, "visited entries"
+			}
 			capWarning = formatWarningDiagnostic(
-				fmt.Sprintf("grep scan stopped after %d file candidate(s) at cap %d", scannedCandidates, scanCap),
+				fmt.Sprintf("grep scan stopped after %d %s at cap %d", scanned, unit, scanCap),
 				"Narrow the path/glob and rerun to inspect remaining matches.",
 			)
 		}
@@ -395,7 +406,7 @@ func grepTool() tools.Tool {
 		switch mode {
 		case "files_with_matches":
 			if len(files) == 0 {
-				return appendGrepWarning("No matches for: "+a.Pattern, warning, scanWarning, capWarning), nil
+				return appendGrepWarning("No matches for: "+a.Pattern, warning, scanWarning, capWarning, skippedDirsWarning("grep", skippedDirs)), nil
 			}
 			// unique + cap
 			uniq := []string{}

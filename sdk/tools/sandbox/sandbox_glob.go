@@ -218,13 +218,19 @@ func globTool() tools.Tool {
 					skippedDirs = append(skippedDirs, resultPathForDisplay(s, path))
 					return filepath.SkipDir
 				}
-				return nil
+				if pathsEqual(filepath.Clean(path), filepath.Clean(base)) {
+					return nil
+				}
 			}
+			// Directories count too, so a tree of empty directories is bounded.
 			if scannedCandidates >= maxGlobScanFiles {
 				scanTruncated = true
 				return errGlobScanCapReached
 			}
 			scannedCandidates++
+			if d.IsDir() {
+				return nil
+			}
 
 			rel, err := filepath.Rel(base, path)
 			if err != nil {

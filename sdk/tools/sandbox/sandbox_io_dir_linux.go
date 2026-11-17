@@ -21,49 +21,67 @@ type fdAtomicDir struct{ fd int }
 
 // openAtomicDir opens dir one component at a time with O_NOFOLLOW|O_DIRECTORY,
 // creating missing directories with the mode of their existing parent. Any
-// symlink (or non-directory) component fails closed.
+// symlink (or non-directory) component fails closed. Components are opened with
+// O_PATH so only search (x) permission is needed, as with a path-based open;
+// openat, mkdirat, renameat, unlinkat and fstat all accept O_PATH directory fds.
 func openAtomicDir(dir string) (atomicDir, error) {
 	dir = filepath.Clean(dir)
 	start := "."
 	if filepath.IsAbs(dir) {
 		start = string(filepath.Separator)
 	}
-	fd, err := syscall.Open(start, syscall.O_RDONLY|syscall.O_DIRECTORY|syscall.O_CLOEXEC, 0)
+	const flags = oPath | syscall.O_DIRECTORY | syscall.O_NOFOLLOW | syscall.O_CLOEXEC
+	fd, err := syscall.Open(start, flags, 0)
 	if err != nil {
 		return nil, &os.PathError{Op: "open", Path: start, Err: err}
 	}
-	const flags = syscall.O_RDONLY | syscall.O_DIRECTORY | syscall.O_NOFOLLOW | syscall.O_CLOEXEC
+	walked := start
 	for _, name := range strings.Split(dir, string(filepath.Separator)) {
 		if name == "" || name == "." {
 			continue
 		}
+		walked = filepath.Join(walked, name)
 		next, err := syscall.Openat(fd, name, flags, 0)
 		if err == syscall.ENOENT {
-			var st syscall.Stat_t
-			if err = syscall.Fstat(fd, &st); err == nil {
-				mode := uint32(st.Mode & 0o777)
-				if err = syscall.Mkdirat(fd, name, mode); err == nil || err == syscall.EEXIST {
-					if next, err = syscall.Openat(fd, name, flags, 0); err == nil {
-						// Chmod explicitly so the inherited bits survive the umask.
-						err = syscall.Fchmod(next, mode)
-					}
-				}
-			}
+			next, err = mkdirAtInherit(fd, name)
 		}
 		if err != nil {
-			if next >= 0 {
-				_ = syscall.Close(next)
-			}
 			_ = syscall.Close(fd)
 			if err == syscall.ELOOP || err == syscall.ENOTDIR {
-				return nil, &SecurityError{Message: fmt.Sprintf("symlink or non-directory path component denied: %q in %q", name, dir)}
+				return nil, &SecurityError{Message: fmt.Sprintf("symlink or non-directory path component denied: %q", walked)}
 			}
-			return nil, &os.PathError{Op: "open", Path: dir, Err: err}
+			return nil, &os.PathError{Op: "open", Path: walked, Err: err}
 		}
 		_ = syscall.Close(fd)
 		fd = next
 	}
 	return fdAtomicDir{fd}, nil
+}
+
+// mkdirAtInherit creates name under parent with the parent's permission bits
+// and returns an O_PATH fd for it.
+func mkdirAtInherit(parent int, name string) (int, error) {
+	var st syscall.Stat_t
+	if err := syscall.Fstat(parent, &st); err != nil {
+		return -1, err
+	}
+	mode := uint32(st.Mode & 0o777)
+	if err := syscall.Mkdirat(parent, name, mode); err != nil && err != syscall.EEXIST {
+		return -1, err
+	}
+	// Chmod explicitly so the inherited bits survive the umask. O_PATH fds cannot
+	// be chmod'ed, so use a short-lived read fd; if the new directory is not
+	// readable by us the umask-reduced mode stays.
+	if rfd, err := syscall.Openat(parent, name, syscall.O_RDONLY|syscall.O_DIRECTORY|syscall.O_NOFOLLOW|syscall.O_CLOEXEC, 0); err == nil {
+		err = syscall.Fchmod(rfd, mode)
+		_ = syscall.Close(rfd)
+		if err != nil {
+			return -1, err
+		}
+	} else if err != syscall.EACCES {
+		return -1, err
+	}
+	return syscall.Openat(parent, name, oPath|syscall.O_DIRECTORY|syscall.O_NOFOLLOW|syscall.O_CLOEXEC, 0)
 }
 
 func (d fdAtomicDir) lstat(name string) (os.FileInfo, error) {
