@@ -3832,26 +3832,3 @@ func TestApplyPatchPreservesConsistentCRLF(t *testing.T) {
 		t.Fatalf("content = %q, want %q", string(got), want)
 	}
 }
-
-func TestConsistentLineEndingRejectsMixedInput(t *testing.T) {
-	t.Parallel()
-	tests := []struct {
-		name    string
-		content string
-		want    string
-	}{
-		{name: "crlf", content: "a\r\nb\r\n", want: "\r\n"},
-		{name: "lf", content: "a\nb\n", want: "\n"},
-		{name: "mixed", content: "a\r\nb\n", want: "\n"},
-		{name: "bare cr", content: "a\rb\r", want: "\n"},
-	}
-	for _, tt := range tests {
-		tt := tt
-		t.Run(tt.name, func(t *testing.T) {
-			t.Parallel()
-			if got := consistentLineEnding(tt.content); got != tt.want {
-				t.Fatalf("consistentLineEnding(%q) = %q, want %q", tt.content, got, tt.want)
-			}
-		})
-	}
-}

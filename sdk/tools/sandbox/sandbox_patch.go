@@ -105,6 +105,9 @@ type patchHunk struct {
 	newLen         int
 	hasLineNumbers bool
 	endOfFile      bool
+	// scopes are Codex-style "@@ <scope>" anchors; each is located on a whole
+	// line after the previous one before the hunk context is matched.
+	scopes []string
 }
 
 // parsePatchOpsForPreview parses patch operations for preview during confirmation.
@@ -253,10 +256,28 @@ func parsePatchOps(lines []string) ([]patchOp, error) {
 				}
 				if strings.HasPrefix(lt, "@@") {
 					oldStart, oldLen, newStart, newLen, ok := parseHunkHeader(lt)
-					if !ok && lt != "@@" {
-						return nil, fmt.Errorf("invalid hunk header in update %q: %q", p, l)
+					scopes := []string{}
+					for !ok && lt != "@@" {
+						scope, isScope := parseScopeHeader(l)
+						if !isScope {
+							return nil, fmt.Errorf("invalid hunk header in update %q: %q", p, l)
+						}
+						scopes = append(scopes, scope)
+						i++
+						// Consecutive scope headers locate nested scopes in order.
+						if i < len(lines) {
+							if next := strings.TrimSpace(lines[i]); strings.HasPrefix(next, "@@ ") {
+								if _, _, _, _, nextOK := parseHunkHeader(next); !nextOK {
+									l, lt = lines[i], next
+									continue
+								}
+							}
+						}
+						break
 					}
-					i++
+					if len(scopes) == 0 {
+						i++
+					}
 					h := []string{}
 					endOfFile := false
 					for i < len(lines) {
@@ -292,6 +313,7 @@ func parsePatchOps(lines []string) ([]patchOp, error) {
 						newLen:         newLen,
 						hasLineNumbers: ok,
 						endOfFile:      endOfFile,
+						scopes:         scopes,
 					})
 					continue
 				}
@@ -309,6 +331,19 @@ func parsePatchOps(lines []string) ([]patchOp, error) {
 		return nil, fmt.Errorf("patch contains no operations; include at least one *** Add File, *** Update File, or *** Delete File section")
 	}
 	return ops, nil
+}
+
+// parseScopeHeader extracts the scope text of a Codex "@@ <scope>" header.
+// Text that starts like a unified-diff range ("-1,2") stays an invalid header.
+func parseScopeHeader(line string) (string, bool) {
+	scope := strings.TrimSpace(strings.TrimPrefix(strings.TrimSpace(line), "@@"))
+	if scope == "" || !strings.HasPrefix(strings.TrimSpace(line), "@@ ") {
+		return "", false
+	}
+	if _, _, ok := parseHunkRange(strings.Fields(scope)[0], '-'); ok {
+		return "", false
+	}
+	return scope, true
 }
 
 // parseHunkHeader parses a unified diff hunk header (@@ -old,old +new,new @@).
@@ -787,26 +822,84 @@ func applyUpdateFile(s *Sandbox, relPath string, hunks []patchHunk) error {
 	return p.commit()
 }
 
+// splitLinesWithEnds splits raw into line bodies and their original terminators
+// ("\r\n", "\n", "\r", or "" for an unterminated last line).
+func splitLinesWithEnds(raw string) (lines, ends []string) {
+	for len(raw) > 0 {
+		n := strings.IndexAny(raw, "\r\n")
+		if n < 0 {
+			lines, ends = append(lines, raw), append(ends, "")
+			break
+		}
+		end := raw[n : n+1]
+		if end == "\r" && n+1 < len(raw) && raw[n+1] == '\n' {
+			end = "\r\n"
+		}
+		lines, ends = append(lines, raw[:n]), append(ends, end)
+		raw = raw[n+len(end):]
+	}
+	return lines, ends
+}
+
+// dominantLineEnding returns the most common terminator, preferring "\n" on ties.
+func dominantLineEnding(ends []string) string {
+	counts := map[string]int{}
+	best := "\n"
+	for _, e := range ends {
+		if e == "" {
+			continue
+		}
+		counts[e]++
+		if counts[e] > counts[best] {
+			best = e
+		}
+	}
+	return best
+}
+
+// findScopeLine returns the first line index >= from that equals scope, trying
+// exact, then right-trimmed, then fully trimmed comparison.
+func findScopeLine(lines []string, from int, scope string) int {
+	for _, norm := range []func(string) string{
+		func(x string) string { return x },
+		func(x string) string { return strings.TrimRight(x, " \t") },
+		strings.TrimSpace,
+	} {
+		want := norm(scope)
+		for i := from; i < len(lines); i++ {
+			if norm(lines[i]) == want {
+				return i
+			}
+		}
+	}
+	return -1
+}
+
 // applyHunksToContent applies hunks to file content in memory and returns the
-// resulting content without touching the filesystem.
+// resulting content without touching the filesystem. Unmodified lines keep
+// their original terminators; added lines borrow the neighbouring terminator.
 func applyHunksToContent(relPath string, raw string, hunks []patchHunk) (string, error) {
-	lineEnding := consistentLineEnding(raw)
-	content := strings.ReplaceAll(raw, "\r\n", "\n")
-	content = strings.ReplaceAll(content, "\r", "\n")
-	hasTrailingNewline := strings.HasSuffix(content, "\n")
-	if hasTrailingNewline {
-		content = strings.TrimSuffix(content, "\n")
-	}
-	lines := []string{}
-	if content != "" {
-		lines = strings.Split(content, "\n")
-	}
+	lines, ends := splitLinesWithEnds(raw)
+	fallback := dominantLineEnding(ends)
+	hasTrailingNewline := len(ends) > 0 && ends[len(ends)-1] != ""
 	offset := 0
+	cursor := 0
 	for hunkIdx, h := range hunks {
 		hunkNumber := hunkIdx + 1
 		oldLines, newLines := hunkLines(h)
 		if len(oldLines) == 0 && !h.hasLineNumbers {
 			return "", fmt.Errorf("hunk %d failed to apply to %s (no context)", hunkNumber, relPath)
+		}
+		searchFrom := 0
+		if len(h.scopes) > 0 {
+			searchFrom = cursor
+			for _, scope := range h.scopes {
+				idx := findScopeLine(lines, searchFrom, scope)
+				if idx < 0 {
+					return "", fmt.Errorf("hunk %d failed to apply to %s (scope %q not found)", hunkNumber, relPath, scope)
+				}
+				searchFrom = idx + 1
+			}
 		}
 		matchIdx := -1
 		if h.hasLineNumbers {
@@ -829,7 +922,7 @@ func applyHunksToContent(relPath string, raw string, hunks []patchHunk) (string,
 			matchIdx = -1
 		}
 		if matchIdx == -1 {
-			matches := findHunkMatches(lines, oldLines)
+			matches := findHunkMatches(lines, oldLines, searchFrom)
 			if h.endOfFile {
 				matches = nil
 				end := len(lines) - len(oldLines)
@@ -855,34 +948,29 @@ func applyHunksToContent(relPath string, raw string, hunks []patchHunk) (string,
 					return "", fmt.Errorf("hunk %d failed to apply to %s (closest context match is %d lines away from declared line %d - max %d; re-read the file and rebuild the hunk)", hunkNumber, relPath, dist, h.oldStart, maxHunkLineDrift)
 				}
 				matchIdx = best
-			} else if len(matches) == 1 {
+			} else if len(matches) == 1 || len(h.scopes) > 0 {
+				// A scope anchors the hunk: take the first context match after it.
 				matchIdx = matches[0]
 			} else {
 				return "", fmt.Errorf("hunk %d failed to apply to %s (context is ambiguous)", hunkNumber, relPath)
 			}
 		}
-		lines = applyHunk(lines, matchIdx, oldLines, newLines)
+		lines, ends = applyHunk(lines, ends, matchIdx, h, fallback)
 		offset += len(newLines) - len(oldLines)
+		cursor = matchIdx + len(newLines)
 	}
-	out := strings.Join(lines, "\n")
-	if hasTrailingNewline {
-		out += "\n"
+	var out strings.Builder
+	for i, line := range lines {
+		out.WriteString(line)
+		switch {
+		case i < len(lines)-1 && ends[i] == "":
+			out.WriteString(fallback)
+		case i == len(lines)-1 && !hasTrailingNewline:
+		default:
+			out.WriteString(ends[i])
+		}
 	}
-	if lineEnding == "\r\n" {
-		out = strings.ReplaceAll(out, "\n", "\r\n")
-	}
-	return out, nil
-}
-
-func consistentLineEnding(content string) string {
-	if !strings.Contains(content, "\r\n") {
-		return "\n"
-	}
-	withoutCRLF := strings.ReplaceAll(content, "\r\n", "")
-	if strings.ContainsAny(withoutCRLF, "\r\n") {
-		return "\n"
-	}
-	return "\r\n"
+	return out.String(), nil
 }
 
 // hunkLines splits a hunk into old (removed/context) and new (added/context) lines.
@@ -921,13 +1009,13 @@ func linesMatch(lines []string, start int, oldLines []string) bool {
 	return true
 }
 
-// findHunkMatches finds all positions where oldLines match in lines.
-func findHunkMatches(lines []string, oldLines []string) []int {
+// findHunkMatches finds all positions >= from where oldLines match in lines.
+func findHunkMatches(lines []string, oldLines []string, from int) []int {
 	if len(oldLines) == 0 {
 		return nil
 	}
 	matches := []int{}
-	for i := 0; i+len(oldLines) <= len(lines); i++ {
+	for i := from; i+len(oldLines) <= len(lines); i++ {
 		if linesMatch(lines, i, oldLines) {
 			matches = append(matches, i)
 		}
@@ -959,11 +1047,39 @@ func nearestHunkMatch(matches []int, expected int) (int, int, bool) {
 	return best, bestDist, ambiguous
 }
 
-// applyHunk applies a single hunk to lines at position start.
-func applyHunk(lines []string, start int, oldLines []string, newLines []string) []string {
-	out := make([]string, 0, len(lines)-len(oldLines)+len(newLines))
-	out = append(out, lines[:start]...)
-	out = append(out, newLines...)
-	out = append(out, lines[start+len(oldLines):]...)
-	return out
+// applyHunk applies a single hunk to lines at position start. Context lines keep
+// their terminator; an added line takes the terminator of the last original line
+// the hunk consumed (or the line before the hunk, then the file's dominant one).
+func applyHunk(lines, ends []string, start int, h patchHunk, fallback string) ([]string, []string) {
+	outLines := append([]string(nil), lines[:start]...)
+	outEnds := append([]string(nil), ends[:start]...)
+	adjacent := fallback
+	switch {
+	case start > 0 && ends[start-1] != "":
+		adjacent = ends[start-1]
+	case start < len(ends) && ends[start] != "":
+		adjacent = ends[start]
+	}
+	pos := start
+	for _, l := range h.lines {
+		if l == "" {
+			continue
+		}
+		switch l[0] {
+		case ' ':
+			outLines, outEnds = append(outLines, lines[pos]), append(outEnds, ends[pos])
+			if ends[pos] != "" {
+				adjacent = ends[pos]
+			}
+			pos++
+		case '-':
+			if ends[pos] != "" {
+				adjacent = ends[pos]
+			}
+			pos++
+		case '+':
+			outLines, outEnds = append(outLines, l[1:]), append(outEnds, adjacent)
+		}
+	}
+	return append(outLines, lines[pos:]...), append(outEnds, ends[pos:]...)
 }
