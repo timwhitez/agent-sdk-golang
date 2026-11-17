@@ -23,6 +23,10 @@ const (
 	// after SIGKILL. Processes that escaped the group (setsid/daemons) can keep
 	// inherited output descriptors open indefinitely, so waiting is best-effort.
 	DefaultKillWaitGrace = 5 * time.Second
+	// DefaultPipeDrainGrace bounds how long Run keeps reading the output pipes
+	// after the foreground process has exited. A background child that inherited
+	// stdout/stderr must not turn a finished command into a timeout.
+	DefaultPipeDrainGrace = 2 * time.Second
 	// invalidUTF8PreviewReplacement marks bytes that cannot be decoded in the
 	// bounded preview. The byte-exact artifact is unaffected.
 	invalidUTF8PreviewReplacement = "�"
@@ -52,7 +56,10 @@ type Options struct {
 	// KillWaitGrace bounds the post-SIGKILL wait for the process to be reaped.
 	// Defaults to DefaultKillWaitGrace.
 	KillWaitGrace time.Duration
-	OnOutputChunk func(OutputChunk)
+	// PipeDrainGrace bounds the wait for output pipes to reach EOF once the
+	// process has exited (exec.Cmd.WaitDelay). Defaults to DefaultPipeDrainGrace.
+	PipeDrainGrace time.Duration
+	OnOutputChunk  func(OutputChunk)
 }
 
 // Result captures execution outcome and output accounting.
@@ -65,10 +72,15 @@ type Result struct {
 	// KillProcessTimedOut reports that the process group was killed but the
 	// process was not reaped within KillWaitGrace, so Run abandoned the wait.
 	KillProcessTimedOut bool
-	OutputTruncated     bool
-	OutputPath          string
-	ArtifactBytes       int64
-	OutputArtifactErr   string
+	// PipeDrainTimedOut reports that the process exited but a surviving
+	// descendant still held stdout/stderr, so the pipes were closed after
+	// PipeDrainGrace. Later output was not captured and the streams are not
+	// committed as complete.
+	PipeDrainTimedOut bool
+	OutputTruncated   bool
+	OutputPath        string
+	ArtifactBytes     int64
+	OutputArtifactErr string
 	// OutputArtifacts contains only complete, validated canonical raw-stream
 	// manifests. Failed streams are represented in OutputArtifactDiagnostics.
 	OutputArtifacts           []artifact.Manifest
@@ -107,6 +119,9 @@ func run(ctx context.Context, opts Options, withTimeout func(context.Context, ti
 	if opts.KillWaitGrace <= 0 {
 		opts.KillWaitGrace = DefaultKillWaitGrace
 	}
+	if opts.PipeDrainGrace <= 0 {
+		opts.PipeDrainGrace = DefaultPipeDrainGrace
+	}
 	if err := ctx.Err(); err != nil {
 		res.TimedOut = errors.Is(err, context.DeadlineExceeded)
 		return res, err
@@ -128,6 +143,7 @@ func run(ctx context.Context, opts Options, withTimeout func(context.Context, ti
 	if len(opts.Env) > 0 {
 		cmd.Env = append([]string(nil), opts.Env...)
 	}
+	cmd.WaitDelay = opts.PipeDrainGrace
 	configureProcessGroup(cmd)
 
 	collector := newOutputCollector(opts.MaxOutputBytes, opts.ArtifactDir, opts.ArtifactPrefix, opts.OnOutputChunk)
@@ -232,8 +248,11 @@ func run(ctx context.Context, opts Options, withTimeout func(context.Context, ti
 	} else {
 		collector.Close()
 	}
+	pipeDrainTimedOut := errors.Is(rawWaitErr, exec.ErrWaitDelay)
 	if killWaitTimedOut {
 		canonical.abortIncomplete(context.WithoutCancel(ctx), fmt.Errorf("process wait exceeded %s after tree kill; output streams have not reached EOF", opts.KillWaitGrace))
+	} else if pipeDrainTimedOut {
+		canonical.abortIncomplete(context.WithoutCancel(ctx), fmt.Errorf("output streams did not reach EOF within %s after the process exited", opts.PipeDrainGrace))
 	} else {
 		canonical.finish(context.WithoutCancel(ctx))
 	}
@@ -258,6 +277,16 @@ func run(ctx context.Context, opts Options, withTimeout func(context.Context, ti
 		}
 	}
 	res.ExitCode = exitCodeFromError(rawWaitErr)
+	if pipeDrainTimedOut {
+		// Wait returns ErrWaitDelay only when the process itself succeeded or was
+		// killed; the real status is on ProcessState. Not a failure of the command.
+		res.PipeDrainTimedOut = true
+		res.ExitCode = cmd.ProcessState.ExitCode()
+		if !res.TimedOut {
+			waitErr = nil
+		}
+		res.Output = strings.TrimRight(res.Output, "\n") + "\n[a background process still holds stdout; output after exit was not captured]"
+	}
 	if killWaitTimedOut {
 		// cmd.Wait never returned, so rawWaitErr is nil and must not be read as
 		// a clean exit.
