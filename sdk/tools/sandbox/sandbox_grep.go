@@ -36,6 +36,13 @@ const (
 	grepResultsDefault  = 50
 )
 
+// Scan budgets are independent of max_results: the traversal budget counts every
+// visited file, the content budget only files opened after the glob filter.
+var (
+	grepTraversalBudget = 100_000
+	grepScanBudget      = 20_000
+)
+
 func validateGrepNumericArgs(args grepArgs) error {
 	for name, value := range map[string]int{
 		"before":  args.Before,
@@ -137,8 +144,10 @@ func grepTool() tools.Tool {
 		scanFailures := []string{}
 		scanFailureSeen := map[string]struct{}{}
 		stopped := false
-		scanCap := maxOut
+		scanCap := grepScanBudget
 		scannedCandidates := 0
+		visitedFiles := 0
+		skippedDirs := []string{}
 		recordPermissionDenied := func(path string) {
 			displayPath := resultPathForDisplay(s, path)
 			if _, ok := permissionDeniedSeen[displayPath]; ok {
@@ -172,10 +181,28 @@ func grepTool() tools.Tool {
 				return nil
 			}
 			if d.IsDir() {
+				if skippedSearchDirs[d.Name()] && !pathsEqual(filepath.Clean(path), filepath.Clean(base)) {
+					skippedDirs = append(skippedDirs, resultPathForDisplay(s, path))
+					return filepath.SkipDir
+				}
 				return nil
 			}
 			if stopped {
 				return errGrepStop
+			}
+			matchPath := resultPathForMatch(s, base, path)
+			displayPath := resultPathForDisplay(s, path)
+			if visitedFiles >= grepTraversalBudget {
+				scanTruncated = true
+				stopped = true
+				scanCap = grepTraversalBudget
+				return errGrepStop
+			}
+			visitedFiles++
+			if globFilter != "" {
+				if !doublestar.MatchUnvalidated(globFilter, matchPath) {
+					return nil
+				}
 			}
 			if scannedCandidates >= scanCap {
 				scanTruncated = true
@@ -183,14 +210,6 @@ func grepTool() tools.Tool {
 				return errGrepStop
 			}
 			scannedCandidates++
-			// filter file path
-			matchPath := resultPathForMatch(s, base, path)
-			displayPath := resultPathForDisplay(s, path)
-			if globFilter != "" {
-				if !doublestar.MatchUnvalidated(globFilter, matchPath) {
-					return nil
-				}
-			}
 
 			f, err := grepOpenFile(path)
 			if err != nil {
@@ -298,7 +317,8 @@ func grepTool() tools.Tool {
 			if mode == "count" {
 				if matchCount > 0 {
 					counts[displayPath] += matchCount
-					if len(counts) >= scanCap {
+					if len(counts) >= maxOut {
+						scanCap = maxOut
 						scanTruncated = true
 						stopped = true
 						return errGrepStop
@@ -310,7 +330,8 @@ func grepTool() tools.Tool {
 				return errGrepStop
 			}
 			if fileMatched && mode == "files_with_matches" {
-				if len(files) >= scanCap {
+				if len(files) >= maxOut {
+					scanCap = maxOut
 					scanTruncated = true
 					stopped = true
 					return errGrepStop
@@ -355,6 +376,9 @@ func grepTool() tools.Tool {
 			}
 			tools.UpsertToolResultMetadata(ctx, meta)
 		}
+		if len(skippedDirs) > 0 {
+			tools.UpsertToolResultMetadata(ctx, map[string]any{"skipped_dirs": len(skippedDirs), "skipped_dir_samples": sampleWarningValues(skippedDirs, 5)})
+		}
 		if scanTruncated {
 			meta := map[string]any{
 				"scan_truncated":     true,
@@ -389,7 +413,7 @@ func grepTool() tools.Tool {
 			return appendGrepWarning(strings.Join(uniq, "\n"), warning, scanWarning, capWarning), nil
 		case "count":
 			if len(counts) == 0 {
-				return appendGrepWarning("No matches for: "+a.Pattern, warning, scanWarning, capWarning), nil
+				return appendGrepWarning("No matches for: "+a.Pattern, warning, scanWarning, capWarning, skippedDirsWarning("grep", skippedDirs)), nil
 			}
 			lines := []string{}
 			keys := make([]string, 0, len(counts))
@@ -406,7 +430,7 @@ func grepTool() tools.Tool {
 			return appendGrepWarning(strings.Join(lines, "\n"), warning, scanWarning, capWarning), nil
 		default:
 			if len(results) == 0 {
-				return appendGrepWarning("No matches for: "+a.Pattern, warning, scanWarning, capWarning), nil
+				return appendGrepWarning("No matches for: "+a.Pattern, warning, scanWarning, capWarning, skippedDirsWarning("grep", skippedDirs)), nil
 			}
 			return appendGrepWarning(strings.Join(results, "\n"), warning, scanWarning, capWarning), nil
 		}

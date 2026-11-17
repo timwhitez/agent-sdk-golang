@@ -2858,6 +2858,8 @@ func TestGlobToolTruncationIncludesWarning(t *testing.T) {
 }
 
 func TestGlobTool_StopsAccumulatingAfterScanCapWithActionableWarning(t *testing.T) {
+	defer func(old int) { maxGlobScanFiles = old }(maxGlobScanFiles)
+	maxGlobScanFiles = 200
 	root := t.TempDir()
 	s, err := New(root)
 	if err != nil {
@@ -2916,6 +2918,8 @@ func TestGlobTool_StopsAccumulatingAfterScanCapWithActionableWarning(t *testing.
 }
 
 func TestGlobTool_ScanCapStopsTraversalOnSparseOrNoMatchesWithActionableWarning(t *testing.T) {
+	defer func(old int) { maxGlobScanFiles = old }(maxGlobScanFiles)
+	maxGlobScanFiles = 200
 	root := t.TempDir()
 	s, err := New(root)
 	if err != nil {
@@ -3438,6 +3442,8 @@ func TestGrepTool_StopsAccumulatingAfterScanCapWithActionableWarning(t *testing.
 }
 
 func TestGrepTool_ScanCapStopsTraversalOnSparseOrNoMatchesWithActionableWarning(t *testing.T) {
+	defer func(old int) { grepScanBudget = old }(grepScanBudget)
+	grepScanBudget = 5
 	root := t.TempDir()
 	s, err := New(root)
 	if err != nil {
