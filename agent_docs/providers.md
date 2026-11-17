@@ -277,8 +277,10 @@ stream normalization, and response metadata behavior.
   provider error arrives first, the agent can retry without leaking failed
   attempt metadata or requiring the user to send a manual continuation.
 - Response-level provider metadata is captured into `Completion.ResponseID` and surfaced to downstream consumers via `UsageEvent` / `AutoContinueEvent` / `FinalResponseEvent` (`sdk/agent/agent.go:255`, `sdk/agent/agent.go:285`, `sdk/agent/agent.go:348`, `sdk/agent/events.go:83`)
-- `StreamRetryEvent` is non-terminal retry progress; the agent converts it to
-  `WarnEvent{Kind:"rate_limit_retry"}` and continues consuming the same stream.
+- `StreamRetryEvent` is non-terminal retry progress; the agent converts status
+  `429` to `WarnEvent{Kind:"rate_limit_retry"}` and other statuses to
+  `WarnEvent{Kind:"provider_retry"}`, attaching the status and retry metadata,
+  then continues consuming the same stream.
 - Completion diagnostics are emitted as `WarnEvent`s. Diagnostics without an
   explicit kind use `provider_diagnostic`, while compatibility downgrades keep
   their provider-specific kind for downstream UIs and protocol adapters.

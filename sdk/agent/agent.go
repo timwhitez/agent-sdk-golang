@@ -2615,9 +2615,15 @@ func (a *Agent) invokeModelCompletionWithSteering(ctx context.Context, model llm
 				}
 				providerState = candidate
 			case llm.StreamRetryEvent:
+				kind := "provider_retry"
+				fallback := "provider request failed transiently"
+				if e.StatusCode == 429 {
+					kind = "rate_limit_retry"
+					fallback = "provider request was rate limited"
+				}
 				msg := strings.TrimSpace(e.Message)
 				if msg == "" {
-					msg = "provider request was rate limited"
+					msg = fallback
 				}
 				if e.Attempt > 0 && e.MaxRetries > 0 {
 					msg = fmt.Sprintf("%s; retry %d/%d", msg, e.Attempt, e.MaxRetries)
@@ -2625,7 +2631,17 @@ func (a *Agent) invokeModelCompletionWithSteering(ctx context.Context, model llm
 				if e.RetryAfter > 0 {
 					msg = fmt.Sprintf("%s in %s", msg, e.RetryAfter.Round(time.Second))
 				}
-				a.emitEvent(out, WarnEvent{Kind: "rate_limit_retry", Message: msg}, correlation)
+				a.emitEvent(out, WarnEvent{
+					Kind:    kind,
+					Message: msg,
+					Metadata: map[string]any{
+						"status_code":    e.StatusCode,
+						"provider":       e.Provider,
+						"attempt":        e.Attempt,
+						"max_retries":    e.MaxRetries,
+						"retry_after_ms": e.RetryAfter.Milliseconds(),
+					},
+				}, correlation)
 			case llm.StreamErrorEvent:
 				return e.AsError()
 			case llm.StreamDoneEvent:
