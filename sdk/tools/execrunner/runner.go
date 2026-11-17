@@ -221,15 +221,26 @@ func run(ctx context.Context, opts Options, withTimeout func(context.Context, ti
 			st.pump()
 		}()
 	}
-	// exited closes when the process is reaped; waitCh when, in addition, both
-	// streams reached EOF (or were force-closed).
+	// waitCh closes once the process is reaped and both streams reached EOF. After
+	// the process exits, a descendant may still hold the pipes: the streams then
+	// get PipeDrainGrace (not counting time inside a slow consumer Write) before
+	// the readers are closed. A cancelled or timed-out run skips that cut-off so
+	// the timeout path below keeps waiting for EOF bounded by KillWaitGrace.
 	var cmdWaitErr error
-	exited := make(chan struct{})
+	var drainForced atomic.Bool
 	waitCh := make(chan struct{})
+	pumpsDone := make(chan struct{})
+	go func() {
+		pumps.Wait()
+		close(pumpsDone)
+	}()
 	go func() {
 		cmdWaitErr = cmd.Wait()
-		close(exited)
-		pumps.Wait()
+		if !waitForPumpsDrain(streams, pumpsDone, runCtx.Done(), opts.PipeDrainGrace) {
+			drainForced.Store(true)
+			closePumpFiles()
+		}
+		<-pumpsDone
 		close(waitCh)
 	}()
 
@@ -238,14 +249,8 @@ func run(ctx context.Context, opts Options, withTimeout func(context.Context, ti
 	killWaitTimedOut := false
 	pipeDrainTimedOut := false
 	select {
-	case <-exited:
-		// The foreground process is gone. A descendant may still hold the output
-		// pipes; give the streams PipeDrainGrace to reach EOF, then stop reading.
-		if !waitForPumpsIdle(streams, waitCh, opts.PipeDrainGrace) {
-			pipeDrainTimedOut = true
-			closePumpFiles()
-			<-waitCh
-		}
+	case <-waitCh:
+		pipeDrainTimedOut = drainForced.Load()
 		rawWaitErr = cmdWaitErr
 		waitErr = rawWaitErr
 	case <-runCtx.Done():
@@ -572,38 +577,37 @@ func truncateAtRuneBoundary(text string, maxBytes int) string {
 type outputPump struct {
 	writer io.Writer
 	r, w   *os.File
-	// readStart is the UnixNano time the pump entered a blocking Read, or 0 while
-	// it is inside writer.Write. done is set once the pump has returned.
-	readStart atomic.Int64
-	done      atomic.Bool
+	// writeStart is the UnixNano time the pump entered writer.Write, or 0 while
+	// it is not inside the consumer.
+	writeStart atomic.Int64
 }
 
 const pipeDrainTick = 10 * time.Millisecond
 
-// waitForPumpsIdle waits until waitCh closes (all streams reached EOF) and
-// returns true, or returns false once the pumps have spent grace in total
-// blocked in Read with nothing arriving. Time a pump spends inside a slow
-// writer.Write does not count, so output the process already wrote is never
-// dropped because the consumer is slow.
-func waitForPumpsIdle(streams []*outputPump, waitCh <-chan struct{}, grace time.Duration) bool {
+// waitForPumpsDrain is called once the process has exited. It returns true if
+// the streams were not cut off: pumpsDone closed, or stop fired. It returns
+// false when grace of wall time has passed since the exit, not counting time
+// any pump spent inside writer.Write: a slow consumer must not lose output the
+// process already wrote, but a descendant that keeps writing (or holds the pipe
+// silently) cannot extend the wait.
+func waitForPumpsDrain(streams []*outputPump, pumpsDone, stop <-chan struct{}, grace time.Duration) bool {
 	ticker := time.NewTicker(pipeDrainTick)
 	defer ticker.Stop()
 	last := time.Now()
-	var idle time.Duration
-	for idle < grace {
+	var spent time.Duration
+	for spent < grace {
 		select {
-		case <-waitCh:
+		case <-pumpsDone:
+			return true
+		case <-stop:
 			return true
 		case now := <-ticker.C:
-			allIdle := true
+			inWrite := false
 			for _, st := range streams {
-				// A Read that has just started may be about to return buffered data.
-				if rs := st.readStart.Load(); !st.done.Load() && (rs == 0 || now.UnixNano()-rs < int64(pipeDrainTick)) {
-					allIdle = false
-				}
+				inWrite = inWrite || st.writeStart.Load() != 0
 			}
-			if allIdle {
-				idle += now.Sub(last)
+			if !inWrite {
+				spent += now.Sub(last)
 			}
 			last = now
 		}
@@ -630,14 +634,14 @@ func (p *outputPump) closeFiles() {
 }
 
 func (p *outputPump) pump() {
-	defer p.done.Store(true)
 	buf := make([]byte, 32*1024)
 	for {
-		p.readStart.Store(time.Now().UnixNano())
 		n, err := p.r.Read(buf)
-		p.readStart.Store(0)
 		if n > 0 {
-			if _, werr := p.writer.Write(buf[:n]); werr != nil {
+			p.writeStart.Store(time.Now().UnixNano())
+			_, werr := p.writer.Write(buf[:n])
+			p.writeStart.Store(0)
+			if werr != nil {
 				return
 			}
 		}

@@ -7,7 +7,10 @@ import (
 	"errors"
 	"os"
 	"os/exec"
+	"path/filepath"
+	"strconv"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 )
@@ -131,5 +134,49 @@ func TestRunClosesPipesWhenContextEndsBeforeStart(t *testing.T) {
 	}
 	if after := count(); after > before {
 		t.Fatalf("leaked %d fds across cancelled starts", after-before)
+	}
+}
+
+// startYesScript backgrounds a continuous writer and exits at once. The
+// background PID is recorded so the test can kill the stray process.
+func startYesScript(t *testing.T) []string {
+	t.Helper()
+	pidFile := filepath.Join(t.TempDir(), "pid")
+	t.Cleanup(func() {
+		if b, err := os.ReadFile(pidFile); err == nil {
+			if pid, err := strconv.Atoi(strings.TrimSpace(string(b))); err == nil {
+				_ = syscall.Kill(pid, syscall.SIGKILL)
+			}
+		}
+	})
+	return []string{"-c", `yes & echo $! > "$0"; exit 0`, pidFile}
+}
+
+// A background writer must not extend the post-exit drain beyond PipeDrainGrace.
+func TestRunContinuousBackgroundWriterIsBoundedByPipeDrainGrace(t *testing.T) {
+	start := time.Now()
+	res, err := Run(context.Background(), Options{Program: "sh", Args: startYesScript(t), PipeDrainGrace: 300 * time.Millisecond})
+	if err != nil || res.ExitCode != 0 || res.TimedOut || !res.PipeDrainTimedOut {
+		t.Fatalf("Run() err=%v exit=%d timed_out=%v drain=%v", err, res.ExitCode, res.TimedOut, res.PipeDrainTimedOut)
+	}
+	if elapsed := time.Since(start); elapsed > 3*time.Second {
+		t.Fatalf("Run waited %s for a continuous background writer", elapsed)
+	}
+}
+
+// Timeout and caller cancellation still end a drain wait with the usual
+// timeout/cancel semantics.
+func TestRunTimeoutAndCancelEndDrainWithChattyBackgroundWriter(t *testing.T) {
+	start := time.Now()
+	res, err := Run(context.Background(), Options{Program: "sh", Args: startYesScript(t), Timeout: time.Second, PipeDrainGrace: time.Minute})
+	if err == nil || !res.TimedOut || time.Since(start) > 4*time.Second {
+		t.Fatalf("timeout: err=%v timed_out=%v after %s", err, res.TimedOut, time.Since(start))
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	time.AfterFunc(200*time.Millisecond, cancel)
+	start = time.Now()
+	res, err = Run(ctx, Options{Program: "sh", Args: startYesScript(t), PipeDrainGrace: time.Minute})
+	if err == nil || res.TimedOut || time.Since(start) > 4*time.Second {
+		t.Fatalf("cancel: err=%v timed_out=%v after %s", err, res.TimedOut, time.Since(start))
 	}
 }
