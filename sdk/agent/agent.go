@@ -3943,7 +3943,7 @@ func (a *Agent) runCompactionAsync(ctx context.Context, sourceFrameID string, sn
 	a.clearSatisfiedCompactionWork(decision)
 	if !res.Compacted {
 		// A summary rejected for not shrinking the history is ineffective too.
-		if decision.recordsOutcome() && decision.allowSummary {
+		if decision.recordsOutcome() {
 			a.noteSummaryEffect(decision.inputEpoch, res)
 		}
 		return
@@ -4213,22 +4213,23 @@ func (a *Agent) automaticSummarySuppressed(epoch uint64, usage *llm.Usage) bool 
 // pay for another summary of the same material. An effective summary clears
 // the suppression. Overflow and manual compaction are never suppressed; an
 // overflow compaction that does not help is stopped by fixedPromptExceedsWindow.
-// res may be uncompacted: a summary rejected for not shrinking the history
-// reports Watermark "summarize" and counts as ineffective.
+// A summary rejected for not shrinking the history (res.SummaryNotSmaller,
+// whether or not local tiers compacted) is ineffective regardless of size.
 func (a *Agent) noteSummaryEffect(epoch uint64, res compaction.Result) {
-	if a == nil || a.compactor == nil || (!slices.Contains(res.TiersApplied, "summarize") && res.Watermark != "summarize") {
+	if a == nil || a.compactor == nil || (!res.SummaryNotSmaller && !slices.Contains(res.TiersApplied, "summarize")) {
 		return
 	}
 	threshold := a.compactor.ThresholdTokens()
-	if res.NewTokens < threshold {
+	if !res.SummaryNotSmaller && res.NewTokens < threshold {
 		a.ineffectiveSummaryEpoch.Store(0)
 		return
 	}
 	if a.ineffectiveSummaryEpoch.Swap(epoch+1) != epoch+1 {
-		a.warnf(
-			"warning: automatic compaction summary left the context at %d estimated tokens, at or above the summary threshold of %d; the automatic summary tier is suppressed until new user input or the context falls below the threshold (overflow and manual compaction are unaffected)",
-			res.NewTokens, threshold,
-		)
+		effect := fmt.Sprintf("left the context at %d estimated tokens, at or above the summary threshold of %d", res.NewTokens, threshold)
+		if res.SummaryNotSmaller {
+			effect = "was not smaller than the history it would replace"
+		}
+		a.warnf("warning: automatic compaction summary %s; the automatic summary tier is suppressed until new user input or the context falls below the threshold (overflow and manual compaction are unaffected)", effect)
 	}
 }
 

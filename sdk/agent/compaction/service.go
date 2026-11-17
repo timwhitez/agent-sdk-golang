@@ -394,10 +394,14 @@ func (s *Service) compactSummary(ctx context.Context, model llm.ChatModel, messa
 	// the result before anything (snapshot, ledger) is persisted. A summary
 	// that does not shrink the history is rejected without an error: retrying
 	// the same material would only pay for another summary call.
+	// Only judged when the estimator sees the whole history: it counts image,
+	// document and thinking blocks as zero, which would reject useful summaries.
 	provisional := newCompactionSummaryMessage(withSummaryCheckpoint(sum, nextLedgerSummary(ledger.Summary, messages, sum, "")))
-	if newTokens := s.approximateMessageTokens(append([]llm.Message{provisional}, recent...)); newTokens >= originalTokens {
+	if newTokens := s.approximateMessageTokens(append([]llm.Message{provisional}, recent...)); newTokens >= originalTokens && !hasUnestimatedBlocks(messages) {
 		warning := fmt.Sprintf("[WARN] Compaction summary not smaller than history (%d -> %d estimated tokens) - original history and ledger were preserved", originalTokens, newTokens)
-		return s.rejectSummary(messages, comp.Usage, originalTokens, ledgerWarnings, checkpointWarnings, warning, nil)
+		_, res, _ := s.rejectSummary(messages, comp.Usage, originalTokens, ledgerWarnings, checkpointWarnings, warning, nil)
+		res.SummaryNotSmaller = true
+		return messages, res, nil
 	}
 	sourceSnapshot, sourceSnapshotWarning := s.persistSummarySourceSnapshot(ctx, messages)
 	if sourceSnapshotWarning != "" {
@@ -484,6 +488,19 @@ func summaryQualityWarning(origTokens, newTokens, summaryTokens, summaryChars, m
 		}
 	}
 	return ""
+}
+
+// hasUnestimatedBlocks reports whether messages hold content blocks that
+// approximateMessageTokens counts as zero.
+func hasUnestimatedBlocks(messages []llm.Message) bool {
+	for _, msg := range messages {
+		for _, block := range msg.Content.Blocks {
+			if block.Type != "text" && !llm.IsProviderStateBlock(block) {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 func (s *Service) approximateMessageTokens(messages []llm.Message) int {

@@ -352,3 +352,37 @@ func orderedPipelineMessages() []llm.Message {
 		llm.NewUserMessage("latest protected"),
 	}
 }
+
+// A summary rejected as not smaller after snip/prune compacted is still
+// reported on the merged result, so the Agent can treat it as ineffective.
+func TestPipelineReportsSummaryNotSmallerAfterLocalTiers(t *testing.T) {
+	svc := newOrderedPipelineService(t, nil, false)
+	svc.Config.KeepRecentUserMessages = 3 // keeps the large first user message verbatim
+	model := &orderedPipelineModel{}
+	_, res, err := svc.CompactPipeline(context.Background(), model, orderedPipelineMessages(), PipelineRequest{
+		Trigger: "usage", Usage: &llm.Usage{PromptTokens: 180, TotalTokens: 180}, TargetWatermark: "summarize", AllowSummary: true,
+	})
+	if err != nil || model.calls != 1 {
+		t.Fatalf("err=%v summary calls=%d", err, model.calls)
+	}
+	if !res.Compacted || !res.SummaryNotSmaller || containsTier(res.TiersApplied, "summarize") {
+		t.Fatalf("result = %#v, want local tiers compacted and SummaryNotSmaller", res)
+	}
+}
+
+// Summaries are not judged against a history the estimator cannot fully see:
+// image blocks count as zero tokens there.
+func TestCompactDoesNotRejectSummaryForImageHistory(t *testing.T) {
+	svc := NewService(&Config{Enabled: true})
+	history := []llm.Message{llm.NewUserMessage("inspect the screenshots")}
+	for i := 0; i < 10; i++ {
+		history = append(history, llm.Message{Role: llm.RoleUser, Content: llm.Content{Blocks: []llm.ContentBlock{
+			{Type: "text", Text: "screenshot"},
+			{Type: "image_url", ImageURL: &llm.ImageURL{URL: "data:image/png;base64,AAAA"}},
+		}}})
+	}
+	_, res, err := svc.Compact(context.Background(), &orderedPipelineModel{}, history)
+	if err != nil || !res.Compacted || res.SummaryNotSmaller {
+		t.Fatalf("image history summary rejected: err=%v result=%#v", err, res)
+	}
+}

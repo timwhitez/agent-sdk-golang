@@ -158,6 +158,6 @@ func (e *fixedPromptExceedsWindowError) Error() string {
 	if e.historyTokens >= e.limit {
 		hint = "the compacted history alone reaches the limit; increase the context window"
 	}
-	return fmt.Sprintf("context window cannot hold the request after overflow compaction: provider reported %d prompt tokens, overflow limit %d; compacted history is about %d estimated tokens, so the fixed prompt (system prompt and tool definitions) is about %d tokens; %s",
+	return fmt.Sprintf("context window cannot hold the request after overflow compaction: provider reported %d prompt tokens, overflow limit %d; compacted history is about %d estimated text tokens (images and documents not counted), so the fixed prompt (system prompt and tool definitions) is about %d tokens; %s",
 		e.promptTokens, e.limit, e.historyTokens, e.promptTokens-e.historyTokens, hint)
 }

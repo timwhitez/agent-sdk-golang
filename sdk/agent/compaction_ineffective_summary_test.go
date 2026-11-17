@@ -424,3 +424,114 @@ func TestOverflowCompactionStopsWhenFixedPromptExceedsWindow(t *testing.T) {
 		t.Fatalf("history overflow: compactions=%d errors=%#v steps=%d, want 1, none, 7", compactions, errs, fits.steps)
 	}
 }
+
+// A summary rejected as not smaller than a small history counts as
+// ineffective even though the history estimate is below the threshold: the
+// provider usage (system prompt, tools) keeps every decision above it, and
+// each repeat would pay for the same rejected summary (#257).
+func TestNotSmallerSummaryIsNotRepeatedWithinUserInput(t *testing.T) {
+	cc := compaction.DefaultConfig()
+	cc.ContextWindow = 12000
+	model := &summaryCountingModel{}
+	ag, err := New(Config{LLM: model, Compaction: &cc, Warningf: func(string, ...any) {}, InitialMessages: []llm.Message{
+		llm.NewUserMessage("rename helper foo to bar in util.go"),
+		llm.NewAssistantMessage("Done: foo is now bar in util.go.", nil),
+		llm.NewUserMessage("thanks, anything else?"),
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	f := ineffectiveSummaryFixture{agent: ag}
+	above := ag.compactor.ThresholdTokens() + 100
+	for i := 0; i < 4; i++ {
+		f.decide(t, &llm.Usage{PromptTokens: above, TotalTokens: above})
+	}
+	if got := model.Calls(); got != 1 {
+		t.Fatalf("summary calls = %d, want 1", got)
+	}
+}
+
+// Local tiers that compacted before a not-smaller summary still leave the
+// summary tier ineffective.
+func TestNotSmallerSummaryAfterLocalTiersArmsSuppression(t *testing.T) {
+	f := newIneffectiveSummaryFixture(t)
+	f.agent.noteSummaryEffect(f.agent.userInputEpoch.Load(), compaction.Result{Compacted: true, Watermark: "prune", TiersApplied: []string{"prune"}, NewTokens: 1, SummaryNotSmaller: true})
+	if !f.agent.automaticSummarySuppressed(f.agent.userInputEpoch.Load(), f.high) {
+		t.Fatal("not-smaller summary after prune did not suppress the automatic summary tier")
+	}
+}
+
+// imageToolModel calls a screenshot tool ten times and reports a provider
+// prompt of 2000 tokens plus 1500 per image in the request.
+type imageToolModel struct {
+	mu               sync.Mutex
+	steps, summaries int
+}
+
+func (*imageToolModel) Provider() string { return "fixture" }
+func (*imageToolModel) Model() string    { return "image-tool" }
+
+func (m *imageToolModel) Invoke(_ context.Context, req llm.InvokeRequest) (*llm.Completion, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	images := 0
+	for _, msg := range req.Messages {
+		if strings.Contains(msg.Content.PlainText(), "Write an operational checkpoint") {
+			m.summaries++
+			return &llm.Completion{Content: llm.TextContent(validCompactionSummary("screenshots inspected so far")), StopReason: "stop"}, nil
+		}
+		for _, block := range msg.Content.Blocks {
+			if block.Type == "image_url" {
+				images++
+			}
+		}
+	}
+	m.steps++
+	prompt := 2000 + 1500*images
+	usage := &llm.Usage{PromptTokens: prompt, CompletionTokens: 50, TotalTokens: prompt + 50}
+	if m.steps > 10 {
+		return &llm.Completion{Content: llm.TextContent("finished"), StopReason: "stop", Usage: usage}, nil
+	}
+	call := llm.ToolCall{ID: fmt.Sprintf("shot-%d", m.steps), Type: "function", Function: llm.FunctionCall{Name: "screenshot", Arguments: `{}`}}
+	return &llm.Completion{ToolCalls: []llm.ToolCall{call}, StopReason: "tool_calls", Usage: usage}, nil
+}
+
+// Images are invisible to the local estimate. An overflow they cause is
+// resolved by the summary (which drops them), so the run continues instead of
+// rejecting the summary and stopping with fixed_prompt_exceeds_window.
+func TestImageOverflowCompactsAndContinues(t *testing.T) {
+	cc := compaction.DefaultConfig()
+	cc.ContextWindow = 12000
+	shot := tools.Tool{
+		Name:        "screenshot",
+		Description: "screenshot",
+		Schema:      map[string]any{"type": "object", "properties": map[string]any{}},
+		Handler: func(context.Context, json.RawMessage, *tools.Container) (llm.Content, error) {
+			return llm.Content{Blocks: []llm.ContentBlock{
+				{Type: "text", Text: "screenshot"},
+				{Type: "image_url", ImageURL: &llm.ImageURL{URL: "data:image/png;base64,AAAA"}},
+			}}, nil
+		},
+	}
+	model := &imageToolModel{}
+	ag, err := New(Config{LLM: model, Tools: []tools.Tool{shot}, Compaction: &cc, MaxIterations: 30, InvokeRetryMaxAttempts: 1, Warningf: func(string, ...any) {}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	compactions := 0
+	var errs []ErrorEvent
+	final := false
+	for ev := range ag.QueryStream(context.Background(), llm.TextContent("take ten screenshots")) {
+		switch e := ev.(type) {
+		case CompactionEvent:
+			compactions++
+		case ErrorEvent:
+			errs = append(errs, e)
+		case FinalResponseEvent:
+			final = true
+		}
+	}
+	if len(errs) != 0 || !final || compactions == 0 || model.summaries == 0 {
+		t.Fatalf("errors=%#v final=%v compactions=%d summaries=%d, want a compacted run that finishes", errs, final, compactions, model.summaries)
+	}
+}

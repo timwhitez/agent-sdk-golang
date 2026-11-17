@@ -183,6 +183,7 @@ func mergePipelineResults(results ...Result) Result {
 	fallbackWatermark := ""
 	for _, res := range results {
 		merged.Compacted = merged.Compacted || res.Compacted
+		merged.SummaryNotSmaller = merged.SummaryNotSmaller || res.SummaryNotSmaller
 		if merged.Trigger == "" && strings.TrimSpace(res.Trigger) != "" {
 			merged.Trigger = strings.TrimSpace(res.Trigger)
 		}

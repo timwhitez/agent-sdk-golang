@@ -158,7 +158,11 @@ A summary that passes the quality gate but does not make the history smaller
 original) is rejected on every entry: the original history is returned with
 `Compacted: false`, a warning and a nil error (so the same compaction does not
 retry the summary call), and neither the source snapshot nor the ledger is
-written. On the automatic path it counts as an ineffective summary.
+written; `Result.SummaryNotSmaller` reports it, also when earlier local tiers
+compacted. The check is skipped when the history holds image, document or
+thinking blocks, which the local estimate counts as zero. On the automatic
+path such a rejection counts as an ineffective summary regardless of the
+history estimate.
 
 Overflow compaction cannot shrink the system prompt and tool definitions that
 the provider also counts. After an overflow compaction run, the first
