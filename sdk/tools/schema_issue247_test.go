@@ -4,7 +4,6 @@ import (
 	"encoding/json"
 	"os"
 	"os/exec"
-	"strings"
 	"testing"
 	"time"
 )
@@ -19,7 +18,7 @@ type s247Base struct {
 	Dup  string `json:"dup"`
 }
 
-type s247Other struct {
+type S247Other struct {
 	Dup   string `json:"dup"`
 	Other string `json:"other,omitempty"`
 }
@@ -30,7 +29,7 @@ type S247Exported struct {
 
 type s247Embedded struct {
 	s247Base
-	*s247Other
+	*S247Other
 	S247Exported `json:"tagged"`
 	Mode         string    `json:"mode"`
 	At           time.Time `json:"at"`
@@ -111,17 +110,39 @@ func TestSchemaForSiblingStructsStayComplete(t *testing.T) {
 
 func TestSchemaForUnmarshalerTypes(t *testing.T) {
 	type args struct {
-		Raw json.RawMessage `json:"raw"`
-		Lvl s247Level       `json:"lvl"`
+		Raw   json.RawMessage `json:"raw"`
+		Lvl   s247Level       `json:"lvl"`
+		Items []s247Lenient   `json:"items"`
 	}
 	props := s247Props(t, SchemaFor[args]())
 	if raw := props["raw"].(map[string]any); len(raw) != 0 {
-		t.Errorf("json.Unmarshaler type = %v, want open schema", raw)
+		t.Errorf("non-struct json.Unmarshaler type = %v, want open schema", raw)
 	}
-	if lvl := props["lvl"].(map[string]any); lvl["type"] != "string" || strings.Contains(lvl["type"].(string), "int") {
+	if lvl := props["lvl"].(map[string]any); lvl["type"] != "string" {
 		t.Errorf("text unmarshaler type = %v, want string", lvl)
 	}
+	items := props["items"].(map[string]any)["items"].(map[string]any)
+	if _, ok := s247Props(t, items)["label"]; !ok {
+		t.Errorf("struct with UnmarshalJSON lost its field schema: %v", items)
+	}
 }
+
+func TestSchemaForSkipsUnexportedEmbeddedPointer(t *testing.T) {
+	type args struct {
+		*s247Base
+		Mode string `json:"mode"`
+	}
+	props := s247Props(t, SchemaFor[args]())
+	if _, ok := props["path"]; ok {
+		t.Errorf("unexported embedded pointer must not be promoted: %v", props)
+	}
+}
+
+type s247Lenient struct {
+	Label string `json:"label"`
+}
+
+func (l *s247Lenient) UnmarshalJSON(b []byte) error { return json.Unmarshal(b, &l.Label) }
 
 type s247Level int
 

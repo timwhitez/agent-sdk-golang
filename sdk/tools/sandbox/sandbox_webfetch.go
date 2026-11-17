@@ -12,6 +12,7 @@ import (
 	"sort"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/timwhitez/agent-sdk-golang/sdk/tools"
 )
@@ -221,7 +222,15 @@ func describeWebfetchHeaders(headers map[string]string) (names, preview []string
 			preview = append(preview, name+": [redacted]")
 			continue
 		}
-		preview = append(preview, name+": "+truncateForMeta(headers[name], 200))
+		value := headers[name]
+		if len(value) > 200 {
+			cut := 197
+			for !utf8.RuneStart(value[cut]) { // never split a multi-byte rune
+				cut--
+			}
+			value = value[:cut] + "..."
+		}
+		preview = append(preview, name+": "+value)
 	}
 	return names, preview, credential
 }

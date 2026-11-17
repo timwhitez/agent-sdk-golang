@@ -64,14 +64,19 @@ var (
 
 // customDecodedSchema describes types whose decoding is not driven by their Go
 // shape: time.Time is an RFC 3339 string, text-only unmarshalers take a string,
-// and json.Unmarshaler implementations accept anything this reflection cannot
-// infer.
+// and non-struct json.Unmarshaler types (e.g. json.RawMessage) accept anything
+// this reflection cannot infer. Structs with a custom UnmarshalJSON keep their
+// reflected field schema: such decoders are typically lenient supersets of the
+// struct shape, and dropping it would remove all guidance for the model.
 func customDecodedSchema(t reflect.Type) (map[string]any, bool) {
 	if t == timeType {
 		return map[string]any{"type": "string", "format": "date-time"}, true
 	}
 	pt := reflect.PointerTo(t)
 	if pt.Implements(jsonUnmarshalerType) {
+		if t.Kind() == reflect.Struct {
+			return nil, false
+		}
 		return map[string]any{}, true
 	}
 	if pt.Implements(textUnmarshalerType) {
@@ -139,6 +144,9 @@ func collectSchemaFields(t reflect.Type, depth int, optional bool, path map[refl
 			ft = ft.Elem()
 		}
 		if f.Anonymous && tagName == "" && ft.Kind() == reflect.Struct {
+			if isPtr && f.PkgPath != "" {
+				continue // encoding/json cannot allocate an unexported embedded pointer
+			}
 			if _, custom := customDecodedSchema(ft); !custom {
 				// Promoted like encoding/json, also from unexported embedded types.
 				collectSchemaFields(ft, depth+1, optional || isPtr, path, out)
