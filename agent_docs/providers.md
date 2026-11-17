@@ -1,5 +1,14 @@
 # Providers and Streaming
 
+## Attempt budget (`MaxRetries`)
+
+Despite its name, `MaxRetries` on the Anthropic, OpenAI Chat and OpenAI
+Responses clients is the maximum number of transient-failure attempts per
+request, including the first: `MaxRetries=N` sends at most N requests for
+retryable statuses or network errors, `MaxRetries=1` disables automatic
+retry, and values `<= 0` use 10. Compatibility downgrade resends are counted
+separately as described per provider below.
+
 ## Retry-After floor and terminal stop
 
 OpenAI Chat and Responses (buffered and streaming) treat a valid parsed
@@ -267,6 +276,11 @@ stream normalization, and response metadata behavior.
   associated assistant `tool_use` blocks on the next request; display-only
   thinking events from other providers remain in `Completion.Thinking` without
   changing their persisted content shape.
+- A stream interrupted before a clean `StreamDoneEvent` (steering, stream-idle
+  recovery, mid-stream error or cancellation) drops `thinking` blocks whose
+  signature never arrived; their text stays in `Completion.Thinking` for
+  display but is never persisted or replayed. Complete streams keep unsigned
+  thinking blocks unchanged for gateways that do not sign them.
 - Agent-level invoke retry treats typed `RateLimitError`/`ProviderError`,
   transient network/timeout failures, and equivalent text-only gateway errors
   as retryable before visible output. Text-only status detection covers 401,
