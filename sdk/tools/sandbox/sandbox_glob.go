@@ -23,11 +23,12 @@ const (
 	globSkippedSampleLimit = 3
 	partialScanWarningKind = "partial_scan_failure"
 	scanCapWarningKind     = "scan_cap_reached"
-	maxGlobScanFiles       = 200
 )
 
 // Variables for testing overrides.
 var (
+	// maxGlobScanFiles is the traversal budget: it counts every visited file, matching or not.
+	maxGlobScanFiles      = 100_000
 	globStatFile          = os.Lstat
 	globWalkDir           = filepath.WalkDir
 	errGlobScanCapReached = errors.New("glob scan cap reached")
@@ -199,6 +200,7 @@ func globTool() tools.Tool {
 		skippedStat := globSkippedDiagnostics{}
 		skippedSymlink := globSkippedDiagnostics{}
 		skippedWalk := globSkippedDiagnostics{}
+		skippedDirs := []string{}
 		walkErr := globWalkDir(base, func(path string, d os.DirEntry, walkErr error) error {
 			if walkErr != nil {
 				displayPath := resultPathForDisplay(s, path)
@@ -212,13 +214,23 @@ func globTool() tools.Tool {
 				return nil
 			}
 			if d.IsDir() {
-				return nil
+				if skippedSearchDirs[d.Name()] && !pathsEqual(filepath.Clean(path), filepath.Clean(base)) {
+					skippedDirs = append(skippedDirs, resultPathForDisplay(s, path))
+					return filepath.SkipDir
+				}
+				if pathsEqual(filepath.Clean(path), filepath.Clean(base)) {
+					return nil
+				}
 			}
+			// Directories count too, so a tree of empty directories is bounded.
 			if scannedCandidates >= maxGlobScanFiles {
 				scanTruncated = true
 				return errGlobScanCapReached
 			}
 			scannedCandidates++
+			if d.IsDir() {
+				return nil
+			}
 
 			rel, err := filepath.Rel(base, path)
 			if err != nil {
@@ -335,9 +347,13 @@ func globTool() tools.Tool {
 				meta["warning_kind"] = scanCapWarningKind
 			}
 		}
+		if len(skippedDirs) > 0 {
+			meta["skipped_dirs"] = len(skippedDirs)
+			meta["skipped_dir_samples"] = sampleWarningValues(skippedDirs, 5)
+		}
 		tools.UpsertToolResultMetadata(ctx, meta)
 		if totalFiles == 0 {
-			return appendGlobWarning("No files match pattern: "+a.Pattern, statWarning, symlinkWarning, walkWarning, scanWarning), nil
+			return appendGlobWarning("No files match pattern: "+a.Pattern, statWarning, symlinkWarning, walkWarning, scanWarning, skippedDirsWarning("glob", skippedDirs)), nil
 		}
 		header := ""
 		if scanTruncated {

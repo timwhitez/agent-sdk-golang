@@ -36,6 +36,13 @@ const (
 	grepResultsDefault  = 50
 )
 
+// Scan budgets are independent of max_results: the traversal budget counts every
+// visited file, the content budget only files opened after the glob filter.
+var (
+	grepTraversalBudget = 100_000
+	grepScanBudget      = 20_000
+)
+
 func validateGrepNumericArgs(args grepArgs) error {
 	for name, value := range map[string]int{
 		"before":  args.Before,
@@ -137,8 +144,11 @@ func grepTool() tools.Tool {
 		scanFailures := []string{}
 		scanFailureSeen := map[string]struct{}{}
 		stopped := false
-		scanCap := maxOut
+		scanCap := grepScanBudget
 		scannedCandidates := 0
+		visitedEntries := 0
+		traversalStopped := false
+		skippedDirs := []string{}
 		recordPermissionDenied := func(path string) {
 			displayPath := resultPathForDisplay(s, path)
 			if _, ok := permissionDeniedSeen[displayPath]; ok {
@@ -172,18 +182,28 @@ func grepTool() tools.Tool {
 				return nil
 			}
 			if d.IsDir() {
-				return nil
-			}
-			if stopped {
+				if skippedSearchDirs[d.Name()] && !pathsEqual(filepath.Clean(path), filepath.Clean(base)) {
+					skippedDirs = append(skippedDirs, resultPathForDisplay(s, path))
+					return filepath.SkipDir
+				}
+				if pathsEqual(filepath.Clean(path), filepath.Clean(base)) {
+					return nil
+				}
+			} else if stopped {
 				return errGrepStop
 			}
-			if scannedCandidates >= scanCap {
+			// Directories count too, so a tree of empty directories is bounded.
+			if visitedEntries >= grepTraversalBudget {
 				scanTruncated = true
 				stopped = true
+				traversalStopped = true
+				scanCap = grepTraversalBudget
 				return errGrepStop
 			}
-			scannedCandidates++
-			// filter file path
+			visitedEntries++
+			if d.IsDir() {
+				return nil
+			}
 			matchPath := resultPathForMatch(s, base, path)
 			displayPath := resultPathForDisplay(s, path)
 			if globFilter != "" {
@@ -191,6 +211,12 @@ func grepTool() tools.Tool {
 					return nil
 				}
 			}
+			if scannedCandidates >= scanCap {
+				scanTruncated = true
+				stopped = true
+				return errGrepStop
+			}
+			scannedCandidates++
 
 			f, err := grepOpenFile(path)
 			if err != nil {
@@ -298,7 +324,8 @@ func grepTool() tools.Tool {
 			if mode == "count" {
 				if matchCount > 0 {
 					counts[displayPath] += matchCount
-					if len(counts) >= scanCap {
+					if len(counts) >= maxOut {
+						scanCap = maxOut
 						scanTruncated = true
 						stopped = true
 						return errGrepStop
@@ -310,7 +337,8 @@ func grepTool() tools.Tool {
 				return errGrepStop
 			}
 			if fileMatched && mode == "files_with_matches" {
-				if len(files) >= scanCap {
+				if len(files) >= maxOut {
+					scanCap = maxOut
 					scanTruncated = true
 					stopped = true
 					return errGrepStop
@@ -327,8 +355,12 @@ func grepTool() tools.Tool {
 		scanWarning := grepScanWarning(scanFailures)
 		capWarning := ""
 		if scanTruncated {
+			scanned, unit := scannedCandidates, "file candidate(s)"
+			if traversalStopped {
+				scanned, unit = visitedEntries, "visited entries"
+			}
 			capWarning = formatWarningDiagnostic(
-				fmt.Sprintf("grep scan stopped after %d file candidate(s) at cap %d", scannedCandidates, scanCap),
+				fmt.Sprintf("grep scan stopped after %d %s at cap %d", scanned, unit, scanCap),
 				"Narrow the path/glob and rerun to inspect remaining matches.",
 			)
 		}
@@ -355,6 +387,9 @@ func grepTool() tools.Tool {
 			}
 			tools.UpsertToolResultMetadata(ctx, meta)
 		}
+		if len(skippedDirs) > 0 {
+			tools.UpsertToolResultMetadata(ctx, map[string]any{"skipped_dirs": len(skippedDirs), "skipped_dir_samples": sampleWarningValues(skippedDirs, 5)})
+		}
 		if scanTruncated {
 			meta := map[string]any{
 				"scan_truncated":     true,
@@ -371,7 +406,7 @@ func grepTool() tools.Tool {
 		switch mode {
 		case "files_with_matches":
 			if len(files) == 0 {
-				return appendGrepWarning("No matches for: "+a.Pattern, warning, scanWarning, capWarning), nil
+				return appendGrepWarning("No matches for: "+a.Pattern, warning, scanWarning, capWarning, skippedDirsWarning("grep", skippedDirs)), nil
 			}
 			// unique + cap
 			uniq := []string{}
@@ -389,7 +424,7 @@ func grepTool() tools.Tool {
 			return appendGrepWarning(strings.Join(uniq, "\n"), warning, scanWarning, capWarning), nil
 		case "count":
 			if len(counts) == 0 {
-				return appendGrepWarning("No matches for: "+a.Pattern, warning, scanWarning, capWarning), nil
+				return appendGrepWarning("No matches for: "+a.Pattern, warning, scanWarning, capWarning, skippedDirsWarning("grep", skippedDirs)), nil
 			}
 			lines := []string{}
 			keys := make([]string, 0, len(counts))
@@ -406,7 +441,7 @@ func grepTool() tools.Tool {
 			return appendGrepWarning(strings.Join(lines, "\n"), warning, scanWarning, capWarning), nil
 		default:
 			if len(results) == 0 {
-				return appendGrepWarning("No matches for: "+a.Pattern, warning, scanWarning, capWarning), nil
+				return appendGrepWarning("No matches for: "+a.Pattern, warning, scanWarning, capWarning, skippedDirsWarning("grep", skippedDirs)), nil
 			}
 			return appendGrepWarning(strings.Join(results, "\n"), warning, scanWarning, capWarning), nil
 		}

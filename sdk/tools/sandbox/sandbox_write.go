@@ -186,6 +186,16 @@ func editTool() tools.Tool {
 		if err != nil {
 			return llm.TextContent(""), err
 		}
+		if a.OldString == "" {
+			err := fmt.Errorf("empty old_string")
+			msg := formatErrorDiagnostic("edit requires old_string", "Provide a non-empty old_string (use write to create or replace a whole file) and retry.")
+			return llm.TextContent(msg), err
+		}
+		if a.OldString == a.NewString {
+			err := fmt.Errorf("old_string equals new_string")
+			msg := formatErrorDiagnostic("edit old_string and new_string are identical", "Provide a different new_string and retry.")
+			return llm.TextContent(msg), err
+		}
 		conf := getConfirmer(deps, ctx)
 		p, err := s.resolveForAccess(a.FilePath)
 		if err != nil {

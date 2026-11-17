@@ -27,7 +27,17 @@ func (a *Agent) applyToolResultBoundary(ctx context.Context, content llm.Content
 	if codec == nil {
 		codec = artifact.JSONEnvelopeCodec{}
 	}
-	decoded, found, decodeErr := codec.Decode(plain)
+	var (
+		decoded   artifact.Envelope
+		found     bool
+		decodeErr error
+	)
+	// Only text framed like an Encode result is an envelope; ordinary output that
+	// merely mentions a marker (source code, docs) stays plain. Custom codecs keep
+	// deciding for themselves.
+	if _, isJSON := codec.(artifact.JSONEnvelopeCodec); !isJSON || artifact.IsFramedEnvelope(plain) {
+		decoded, found, decodeErr = codec.Decode(plain)
+	}
 	if found {
 		if decodeErr != nil {
 			return a.nonRecoverableToolResultFallback(plain, meta, artifactDecodeFailureStage, "return_valid_envelope_or_plain_result", decodeErr)

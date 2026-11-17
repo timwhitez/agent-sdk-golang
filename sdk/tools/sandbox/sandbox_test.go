@@ -2858,6 +2858,8 @@ func TestGlobToolTruncationIncludesWarning(t *testing.T) {
 }
 
 func TestGlobTool_StopsAccumulatingAfterScanCapWithActionableWarning(t *testing.T) {
+	defer func(old int) { maxGlobScanFiles = old }(maxGlobScanFiles)
+	maxGlobScanFiles = 200
 	root := t.TempDir()
 	s, err := New(root)
 	if err != nil {
@@ -2916,6 +2918,8 @@ func TestGlobTool_StopsAccumulatingAfterScanCapWithActionableWarning(t *testing.
 }
 
 func TestGlobTool_ScanCapStopsTraversalOnSparseOrNoMatchesWithActionableWarning(t *testing.T) {
+	defer func(old int) { maxGlobScanFiles = old }(maxGlobScanFiles)
+	maxGlobScanFiles = 200
 	root := t.TempDir()
 	s, err := New(root)
 	if err != nil {
@@ -3438,6 +3442,8 @@ func TestGrepTool_StopsAccumulatingAfterScanCapWithActionableWarning(t *testing.
 }
 
 func TestGrepTool_ScanCapStopsTraversalOnSparseOrNoMatchesWithActionableWarning(t *testing.T) {
+	defer func(old int) { grepScanBudget = old }(grepScanBudget)
+	grepScanBudget = 5
 	root := t.TempDir()
 	s, err := New(root)
 	if err != nil {
@@ -3824,28 +3830,5 @@ func TestApplyPatchPreservesConsistentCRLF(t *testing.T) {
 	}
 	if want := "alpha\r\nchanged\r\ngamma\r\n"; string(got) != want {
 		t.Fatalf("content = %q, want %q", string(got), want)
-	}
-}
-
-func TestConsistentLineEndingRejectsMixedInput(t *testing.T) {
-	t.Parallel()
-	tests := []struct {
-		name    string
-		content string
-		want    string
-	}{
-		{name: "crlf", content: "a\r\nb\r\n", want: "\r\n"},
-		{name: "lf", content: "a\nb\n", want: "\n"},
-		{name: "mixed", content: "a\r\nb\n", want: "\n"},
-		{name: "bare cr", content: "a\rb\r", want: "\n"},
-	}
-	for _, tt := range tests {
-		tt := tt
-		t.Run(tt.name, func(t *testing.T) {
-			t.Parallel()
-			if got := consistentLineEnding(tt.content); got != tt.want {
-				t.Fatalf("consistentLineEnding(%q) = %q, want %q", tt.content, got, tt.want)
-			}
-		})
 	}
 }

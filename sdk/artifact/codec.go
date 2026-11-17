@@ -92,6 +92,14 @@ func (JSONEnvelopeCodec) Encode(envelope Envelope, budget Budget) (string, Envel
 	return bestText, bestEnvelope, nil
 }
 
+// IsFramedEnvelope reports whether text has the shape JSONEnvelopeCodec.Encode
+// produces: after trimming whitespace it starts with the start marker and ends
+// with the end marker. Ordinary text that merely mentions a marker is not framed.
+func IsFramedEnvelope(text string) bool {
+	text = strings.TrimSpace(text)
+	return strings.HasPrefix(text, EnvelopeStartMarker) && strings.HasSuffix(text, EnvelopeEndMarker)
+}
+
 func (JSONEnvelopeCodec) Decode(text string) (Envelope, bool, error) {
 	start := strings.Index(text, EnvelopeStartMarker)
 	end := strings.Index(text, EnvelopeEndMarker)

@@ -195,6 +195,21 @@ func formatWarningDiagnostic(summary, action string) string {
 	return fmt.Sprintf("[WARN] %s - %s", summary, action)
 }
 
+// skippedSearchDirs are VCS/dependency directories grep and glob do not descend into
+// (unless one is the search root itself).
+var skippedSearchDirs = map[string]bool{".git": true, ".hg": true, ".svn": true, "node_modules": true}
+
+// skippedDirsWarning explains an empty result when directories were not searched.
+func skippedDirsWarning(tool string, dirs []string) string {
+	if len(dirs) == 0 {
+		return ""
+	}
+	return formatWarningDiagnostic(
+		fmt.Sprintf("%s did not search %d VCS/dependency director(y/ies): %s", tool, len(dirs), strings.Join(sampleWarningValues(dirs, 5), ", ")),
+		"Pass one of them as path to search inside it.",
+	)
+}
+
 // isSeverityActionDiagnostic checks if text is a severity-action diagnostic.
 func isSeverityActionDiagnostic(text string) bool {
 	text = strings.TrimSpace(text)
