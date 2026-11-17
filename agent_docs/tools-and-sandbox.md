@@ -17,7 +17,7 @@ are never retried, and the original execution error/result is preserved.
 - `Definition()` selects strict mode automatically: closed struct schemas use strict mode; maps, open objects and unconstrained `any` use non-strict mode without changing their allowed values. `WithStrict(true)` requires strict mode and OpenAI rejects incompatible schemas locally with the tool name and schema path. `WithStrict(false)` sends explicit `strict: false` on Chat Completions and Responses. Automatically selected non-strict definitions carry a schema-only `StrictWarning`; OpenAI request construction reports this hint via the existing warning sink (`Config.Warningf` in an Agent, provider `Warningf` for direct calls, default `log.Printf`), without argument values. This compatibility check detects shapes that strict mode would narrow; it is not a complete JSON Schema validator. Already strict compositions, references/definitions and nullable objects remain supported. Provider non-strict mode does not disable typed argument decoding or sandbox checks.
 - `Execute()` is the single execution path used by the agent (`sdk/tools/tool.go:40`)
 - Typed helper `Func` builds a `Tool` from typed args + handler and enforces strict decode (`sdk/tools/tool.go:701`)
-- `SchemaFor` derives conservative JSON schema from Go structs (`sdk/tools/schema.go:8`)
+- `SchemaFor` derives conservative JSON schema from Go structs (`sdk/tools/schema.go:8`). It follows `encoding/json`: embedded structs without a json name are flattened (shallowest field wins; equal-depth conflicts are dropped), `time.Time` is `{"type":"string","format":"date-time"}`, nested `json.Unmarshaler` types are open (`{}`) and text-only unmarshalers are strings. A recursive struct type is expanded once; the back-reference is an open schema (`{}`).
 - `SerializeResult` converts handler outputs into `llm.Content` blocks (`sdk/tools/result.go:10`)
 
 ## Argument Normalization and Repair Pipeline
@@ -182,6 +182,16 @@ are never retried, and the original execution error/result is preserved.
   DNS lookup or connection and tells the caller to request the target URL
   directly for a new confirmation; embedded URL userinfo is rejected without
   echoing credential values (`sdk/tools/sandbox/sandbox_webfetch.go`).
+- `webfetch` confirmation lists every model-supplied header: names and
+  previews in `header_names`/`headers` and in `summary`/`raw`. Values of
+  `Authorization`, `Cookie`, `X-Api-Key` and `Proxy-*` headers are redacted and
+  set `force_confirm`; other custom headers are shown but not force-confirmed.
+  Idle connections of the per-call transport are closed when the call ends.
+- Execrunner sets `exec.Cmd.WaitDelay` (`Options.PipeDrainGrace`, default 2s).
+  If the process exits but a descendant still holds stdout/stderr, Run returns
+  the real exit status with `PipeDrainTimedOut=true`, no timeout, and a note
+  appended to the output; canonical streams are aborted as incomplete. The
+  process group is only killed on a real timeout.
 - Shell command confirmation and timeout-guarded execution (`sdk/tools/sandbox/sandbox.go:558`, `sdk/tools/sandbox/sandbox.go:572`)
 - Execrunner checks parent cancellation after argument validation, checks its
   timeout context before preparation, and checks again immediately before Start.
