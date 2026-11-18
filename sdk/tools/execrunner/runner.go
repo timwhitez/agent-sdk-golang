@@ -10,6 +10,7 @@ import (
 	"os/exec"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 	"unicode/utf8"
 
@@ -23,6 +24,10 @@ const (
 	// after SIGKILL. Processes that escaped the group (setsid/daemons) can keep
 	// inherited output descriptors open indefinitely, so waiting is best-effort.
 	DefaultKillWaitGrace = 5 * time.Second
+	// DefaultPipeDrainGrace bounds how long Run keeps reading the output pipes
+	// after the foreground process has exited. A background child that inherited
+	// stdout/stderr must not turn a finished command into a timeout.
+	DefaultPipeDrainGrace = 2 * time.Second
 	// invalidUTF8PreviewReplacement marks bytes that cannot be decoded in the
 	// bounded preview. The byte-exact artifact is unaffected.
 	invalidUTF8PreviewReplacement = "�"
@@ -52,7 +57,10 @@ type Options struct {
 	// KillWaitGrace bounds the post-SIGKILL wait for the process to be reaped.
 	// Defaults to DefaultKillWaitGrace.
 	KillWaitGrace time.Duration
-	OnOutputChunk func(OutputChunk)
+	// PipeDrainGrace bounds the wait for output pipes to reach EOF once the
+	// process has exited. Defaults to DefaultPipeDrainGrace.
+	PipeDrainGrace time.Duration
+	OnOutputChunk  func(OutputChunk)
 }
 
 // Result captures execution outcome and output accounting.
@@ -65,10 +73,15 @@ type Result struct {
 	// KillProcessTimedOut reports that the process group was killed but the
 	// process was not reaped within KillWaitGrace, so Run abandoned the wait.
 	KillProcessTimedOut bool
-	OutputTruncated     bool
-	OutputPath          string
-	ArtifactBytes       int64
-	OutputArtifactErr   string
+	// PipeDrainTimedOut reports that the process exited but a surviving
+	// descendant still held stdout/stderr, so the pipes were closed after
+	// PipeDrainGrace. Later output was not captured and the streams are not
+	// committed as complete.
+	PipeDrainTimedOut bool
+	OutputTruncated   bool
+	OutputPath        string
+	ArtifactBytes     int64
+	OutputArtifactErr string
 	// OutputArtifacts contains only complete, validated canonical raw-stream
 	// manifests. Failed streams are represented in OutputArtifactDiagnostics.
 	OutputArtifacts           []artifact.Manifest
@@ -107,6 +120,9 @@ func run(ctx context.Context, opts Options, withTimeout func(context.Context, ti
 	if opts.KillWaitGrace <= 0 {
 		opts.KillWaitGrace = DefaultKillWaitGrace
 	}
+	if opts.PipeDrainGrace <= 0 {
+		opts.PipeDrainGrace = DefaultPipeDrainGrace
+	}
 	if err := ctx.Err(); err != nil {
 		res.TimedOut = errors.Is(err, context.DeadlineExceeded)
 		return res, err
@@ -135,9 +151,33 @@ func run(ctx context.Context, opts Options, withTimeout func(context.Context, ti
 	if canonical.requested {
 		collector.disableLegacyArtifact()
 	}
-	cmd.Stdout = processStreamWriter{stream: "stdout", combined: collector, canonical: canonical.stdout}
-	cmd.Stderr = processStreamWriter{stream: "stderr", combined: collector, canonical: canonical.stderr}
+	// Own the output pipes (instead of letting exec create them) so EOF is observed
+	// directly: exec.Cmd.Wait reports ErrWaitDelay only for a zero exit status, so
+	// it cannot tell whether a failed or killed command's streams were complete.
+	streams := []*outputPump{
+		{writer: processStreamWriter{stream: "stdout", combined: collector, canonical: canonical.stdout}},
+		{writer: processStreamWriter{stream: "stderr", combined: collector, canonical: canonical.stderr}},
+	}
+	closePumpFiles := func() {
+		for _, st := range streams {
+			st.closeFiles()
+		}
+	}
+	for i, st := range streams {
+		if err := st.open(); err != nil {
+			closePumpFiles()
+			collector.Close()
+			canonical.abortIncomplete(context.WithoutCancel(ctx), err)
+			return res, err
+		}
+		if i == 0 {
+			cmd.Stdout = st.w
+		} else {
+			cmd.Stderr = st.w
+		}
+	}
 	abortBeforeStart := func(cause error) {
+		closePumpFiles()
 		collector.Close()
 		// Writers currently Begin on their first write. Abort also covers any
 		// writer acquired by future preparation; unexecuted output is never committed.
@@ -152,9 +192,13 @@ func run(ctx context.Context, opts Options, withTimeout func(context.Context, ti
 		res.TimedOut = errors.Is(err, context.DeadlineExceeded)
 		return res, err
 	}
-	if err := start(cmd); err != nil {
-		abortBeforeStart(err)
-		return res, err
+	startErr := start(cmd)
+	for _, st := range streams {
+		st.closeWriteEnd() // the child owns its copy; EOF needs ours closed
+	}
+	if startErr != nil {
+		abortBeforeStart(startErr)
+		return res, startErr
 	}
 	processGroup, err := attachProcessGroup(cmd.Process)
 	if err != nil {
@@ -162,22 +206,52 @@ func run(ctx context.Context, opts Options, withTimeout func(context.Context, ti
 		// process-tree boundary must not continue running unsupervised.
 		_ = cmd.Process.Kill()
 		_ = cmd.Wait()
+		closePumpFiles()
 		collector.Close()
 		canonical.finish(context.WithoutCancel(ctx))
 		return res, fmt.Errorf("establish process-tree boundary: %w", err)
 	}
 	defer processGroup.close()
 
-	waitCh := make(chan error, 1)
+	var pumps sync.WaitGroup
+	for _, st := range streams {
+		pumps.Add(1)
+		go func() {
+			defer pumps.Done()
+			st.pump()
+		}()
+	}
+	// waitCh closes once the process is reaped and both streams reached EOF. After
+	// the process exits, a descendant may still hold the pipes: the streams then
+	// get PipeDrainGrace (not counting time inside a slow consumer Write) before
+	// the readers are closed. A cancelled or timed-out run skips that cut-off so
+	// the timeout path below keeps waiting for EOF bounded by KillWaitGrace.
+	var cmdWaitErr error
+	var drainForced atomic.Bool
+	waitCh := make(chan struct{})
+	pumpsDone := make(chan struct{})
 	go func() {
-		waitCh <- cmd.Wait()
+		pumps.Wait()
+		close(pumpsDone)
+	}()
+	go func() {
+		cmdWaitErr = cmd.Wait()
+		if !waitForPumpsDrain(streams, pumpsDone, runCtx.Done(), opts.PipeDrainGrace, opts.PipeDrainGrace+opts.KillWaitGrace) {
+			drainForced.Store(true)
+			closePumpFiles()
+		}
+		<-pumpsDone
+		closePumpFiles() // release the read ends deterministically, not via GC
+		close(waitCh)
 	}()
 
 	var waitErr error
 	var rawWaitErr error
 	killWaitTimedOut := false
+	pipeDrainTimedOut := false
 	select {
-	case rawWaitErr = <-waitCh:
+	case <-waitCh:
+		rawWaitErr = cmdWaitErr
 		waitErr = rawWaitErr
 	case <-runCtx.Done():
 		res.TimedOut = errors.Is(runCtx.Err(), context.DeadlineExceeded)
@@ -187,7 +261,8 @@ func run(ctx context.Context, opts Options, withTimeout func(context.Context, ti
 		if opts.KillGrace > 0 {
 			timer := time.NewTimer(opts.KillGrace)
 			select {
-			case rawWaitErr = <-waitCh:
+			case <-waitCh:
+				rawWaitErr = cmdWaitErr
 				reaped = true
 				if !timer.Stop() {
 					<-timer.C
@@ -203,7 +278,8 @@ func run(ctx context.Context, opts Options, withTimeout func(context.Context, ti
 			// post-kill wait so the caller always gets a result.
 			killTimer := time.NewTimer(opts.KillWaitGrace)
 			select {
-			case rawWaitErr = <-waitCh:
+			case <-waitCh:
+				rawWaitErr = cmdWaitErr
 				if !killTimer.Stop() {
 					<-killTimer.C
 				}
@@ -219,6 +295,11 @@ func run(ctx context.Context, opts Options, withTimeout func(context.Context, ti
 		}
 	}
 
+	if !killWaitTimedOut {
+		// waitCh closed on every path, so this also covers a forced cut-off that
+		// raced with a timeout or cancellation: it must never be committed complete.
+		pipeDrainTimedOut = drainForced.Load()
+	}
 	if killWaitTimedOut {
 		// cmd.Wait never returned, so the wait goroutine still owns the stream
 		// writers and the legacy artifact file must stay open for any straggler
@@ -234,6 +315,8 @@ func run(ctx context.Context, opts Options, withTimeout func(context.Context, ti
 	}
 	if killWaitTimedOut {
 		canonical.abortIncomplete(context.WithoutCancel(ctx), fmt.Errorf("process wait exceeded %s after tree kill; output streams have not reached EOF", opts.KillWaitGrace))
+	} else if pipeDrainTimedOut {
+		canonical.abortIncomplete(context.WithoutCancel(ctx), fmt.Errorf("output streams did not reach EOF within %s after the process exited", opts.PipeDrainGrace))
 	} else {
 		canonical.finish(context.WithoutCancel(ctx))
 	}
@@ -258,6 +341,11 @@ func run(ctx context.Context, opts Options, withTimeout func(context.Context, ti
 		}
 	}
 	res.ExitCode = exitCodeFromError(rawWaitErr)
+	if pipeDrainTimedOut {
+		// The command's own status stands; only the stream capture is incomplete.
+		res.PipeDrainTimedOut = true
+		res.Output = strings.TrimRight(res.Output, "\n") + "\n[a background process still holds stdout; output after exit was not captured]"
+	}
 	if killWaitTimedOut {
 		// cmd.Wait never returned, so rawWaitErr is nil and must not be read as
 		// a clean exit.
@@ -488,4 +576,85 @@ func truncateAtRuneBoundary(text string, maxBytes int) string {
 		cut--
 	}
 	return text[:cut]
+}
+
+// outputPump copies one child output stream from an os.Pipe into writer.
+type outputPump struct {
+	writer io.Writer
+	r, w   *os.File
+	// writeStart is the UnixNano time the pump entered writer.Write, or 0 while
+	// it is not inside the consumer.
+	writeStart atomic.Int64
+}
+
+const pipeDrainTick = 10 * time.Millisecond
+
+// waitForPumpsDrain is called once the process has exited. It returns true if
+// the streams were not cut off: pumpsDone closed, or stop fired. It returns
+// false when grace of wall time has passed since the exit, not counting time
+// any pump spent inside writer.Write: a slow consumer must not lose output the
+// process already wrote, but a descendant that keeps writing (or holds the pipe
+// silently) cannot extend the wait. Excluding Write time cannot tell a slow
+// consumer from a fast producer, so ceiling is a hard wall-clock limit since the
+// exit that no excluded time can exceed.
+func waitForPumpsDrain(streams []*outputPump, pumpsDone, stop <-chan struct{}, grace, ceiling time.Duration) bool {
+	ticker := time.NewTicker(pipeDrainTick)
+	defer ticker.Stop()
+	begin := time.Now()
+	last := begin
+	var spent time.Duration
+	for spent < grace && last.Sub(begin) < ceiling {
+		select {
+		case <-pumpsDone:
+			return true
+		case <-stop:
+			return true
+		case now := <-ticker.C:
+			inWrite := false
+			for _, st := range streams {
+				inWrite = inWrite || st.writeStart.Load() != 0
+			}
+			if !inWrite {
+				spent += now.Sub(last)
+			}
+			last = now
+		}
+	}
+	return false
+}
+
+func (p *outputPump) open() (err error) {
+	p.r, p.w, err = os.Pipe()
+	return err
+}
+
+func (p *outputPump) closeWriteEnd() {
+	if p.w != nil {
+		_ = p.w.Close()
+	}
+}
+
+func (p *outputPump) closeFiles() {
+	p.closeWriteEnd()
+	if p.r != nil {
+		_ = p.r.Close()
+	}
+}
+
+func (p *outputPump) pump() {
+	buf := make([]byte, 32*1024)
+	for {
+		n, err := p.r.Read(buf)
+		if n > 0 {
+			p.writeStart.Store(time.Now().UnixNano())
+			_, werr := p.writer.Write(buf[:n])
+			p.writeStart.Store(0)
+			if werr != nil {
+				return
+			}
+		}
+		if err != nil {
+			return
+		}
+	}
 }

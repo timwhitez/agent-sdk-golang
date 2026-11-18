@@ -6,6 +6,7 @@ import (
 	"context"
 	"errors"
 	"os/exec"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -16,10 +17,13 @@ func TestRunDoesNotCommitCanonicalStreamsBeforeEOF(t *testing.T) {
 		t.Skip("setsid is required for escaped-process fixture")
 	}
 	sink := &recordingStreamSink{}
+	ready := filepath.Join(t.TempDir(), "ready")
 	res, err := Run(context.Background(), Options{
-		Program:                    "sh",
-		Args:                       []string{"-c", "printf early; setsid sh -c 'sleep 1; printf late' & sleep 30"},
-		Timeout:                    100 * time.Millisecond,
+		Program: "sh",
+		// ready is touched by the escaped child, so the timeout cannot fire before
+		// setsid ran (the group kill would then end the child and the stream).
+		Args:                       []string{"-c", `printf early; setsid sh -c 'touch "$0"; sleep 2; printf late' "$0" & while [ ! -e "$0" ]; do sleep 0.01; done; sleep 30`, ready},
+		Timeout:                    time.Second,
 		KillGrace:                  10 * time.Millisecond,
 		KillWaitGrace:              100 * time.Millisecond,
 		ArtifactOwner:              canonicalRunnerOwner(),

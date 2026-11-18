@@ -9,8 +9,10 @@ import (
 	"net/http"
 	"net/netip"
 	"net/url"
+	"sort"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/timwhitez/agent-sdk-golang/sdk/tools"
 )
@@ -97,12 +99,23 @@ func webfetchTool() tools.Tool {
 			maxBytes = 5 * 1024 * 1024
 		}
 
-		meta := attachToolCallMeta(ctx, map[string]any{
-			"category": "network",
-			"summary":  fmt.Sprintf("%s %s", method, rawURL),
-			"url":      rawURL,
-			"raw":      fmt.Sprintf("%s %s (timeout=%ds, max_bytes=%d)", method, rawURL, timeout, maxBytes),
-		})
+		// The request carries exactly these headers; the confirmation shows the same set.
+		headers := webfetchRequestHeaders(a.Headers)
+		summary := fmt.Sprintf("%s %s", method, rawURL)
+		raw := fmt.Sprintf("%s %s (timeout=%ds, max_bytes=%d)", method, rawURL, timeout, maxBytes)
+		metaFields := map[string]any{"category": "network", "url": rawURL}
+		if len(headers) > 0 {
+			names, preview, credential := describeWebfetchHeaders(headers)
+			summary += fmt.Sprintf(" (+%d custom headers: %s)", len(names), strings.Join(names, ", "))
+			raw += " headers=" + strings.Join(preview, "; ")
+			metaFields["header_names"] = names
+			metaFields["headers"] = preview
+			if credential {
+				metaFields["force_confirm"] = true
+			}
+		}
+		metaFields["summary"], metaFields["raw"] = summary, raw
+		meta := attachToolCallMeta(ctx, metaFields)
 		ok, err := conf.Confirm(ctx, "webfetch", buildConfirmDetail(meta))
 		if err != nil {
 			return "", err
@@ -113,6 +126,8 @@ func webfetchTool() tools.Tool {
 		}
 
 		hc := newWebfetchHTTPClient(time.Duration(timeout) * time.Second)
+		// The transport is per call; release its keep-alive connections when done.
+		defer hc.CloseIdleConnections()
 		hc.CheckRedirect = func(req *http.Request, via []*http.Request) error {
 			if len(via) >= webfetchMaxRedirects {
 				return newWebfetchSafeRequestDiagnostic(fmt.Errorf("stopped after %d redirects", webfetchMaxRedirects))
@@ -140,12 +155,8 @@ func webfetchTool() tools.Tool {
 		if err != nil {
 			return "", fmt.Errorf("build request: %w", err)
 		}
-		for k, v := range a.Headers {
-			kk := strings.TrimSpace(k)
-			vv := strings.TrimSpace(v)
-			if kk != "" && vv != "" {
-				req.Header.Set(kk, vv)
-			}
+		for k, v := range headers {
+			req.Header.Set(k, v)
 		}
 		resp, err := webfetchDoRequest(hc, req)
 		if err != nil {
@@ -175,6 +186,53 @@ func webfetchTool() tools.Tool {
 		}
 		return fmt.Sprintf("%s\n\n%s", resp.Status, text), nil
 	})
+}
+
+// webfetchRequestHeaders normalizes model-supplied headers the way they are
+// sent: trimmed, empty entries dropped, names canonicalized. Keys that collide
+// after canonicalization resolve deterministically (last in sorted order wins).
+func webfetchRequestHeaders(in map[string]string) map[string]string {
+	keys := make([]string, 0, len(in))
+	for k := range in {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	out := map[string]string{}
+	for _, k := range keys {
+		kk, vv := strings.TrimSpace(k), strings.TrimSpace(in[k])
+		if kk != "" && vv != "" {
+			out[http.CanonicalHeaderKey(kk)] = vv
+		}
+	}
+	return out
+}
+
+// describeWebfetchHeaders returns sorted header names, "Name: value" previews
+// (values of credential-bearing headers redacted, others truncated), and
+// whether any header carries credentials.
+func describeWebfetchHeaders(headers map[string]string) (names, preview []string, credential bool) {
+	for name := range headers {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	for _, name := range names {
+		lower := strings.ToLower(name)
+		if lower == "authorization" || lower == "cookie" || lower == "x-api-key" || strings.HasPrefix(lower, "proxy-") {
+			credential = true
+			preview = append(preview, name+": [redacted]")
+			continue
+		}
+		value := headers[name]
+		if len(value) > 200 {
+			cut := 197
+			for !utf8.RuneStart(value[cut]) { // never split a multi-byte rune
+				cut--
+			}
+			value = value[:cut] + "..."
+		}
+		preview = append(preview, name+": "+value)
+	}
+	return names, preview, credential
 }
 
 func newWebfetchHTTPClient(timeout time.Duration) *http.Client {
