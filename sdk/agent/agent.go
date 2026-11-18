@@ -5822,6 +5822,7 @@ func errEventForModel(err error, model llm.ChatModel) ErrorEvent {
 			StatusCode:   429,
 			Message:      appendRetryAfterMessage(rl.Message, rl.RetryAfter),
 			RetryAfterMS: retryAfterMillis(rl.RetryAfter),
+			Reason:       rl.Reason,
 			Kind:         "rate_limit",
 		}
 	}
