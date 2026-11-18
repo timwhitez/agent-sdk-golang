@@ -28,20 +28,57 @@ var beforeWriteAnchor = func(path string) {}
 var beforeAnchorMkdir = func() {}
 
 // atomicDir is a directory pinned by an anchored walk: it is opened one
-// component at a time from the filesystem root without following symlinks, so a
-// path component replaced after revalidation cannot redirect a write, link or
-// unlink. Linux uses O_PATH directory fds (sandbox_io_dir_linux.go); other
-// platforms use os.Root (sandbox_io_dir_root.go). openAtomicDir(dir, create)
-// selects the platform implementation; create makes missing directories with
-// their parent's permission bits.
+// component at a time without following symlinks, so a path component replaced
+// after revalidation cannot redirect a write, link or unlink.
+// openAtomicDir(anchor, dir, create) selects the platform implementation:
+//   - Linux (sandbox_io_dir_linux.go) walks from the filesystem root with O_PATH
+//     directory fds and ignores anchor.
+//   - Elsewhere (sandbox_io_dir_root.go) os.Root opens anchor, the allowed root
+//     containing dir, and walks only the components below it; a component that
+//     cannot be opened fails closed.
+//
+// create makes missing directories with their parent's permission bits.
 type atomicDir interface {
 	lstat(name string) (os.FileInfo, error)
 	createTemp() (*os.File, string, error)
 	rename(tmpName, name string) error
-	// link hard-links name to dstName in dst without replacing an existing entry.
+	// link creates dstName in dst as the regular file name, never replacing an
+	// existing entry. Linux hard-links across the two pinned fds; os.Root
+	// hard-links within one directory and otherwise copies into a temp file in
+	// dst and hard-links that into place.
 	link(name string, dst atomicDir, dstName string) error
+	// remove unlinks a non-directory entry.
 	remove(name string) error
 	close()
+}
+
+// anchorFor returns the allowed root that contains the resolved path: the
+// sandbox root or an approved external root (its parent when path is the root
+// itself, e.g. a single approved file). Paths in no allowed root are refused.
+func (s *Sandbox) anchorFor(path string) (string, error) {
+	s.mu.Lock()
+	roots := append([]string{s.RootDir}, s.allowedRoots...)
+	s.mu.Unlock()
+	for _, root := range roots {
+		if root == "" || !isWithinRoot(path, root) {
+			continue
+		}
+		if pathsEqual(path, root) {
+			return filepath.Dir(root), nil
+		}
+		return root, nil
+	}
+	return "", &SecurityError{Message: fmt.Sprintf("path outside every allowed root: %q", path)}
+}
+
+// openAnchoredDir pins the parent directory of path below the allowed root
+// that contains path.
+func (s *Sandbox) openAnchoredDir(path string, create bool) (atomicDir, error) {
+	anchor, err := s.anchorFor(path)
+	if err != nil {
+		return nil, err
+	}
+	return openAtomicDir(anchor, filepath.Dir(path), create)
 }
 
 func atomicTempName() (string, error) {
@@ -53,9 +90,9 @@ func atomicTempName() (string, error) {
 }
 
 // removeFileAnchored unlinks path through its anchored parent directory.
-func removeFileAnchored(path string) error {
+func (s *Sandbox) removeFileAnchored(path string) error {
 	beforeWriteAnchor(path)
-	ad, err := openAtomicDir(filepath.Dir(path), false)
+	ad, err := s.openAnchoredDir(path, false)
 	if err != nil {
 		return err
 	}
@@ -69,10 +106,10 @@ func removeFileAnchored(path string) error {
 // best-effort basis: rename does not inherit the previous owner, so the temp
 // file is chowned back before the swap when the process is privileged enough.
 // path must already be symlink-resolved; a symlink on any component fails closed.
-func writeFilePreserveMode(path string, data []byte, defaultMode os.FileMode) error {
+func (s *Sandbox) writeFilePreserveMode(path string, data []byte, defaultMode os.FileMode) error {
 	beforeWriteAnchor(path)
-	dir, name := filepath.Dir(path), filepath.Base(path)
-	ad, err := openAtomicDir(dir, true)
+	name := filepath.Base(path)
+	ad, err := s.openAnchoredDir(path, true)
 	if err != nil {
 		return err
 	}

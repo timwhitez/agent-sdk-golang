@@ -21,12 +21,13 @@ const oPath = 0x200000
 // fdAtomicDir pins the destination directory with a directory fd.
 type fdAtomicDir struct{ fd int }
 
-// openFDAtomicDir opens dir one component at a time with O_NOFOLLOW|O_DIRECTORY,
+// openFDAtomicDir opens dir one component at a time, from the filesystem root
+// (anchor is not needed: every component is pinned), with O_NOFOLLOW|O_DIRECTORY,
 // creating missing directories (when create is set) with the mode of their
 // existing parent. Any symlink (or non-directory) component fails closed. Components are opened with
 // O_PATH so only search (x) permission is needed, as with a path-based open;
 // openat, mkdirat, renameat, unlinkat and fstat all accept O_PATH directory fds.
-func openFDAtomicDir(dir string, create bool) (atomicDir, error) {
+func openFDAtomicDir(_, dir string, create bool) (atomicDir, error) {
 	dir = filepath.Clean(dir)
 	start := "."
 	if filepath.IsAbs(dir) {

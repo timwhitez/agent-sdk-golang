@@ -696,7 +696,7 @@ func (p *patchPlanner) commitAction(a patchAction, expected map[string]writeTarg
 		if err := verifyPatchTargetUnchanged(expected, a.path.resolved, resolvedPath, a.relPath); err != nil {
 			return err
 		}
-		if err := removeFileAnchored(resolvedPath); err != nil {
+		if err := p.s.removeFileAnchored(resolvedPath); err != nil {
 			return err
 		}
 		expected[a.path.resolved] = writeTargetSnapshot{Exists: false}
@@ -728,7 +728,7 @@ func (p *patchPlanner) commitAction(a patchAction, expected map[string]writeTarg
 			return err
 		}
 		sourceContent := []byte(expected[a.path.resolved].Content)
-		if err := moveRegularFileNoReplace(fromPath, toPath); err != nil {
+		if err := p.s.moveRegularFileNoReplace(fromPath, toPath); err != nil {
 			return err
 		}
 		expected[a.path.resolved] = writeTargetSnapshot{Exists: false}
@@ -744,7 +744,7 @@ func (p *patchPlanner) commitAction(a patchAction, expected map[string]writeTarg
 		if err := verifyPatchTargetUnchanged(expected, a.path.resolved, currentPath, a.relPath); err != nil {
 			return err
 		}
-		if err := writeFilePreserveMode(currentPath, a.content, 0o644); err != nil {
+		if err := p.s.writeFilePreserveMode(currentPath, a.content, 0o644); err != nil {
 			return err
 		}
 		return updatePatchExpected(expected, a.path.resolved, currentPath, a.content)
@@ -760,16 +760,16 @@ var beforePatchMoveNoReplace = func(string, string) {}
 // support fail closed instead of risking destination data loss. Both
 // directories are anchored (see atomicDir); missing destination parents are
 // created with their parent's permission bits.
-func moveRegularFileNoReplace(fromPath, toPath string) error {
+func (s *Sandbox) moveRegularFileNoReplace(fromPath, toPath string) error {
 	if beforePatchMoveNoReplace != nil {
 		beforePatchMoveNoReplace(fromPath, toPath)
 	}
-	from, err := openAtomicDir(filepath.Dir(fromPath), false)
+	from, err := s.openAnchoredDir(fromPath, false)
 	if err != nil {
 		return err
 	}
 	defer from.close()
-	to, err := openAtomicDir(filepath.Dir(toPath), true)
+	to, err := s.openAnchoredDir(toPath, true)
 	if err != nil {
 		return err
 	}

@@ -2,6 +2,7 @@ package sandbox
 
 import (
 	"context"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -13,7 +14,7 @@ import (
 // atomicDirImpls lists every anchored-directory implementation runnable here:
 // the platform default (O_PATH dirfd on Linux) and the portable os.Root one
 // that is the default on darwin, windows and other unix systems.
-var atomicDirImpls = map[string]func(string, bool) (atomicDir, error){
+var atomicDirImpls = map[string]func(string, string, bool) (atomicDir, error){
 	"platform": openAtomicDir,
 	"root":     openRootAtomicDir,
 }
@@ -90,10 +91,14 @@ func evalTempDir(t *testing.T) string {
 func TestAnchoredWriteRefusesSymlinkComponents(t *testing.T) {
 	forEachAtomicDirImpl(t, func(t *testing.T, _ string) {
 		root, outside := evalTempDir(t), evalTempDir(t)
+		s, err := New(root)
+		if err != nil {
+			t.Fatal(err)
+		}
 		if err := os.Symlink(outside, filepath.Join(root, "dirlink")); err != nil {
 			t.Fatal(err)
 		}
-		if err := writeFilePreserveMode(filepath.Join(root, "dirlink", "f.txt"), []byte("x"), 0o644); err == nil {
+		if err := s.writeFilePreserveMode(filepath.Join(root, "dirlink", "f.txt"), []byte("x"), 0o644); err == nil {
 			t.Fatal("write through symlinked intermediate directory succeeded")
 		}
 		wantAbsent(t, filepath.Join(outside, "f.txt"))
@@ -103,13 +108,13 @@ func TestAnchoredWriteRefusesSymlinkComponents(t *testing.T) {
 		if err := os.Symlink(victim, filepath.Join(root, "leaf.txt")); err != nil {
 			t.Fatal(err)
 		}
-		err := writeFilePreserveMode(filepath.Join(root, "leaf.txt"), []byte("x"), 0o644)
+		err = s.writeFilePreserveMode(filepath.Join(root, "leaf.txt"), []byte("x"), 0o644)
 		if _, ok := err.(*SecurityError); !ok {
 			t.Fatalf("write to final-component symlink: err = %v, want SecurityError", err)
 		}
 		wantContent(t, victim, "victim")
 
-		if err := removeFileAnchored(filepath.Join(root, "dirlink", "victim.txt")); err == nil {
+		if err := s.removeFileAnchored(filepath.Join(root, "dirlink", "victim.txt")); err == nil {
 			t.Fatal("remove through symlinked intermediate directory succeeded")
 		}
 		wantContent(t, victim, "victim")
@@ -245,7 +250,11 @@ func TestAnchoredWriteModes(t *testing.T) {
 		if err := os.Chmod(root, 0o777); err != nil {
 			t.Fatal(err)
 		}
-		if err := writeFilePreserveMode(filepath.Join(root, "n1", "n2", "f.txt"), []byte("x"), 0o644); err != nil {
+		s, err := New(root)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := s.writeFilePreserveMode(filepath.Join(root, "n1", "n2", "f.txt"), []byte("x"), 0o644); err != nil {
 			t.Fatal(err)
 		}
 		for _, d := range []string{"n1", filepath.Join("n1", "n2")} {
@@ -265,7 +274,7 @@ func TestAnchoredWriteModes(t *testing.T) {
 			}
 		}
 		t.Cleanup(func() { beforeAnchorMkdir = func() {} })
-		if err := writeFilePreserveMode(filepath.Join(raced, "f.txt"), []byte("x"), 0o644); err != nil {
+		if err := s.writeFilePreserveMode(filepath.Join(raced, "f.txt"), []byte("x"), 0o644); err != nil {
 			t.Fatal(err)
 		}
 		if info, err := os.Stat(raced); err != nil || info.Mode().Perm() != 0o700 {
@@ -281,7 +290,7 @@ func TestAnchoredWriteModes(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if err := writeFilePreserveMode(f, []byte("new"), 0o644); err != nil {
+		if err := s.writeFilePreserveMode(f, []byte("new"), 0o644); err != nil {
 			t.Fatal(err)
 		}
 		after, err := os.Stat(f)
@@ -304,44 +313,165 @@ func TestAnchoredWriteModes(t *testing.T) {
 	})
 }
 
-// The os.Root link runs in a root at the common ancestor and is verified against
-// the pinned directories: a destination swapped after pinning is rolled back.
-func TestRootAtomicDirLinkRollsBackSwappedDestination(t *testing.T) {
-	root, outside := evalTempDir(t), evalTempDir(t)
-	mustWrite(t, filepath.Join(root, "s", "src.txt"), "src", 0o644)
-	for _, d := range []string{filepath.Join(root, "d"), filepath.Join(root, "other")} {
-		if err := os.Mkdir(d, 0o755); err != nil {
-			t.Fatal(err)
+// Review probe for #272: after the destination directory of a cross-root move
+// is pinned, the attacker moves it aside, symlinks its name to a directory
+// outside every allowed root and plants a hard link of the source under the
+// destination name in the pinned directory. Nothing may land outside, and the
+// source must stay.
+func TestApplyPatchCrossRootMoveHardlinkDecoy(t *testing.T) {
+	forEachAtomicDirImpl(t, func(t *testing.T, _ string) {
+		home := evalTempDir(t)
+		ws, ext, ssh := filepath.Join(home, "ws"), filepath.Join(home, "ext"), filepath.Join(home, ".ssh")
+		for _, d := range []string{ws, filepath.Join(ext, "d"), ssh} {
+			if err := os.MkdirAll(d, 0o755); err != nil {
+				t.Fatal(err)
+			}
 		}
-	}
-	for _, target := range []string{filepath.Join(root, "other"), outside} {
-		from, err := openRootAtomicDir(filepath.Join(root, "s"), false)
+		mustWrite(t, filepath.Join(ws, "src.txt"), "ssh-ed25519 ATTACKER\n", 0o644)
+		s, err := New(ws)
 		if err != nil {
 			t.Fatal(err)
 		}
-		to, err := openRootAtomicDir(filepath.Join(root, "d"), false)
+		if _, _, err := s.AllowExternalDirectory(ext); err != nil {
+			t.Fatal(err)
+		}
+		impl := openAtomicDir
+		fired := false
+		openAtomicDir = func(anchor, dir string, create bool) (atomicDir, error) {
+			ad, err := impl(anchor, dir, create)
+			if !fired && err == nil && dir == filepath.Join(ext, "d") {
+				fired = true
+				for _, step := range []error{
+					os.Rename(filepath.Join(ext, "d"), filepath.Join(ext, "d-real")),
+					os.Symlink("../.ssh", filepath.Join(ext, "d")),
+					os.Link(filepath.Join(ws, "src.txt"), filepath.Join(ext, "d-real", "authorized_keys")),
+				} {
+					if step != nil {
+						t.Error(step)
+					}
+				}
+			}
+			return ad, err
+		}
+		patch := fmt.Sprintf(`{"patch":"*** Begin Patch\n*** Update File: src.txt\n*** Move to: %s\n@@\n-ssh-ed25519 ATTACKER\n+ssh-ed25519 ATTACKER\n+x\n*** End Patch"}`, filepath.Join(ext, "d", "authorized_keys"))
+		toolErr := runSandboxTool(t, s, "apply_patch", patch)
+		if !fired {
+			t.Fatal("attacker hook did not run")
+		}
+		if toolErr == nil {
+			t.Error("cross-root move onto a planted decoy succeeded")
+		}
+		wantAbsent(t, filepath.Join(ssh, "authorized_keys"))
+		if _, err := os.Stat(filepath.Join(ws, "src.txt")); err != nil {
+			t.Fatalf("source removed: %v", err)
+		}
+	})
+}
+
+func dirHasTemp(t *testing.T, dir string) bool {
+	t.Helper()
+	entries, _ := os.ReadDir(dir)
+	for _, e := range entries {
+		if strings.HasPrefix(e.Name(), ".tmp-") {
+			return true
+		}
+	}
+	return false
+}
+
+// The move primitive never replaces, keeps content and mode across roots,
+// leaves no temp file, and on a failed copy keeps the source.
+func TestMoveRegularFileNoReplace(t *testing.T) {
+	forEachAtomicDirImpl(t, func(t *testing.T, impl string) {
+		home := evalTempDir(t)
+		ws, ext := filepath.Join(home, "ws"), filepath.Join(home, "ext")
+		mustWrite(t, filepath.Join(ws, "a", "src"), "src", 0o644)
+		mustWrite(t, filepath.Join(ws, "b", "dst"), "dst", 0o644)
+		if err := os.MkdirAll(ext, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		s, err := New(ws)
 		if err != nil {
 			t.Fatal(err)
 		}
-		if err := os.Rename(filepath.Join(root, "d"), filepath.Join(root, "d-pinned")); err != nil {
+		if _, _, err := s.AllowExternalDirectory(ext); err != nil {
 			t.Fatal(err)
 		}
-		if err := os.Symlink(target, filepath.Join(root, "d")); err != nil {
+
+		if err := s.moveRegularFileNoReplace(filepath.Join(ws, "a", "src"), filepath.Join(ws, "b", "dst")); err == nil {
+			t.Error("move onto an existing destination succeeded")
+		}
+		wantContent(t, filepath.Join(ws, "b", "dst"), "dst")
+		wantContent(t, filepath.Join(ws, "a", "src"), "src")
+
+		if err := s.moveRegularFileNoReplace(filepath.Join(ws, "a", "src"), filepath.Join(ws, "a", "src2")); err != nil {
+			t.Fatalf("same-directory move: %v", err)
+		}
+		wantContent(t, filepath.Join(ws, "a", "src2"), "src")
+		wantAbsent(t, filepath.Join(ws, "a", "src"))
+
+		if impl == "root" {
+			orig := writeFileBytes
+			writeFileBytes = func(*os.File, []byte) (int, error) { return 0, os.ErrInvalid }
+			err := s.moveRegularFileNoReplace(filepath.Join(ws, "a", "src2"), filepath.Join(ext, "n", "moved"))
+			writeFileBytes = orig
+			if err == nil {
+				t.Error("cross-root move with a failing copy succeeded")
+			}
+			wantContent(t, filepath.Join(ws, "a", "src2"), "src")
+			wantAbsent(t, filepath.Join(ext, "n", "moved"))
+			if dirHasTemp(t, filepath.Join(ext, "n")) {
+				t.Error("temp file left after a failed copy")
+			}
+		}
+
+		if err := os.Chmod(filepath.Join(ws, "a", "src2"), 0o640); err != nil {
 			t.Fatal(err)
 		}
-		if err := from.link("src.txt", to, "dst.txt"); err == nil {
-			t.Fatalf("link through swapped destination (%s) succeeded", target)
+		if err := s.moveRegularFileNoReplace(filepath.Join(ws, "a", "src2"), filepath.Join(ext, "n", "moved")); err != nil {
+			t.Fatalf("cross-root move: %v", err)
 		}
-		from.close()
-		to.close()
-		wantAbsent(t, filepath.Join(target, "dst.txt"))
-		wantAbsent(t, filepath.Join(root, "d-pinned", "dst.txt"))
-		wantContent(t, filepath.Join(root, "s", "src.txt"), "src")
-		if err := os.Remove(filepath.Join(root, "d")); err != nil {
+		wantContent(t, filepath.Join(ext, "n", "moved"), "src")
+		wantAbsent(t, filepath.Join(ws, "a", "src2"))
+		if info, err := os.Stat(filepath.Join(ext, "n", "moved")); err != nil || info.Mode().Perm() != 0o640 {
+			t.Fatalf("moved mode = %v, %v; want 0640", info.Mode().Perm(), err)
+		}
+		if dirHasTemp(t, filepath.Join(ext, "n")) {
+			t.Error("temp file left after a cross-root move")
+		}
+
+		// A symlink source: the dirfd hard link keeps it a symlink (never
+		// followed); os.Root cannot copy a symlink and refuses it.
+		if err := os.Symlink("/etc/passwd", filepath.Join(ws, "a", "lnk")); err != nil {
 			t.Fatal(err)
 		}
-		if err := os.Rename(filepath.Join(root, "d-pinned"), filepath.Join(root, "d")); err != nil {
+		err = s.moveRegularFileNoReplace(filepath.Join(ws, "a", "lnk"), filepath.Join(ws, "c", "lnk2"))
+		info, lerr := os.Lstat(filepath.Join(ws, "c", "lnk2"))
+		switch {
+		case impl == "root" && (err == nil || lerr == nil):
+			t.Errorf("os.Root moved a symlink source: err=%v", err)
+		case lerr == nil && info.Mode()&os.ModeSymlink == 0:
+			t.Error("symlink source was followed")
+		}
+	})
+}
+
+// Both implementations refuse to unlink a directory.
+func TestRemoveFileAnchoredRefusesDirectory(t *testing.T) {
+	forEachAtomicDirImpl(t, func(t *testing.T, _ string) {
+		root := evalTempDir(t)
+		s, err := New(root)
+		if err != nil {
 			t.Fatal(err)
 		}
-	}
+		if err := os.Mkdir(filepath.Join(root, "empty"), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := s.removeFileAnchored(filepath.Join(root, "empty")); err == nil {
+			t.Error("removed a directory")
+		}
+		if info, err := os.Stat(filepath.Join(root, "empty")); err != nil || !info.IsDir() {
+			t.Fatalf("directory gone: %v", err)
+		}
+	})
 }

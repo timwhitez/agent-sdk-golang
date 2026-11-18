@@ -165,7 +165,7 @@ func writeTool() tools.Tool {
 			msg := formatErrorDiagnosticFromErr("Unable to verify file before write", err, "Check file permissions/path and retry.")
 			return llm.TextContent(msg), err
 		}
-		if err := writeFilePreserveMode(resolvedPath, []byte(a.Content), 0o644); err != nil {
+		if err := s.writeFilePreserveMode(resolvedPath, []byte(a.Content), 0o644); err != nil {
 			msg := formatErrorDiagnosticFromErr("Unable to write file", err, "Check file permissions/path and retry.")
 			return llm.TextContent(msg), err
 		}
@@ -273,7 +273,7 @@ func editTool() tools.Tool {
 			msg := formatErrorDiagnosticFromErr("Unable to verify file before edit", err, "Check file permissions/path and retry.")
 			return llm.TextContent(msg), err
 		}
-		if err := writeFilePreserveMode(resolvedPath, []byte(newContent), 0o644); err != nil {
+		if err := s.writeFilePreserveMode(resolvedPath, []byte(newContent), 0o644); err != nil {
 			msg := formatErrorDiagnosticFromErr("Unable to write edited file", err, "Check file permissions/path and retry.")
 			return llm.TextContent(msg), err
 		}
@@ -404,7 +404,7 @@ func multieditTool() tools.Tool {
 			msg := formatErrorDiagnosticFromErr("Unable to verify file before multiedit", err, "Check file permissions/path and retry.")
 			return llm.TextContent(msg), err
 		}
-		if err := writeFilePreserveMode(resolvedPath, []byte(content), 0o644); err != nil {
+		if err := s.writeFilePreserveMode(resolvedPath, []byte(content), 0o644); err != nil {
 			msg := formatErrorDiagnosticFromErr("Unable to write multiedit result", err, "Check file permissions/path and retry.")
 			return llm.TextContent(msg), err
 		}
