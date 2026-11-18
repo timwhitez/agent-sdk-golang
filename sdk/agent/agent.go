@@ -2885,6 +2885,9 @@ func (a *Agent) transientInvokeRetryDelay(err error, partial *llm.Completion, st
 
 	var rl *llm.RateLimitError
 	if errors.As(err, &rl) {
+		if rl.Reason == llm.RateLimitReasonQuotaExhausted {
+			return 0, false
+		}
 		transient = true
 		retryAfter = rl.RetryAfter
 	}

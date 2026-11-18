@@ -214,11 +214,11 @@ func (c *ChatClient) Invoke(ctx context.Context, req llm.InvokeRequest) (*llm.Co
 				continue
 			}
 			if resp.StatusCode == 429 {
-				lastErr = &llm.RateLimitError{Provider: local.Provider(), Message: msg, RetryAfter: retryAfter}
+				lastErr = &llm.RateLimitError{Provider: local.Provider(), Message: msg, RetryAfter: retryAfter, Reason: openAIRateLimitReason(data)}
 			} else {
 				lastErr = &llm.ProviderError{Provider: local.Provider(), StatusCode: resp.StatusCode, Message: msg, RetryAfter: retryAfter, Reason: openAIErrorReason(data)}
 			}
-			if local.isRetryableStatus(resp.StatusCode) && attempt < retry.maxRetries-1 {
+			if local.isRetryableStatus(resp.StatusCode) && !llm.IsQuotaExhausted(lastErr) && attempt < retry.maxRetries-1 {
 				if waitErr := local.sleepBackoff(ctx, attempt, retry.baseDelay, retry.maxDelay, retryAfter, lastErr); waitErr != nil {
 					return nil, waitErr
 				}
@@ -383,13 +383,13 @@ func (c *ChatClient) InvokeStream(ctx context.Context, req llm.InvokeRequest) (<
 
 				var lastErr error
 				if resp.StatusCode == 429 {
-					lastErr = &llm.RateLimitError{Provider: local.Provider(), Message: msg, RetryAfter: retryAfter}
+					lastErr = &llm.RateLimitError{Provider: local.Provider(), Message: msg, RetryAfter: retryAfter, Reason: openAIRateLimitReason(data)}
 				} else {
 					lastErr = &llm.ProviderError{Provider: local.Provider(), StatusCode: resp.StatusCode, Message: msg, RetryAfter: retryAfter, Reason: openAIErrorReason(data)}
 				}
 				// Preserve this parsed cause before backoff can replace it with cancellation.
 				outcome.Observe(llm.StreamErrorEvent{Err: lastErr})
-				if local.isRetryableStatus(resp.StatusCode) && attempt < retry.maxRetries-1 {
+				if local.isRetryableStatus(resp.StatusCode) && !llm.IsQuotaExhausted(lastErr) && attempt < retry.maxRetries-1 {
 					if waitErr := local.sleepBackoff(ctx, attempt, retry.baseDelay, retry.maxDelay, retryAfter, lastErr); waitErr != nil {
 						out <- llm.StreamErrorEvent{Err: waitErr}
 						return
@@ -2066,15 +2066,31 @@ func intFromAny(v any) int {
 // openAIErrorReason maps the documented structured error code of an OpenAI
 // error body to a provider-neutral reason. Message text is never consulted.
 func openAIErrorReason(body []byte) string {
+	return openAIErrorCodeReason(openAIErrorCode(body))
+}
+
+// openAIRateLimitReason classifies a 429 body by its structured error code.
+func openAIRateLimitReason(body []byte) string {
+	return openAIRateLimitCodeReason(openAIErrorCode(body))
+}
+
+func openAIErrorCode(body []byte) any {
 	var envelope struct {
 		Error struct {
 			Code any `json:"code"`
 		} `json:"error"`
 	}
 	if json.Unmarshal(body, &envelope) != nil {
-		return ""
+		return nil
 	}
-	return openAIErrorCodeReason(envelope.Error.Code)
+	return envelope.Error.Code
+}
+
+func openAIRateLimitCodeReason(code any) string {
+	if value, ok := code.(string); ok && strings.TrimSpace(value) == "insufficient_quota" {
+		return llm.RateLimitReasonQuotaExhausted
+	}
+	return ""
 }
 
 func openAIErrorCodeReason(code any) string {

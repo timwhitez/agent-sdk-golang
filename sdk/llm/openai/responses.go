@@ -225,11 +225,11 @@ func (c *ResponsesClient) Invoke(ctx context.Context, req llm.InvokeRequest) (*l
 				continue
 			}
 			if resp.StatusCode == 429 {
-				lastErr = &llm.RateLimitError{Provider: local.Provider(), Message: msg, RetryAfter: retryAfter}
+				lastErr = &llm.RateLimitError{Provider: local.Provider(), Message: msg, RetryAfter: retryAfter, Reason: openAIRateLimitReason(data)}
 			} else {
 				lastErr = &llm.ProviderError{Provider: local.Provider(), StatusCode: resp.StatusCode, Message: msg, RetryAfter: retryAfter, Reason: openAIErrorReason(data)}
 			}
-			if local.isRetryableStatus(resp.StatusCode) && attempt < retry.maxRetries-1 {
+			if local.isRetryableStatus(resp.StatusCode) && !llm.IsQuotaExhausted(lastErr) && attempt < retry.maxRetries-1 {
 				if waitErr := local.sleepBackoff(ctx, attempt, retry.baseDelay, retry.maxDelay, retryAfter, lastErr); waitErr != nil {
 					return nil, waitErr
 				}
@@ -610,13 +610,13 @@ func (c *ResponsesClient) InvokeStream(ctx context.Context, req llm.InvokeReques
 
 				var lastErr error
 				if resp.StatusCode == 429 {
-					lastErr = &llm.RateLimitError{Provider: local.Provider(), Message: msg, RetryAfter: retryAfter}
+					lastErr = &llm.RateLimitError{Provider: local.Provider(), Message: msg, RetryAfter: retryAfter, Reason: openAIRateLimitReason(data)}
 				} else {
 					lastErr = &llm.ProviderError{Provider: local.Provider(), StatusCode: resp.StatusCode, Message: msg, RetryAfter: retryAfter, Reason: openAIErrorReason(data)}
 				}
 				// Preserve this parsed cause before backoff can replace it with cancellation.
 				outcome.Observe(llm.StreamErrorEvent{Err: lastErr})
-				if local.isRetryableStatus(resp.StatusCode) && attempt < retry.maxRetries-1 {
+				if local.isRetryableStatus(resp.StatusCode) && !llm.IsQuotaExhausted(lastErr) && attempt < retry.maxRetries-1 {
 					if waitErr := local.sleepBackoff(ctx, attempt, retry.baseDelay, retry.maxDelay, retryAfter, lastErr); waitErr != nil {
 						out <- llm.StreamErrorEvent{Err: waitErr}
 						return
@@ -1342,7 +1342,7 @@ func parseResponsesStreamEventError(provider string, root map[string]any) error 
 	}
 	provider = openAIProviderLabel(provider)
 	if rateLimited {
-		return &llm.RateLimitError{Provider: provider, Message: msg, RetryAfter: retryAfter}
+		return &llm.RateLimitError{Provider: provider, Message: msg, RetryAfter: retryAfter, Reason: openAIRateLimitCodeReason(errObj["code"])}
 	}
 	return &llm.ProviderError{Provider: provider, StatusCode: statusCode, Message: msg, RetryAfter: retryAfter, Reason: openAIErrorCodeReason(errObj["code"])}
 }
