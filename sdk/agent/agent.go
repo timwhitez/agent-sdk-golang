@@ -5809,7 +5809,12 @@ func errEventForModel(err error, model llm.ChatModel) ErrorEvent {
 	}
 	var stop *llm.RetryStopError
 	if errors.As(err, &stop) && stop != nil {
-		return ErrorEvent{Provider: prov, Message: stop.Error(), RetryAfterMS: retryAfterMillis(stop.RetryAfter), Kind: "retry_stopped", RetryStop: stop}
+		ev := ErrorEvent{Provider: prov, Message: stop.Error(), RetryAfterMS: retryAfterMillis(stop.RetryAfter), Kind: "retry_stopped", RetryStop: stop}
+		var cause *llm.RateLimitError
+		if errors.As(stop, &cause) && cause != nil {
+			ev.Reason = cause.Reason // quota exhausted behind a bounded Retry-After stays detectable
+		}
+		return ev
 	}
 	var rl *llm.RateLimitError
 	if errors.As(err, &rl) {
@@ -5822,6 +5827,7 @@ func errEventForModel(err error, model llm.ChatModel) ErrorEvent {
 			StatusCode:   429,
 			Message:      appendRetryAfterMessage(rl.Message, rl.RetryAfter),
 			RetryAfterMS: retryAfterMillis(rl.RetryAfter),
+			Reason:       rl.Reason,
 			Kind:         "rate_limit",
 		}
 	}
