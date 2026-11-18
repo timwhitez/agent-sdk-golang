@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
-	"sync"
 	"syscall"
 	"unsafe"
 )
@@ -60,12 +59,8 @@ type jobObjectExtendedLimitInfo struct {
 	PeakJobMemoryUsed     uintptr
 }
 
-type processGroupController struct {
-	mu      sync.Mutex
-	process *os.Process
-	job     syscall.Handle
-	closed  bool
-}
+// processGroupController is the Job Object controller; the logic is in process_job.go.
+type processGroupController = jobController
 
 func configureProcessGroup(cmd *exec.Cmd) {
 	if cmd == nil {
@@ -83,86 +78,67 @@ func attachProcessGroup(proc *os.Process) (*processGroupController, error) {
 	if proc == nil {
 		return nil, fmt.Errorf("missing process")
 	}
-	jobRaw, _, callErr := procCreateJobObjectW.Call(0, 0)
-	if jobRaw == 0 {
-		return nil, windowsCallError("CreateJobObjectW", callErr)
-	}
-	job := syscall.Handle(jobRaw)
-	closeJob := true
-	defer func() {
-		if closeJob {
-			_ = syscall.CloseHandle(job)
-		}
-	}()
+	return attachJob(winJobOps{}, proc.Pid)
+}
 
+// winJobOps is the Win32 glue behind jobOps.
+type winJobOps struct{}
+
+func (winJobOps) createJob() (uintptr, error) {
+	job, _, callErr := procCreateJobObjectW.Call(0, 0)
+	if job == 0 {
+		return 0, windowsCallError("CreateJobObjectW", callErr)
+	}
+	return job, nil
+}
+
+func (winJobOps) setKillOnClose(job uintptr, on bool) error {
 	info := jobObjectExtendedLimitInfo{}
-	info.BasicLimitInformation.LimitFlags = jobObjectLimitKillOnJobClose
+	if on {
+		info.BasicLimitInformation.LimitFlags = jobObjectLimitKillOnJobClose
+	}
 	ok, _, callErr := procSetInformationJobObject.Call(
-		uintptr(job),
+		job,
 		jobObjectExtendedLimitInformation,
 		uintptr(unsafe.Pointer(&info)),
 		unsafe.Sizeof(info),
 	)
 	if ok == 0 {
-		return nil, windowsCallError("SetInformationJobObject", callErr)
+		return windowsCallError("SetInformationJobObject", callErr)
 	}
+	return nil
+}
 
-	processHandle, err := syscall.OpenProcess(processSetQuota|processTerminate|processSuspendResume, false, uint32(proc.Pid))
-	if err != nil {
-		return nil, fmt.Errorf("OpenProcess(%d): %w", proc.Pid, err)
-	}
-	defer syscall.CloseHandle(processHandle)
-	ok, _, callErr = procAssignProcessToJobObject.Call(uintptr(job), uintptr(processHandle))
+func (winJobOps) openProcess(pid int) (uintptr, error) {
+	h, err := syscall.OpenProcess(processSetQuota|processTerminate|processSuspendResume, false, uint32(pid))
+	return uintptr(h), err
+}
+
+func (winJobOps) assign(job, proc uintptr) error {
+	ok, _, callErr := procAssignProcessToJobObject.Call(job, proc)
 	if ok == 0 {
-		return nil, windowsCallError("AssignProcessToJobObject", callErr)
+		return windowsCallError("AssignProcessToJobObject", callErr)
 	}
-	status, _, _ := procNtResumeProcess.Call(uintptr(processHandle))
+	return nil
+}
+
+func (winJobOps) resume(proc uintptr) error {
+	status, _, _ := procNtResumeProcess.Call(proc)
 	if status != 0 {
-		return nil, fmt.Errorf("NtResumeProcess: NTSTATUS 0x%08X", uint32(status))
+		return fmt.Errorf("NtResumeProcess: NTSTATUS 0x%08X", uint32(status))
 	}
-
-	closeJob = false
-	return &processGroupController{process: proc, job: job}, nil
+	return nil
 }
 
-func (c *processGroupController) terminate() error {
-	return c.terminateJob()
-}
-
-func (c *processGroupController) kill() error {
-	return c.terminateJob()
-}
-
-func (c *processGroupController) terminateJob() error {
-	if c == nil {
-		return nil
-	}
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	if c.closed || c.job == 0 {
-		return nil
-	}
-	ok, _, callErr := procTerminateJobObject.Call(uintptr(c.job), 1)
+func (winJobOps) terminate(job uintptr) error {
+	ok, _, callErr := procTerminateJobObject.Call(job, 1)
 	if ok == 0 {
 		return windowsCallError("TerminateJobObject", callErr)
 	}
 	return nil
 }
 
-func (c *processGroupController) close() error {
-	if c == nil {
-		return nil
-	}
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	if c.closed || c.job == 0 {
-		return nil
-	}
-	c.closed = true
-	err := syscall.CloseHandle(c.job)
-	c.job = 0
-	return err
-}
+func (winJobOps) closeHandle(h uintptr) error { return syscall.CloseHandle(syscall.Handle(h)) }
 
 func windowsCallError(name string, callErr error) error {
 	if callErr == nil || callErr == syscall.Errno(0) {
