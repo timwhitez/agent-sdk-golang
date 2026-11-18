@@ -15,7 +15,7 @@ const (
 )
 
 func summaryCheckpointMarkerPrefix(namespace string) string {
-	return summaryCheckpointMarkerOpen + resolveHostNamespace(namespace) + summaryCheckpointMarkerName
+	return summaryCheckpointMarkerOpen + messageorigin.ResolveHostNamespace(namespace) + summaryCheckpointMarkerName
 }
 
 func incrementalSummaryContext(namespace string, messages []llm.Message, ledger *Ledger, keepRecentUsers int, estimate tokenEstimator) (string, string) {

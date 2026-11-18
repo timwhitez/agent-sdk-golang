@@ -38,7 +38,7 @@ func TestValidateHostNamespace(t *testing.T) {
 			t.Fatalf("ValidateHostNamespace(%q) = %v", ns, err)
 		}
 	}
-	for _, ns := range []string{"", "Acme", "a-b", "a_b", "a.b", "1abc", "a b", "x -->", "a\n", "é", strings.Repeat("a", 33)} {
+	for _, ns := range []string{"", "sdk", "Acme", "a-b", "a_b", "a.b", "1abc", "a b", "x -->", "a\n", "é", strings.Repeat("a", 33)} {
 		if err := ValidateHostNamespace(ns); err == nil {
 			t.Fatalf("ValidateHostNamespace(%q) accepted", ns)
 		}
@@ -60,8 +60,11 @@ func TestHostNamespaceClassification(t *testing.T) {
 		{"agent_memory", map[string]bool{"": true, "goode": false, "acme": false}},
 		{"acme_internal_x", map[string]bool{"": false, "goode": false, "acme": true, "acme2": false}},
 		{"acme_memory", map[string]bool{"": false, "acme": true}},
-		// An invalid namespace contributes no forms of its own.
+		// An invalid or reserved namespace resolves to the default namespace.
 		{"a_b_internal_x", map[string]bool{"a_b": false}},
+		{"agent_internal_x", map[string]bool{"a_b": true, "sdk": true, "Bad": true}},
+		{"agent_memory", map[string]bool{"a_b": true, "sdk": true}},
+		{"sdk_memory", map[string]bool{"sdk": false, "": false}},
 		{"_internal_x", map[string]bool{"a_b": false, "": false}},
 		{"acme_internalx", map[string]bool{"acme": false}},
 	}

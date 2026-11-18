@@ -42,8 +42,12 @@ const (
 // ValidateHostNamespace accepts 1-32 bytes of [a-z0-9] starting with a letter.
 // The namespace is embedded in names and an HTML-comment marker that are
 // parsed later, so the separators "_", "-", "." and anything that could close
-// or extend the marker are excluded.
+// or extend the marker are excluded. "sdk" is reserved: its "sdk_internal_"
+// names already belong to the SDK.
 func ValidateHostNamespace(namespace string) error {
+	if namespace == "sdk" {
+		return fmt.Errorf("host namespace %q is reserved for the SDK", namespace)
+	}
 	if namespace == "" || len(namespace) > maxHostNamespaceLen {
 		return fmt.Errorf("host namespace %q must be 1-%d characters", namespace, maxHostNamespaceLen)
 	}
@@ -56,15 +60,12 @@ func ValidateHostNamespace(namespace string) error {
 	return nil
 }
 
-// ResolveHostNamespace maps an empty namespace to DefaultHostNamespace. An
-// invalid namespace resolves to "" so that callers recognize only the SDK and
-// legacy forms and never build an identifier from it.
+// ResolveHostNamespace maps an empty or invalid namespace to
+// DefaultHostNamespace, so every writer and reader uses the same valid
+// namespace and never builds an identifier from invalid input.
 func ResolveHostNamespace(namespace string) string {
-	if namespace == "" {
-		return DefaultHostNamespace
-	}
 	if ValidateHostNamespace(namespace) != nil {
-		return ""
+		return DefaultHostNamespace
 	}
 	return namespace
 }
@@ -140,8 +141,9 @@ func IsRealUserMessage(message llm.Message) bool {
 }
 
 // IsInternalMessageIn reports whether a message is framework- or host-authored.
-// Host-owned names are recognized for the given namespace (empty means
-// DefaultHostNamespace) and for LegacyHostNamespace; other namespaces are not.
+// Host-owned names are recognized for the given namespace (empty or invalid
+// means DefaultHostNamespace) and for LegacyHostNamespace; other namespaces
+// are not.
 func IsInternalMessageIn(namespace string, message llm.Message) bool {
 	name := strings.TrimSpace(message.Name)
 	if isReservedInternalName(ResolveHostNamespace(namespace), name) {
@@ -167,7 +169,7 @@ func isReservedInternalName(namespace, name string) bool {
 	if strings.HasPrefix(name, SDKInternalNamePrefix) || strings.HasPrefix(name, LegacyHostInternalNamePrefix) {
 		return true
 	}
-	return namespace != "" && (name == namespace+"_memory" || strings.HasPrefix(name, namespace+"_internal_"))
+	return name == namespace+"_memory" || strings.HasPrefix(name, namespace+"_internal_")
 }
 
 func isLegacyInternalUserText(text string) bool {

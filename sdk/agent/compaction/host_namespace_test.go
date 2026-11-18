@@ -7,6 +7,7 @@ import (
 	"sync"
 	"testing"
 
+	"github.com/timwhitez/agent-sdk-golang/sdk/agent/messageorigin"
 	"github.com/timwhitez/agent-sdk-golang/sdk/llm"
 )
 
@@ -156,5 +157,31 @@ func TestServicesWithDifferentNamespacesDoNotInterfere(t *testing.T) {
 	// there; beta classifies its own name as internal.
 	if latest["acme"] != "beta host note" || latest["beta"] != "real request" {
 		t.Fatalf("latest real user anchors = %#v", latest)
+	}
+}
+
+func TestInvalidNamespaceResolvesLikeDefaultInExportedHelpers(t *testing.T) {
+	source := []llm.Message{llm.NewUserMessage("first request")}
+	meta := nextLedgerSummary(nil, source, "summary", "")
+	summary := llm.Message{Role: llm.RoleUser, Name: CompactionSummaryMessageName, Content: llm.TextContent(withSummaryCheckpoint("", "summary", meta))}
+	agentNote := llm.Message{Role: llm.RoleUser, Name: "agent_internal_note", Content: llm.TextContent("host note")}
+	// The agent-internal note may precede the summary only if it is internal.
+	history := []llm.Message{agentNote, summary}
+	for _, ns := range []string{"Bad", "sdk", "x -->", "a_b", strings.Repeat("a", 33)} {
+		if got := messageorigin.ResolveHostNamespace(ns); got != messageorigin.DefaultHostNamespace {
+			t.Fatalf("ResolveHostNamespace(%q) = %q", ns, got)
+		}
+		if !messageorigin.IsInternalMessageIn(ns, agentNote) || messageorigin.IsRealUserMessageIn(ns, agentNote) {
+			t.Fatalf("ns=%q does not classify agent_internal_* like the default namespace", ns)
+		}
+		if err := ValidateLedgerSummaryBindingIn(ns, history, meta); err != nil {
+			t.Fatalf("ns=%q binding differs from default: %v", ns, err)
+		}
+		if got := compactionMaterialSchema(ns); got != "agent.compaction.material.v1" {
+			t.Fatalf("ns=%q schema = %q", ns, got)
+		}
+	}
+	if err := ValidateLedgerSummaryBindingIn("", history, meta); err != nil {
+		t.Fatalf("default binding: %v", err)
 	}
 }

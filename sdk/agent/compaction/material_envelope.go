@@ -14,7 +14,7 @@ import (
 const compactionMaterialSchemaSuffix = ".compaction.material.v1"
 
 func compactionMaterialSchema(namespace string) string {
-	return resolveHostNamespace(namespace) + compactionMaterialSchemaSuffix
+	return messageorigin.ResolveHostNamespace(namespace) + compactionMaterialSchemaSuffix
 }
 
 type realUserAnchors struct {

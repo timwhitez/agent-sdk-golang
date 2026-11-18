@@ -111,18 +111,9 @@ func NewService(cfg *Config) *Service {
 
 func (s *Service) hostNamespace() string {
 	if s == nil {
-		return resolveHostNamespace("")
+		return messageorigin.DefaultHostNamespace
 	}
-	return resolveHostNamespace(s.Config.HostNamespace)
-}
-
-// resolveHostNamespace never yields an invalid namespace, so identifiers built
-// from it always parse back.
-func resolveHostNamespace(namespace string) string {
-	if resolved := messageorigin.ResolveHostNamespace(namespace); resolved != "" {
-		return resolved
-	}
-	return messageorigin.DefaultHostNamespace
+	return messageorigin.ResolveHostNamespace(s.Config.HostNamespace)
 }
 
 // resolveTokenEstimator returns a safe estimator: it falls back to the naive
