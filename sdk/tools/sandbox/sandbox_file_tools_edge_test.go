@@ -368,6 +368,11 @@ func TestSkippedSearchDirsConfigurable(t *testing.T) {
 			}
 		})
 	}
+	// Entries with a separator or glob character can never match a base name and are ignored.
+	s.SetSkippedSearchDirs([]string{".git/objects", "*", "{src}"})
+	if len(s.searchSkipDirs()) != 0 {
+		t.Errorf("unmatchable entries kept: %v", s.searchSkipDirs())
+	}
 	// An explicit path inside a configured-skipped directory is still searched.
 	s.SetSkippedSearchDirs([]string{"src"})
 	res, err := globTool().Execute(context.Background(), `{"pattern":"**/*.go","path":"src"}`, deps)

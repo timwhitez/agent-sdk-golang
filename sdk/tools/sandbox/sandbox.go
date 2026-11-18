@@ -122,8 +122,11 @@ func (s *Sandbox) ReplaceAllowedRoots(roots []string) {
 }
 
 // SetSkippedSearchDirs sets the directory base names grep and glob do not descend
-// into. nil restores the default list; a non-nil empty slice skips nothing. A
-// directory passed explicitly as the search path is always searched.
+// into. nil restores the default list; a non-nil empty slice skips nothing. Only
+// exact base names match (case-sensitive); entries containing a path separator
+// or a glob character (/ \ * ? [ {) can never match and are ignored. A directory
+// passed explicitly as the search path is always searched. A running search uses
+// the list as it was when the search started.
 func (s *Sandbox) SetSkippedSearchDirs(names []string) {
 	if s == nil {
 		return
@@ -132,7 +135,7 @@ func (s *Sandbox) SetSkippedSearchDirs(names []string) {
 	if names != nil {
 		m = make(map[string]bool, len(names))
 		for _, n := range names {
-			if n = strings.TrimSpace(n); n != "" {
+			if n = strings.TrimSpace(n); n != "" && !strings.ContainsAny(n, `/\*?[{`) {
 				m[n] = true
 			}
 		}
@@ -142,14 +145,15 @@ func (s *Sandbox) SetSkippedSearchDirs(names []string) {
 	s.mu.Unlock()
 }
 
-// skipsSearchDir reports whether grep/glob skip directories with this base name.
-func (s *Sandbox) skipsSearchDir(name string) bool {
+// searchSkipDirs returns the skip list for one grep/glob search; the map is never
+// mutated after it is installed, so one snapshot is consistent for the whole walk.
+func (s *Sandbox) searchSkipDirs() map[string]bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.skipDirs != nil {
-		return s.skipDirs[name]
+		return s.skipDirs
 	}
-	return skippedSearchDirs[name]
+	return skippedSearchDirs
 }
 
 func New(root string) (*Sandbox, error) {

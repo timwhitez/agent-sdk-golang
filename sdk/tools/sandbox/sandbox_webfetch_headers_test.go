@@ -115,7 +115,7 @@ func TestDescribeWebfetchHeadersCredentialRule(t *testing.T) {
 		name string
 		cred bool
 	}{
-		{"Authorization", true}, {"Cookie", true}, {"Proxy-Authorization", true}, {"Proxy-Foo", true},
+		{"Authorization", true}, {"X-Authorization", true}, {"Cookie", true}, {"X-Cookie", true}, {"Set-Cookie", true}, {"Proxy-Authorization", true}, {"Proxy-Foo", true},
 		{"X-Api-Key", true}, {"X-Goog-Api-Key", true}, {"Api-Key", true}, {"X-ApiKey", true},
 		{"X-Auth-Token", true}, {"Private-Token", true}, {"X-Amz-Security-Token", true},
 		{"Ocp-Apim-Subscription-Key", true}, {"X-Access-Key", true}, {"X-Client-Secret", true},

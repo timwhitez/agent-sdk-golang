@@ -202,6 +202,7 @@ func globTool() tools.Tool {
 		skippedSymlink := globSkippedDiagnostics{}
 		skippedWalk := globSkippedDiagnostics{}
 		skippedDirs := []string{}
+		skipDirNames := s.searchSkipDirs()
 		walkErr := globWalkDir(base, func(path string, d os.DirEntry, walkErr error) error {
 			if walkErr != nil {
 				displayPath := resultPathForDisplay(s, path)
@@ -215,7 +216,7 @@ func globTool() tools.Tool {
 				return nil
 			}
 			if d.IsDir() {
-				if s.skipsSearchDir(d.Name()) && !pathsEqual(filepath.Clean(path), filepath.Clean(base)) {
+				if skipDirNames[d.Name()] && !pathsEqual(filepath.Clean(path), filepath.Clean(base)) {
 					skippedDirs = append(skippedDirs, resultPathForDisplay(s, path))
 					return filepath.SkipDir
 				}

@@ -149,6 +149,7 @@ func grepTool() tools.Tool {
 		visitedEntries := 0
 		traversalStopped := false
 		skippedDirs := []string{}
+		skipDirNames := s.searchSkipDirs()
 		recordPermissionDenied := func(path string) {
 			displayPath := resultPathForDisplay(s, path)
 			if _, ok := permissionDeniedSeen[displayPath]; ok {
@@ -182,7 +183,7 @@ func grepTool() tools.Tool {
 				return nil
 			}
 			if d.IsDir() {
-				if s.skipsSearchDir(d.Name()) && !pathsEqual(filepath.Clean(path), filepath.Clean(base)) {
+				if skipDirNames[d.Name()] && !pathsEqual(filepath.Clean(path), filepath.Clean(base)) {
 					skippedDirs = append(skippedDirs, resultPathForDisplay(s, path))
 					return filepath.SkipDir
 				}

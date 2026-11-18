@@ -11,6 +11,7 @@ import (
 	"runtime/debug"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"syscall"
 	"testing"
 	"time"
@@ -110,7 +111,7 @@ func TestRunSlowConsumerDoesNotLoseOutputToPipeDrain(t *testing.T) {
 		Program:        "sh",
 		Args:           []string{"-c", "echo a; sleep 0.2; echo b"},
 		Timeout:        10 * time.Second,
-		PipeDrainGrace: 300 * time.Millisecond,
+		PipeDrainGrace: 100 * time.Millisecond,
 		OnOutputChunk:  func(OutputChunk) { time.Sleep(time.Second) },
 	})
 	if err != nil || res.PipeDrainTimedOut || !strings.Contains(res.Output, "a") || !strings.Contains(res.Output, "b") || strings.Contains(res.Output, "background process") {
@@ -162,7 +163,7 @@ func startYesScript(t *testing.T) (args []string, stampFile string) {
 // is excluded from the PipeDrainGrace budget.
 func TestRunContinuousBackgroundWriterIsBoundedByPipeDrainGrace(t *testing.T) {
 	args, stampFile := startYesScript(t)
-	res, err := Run(context.Background(), Options{Program: "sh", Args: args, PipeDrainGrace: 300 * time.Millisecond, KillWaitGrace: 300 * time.Millisecond})
+	res, err := Run(context.Background(), Options{Program: "sh", Args: args, PipeDrainGrace: 100 * time.Millisecond, KillWaitGrace: 300 * time.Millisecond})
 	end := time.Now()
 	if err != nil || res.ExitCode != 0 || res.TimedOut || !res.PipeDrainTimedOut {
 		t.Fatalf("Run() err=%v exit=%d timed_out=%v drain=%v", err, res.ExitCode, res.TimedOut, res.PipeDrainTimedOut)
@@ -261,9 +262,12 @@ func yesArgs(t *testing.T) []string {
 }
 
 // Issue #248/#266: a finished foreground command must not kill a background
-// child that still holds stdout; the child outlives Run.
+// child that still holds stdout. A killed process may still look alive to
+// kill(pid, 0) until reaped, so the child proves it outlived Run by creating a
+// marker file after Run has returned.
 func TestRunDoesNotKillBackgroundChildHoldingPipe(t *testing.T) {
 	dir := t.TempDir()
+	marker := filepath.Join(dir, "marker")
 	pidFile := filepath.Join(dir, "pid")
 	t.Cleanup(func() {
 		if b, err := os.ReadFile(pidFile); err == nil {
@@ -274,48 +278,43 @@ func TestRunDoesNotKillBackgroundChildHoldingPipe(t *testing.T) {
 	})
 	res, err := Run(context.Background(), Options{
 		Program:        "sh",
-		Args:           []string{"-c", `sleep 30 & echo $! > "$0"; exit 0`, pidFile},
+		Args:           []string{"-c", `(sleep 1; touch "$1") & echo $! > "$0"; exit 0`, pidFile, marker},
 		Timeout:        30 * time.Second, // safety net only
 		PipeDrainGrace: 100 * time.Millisecond,
 	})
 	if err != nil || res.TimedOut || res.ExitCode != 0 || !res.PipeDrainTimedOut {
 		t.Fatalf("Run() err=%v timed_out=%v exit=%d drain=%v", err, res.TimedOut, res.ExitCode, res.PipeDrainTimedOut)
 	}
-	b, err := os.ReadFile(pidFile) // written before the shell exited, so present once Run returns
-	if err != nil {
-		t.Fatalf("pid file: %v", err)
+	if _, err := os.Stat(marker); err == nil {
+		t.Fatal("marker exists before Run returned; the child did not outlive Run")
 	}
-	pid, err := strconv.Atoi(strings.TrimSpace(string(b)))
-	if err != nil {
-		t.Fatalf("pid %q: %v", b, err)
-	}
-	if err := syscall.Kill(pid, 0); err != nil {
-		t.Fatalf("background child %d was killed or exited after Run returned: %v", pid, err)
+	for deadline := time.Now().Add(20 * time.Second); ; time.Sleep(20 * time.Millisecond) {
+		if _, err := os.Stat(marker); err == nil {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("background child never completed after Run returned: it was killed")
+		}
 	}
 }
 
-// Issue #266: a continuous writer behind a slow consumer must still be cut off
-// well before the hard ceiling once more than a pipe capacity is read after the
-// exit (Write time is excluded only for output that predates it).
-func TestRunContinuousWriterWithSlowConsumerIsCutOffBeforeCeiling(t *testing.T) {
-	args, stampFile := startYesScript(t)
+// Output the process wrote before exiting must reach a slow consumer in full,
+// even when it exceeds one pipe capacity (two streams, or enlarged pipes). Do not
+// bound the drain by "bytes read after exit": that premise is false.
+func TestRunSlowConsumerReceivesAllOutputWrittenBeforeExit(t *testing.T) {
+	const n = 400_000
+	var got atomic.Int64
 	res, err := Run(context.Background(), Options{
 		Program:        "sh",
-		Args:           args,
-		PipeDrainGrace: 300 * time.Millisecond,
-		KillWaitGrace:  30 * time.Second, // ceiling = 30.3s
-		OnOutputChunk:  func(OutputChunk) { time.Sleep(100 * time.Millisecond) },
+		Args:           []string{"-c", "head -c 400000 /dev/zero & head -c 400000 /dev/zero >&2; wait"},
+		Timeout:        2 * time.Minute, // safety net only
+		PipeDrainGrace: 100 * time.Millisecond,
+		OnOutputChunk: func(c OutputChunk) {
+			got.Add(int64(len(c.Data)))
+			time.Sleep(100 * time.Millisecond)
+		},
 	})
-	end := time.Now()
-	if err != nil || res.TimedOut || !res.PipeDrainTimedOut {
-		t.Fatalf("Run() err=%v timed_out=%v drain=%v", err, res.TimedOut, res.PipeDrainTimedOut)
-	}
-	b, _ := os.ReadFile(stampFile)
-	exitNanos, perr := strconv.ParseInt(strings.TrimSpace(string(b)), 10, 64)
-	if perr != nil {
-		t.Fatalf("exit stamp unreadable: %v", perr)
-	}
-	if after := end.Sub(time.Unix(0, exitNanos)); after > 10*time.Second {
-		t.Fatalf("Run returned %s after exit; the slow consumer kept extending the drain", after)
+	if err != nil || res.PipeDrainTimedOut || got.Load() != 2*n {
+		t.Fatalf("Run() err=%v drain=%v delivered=%d of %d bytes", err, res.PipeDrainTimedOut, got.Load(), 2*n)
 	}
 }

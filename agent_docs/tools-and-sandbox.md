@@ -184,7 +184,7 @@ are never retried, and the original execution error/result is preserved.
   echoing credential values (`sdk/tools/sandbox/sandbox_webfetch.go`).
 - `webfetch` confirmation lists every model-supplied header: names and
   previews in `header_names`/`headers` and in `summary`/`raw`. Values of
-  `Authorization`, `Cookie`, `Proxy-*` and any header whose name contains
+  `Proxy-*` and any header whose name contains `authorization`, `cookie`,
   `token`, `secret`, `api-key`, `apikey`, `subscription-key`, `access-key` or
   `password` (case-insensitive; includes `X-CSRF-Token`) are redacted and
   set `force_confirm`; other custom headers are shown but not force-confirmed.
