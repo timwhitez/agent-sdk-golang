@@ -50,11 +50,25 @@ func (e *ProviderError) Error() string {
 	return fmt.Sprintf("%s error: %s", e.Provider, msg)
 }
 
+// RateLimitReasonQuotaExhausted marks a rate limit that waiting cannot
+// resolve because the account's quota or credit is exhausted.
+const RateLimitReasonQuotaExhausted = "quota_exhausted"
+
 // RateLimitError is a convenience type for retry logic.
 type RateLimitError struct {
 	Provider   string
 	Message    string
 	RetryAfter time.Duration
+	// Reason is set by a provider adapter only from a documented structured
+	// error code, never from message text. Empty means an ordinary rate limit.
+	Reason string
+}
+
+// IsQuotaExhausted reports whether err is a rate limit that carries typed
+// provider evidence of exhausted quota; retrying it cannot succeed.
+func IsQuotaExhausted(err error) bool {
+	var rl *RateLimitError
+	return errors.As(err, &rl) && rl != nil && rl.Reason == RateLimitReasonQuotaExhausted
 }
 
 func (e *RateLimitError) Error() string {
