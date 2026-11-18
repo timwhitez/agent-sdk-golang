@@ -8,6 +8,7 @@ import (
 	"strings"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/timwhitez/agent-sdk-golang/sdk/llm"
 )
@@ -106,5 +107,26 @@ func TestQueryStreamErrorEventReportsQuotaExhausted(t *testing.T) {
 	}
 	if n := model.calls.Load(); n != 1 {
 		t.Fatalf("model called %d times, want 1 (quota is not retried)", n)
+	}
+}
+
+// compactWithRetry bounds a quota 429 whose Retry-After exceeds the wait limit
+// into a RetryStopError; the reason must survive that wrapping.
+func TestErrorEventKeepsQuotaReasonThroughRetryStop(t *testing.T) {
+	quota := &llm.RateLimitError{Provider: "p", Message: "no credit", RetryAfter: time.Hour, Reason: llm.RateLimitReasonQuotaExhausted}
+	err := llm.BoundRetryAfter(context.Background(), quota, 5*time.Second)
+	if !llm.IsRetryStop(err) {
+		t.Fatalf("setup: %v is not a retry stop", err)
+	}
+	ev := errEventForModel(err, nil)
+	if ev.Kind != "retry_stopped" || ev.RetryStop == nil {
+		t.Fatalf("Kind=%q RetryStop=%v, want retry_stopped unchanged", ev.Kind, ev.RetryStop)
+	}
+	if !ev.IsQuotaExhausted() || ev.IsQuotaExhausted() != llm.IsQuotaExhausted(err) {
+		t.Fatalf("Reason=%q, want quota_exhausted matching llm.IsQuotaExhausted", ev.Reason)
+	}
+	ordinary := llm.BoundRetryAfter(context.Background(), &llm.RateLimitError{Provider: "p", RetryAfter: time.Hour}, 5*time.Second)
+	if ev := errEventForModel(ordinary, nil); ev.Reason != "" || ev.IsQuotaExhausted() {
+		t.Fatalf("ordinary bounded 429 got Reason=%q", ev.Reason)
 	}
 }

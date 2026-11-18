@@ -60,6 +60,10 @@ type jobController struct {
 	mu     sync.Mutex
 	job    uintptr
 	closed bool
+	// killRequested records that terminate/kill ran (timeout, cancel). The
+	// call's error is discarded by the runner, so close() keeps kill-on-close
+	// as the backstop for whatever it failed to reach.
+	killRequested bool
 }
 
 func (c *jobController) terminate() error {
@@ -71,6 +75,7 @@ func (c *jobController) terminate() error {
 	if c.closed {
 		return nil
 	}
+	c.killRequested = true
 	return c.ops.terminate(c.job)
 }
 
@@ -80,8 +85,11 @@ func (c *jobController) kill() error { return c.terminate() }
 // last handle of a job with JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE terminates every
 // process in it (Win32 JOBOBJECT_BASIC_LIMIT_INFORMATION), which would kill a
 // background child that outlived the foreground command, unlike unix (#248).
-// Kill-on-close stays set until here so a crashed host still cleans up; timeouts
-// and cancellation have already called kill() explicitly.
+// Kill-on-close stays set until here so a crashed host still cleans up. It is
+// cleared only on a normal exit: after terminate/kill was requested the handle
+// is closed with the flag still set, so a failed terminate is backed up by the
+// kill. If clearing the flag fails, close falls back to that kill-on-close
+// behaviour and returns the error.
 func (c *jobController) close() error {
 	if c == nil {
 		return nil
@@ -92,7 +100,10 @@ func (c *jobController) close() error {
 		return nil
 	}
 	c.closed = true
-	releaseErr := c.ops.setKillOnClose(c.job, false)
+	var releaseErr error
+	if !c.killRequested {
+		releaseErr = c.ops.setKillOnClose(c.job, false)
+	}
 	closeErr := c.ops.closeHandle(c.job)
 	if releaseErr != nil {
 		return releaseErr

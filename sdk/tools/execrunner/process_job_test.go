@@ -114,3 +114,27 @@ func TestJobTerminateAndKillReachTheJob(t *testing.T) {
 		t.Fatal("nil controller must be a no-op")
 	}
 }
+
+// After terminate/kill (timeout, cancel) the runner discards their errors, so
+// close must leave kill-on-close set as the backstop.
+func TestJobCloseAfterTerminateOrKillKeepsKillOnClose(t *testing.T) {
+	for _, name := range []string{"terminate", "kill"} {
+		t.Run(name, func(t *testing.T) {
+			f := &fakeJobOps{}
+			c, _ := attachJob(f, 42)
+			f.calls, f.failAt = nil, "terminate" // the kill itself fails
+			if name == "terminate" {
+				_ = c.terminate()
+			} else {
+				_ = c.kill()
+			}
+			f.calls, f.failAt = nil, ""
+			if err := c.close(); err != nil {
+				t.Fatal(err)
+			}
+			if want := []string{"closeJob"}; !reflect.DeepEqual(f.calls, want) {
+				t.Fatalf("close calls = %v, want %v (no release after a kill request)", f.calls, want)
+			}
+		})
+	}
+}
