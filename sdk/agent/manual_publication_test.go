@@ -30,7 +30,7 @@ func BenchmarkManualCompactionAdmission(b *testing.B) {
 
 func TestManualCompactionOwnsHistoryThroughCheckpointPublication(t *testing.T) {
 	entered, release := make(chan struct{}), make(chan struct{})
-	original := []llm.Message{llm.NewSystemMessage("base"), llm.NewUserMessage("old request"), llm.NewAssistantMessage("old answer", nil)}
+	original := []llm.Message{llm.NewSystemMessage("base"), llm.NewUserMessage("old request"), compactableAnswer("old answer")}
 	var checkpoint []llm.Message
 	var ag *Agent
 	var callbackMutation error
@@ -189,7 +189,7 @@ func TestManualCompactionReleasesAdmissionAfterEarlyExit(t *testing.T) {
 			if mode == "checkpoint_failure" {
 				cfg.CheckpointWriter = compaction.CompactionCheckpointWriterFunc(func(context.Context, compaction.CompactionCheckpoint) error { return failure })
 			}
-			ag, err := New(Config{LLM: &countingCompactionModel{}, Compaction: cfg, InitialMessages: []llm.Message{llm.NewUserMessage("original")}})
+			ag, err := New(Config{LLM: &countingCompactionModel{}, Compaction: cfg, InitialMessages: []llm.Message{compactableAnswer("earlier"), llm.NewUserMessage("original")}})
 			if err != nil {
 				t.Fatal(err)
 			}

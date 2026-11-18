@@ -277,7 +277,7 @@ func TestCheckAndCompactCancelsAsyncCompactionWithTurn(t *testing.T) {
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
-	ag.ReplaceHistory([]llm.Message{llm.NewUserMessage("hello")})
+	ag.ReplaceHistory([]llm.Message{compactableAnswer("earlier"), llm.NewUserMessage("hello")})
 
 	ctx, cancel := context.WithCancel(context.Background())
 	comp := &llm.Completion{Usage: &llm.Usage{TotalTokens: 100, PromptTokens: 80}}
@@ -316,7 +316,7 @@ func TestCheckAndCompactRetriesOnceByDefault(t *testing.T) {
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
-	ag.ReplaceHistory([]llm.Message{llm.NewUserMessage("hello")})
+	ag.ReplaceHistory([]llm.Message{compactableAnswer("earlier"), llm.NewUserMessage("hello")})
 
 	comp := &llm.Completion{Usage: &llm.Usage{TotalTokens: 100, PromptTokens: 80}}
 	ag.checkAndCompact(context.Background(), "", comp, nil)
@@ -373,7 +373,7 @@ func TestCheckAndCompactSkipsInvokeWhenBelowThreshold(t *testing.T) {
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
-	ag.ReplaceHistory([]llm.Message{llm.NewUserMessage("hello")})
+	ag.ReplaceHistory([]llm.Message{compactableAnswer("earlier"), llm.NewUserMessage("hello")})
 
 	comp := &llm.Completion{Usage: &llm.Usage{TotalTokens: 10, PromptTokens: 10}}
 	ag.checkAndCompact(context.Background(), "", comp, nil)
@@ -398,7 +398,7 @@ func TestCheckAndCompactSkipsInvokeWhenContextCanceled(t *testing.T) {
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
-	ag.ReplaceHistory([]llm.Message{llm.NewUserMessage("hello")})
+	ag.ReplaceHistory([]llm.Message{compactableAnswer("earlier"), llm.NewUserMessage("hello")})
 
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
@@ -566,7 +566,7 @@ func TestCheckAndCompactAsyncSurvivesCallerCancelAfterStart(t *testing.T) {
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
-	ag.ReplaceHistory([]llm.Message{llm.NewUserMessage("hello")})
+	ag.ReplaceHistory([]llm.Message{compactableAnswer("earlier"), llm.NewUserMessage("hello")})
 
 	ctx, cancel := context.WithCancel(context.Background())
 	comp := &llm.Completion{Usage: &llm.Usage{TotalTokens: 120, PromptTokens: 99}}
@@ -606,7 +606,7 @@ func TestNewCachesDisabledCompactorState(t *testing.T) {
 		t.Fatalf("expected compactor service to be nil when compaction is disabled")
 	}
 
-	ag.ReplaceHistory([]llm.Message{llm.NewUserMessage("hello")})
+	ag.ReplaceHistory([]llm.Message{compactableAnswer("earlier"), llm.NewUserMessage("hello")})
 	comp := &llm.Completion{Usage: &llm.Usage{TotalTokens: 1000, PromptTokens: 1000}}
 	ag.checkAndCompact(context.Background(), "", comp, nil)
 	if got := model.Calls(); got != 0 {

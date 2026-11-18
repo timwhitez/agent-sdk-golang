@@ -2,12 +2,15 @@ package agent
 
 import (
 	"context"
+	"encoding/json"
+	"fmt"
 	"strings"
 	"sync"
 	"testing"
 
 	"github.com/timwhitez/agent-sdk-golang/sdk/agent/compaction"
 	"github.com/timwhitez/agent-sdk-golang/sdk/llm"
+	"github.com/timwhitez/agent-sdk-golang/sdk/tools"
 )
 
 // summaryCountingModel answers every call with a valid summary and counts
@@ -49,10 +52,19 @@ type ineffectiveSummaryFixture struct {
 // newIneffectiveSummaryFixture builds an Agent whose newest user message,
 // which every summary keeps verbatim, is alone above the summary threshold:
 // a successful summary cannot bring the history back under it.
+// The summary is rejected as not smaller than this short history (#257), which
+// counts as ineffective too.
 func newIneffectiveSummaryFixture(t *testing.T) ineffectiveSummaryFixture {
 	t.Helper()
+	return newIneffectiveSummaryFixtureWith(t, "earlier answer")
+}
+
+// newIneffectiveSummaryFixtureWith uses earlier as the summarized assistant
+// answer; a long one makes the summary accepted yet still ineffective.
+func newIneffectiveSummaryFixtureWith(t *testing.T, earlier string) ineffectiveSummaryFixture {
+	t.Helper()
 	kept := llm.NewUserMessage(strings.Repeat("constraint ", 3000))
-	original := []llm.Message{llm.NewSystemMessage("base"), llm.NewUserMessage("earlier request"), llm.NewAssistantMessage("earlier answer", nil), kept}
+	original := []llm.Message{llm.NewSystemMessage("base"), llm.NewUserMessage("earlier request"), llm.NewAssistantMessage(earlier, nil), kept}
 	probe := compaction.NewService(&compaction.Config{Enabled: true})
 	estimate := probe.EstimateMessages([]llm.Message{kept})
 	model := &summaryCountingModel{}
@@ -98,7 +110,16 @@ func (f ineffectiveSummaryFixture) decide(t *testing.T, usage *llm.Usage) {
 // threshold is not repeated for the same real user input; local tiers and the
 // overflow boundary are unaffected.
 func TestIneffectiveAutomaticSummaryIsNotRepeatedWithinUserInput(t *testing.T) {
-	f := newIneffectiveSummaryFixture(t)
+	for name, earlier := range map[string]string{
+		"summary_not_smaller": "earlier answer",
+		"summary_accepted":    strings.Repeat("earlier answer detail ", 400),
+	} {
+		t.Run(name, func(t *testing.T) { testIneffectiveAutomaticSummaryIsNotRepeated(t, earlier) })
+	}
+}
+
+func testIneffectiveAutomaticSummaryIsNotRepeated(t *testing.T, earlier string) {
+	f := newIneffectiveSummaryFixtureWith(t, earlier)
 	f.decide(t, f.high)
 	if got := f.model.Calls(); got != 1 {
 		t.Fatalf("first automatic summary calls = %d, want 1", got)
@@ -286,4 +307,231 @@ func TestIneffectiveSummarySuppressionFollowsConfiguredRuntimeIdentity(t *testin
 			t.Fatalf("calls = %d, want 2 (the queued runtime rearmed on installation)", got)
 		}
 	})
+}
+
+// fixedOverheadModel reports a provider prompt of prompt(step) tokens for each
+// agent request, asks for one probe call per step for six steps, and counts
+// summary requests.
+type fixedOverheadModel struct {
+	mu               sync.Mutex
+	prompt           func(step int) int
+	steps, summaries int
+}
+
+func (*fixedOverheadModel) Provider() string { return "fixture" }
+func (*fixedOverheadModel) Model() string    { return "fixed-overhead" }
+
+func (m *fixedOverheadModel) Invoke(_ context.Context, req llm.InvokeRequest) (*llm.Completion, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	for _, msg := range req.Messages {
+		if strings.Contains(msg.Content.PlainText(), "Write an operational checkpoint") {
+			m.summaries++
+			return &llm.Completion{Content: llm.TextContent(validCompactionSummary("probe calls so far")), StopReason: "stop"}, nil
+		}
+	}
+	m.steps++
+	prompt := m.prompt(m.steps)
+	usage := &llm.Usage{PromptTokens: prompt, CompletionTokens: 50, TotalTokens: prompt + 50}
+	if m.steps%7 == 0 {
+		return &llm.Completion{Content: llm.TextContent("finished"), StopReason: "stop", Usage: usage}, nil
+	}
+	call := llm.ToolCall{ID: fmt.Sprintf("probe-%d", m.steps), Type: "function", Function: llm.FunctionCall{Name: "probe", Arguments: `{}`}}
+	return &llm.Completion{ToolCalls: []llm.ToolCall{call}, StopReason: "tool_calls", Usage: usage}, nil
+}
+
+func (m *fixedOverheadModel) Summaries() int {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.summaries
+}
+
+func newFixedOverheadAgent(t *testing.T, model *fixedOverheadModel) *Agent {
+	t.Helper()
+	cc := compaction.DefaultConfig()
+	cc.ContextWindow = 12000
+	probe := tools.Tool{
+		Name:        "probe",
+		Description: "probe",
+		Schema:      map[string]any{"type": "object", "properties": map[string]any{}},
+		Handler: func(context.Context, json.RawMessage, *tools.Container) (llm.Content, error) {
+			return llm.TextContent(strings.Repeat("probe output line\n", 300)), nil
+		},
+	}
+	ag, err := New(Config{
+		LLM: model,
+		InitialMessages: []llm.Message{
+			llm.NewSystemMessage("system"),
+			llm.NewUserMessage("earlier request"),
+			llm.NewAssistantMessage(strings.Repeat("earlier notes ", 600), nil),
+		},
+		Tools:                  []tools.Tool{probe},
+		Compaction:             &cc,
+		MaxIterations:          20,
+		InvokeRetryMaxAttempts: 1,
+		Warningf:               func(string, ...any) {},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return ag
+}
+
+func runFixedOverheadQuery(ag *Agent) (compactions int, errs []ErrorEvent) {
+	for ev := range ag.QueryStream(context.Background(), llm.TextContent("call probe until done")) {
+		switch e := ev.(type) {
+		case CompactionEvent:
+			compactions++
+		case ErrorEvent:
+			errs = append(errs, e)
+		}
+	}
+	return compactions, errs
+}
+
+// When the provider still reports a prompt over the overflow limit for the
+// first request after an overflow compaction, the part compaction cannot
+// shrink does not fit: the turn ends with a typed error instead of paying for
+// a summary on every step (#258). A new user input may try once more, and an
+// overflow that compaction resolves keeps running.
+func TestOverflowCompactionStopsWhenFixedPromptExceedsWindow(t *testing.T) {
+	model := &fixedOverheadModel{prompt: func(int) int { return 31000 }}
+	ag := newFixedOverheadAgent(t, model)
+	compactions, errs := runFixedOverheadQuery(ag)
+	if compactions != 1 || model.Summaries() != 1 {
+		t.Fatalf("compactions=%d summaries=%d, want 1 and 1", compactions, model.Summaries())
+	}
+	if len(errs) != 1 || errs[0].Kind != "fixed_prompt_exceeds_window" ||
+		!strings.Contains(errs[0].Message, "31000 prompt tokens") || !strings.Contains(errs[0].Message, fmt.Sprintf("overflow limit %d", ag.compactor.OverflowLimit())) {
+		t.Fatalf("errors = %#v, want one fixed_prompt_exceeds_window error with the provider prompt and limit", errs)
+	}
+
+	// New user input: one more overflow summary attempt, then the same stop.
+	_, errs = runFixedOverheadQuery(ag)
+	if model.Summaries() != 2 || len(errs) != 1 || errs[0].Kind != "fixed_prompt_exceeds_window" {
+		t.Fatalf("second input: summaries=%d errors=%#v, want 2 and one fixed_prompt_exceeds_window", model.Summaries(), errs)
+	}
+
+	// History-driven overflow: the compacted request fits, so the run continues.
+	fits := &fixedOverheadModel{prompt: func(step int) int {
+		if step == 1 {
+			return 31000
+		}
+		return 2000
+	}}
+	compactions, errs = runFixedOverheadQuery(newFixedOverheadAgent(t, fits))
+	if compactions != 1 || len(errs) != 0 || fits.steps != 7 {
+		t.Fatalf("history overflow: compactions=%d errors=%#v steps=%d, want 1, none, 7", compactions, errs, fits.steps)
+	}
+}
+
+// A summary rejected as not smaller than a small history counts as
+// ineffective even though the history estimate is below the threshold: the
+// provider usage (system prompt, tools) keeps every decision above it, and
+// each repeat would pay for the same rejected summary (#257).
+func TestNotSmallerSummaryIsNotRepeatedWithinUserInput(t *testing.T) {
+	cc := compaction.DefaultConfig()
+	cc.ContextWindow = 12000
+	model := &summaryCountingModel{}
+	ag, err := New(Config{LLM: model, Compaction: &cc, Warningf: func(string, ...any) {}, InitialMessages: []llm.Message{
+		llm.NewUserMessage("rename helper foo to bar in util.go"),
+		llm.NewAssistantMessage("Done: foo is now bar in util.go.", nil),
+		llm.NewUserMessage("thanks, anything else?"),
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	f := ineffectiveSummaryFixture{agent: ag}
+	above := ag.compactor.ThresholdTokens() + 100
+	for i := 0; i < 4; i++ {
+		f.decide(t, &llm.Usage{PromptTokens: above, TotalTokens: above})
+	}
+	if got := model.Calls(); got != 1 {
+		t.Fatalf("summary calls = %d, want 1", got)
+	}
+}
+
+// Local tiers that compacted before a not-smaller summary still leave the
+// summary tier ineffective.
+func TestNotSmallerSummaryAfterLocalTiersArmsSuppression(t *testing.T) {
+	f := newIneffectiveSummaryFixture(t)
+	f.agent.noteSummaryEffect(f.agent.userInputEpoch.Load(), compaction.Result{Compacted: true, Watermark: "prune", TiersApplied: []string{"prune"}, NewTokens: 1, SummaryNotSmaller: true})
+	if !f.agent.automaticSummarySuppressed(f.agent.userInputEpoch.Load(), f.high) {
+		t.Fatal("not-smaller summary after prune did not suppress the automatic summary tier")
+	}
+}
+
+// imageToolModel calls a screenshot tool ten times and reports a provider
+// prompt of 2000 tokens plus 1500 per image in the request.
+type imageToolModel struct {
+	mu               sync.Mutex
+	steps, summaries int
+}
+
+func (*imageToolModel) Provider() string { return "fixture" }
+func (*imageToolModel) Model() string    { return "image-tool" }
+
+func (m *imageToolModel) Invoke(_ context.Context, req llm.InvokeRequest) (*llm.Completion, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	images := 0
+	for _, msg := range req.Messages {
+		if strings.Contains(msg.Content.PlainText(), "Write an operational checkpoint") {
+			m.summaries++
+			return &llm.Completion{Content: llm.TextContent(validCompactionSummary("screenshots inspected so far")), StopReason: "stop"}, nil
+		}
+		for _, block := range msg.Content.Blocks {
+			if block.Type == "image_url" {
+				images++
+			}
+		}
+	}
+	m.steps++
+	prompt := 2000 + 1500*images
+	usage := &llm.Usage{PromptTokens: prompt, CompletionTokens: 50, TotalTokens: prompt + 50}
+	if m.steps > 10 {
+		return &llm.Completion{Content: llm.TextContent("finished"), StopReason: "stop", Usage: usage}, nil
+	}
+	call := llm.ToolCall{ID: fmt.Sprintf("shot-%d", m.steps), Type: "function", Function: llm.FunctionCall{Name: "screenshot", Arguments: `{}`}}
+	return &llm.Completion{ToolCalls: []llm.ToolCall{call}, StopReason: "tool_calls", Usage: usage}, nil
+}
+
+// Images are invisible to the local estimate. An overflow they cause is
+// resolved by the summary (which drops them), so the run continues instead of
+// rejecting the summary and stopping with fixed_prompt_exceeds_window.
+func TestImageOverflowCompactsAndContinues(t *testing.T) {
+	cc := compaction.DefaultConfig()
+	cc.ContextWindow = 12000
+	shot := tools.Tool{
+		Name:        "screenshot",
+		Description: "screenshot",
+		Schema:      map[string]any{"type": "object", "properties": map[string]any{}},
+		Handler: func(context.Context, json.RawMessage, *tools.Container) (llm.Content, error) {
+			return llm.Content{Blocks: []llm.ContentBlock{
+				{Type: "text", Text: "screenshot"},
+				{Type: "image_url", ImageURL: &llm.ImageURL{URL: "data:image/png;base64,AAAA"}},
+			}}, nil
+		},
+	}
+	model := &imageToolModel{}
+	ag, err := New(Config{LLM: model, Tools: []tools.Tool{shot}, Compaction: &cc, MaxIterations: 30, InvokeRetryMaxAttempts: 1, Warningf: func(string, ...any) {}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	compactions := 0
+	var errs []ErrorEvent
+	final := false
+	for ev := range ag.QueryStream(context.Background(), llm.TextContent("take ten screenshots")) {
+		switch e := ev.(type) {
+		case CompactionEvent:
+			compactions++
+		case ErrorEvent:
+			errs = append(errs, e)
+		case FinalResponseEvent:
+			final = true
+		}
+	}
+	if len(errs) != 0 || !final || compactions == 0 || model.summaries == 0 {
+		t.Fatalf("errors=%#v final=%v compactions=%d summaries=%d, want a compacted run that finishes", errs, final, compactions, model.summaries)
+	}
 }

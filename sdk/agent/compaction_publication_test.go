@@ -261,7 +261,7 @@ func TestCompactionHistoryPreservesLedgerAndHistoryOnFailure(t *testing.T) {
 				store.failSaveAt = map[int]error{1: failure}
 			}
 			writes := 0
-			ag, err := New(Config{LLM: &countingCompactionModel{}, InitialMessages: []llm.Message{llm.NewUserMessage("source"), llm.NewAssistantMessage("answer", nil)}, Compaction: &compaction.Config{Enabled: true, SessionID: "publication-ledger", LedgerStore: store, CheckpointWriter: compaction.CompactionCheckpointWriterFunc(func(context.Context, compaction.CompactionCheckpoint) error {
+			ag, err := New(Config{LLM: &countingCompactionModel{}, InitialMessages: []llm.Message{llm.NewUserMessage("source"), compactableAnswer("answer")}, Compaction: &compaction.Config{Enabled: true, SessionID: "publication-ledger", LedgerStore: store, CheckpointWriter: compaction.CompactionCheckpointWriterFunc(func(context.Context, compaction.CompactionCheckpoint) error {
 				writes++
 				if mode == "writer" || mode == "writer_busy" {
 					return failure

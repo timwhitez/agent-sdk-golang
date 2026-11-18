@@ -2,6 +2,8 @@ package agent
 
 import (
 	"context"
+	"fmt"
+	"sync"
 
 	"github.com/timwhitez/agent-sdk-golang/sdk/agent/compaction"
 	"github.com/timwhitez/agent-sdk-golang/sdk/llm"
@@ -99,4 +101,63 @@ func (d compactionDecision) clearsPending() (todo, retry bool) {
 // and cooldown.
 func (d compactionDecision) recordsOutcome() bool {
 	return d.entry == compactionEntryAutomatic
+}
+
+// overflowCompactionMark records the latest overflow compaction: the user
+// input it ran in (epoch+1, 0 when unset), the Frame whose usage drove it and
+// the estimated history it left.
+type overflowCompactionMark struct {
+	mu            sync.Mutex
+	epoch         uint64
+	frameID       string
+	historyTokens int
+}
+
+// noteOverflowCompaction arms fixedPromptExceedsWindow after an overflow
+// compaction run, including one whose summary was rejected as not smaller.
+func (a *Agent) noteOverflowCompaction(frameID string, historyTokens int) {
+	m := &a.overflowCompaction
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.epoch, m.frameID, m.historyTokens = a.userInputEpoch.Load()+1, frameID, historyTokens
+}
+
+// fixedPromptExceedsWindow is the overflow side of the ineffective-summary
+// guard. Compaction shrinks only history, not the system prompt and tool
+// definitions the provider also counts. The first decision driven by a later
+// Frame of the same user input therefore checks the provider-reported prompt
+// of that Frame's request: still at or above the overflow limit means the
+// compacted request did not fit, and compacting or trimming again cannot help,
+// so the turn ends with this error. Only provider usage stops the turn; a
+// local estimate does not count images and would misjudge the fixed share.
+// Decisions on the compacting Frame itself still carry its pre-compaction
+// usage and are not judged.
+func (a *Agent) fixedPromptExceedsWindow(frameID string, usage *llm.Usage) error {
+	m := &a.overflowCompaction
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.epoch == 0 || frameID == "" || frameID == m.frameID {
+		return nil
+	}
+	limit := a.compactor.OverflowLimit()
+	if m.epoch != a.userInputEpoch.Load()+1 || usage == nil || usage.PromptTokensSource == llm.PromptTokensSourceEstimate ||
+		!llm.PromptUsageIsProviderValid(usage) || usage.PromptTokens < limit {
+		m.epoch = 0
+		return nil
+	}
+	// Stays armed, so every later decision on this Frame reports the same stop.
+	return &fixedPromptExceedsWindowError{promptTokens: usage.PromptTokens, historyTokens: m.historyTokens, limit: limit}
+}
+
+type fixedPromptExceedsWindowError struct {
+	promptTokens, historyTokens, limit int
+}
+
+func (e *fixedPromptExceedsWindowError) Error() string {
+	hint := "increase the context window or send fewer tool definitions / a shorter system prompt"
+	if e.historyTokens >= e.limit {
+		hint = "the compacted history alone reaches the limit; increase the context window"
+	}
+	return fmt.Sprintf("context window cannot hold the request after overflow compaction: provider reported %d prompt tokens, overflow limit %d; compacted history is about %d estimated text tokens (images and documents not counted), so the fixed prompt (system prompt and tool definitions) is about %d tokens; %s",
+		e.promptTokens, e.limit, e.historyTokens, e.promptTokens-e.historyTokens, hint)
 }

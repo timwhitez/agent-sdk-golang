@@ -498,7 +498,8 @@ func TestAgentAutoContinueWaitsForAsyncCompactionAtNextProviderBoundary(t *testi
 	}
 
 	ag, err := New(Config{
-		LLM: model,
+		LLM:             model,
+		InitialMessages: []llm.Message{llm.NewUserMessage("earlier"), compactableAnswer("earlier answer")},
 		Compaction: &compaction.Config{
 			Enabled:                true,
 			ContextWindow:          200,

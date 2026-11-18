@@ -205,6 +205,10 @@ type Result struct {
 	Summary            string     `json:"summary,omitempty"`
 	CheckpointID       string     `json:"checkpoint_id,omitempty"`
 	CheckpointMessages int        `json:"checkpoint_messages,omitempty"`
+	// SummaryNotSmaller reports that a summary passed the quality gate but was
+	// rejected because it did not shrink the history; earlier local tiers may
+	// still have compacted.
+	SummaryNotSmaller bool `json:"summary_not_smaller,omitempty"`
 
 	// Ledger updates are deferred when a runtime checkpoint writer is configured.
 	// The Agent commits this transaction immediately before the replayable
