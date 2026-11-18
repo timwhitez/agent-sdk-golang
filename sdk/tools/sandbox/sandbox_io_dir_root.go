@@ -132,10 +132,15 @@ func (d rootAtomicDir) createTemp() (*os.File, string, error) {
 
 func (d rootAtomicDir) rename(tmpName, name string) error { return d.r.Rename(tmpName, name) }
 
+// beforeRootCopyOpen is a test hook that runs between the source lstat and
+// open of a cross-directory copy.
+var beforeRootCopyOpen = func(name string) {}
+
 // link never resolves a multi-component path: os.Root cannot link between two
 // roots, so across directories the source is copied (content, mode, best-effort
-// owner) into a temp file in the pinned destination, which is then hard-linked
-// to dstName without replacing anything. A non-regular source is refused.
+// owner; at most maxEditFileBytes; fsynced) into a temp file in the pinned
+// destination, which is then hard-linked to dstName without replacing anything.
+// A non-regular source is refused.
 func (d rootAtomicDir) link(name string, dst atomicDir, dstName string) error {
 	to, ok := dst.(rootAtomicDir)
 	if !ok {
@@ -153,32 +158,34 @@ func (d rootAtomicDir) link(name string, dst atomicDir, dstName string) error {
 	if err1 == nil && err2 == nil && os.SameFile(fromDir, toDir) {
 		return d.r.Link(name, dstName)
 	}
-	f, err := d.r.OpenFile(name, os.O_RDONLY, 0)
+	beforeRootCopyOpen(name)
+	// Non-blocking so a FIFO swapped in after the lstat cannot hang the open.
+	f, err := d.r.OpenFile(name, os.O_RDONLY|openNonblock, 0)
 	if err != nil {
 		return err
 	}
 	defer f.Close()
-	if st, err := f.Stat(); err != nil || !os.SameFile(src, st) {
+	if st, err := f.Stat(); err != nil || !st.Mode().IsRegular() || !os.SameFile(src, st) {
 		return &SecurityError{Message: fmt.Sprintf("path changed during open: %q", name)}
-	}
-	data, err := io.ReadAll(f)
-	if err != nil {
-		return err
 	}
 	tmp, tmpName, err := to.createTemp()
 	if err != nil {
 		return err
 	}
 	defer func() { _ = to.r.Remove(tmpName) }()
-	n, err := writeFileBytes(tmp, data)
-	if err == nil && n != len(data) {
-		err = io.ErrShortWrite
+	// Bound the copy here: the file can grow after the planning-time size check.
+	n, err := io.Copy(tmp, &io.LimitedReader{R: f, N: maxEditFileBytes + 1})
+	if err == nil && n > maxEditFileBytes {
+		err = errFileReadLimitReached
 	}
 	if err == nil {
 		err = tmp.Chmod(src.Mode().Perm())
 	}
 	if uid, gid, ok := fileOwnerIDs(src); ok && err == nil {
 		_ = tmp.Chown(uid, gid) // best effort, as for writes
+	}
+	if err == nil {
+		err = syncFile(tmp)
 	}
 	if closeErr := tmp.Close(); err == nil {
 		err = closeErr

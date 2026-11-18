@@ -19,6 +19,9 @@ var writeFileBytes = func(f *os.File, data []byte) (int, error) {
 	return f.Write(data)
 }
 
+// syncFile is a var for testing fsync failures.
+var syncFile = (*os.File).Sync
+
 // beforeWriteAnchor is a test hook that runs after the caller revalidated path
 // and before the destination directory is opened (writes and patch deletes).
 var beforeWriteAnchor = func(path string) {}
@@ -146,7 +149,7 @@ func (s *Sandbox) writeFilePreserveMode(path string, data []byte, defaultMode os
 		cleanup()
 		return io.ErrShortWrite
 	}
-	if err := tmp.Sync(); err != nil {
+	if err := syncFile(tmp); err != nil {
 		cleanup()
 		return err
 	}

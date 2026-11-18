@@ -2,6 +2,7 @@ package sandbox
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -411,17 +412,36 @@ func TestMoveRegularFileNoReplace(t *testing.T) {
 		wantAbsent(t, filepath.Join(ws, "a", "src"))
 
 		if impl == "root" {
-			orig := writeFileBytes
-			writeFileBytes = func(*os.File, []byte) (int, error) { return 0, os.ErrInvalid }
+			// A failed fsync of the copy fails the move before anything is linked.
+			orig := syncFile
+			syncFile = func(*os.File) error { return os.ErrInvalid }
 			err := s.moveRegularFileNoReplace(filepath.Join(ws, "a", "src2"), filepath.Join(ext, "n", "moved"))
-			writeFileBytes = orig
+			syncFile = orig
 			if err == nil {
-				t.Error("cross-root move with a failing copy succeeded")
+				t.Error("cross-root move with a failing fsync succeeded")
 			}
 			wantContent(t, filepath.Join(ws, "a", "src2"), "src")
 			wantAbsent(t, filepath.Join(ext, "n", "moved"))
 			if dirHasTemp(t, filepath.Join(ext, "n")) {
-				t.Error("temp file left after a failed copy")
+				t.Error("temp file left after a failed fsync")
+			}
+
+			// The copy enforces the edit size limit itself (the source may grow
+			// after planning); a sparse file keeps this cheap.
+			big := filepath.Join(ws, "a", "big")
+			mustWrite(t, big, "", 0o644)
+			if err := os.Truncate(big, maxEditFileBytes+1); err != nil {
+				t.Fatal(err)
+			}
+			if err := s.moveRegularFileNoReplace(big, filepath.Join(ext, "n", "big")); !errors.Is(err, errFileReadLimitReached) {
+				t.Errorf("oversized cross-root move: err = %v, want errFileReadLimitReached", err)
+			}
+			if info, err := os.Stat(big); err != nil || info.Size() != maxEditFileBytes+1 {
+				t.Fatalf("oversized source changed: %v %v", info, err)
+			}
+			wantAbsent(t, filepath.Join(ext, "n", "big"))
+			if dirHasTemp(t, filepath.Join(ext, "n")) {
+				t.Error("temp file left after an oversized copy")
 			}
 		}
 

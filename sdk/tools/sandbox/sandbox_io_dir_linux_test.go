@@ -6,6 +6,7 @@ import (
 	"path/filepath"
 	"syscall"
 	"testing"
+	"time"
 )
 
 // runAsNobody re-runs test (selected by name) as uid/gid 65534 with impl and
@@ -165,4 +166,48 @@ func TestAnchoredWalkBelowUnreadableInRootDir(t *testing.T) {
 		})
 		runAsNobody(t, "TestAnchoredWalkBelowUnreadableInRootDir", impl, base, base, child)
 	})
+}
+
+// A FIFO swapped in for the source between the regular-file lstat and the open
+// of an os.Root cross-directory copy must not block the move.
+func TestRootCopyRefusesFIFOSwappedInForSource(t *testing.T) {
+	useAtomicDirImpl(t, "root")
+	home := evalTempDir(t)
+	ws, ext := filepath.Join(home, "ws"), filepath.Join(home, "ext")
+	mustWrite(t, filepath.Join(ws, "src"), "src", 0o644)
+	if err := os.MkdirAll(ext, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	s, err := New(ws)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := s.AllowExternalDirectory(ext); err != nil {
+		t.Fatal(err)
+	}
+	beforeRootCopyOpen = func(string) {
+		beforeRootCopyOpen = func(string) {}
+		if err := os.Rename(filepath.Join(ws, "src"), filepath.Join(ws, "src-real")); err != nil {
+			t.Error(err)
+		}
+		if err := syscall.Mkfifo(filepath.Join(ws, "src"), 0o644); err != nil {
+			t.Error(err)
+		}
+	}
+	t.Cleanup(func() { beforeRootCopyOpen = func(string) {} })
+	done := make(chan error, 1)
+	go func() { done <- s.moveRegularFileNoReplace(filepath.Join(ws, "src"), filepath.Join(ext, "dst")) }()
+	select {
+	case err := <-done:
+		if err == nil {
+			t.Fatal("move of a swapped-in FIFO succeeded")
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("move blocked on a FIFO source")
+	}
+	if info, err := os.Lstat(filepath.Join(ws, "src")); err != nil || info.Mode()&os.ModeNamedPipe == 0 {
+		t.Fatalf("source name changed: %v %v", info, err)
+	}
+	wantAbsent(t, filepath.Join(ext, "dst"))
+	wantContent(t, filepath.Join(ws, "src-real"), "src")
 }
