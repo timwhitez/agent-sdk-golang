@@ -232,7 +232,7 @@ func (s *Service) compactLocalWithWatermark(ctx context.Context, messages []llm.
 		ledger:        ledger,
 		replacements:  ledgerReplacementIndex(ledger),
 		protectedFrom: s.protectedZoneStart(messages),
-		latestUser:    latestRealUserIndex(messages),
+		latestUser:    latestRealUserIndex(s.hostNamespace(), messages),
 		watermark:     watermark,
 	}
 	out, warnings, changed, ledgerChanged, tiers := reducer.reduce(messages)
@@ -674,7 +674,7 @@ func (r *localReducer) eligibleUserCodeMessage(index int, msg llm.Message) bool 
 	if !r.service.Config.EnableUserCodeMicrocompact {
 		return false
 	}
-	if index >= r.protectedFrom || index == r.latestUser || !messageorigin.IsRealUserMessage(msg) {
+	if index >= r.protectedFrom || index == r.latestUser || !messageorigin.IsRealUserMessageIn(r.service.hostNamespace(), msg) {
 		return false
 	}
 	text := msg.Content.PlainText()
@@ -941,10 +941,10 @@ func protectedMessageStart(length int, protected int) int {
 	return start
 }
 
-func latestRealUserIndex(messages []llm.Message) int {
+func latestRealUserIndex(namespace string, messages []llm.Message) int {
 	for i := len(messages) - 1; i >= 0; i-- {
 		msg := messages[i]
-		if messageorigin.IsRealUserMessage(msg) {
+		if messageorigin.IsRealUserMessageIn(namespace, msg) {
 			return i
 		}
 	}
@@ -953,7 +953,7 @@ func latestRealUserIndex(messages []llm.Message) int {
 
 func (s *Service) protectedZoneStart(messages []llm.Message) int {
 	start := protectedMessageStart(len(messages), s.protectedRecentMessages())
-	if latestUser := latestRealUserIndex(messages); latestUser >= 0 && latestUser < start {
+	if latestUser := latestRealUserIndex(s.hostNamespace(), messages); latestUser >= 0 && latestUser < start {
 		start = latestUser
 	}
 	if openToolBlock := llm.OpenToolCallBlockStart(messages); openToolBlock >= 0 && openToolBlock < start {
