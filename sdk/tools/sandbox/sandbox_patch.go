@@ -696,7 +696,7 @@ func (p *patchPlanner) commitAction(a patchAction, expected map[string]writeTarg
 		if err := verifyPatchTargetUnchanged(expected, a.path.resolved, resolvedPath, a.relPath); err != nil {
 			return err
 		}
-		if err := os.Remove(resolvedPath); err != nil {
+		if err := p.s.removeFileAnchored(resolvedPath); err != nil {
 			return err
 		}
 		expected[a.path.resolved] = writeTargetSnapshot{Exists: false}
@@ -727,16 +727,8 @@ func (p *patchPlanner) commitAction(a patchAction, expected map[string]writeTarg
 		if err := verifyPatchTargetUnchanged(expected, a.movePath.resolved, toPath, a.moveTo); err != nil {
 			return err
 		}
-		if err := os.MkdirAll(toDir, 0o755); err != nil {
-			return err
-		}
-		if dirFile, _, err := openFileNoFollow(toDir); err != nil {
-			return err
-		} else {
-			_ = dirFile.Close()
-		}
 		sourceContent := []byte(expected[a.path.resolved].Content)
-		if err := moveRegularFileNoReplace(fromPath, toPath); err != nil {
+		if err := p.s.moveRegularFileNoReplace(fromPath, toPath); err != nil {
 			return err
 		}
 		expected[a.path.resolved] = writeTargetSnapshot{Exists: false}
@@ -752,7 +744,7 @@ func (p *patchPlanner) commitAction(a patchAction, expected map[string]writeTarg
 		if err := verifyPatchTargetUnchanged(expected, a.path.resolved, currentPath, a.relPath); err != nil {
 			return err
 		}
-		if err := writeFilePreserveMode(currentPath, a.content, 0o644); err != nil {
+		if err := p.s.writeFilePreserveMode(currentPath, a.content, 0o644); err != nil {
 			return err
 		}
 		return updatePatchExpected(expected, a.path.resolved, currentPath, a.content)
@@ -765,19 +757,32 @@ var beforePatchMoveNoReplace = func(string, string) {}
 // replacing an existing path. Patch moves are limited to regular files, so a
 // hard link plus source unlink preserves file identity while avoiding the
 // replacement behavior of os.Rename on Unix. Filesystems without hard-link
-// support fail closed instead of risking destination data loss.
-func moveRegularFileNoReplace(fromPath, toPath string) error {
+// support fail closed instead of risking destination data loss. Both
+// directories are anchored (see atomicDir); missing destination parents are
+// created with their parent's permission bits.
+func (s *Sandbox) moveRegularFileNoReplace(fromPath, toPath string) error {
 	if beforePatchMoveNoReplace != nil {
 		beforePatchMoveNoReplace(fromPath, toPath)
 	}
-	if err := os.Link(fromPath, toPath); err != nil {
+	from, err := s.openAnchoredDir(fromPath, false)
+	if err != nil {
+		return err
+	}
+	defer from.close()
+	to, err := s.openAnchoredDir(toPath, true)
+	if err != nil {
+		return err
+	}
+	defer to.close()
+	fromName, toName := filepath.Base(fromPath), filepath.Base(toPath)
+	if err := from.link(fromName, to, toName); err != nil {
 		if os.IsExist(err) {
 			return fmt.Errorf("move destination already exists: %s", toPath)
 		}
 		return fmt.Errorf("create non-clobbering move destination %s: %w", toPath, err)
 	}
-	if err := os.Remove(fromPath); err != nil {
-		rollbackErr := os.Remove(toPath)
+	if err := from.remove(fromName); err != nil {
+		rollbackErr := to.remove(toName)
 		if rollbackErr != nil {
 			return fmt.Errorf("remove move source %s: %w (destination rollback failed: %v)", fromPath, err, rollbackErr)
 		}

@@ -1,12 +1,13 @@
 package sandbox
 
 import (
+	"crypto/rand"
+	"encoding/hex"
 	"fmt"
 	"io"
 	"os"
 	"path/filepath"
 	"strings"
-	"syscall"
 )
 
 // ============================================================================
@@ -18,20 +19,88 @@ var writeFileBytes = func(f *os.File, data []byte) (int, error) {
 	return f.Write(data)
 }
 
+// syncFile is a var for testing fsync failures.
+var syncFile = (*os.File).Sync
+
 // beforeWriteAnchor is a test hook that runs after the caller revalidated path
-// and before the destination directory is opened.
+// and before the destination directory is opened (writes and patch deletes).
 var beforeWriteAnchor = func(path string) {}
 
-// atomicDir is the destination directory of an atomic write. On Linux it is
-// pinned by a directory fd opened component-by-component without following
-// symlinks, so a path component replaced after revalidation cannot redirect the
-// write; other platforms fall back to path-based checks (see sandbox_io_dir_other.go).
+// beforeAnchorMkdir is a test hook that runs after an anchored walk found a
+// component missing and before it creates it.
+var beforeAnchorMkdir = func() {}
+
+// atomicDir is a directory pinned by an anchored walk: it is opened one
+// component at a time without following symlinks, so a path component replaced
+// after revalidation cannot redirect a write, link or unlink.
+// openAtomicDir(anchor, dir, create) selects the platform implementation:
+//   - Linux (sandbox_io_dir_linux.go) walks from the filesystem root with O_PATH
+//     directory fds and ignores anchor.
+//   - Elsewhere (sandbox_io_dir_root.go) os.Root opens anchor, the allowed root
+//     containing dir, and walks only the components below it; a component that
+//     cannot be opened fails closed.
+//
+// create makes missing directories with their parent's permission bits.
 type atomicDir interface {
 	lstat(name string) (os.FileInfo, error)
 	createTemp() (*os.File, string, error)
 	rename(tmpName, name string) error
-	remove(name string)
+	// link creates dstName in dst as the regular file name, never replacing an
+	// existing entry. Linux hard-links across the two pinned fds; os.Root
+	// hard-links within one directory and otherwise copies into a temp file in
+	// dst and hard-links that into place.
+	link(name string, dst atomicDir, dstName string) error
+	// remove unlinks a non-directory entry.
+	remove(name string) error
 	close()
+}
+
+// anchorFor returns the allowed root that contains the resolved path: the
+// sandbox root or an approved external root (its parent when path is the root
+// itself, e.g. a single approved file). Paths in no allowed root are refused.
+func (s *Sandbox) anchorFor(path string) (string, error) {
+	s.mu.Lock()
+	roots := append([]string{s.RootDir}, s.allowedRoots...)
+	s.mu.Unlock()
+	for _, root := range roots {
+		if root == "" || !isWithinRoot(path, root) {
+			continue
+		}
+		if pathsEqual(path, root) {
+			return filepath.Dir(root), nil
+		}
+		return root, nil
+	}
+	return "", &SecurityError{Message: fmt.Sprintf("path outside every allowed root: %q", path)}
+}
+
+// openAnchoredDir pins the parent directory of path below the allowed root
+// that contains path.
+func (s *Sandbox) openAnchoredDir(path string, create bool) (atomicDir, error) {
+	anchor, err := s.anchorFor(path)
+	if err != nil {
+		return nil, err
+	}
+	return openAtomicDir(anchor, filepath.Dir(path), create)
+}
+
+func atomicTempName() (string, error) {
+	var b [8]byte
+	if _, err := rand.Read(b[:]); err != nil {
+		return "", err
+	}
+	return ".tmp-" + hex.EncodeToString(b[:]), nil
+}
+
+// removeFileAnchored unlinks path through its anchored parent directory.
+func (s *Sandbox) removeFileAnchored(path string) error {
+	beforeWriteAnchor(path)
+	ad, err := s.openAnchoredDir(path, false)
+	if err != nil {
+		return err
+	}
+	defer ad.close()
+	return ad.remove(filepath.Base(path))
 }
 
 // writeFilePreserveMode writes data to path while preserving the existing file
@@ -40,10 +109,10 @@ type atomicDir interface {
 // best-effort basis: rename does not inherit the previous owner, so the temp
 // file is chowned back before the swap when the process is privileged enough.
 // path must already be symlink-resolved; a symlink on any component fails closed.
-func writeFilePreserveMode(path string, data []byte, defaultMode os.FileMode) error {
+func (s *Sandbox) writeFilePreserveMode(path string, data []byte, defaultMode os.FileMode) error {
 	beforeWriteAnchor(path)
-	dir, name := filepath.Dir(path), filepath.Base(path)
-	ad, err := openAtomicDir(dir)
+	name := filepath.Base(path)
+	ad, err := s.openAnchoredDir(path, true)
 	if err != nil {
 		return err
 	}
@@ -68,7 +137,7 @@ func writeFilePreserveMode(path string, data []byte, defaultMode os.FileMode) er
 	}
 	cleanup := func() {
 		_ = tmp.Close()
-		ad.remove(tmpName)
+		_ = ad.remove(tmpName)
 	}
 
 	n, err := writeFileBytes(tmp, data)
@@ -80,7 +149,7 @@ func writeFilePreserveMode(path string, data []byte, defaultMode os.FileMode) er
 		cleanup()
 		return io.ErrShortWrite
 	}
-	if err := tmp.Sync(); err != nil {
+	if err := syncFile(tmp); err != nil {
 		cleanup()
 		return err
 	}
@@ -95,77 +164,12 @@ func writeFilePreserveMode(path string, data []byte, defaultMode os.FileMode) er
 		_ = tmp.Chown(ownerUID, ownerGID)
 	}
 	if err := tmp.Close(); err != nil {
-		ad.remove(tmpName)
+		_ = ad.remove(tmpName)
 		return err
 	}
 	if err := ad.rename(tmpName, name); err != nil {
-		ad.remove(tmpName)
+		_ = ad.remove(tmpName)
 		return err
-	}
-	return nil
-}
-
-// ensureWriteDirNoFollow verifies dir is not a symlink and still refers to the
-// same directory that was stat'ed, closing the probe handle immediately.
-func ensureWriteDirNoFollow(dir string) error {
-	dirFile, _, err := openFileNoFollow(dir)
-	if err != nil {
-		return err
-	}
-	_ = dirFile.Close()
-	return nil
-}
-
-// mkdirAllInheritMode creates dir and any missing parents, giving each created
-// directory the permission bits of the nearest pre-existing ancestor instead of
-// a fixed 0755. This keeps new subtrees private when they live under a
-// restrictive directory (e.g. 0700).
-func mkdirAllInheritMode(dir string) error {
-	if info, err := os.Lstat(dir); err == nil {
-		if !info.IsDir() {
-			return &os.PathError{Op: "mkdir", Path: dir, Err: syscall.ENOTDIR}
-		}
-		return nil
-	} else if !os.IsNotExist(err) {
-		return err
-	}
-
-	// Walk up to the nearest existing ancestor, recording what must be created.
-	var missing []string
-	current := dir
-	var mode os.FileMode = 0o755
-	for {
-		info, err := os.Lstat(current)
-		if err == nil {
-			if !info.IsDir() {
-				return &os.PathError{Op: "mkdir", Path: current, Err: syscall.ENOTDIR}
-			}
-			mode = info.Mode().Perm()
-			break
-		}
-		if !os.IsNotExist(err) {
-			return err
-		}
-		missing = append(missing, current)
-		parent := filepath.Dir(current)
-		if parent == current {
-			break
-		}
-		current = parent
-	}
-
-	// Create from the outermost missing directory inward, chmod'ing explicitly
-	// so the inherited bits survive the process umask.
-	for i := len(missing) - 1; i >= 0; i-- {
-		if err := os.Mkdir(missing[i], mode); err != nil {
-			if os.IsExist(err) {
-				continue
-			}
-			return err
-		}
-		if err := os.Chmod(missing[i], mode); err != nil {
-			return err
-		}
 	}
 	return nil
 }

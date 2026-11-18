@@ -3,7 +3,7 @@
 This document covers build prerequisites, module metadata, and common build commands.
 
 ## Requirements
-- Go 1.24+ (`go.mod:3`)
+- Go 1.25+ (`go.mod:3`; `os.Root.Rename`/`Link`/`Chmod` back the anchored file writes)
 - Module path: `github.com/timwhitez/agent-sdk-golang` (`go.mod:1`)
 - External dependency: `github.com/bmatcuk/doublestar/v4` (`go.mod:5`)
 

@@ -5,7 +5,6 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
-	"runtime"
 	"strings"
 	"testing"
 
@@ -142,9 +141,10 @@ func TestTraversalBudgetCountsDirectories(t *testing.T) {
 }
 
 func TestWriteToolsFailClosedWhenIntermediateDirBecomesSymlink(t *testing.T) {
-	if runtime.GOOS != "linux" {
-		t.Skip("dirfd-anchored writes are Linux-only")
-	}
+	forEachAtomicDirImpl(t, testWriteToolsFailClosedWhenIntermediateDirBecomesSymlink)
+}
+
+func testWriteToolsFailClosedWhenIntermediateDirBecomesSymlink(t *testing.T, _ string) {
 	for _, tc := range []struct{ name, args string }{
 		{"write", `{"file_path":"a/b/c.txt","content":"after\n"}`},
 		{"edit", `{"file_path":"a/b/c.txt","old_string":"before","new_string":"after"}`},

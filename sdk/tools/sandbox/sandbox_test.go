@@ -1053,7 +1053,11 @@ func TestWriteFilePreserveModeWriteFailureKeepsOriginal(t *testing.T) {
 		writeFileBytes = origWriter
 	})
 
-	err := writeFilePreserveMode(path, []byte("updated\n"), 0o644)
+	s, err := New(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	err = s.writeFilePreserveMode(path, []byte("updated\n"), 0o644)
 	if !errors.Is(err, io.ErrShortWrite) {
 		t.Fatalf("expected short write error, got %v", err)
 	}

@@ -3,14 +3,16 @@
 package sandbox
 
 import (
-	"crypto/rand"
-	"encoding/hex"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
 	"syscall"
+	"unsafe"
 )
+
+var openAtomicDir = openFDAtomicDir
 
 // oPath is O_PATH, which the stdlib syscall package does not export: it lets
 // lstat open a symlink leaf itself without needing read permission.
@@ -19,12 +21,13 @@ const oPath = 0x200000
 // fdAtomicDir pins the destination directory with a directory fd.
 type fdAtomicDir struct{ fd int }
 
-// openAtomicDir opens dir one component at a time with O_NOFOLLOW|O_DIRECTORY,
-// creating missing directories with the mode of their existing parent. Any
-// symlink (or non-directory) component fails closed. Components are opened with
+// openFDAtomicDir opens dir one component at a time, from the filesystem root
+// (anchor is not needed: every component is pinned), with O_NOFOLLOW|O_DIRECTORY,
+// creating missing directories (when create is set) with the mode of their
+// existing parent. Any symlink (or non-directory) component fails closed. Components are opened with
 // O_PATH so only search (x) permission is needed, as with a path-based open;
 // openat, mkdirat, renameat, unlinkat and fstat all accept O_PATH directory fds.
-func openAtomicDir(dir string) (atomicDir, error) {
+func openFDAtomicDir(_, dir string, create bool) (atomicDir, error) {
 	dir = filepath.Clean(dir)
 	start := "."
 	if filepath.IsAbs(dir) {
@@ -42,7 +45,7 @@ func openAtomicDir(dir string) (atomicDir, error) {
 		}
 		walked = filepath.Join(walked, name)
 		next, err := syscall.Openat(fd, name, flags, 0)
-		if err == syscall.ENOENT {
+		if err == syscall.ENOENT && create {
 			next, err = mkdirAtInherit(fd, name)
 		}
 		if err != nil {
@@ -59,14 +62,18 @@ func openAtomicDir(dir string) (atomicDir, error) {
 }
 
 // mkdirAtInherit creates name under parent with the parent's permission bits
-// and returns an O_PATH fd for it.
+// and returns an O_PATH fd for it. A directory that appeared concurrently
+// (EEXIST) is opened as is: its mode belongs to whoever created it.
 func mkdirAtInherit(parent int, name string) (int, error) {
 	var st syscall.Stat_t
 	if err := syscall.Fstat(parent, &st); err != nil {
 		return -1, err
 	}
 	mode := uint32(st.Mode & 0o777)
-	if err := syscall.Mkdirat(parent, name, mode); err != nil && err != syscall.EEXIST {
+	beforeAnchorMkdir()
+	if err := syscall.Mkdirat(parent, name, mode); err == syscall.EEXIST {
+		return syscall.Openat(parent, name, oPath|syscall.O_DIRECTORY|syscall.O_NOFOLLOW|syscall.O_CLOEXEC, 0)
+	} else if err != nil {
 		return -1, err
 	}
 	// Chmod explicitly so the inherited bits survive the umask. O_PATH fds cannot
@@ -95,11 +102,10 @@ func (d fdAtomicDir) lstat(name string) (os.FileInfo, error) {
 }
 
 func (d fdAtomicDir) createTemp() (*os.File, string, error) {
-	var b [8]byte
-	if _, err := rand.Read(b[:]); err != nil {
+	name, err := atomicTempName()
+	if err != nil {
 		return nil, "", err
 	}
-	name := ".tmp-" + hex.EncodeToString(b[:])
 	fd, err := syscall.Openat(d.fd, name, syscall.O_RDWR|syscall.O_CREAT|syscall.O_EXCL|syscall.O_NOFOLLOW|syscall.O_CLOEXEC, 0o600)
 	if err != nil {
 		return nil, "", &os.PathError{Op: "createtemp", Path: name, Err: err}
@@ -114,6 +120,32 @@ func (d fdAtomicDir) rename(tmpName, name string) error {
 	return nil
 }
 
-func (d fdAtomicDir) remove(name string) { _ = syscall.Unlinkat(d.fd, name) }
+func (d fdAtomicDir) link(name string, dst atomicDir, dstName string) error {
+	to, ok := dst.(fdAtomicDir)
+	if !ok {
+		return errors.New("link: mixed atomic directory implementations")
+	}
+	oldp, err := syscall.BytePtrFromString(name)
+	if err != nil {
+		return err
+	}
+	newp, err := syscall.BytePtrFromString(dstName)
+	if err != nil {
+		return err
+	}
+	// The stdlib syscall package does not export linkat; flags 0 never follows a
+	// symlink source.
+	if _, _, e := syscall.Syscall6(syscall.SYS_LINKAT, uintptr(d.fd), uintptr(unsafe.Pointer(oldp)), uintptr(to.fd), uintptr(unsafe.Pointer(newp)), 0, 0); e != 0 {
+		return &os.LinkError{Op: "link", Old: name, New: dstName, Err: e}
+	}
+	return nil
+}
+
+func (d fdAtomicDir) remove(name string) error {
+	if err := syscall.Unlinkat(d.fd, name); err != nil {
+		return &os.PathError{Op: "unlinkat", Path: name, Err: err}
+	}
+	return nil
+}
 
 func (d fdAtomicDir) close() { _ = syscall.Close(d.fd) }
