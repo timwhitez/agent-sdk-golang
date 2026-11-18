@@ -207,6 +207,25 @@ func webfetchRequestHeaders(in map[string]string) map[string]string {
 	return out
 }
 
+// credentialHeaderMarkers are case-insensitive name substrings that mark a header as
+// credential-bearing (so X-Authorization, X-Cookie and Set-Cookie match too). "token" also matches X-CSRF-Token: a CSRF token is a session
+// secret, so redacting and force-confirming it is intended.
+var credentialHeaderMarkers = []string{"authorization", "cookie", "token", "secret", "api-key", "apikey", "subscription-key", "access-key", "password"}
+
+// isCredentialHeader reports whether a header's value must be redacted and force confirmation.
+func isCredentialHeader(name string) bool {
+	lower := strings.ToLower(name)
+	if strings.HasPrefix(lower, "proxy-") {
+		return true
+	}
+	for _, m := range credentialHeaderMarkers {
+		if strings.Contains(lower, m) {
+			return true
+		}
+	}
+	return false
+}
+
 // describeWebfetchHeaders returns sorted header names, "Name: value" previews
 // (values of credential-bearing headers redacted, others truncated), and
 // whether any header carries credentials.
@@ -216,8 +235,7 @@ func describeWebfetchHeaders(headers map[string]string) (names, preview []string
 	}
 	sort.Strings(names)
 	for _, name := range names {
-		lower := strings.ToLower(name)
-		if lower == "authorization" || lower == "cookie" || lower == "x-api-key" || strings.HasPrefix(lower, "proxy-") {
+		if isCredentialHeader(name) {
 			credential = true
 			preview = append(preview, name+": [redacted]")
 			continue

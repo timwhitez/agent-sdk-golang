@@ -27,7 +27,7 @@ const (
 
 // Variables for testing overrides.
 var (
-	// maxGlobScanFiles is the traversal budget: it counts every visited file, matching or not.
+	// maxGlobScanFiles is the traversal budget: it counts every visited entry (files and directories), matching or not.
 	maxGlobScanFiles      = 100_000
 	globStatFile          = os.Lstat
 	globWalkDir           = filepath.WalkDir
@@ -115,13 +115,13 @@ func globSymlinkWarning(diag globSkippedDiagnostics) string {
 	)
 }
 
-// globScanCapWarning creates a warning when the scan cap is reached.
-func globScanCapWarning(scanned, cap int) string {
-	if cap <= 0 || scanned <= 0 {
+// globScanCapWarning creates a warning when the traversal cap (files and directories) is reached.
+func globScanCapWarning(visited, cap int) string {
+	if cap <= 0 || visited <= 0 {
 		return ""
 	}
 	return formatWarningDiagnostic(
-		fmt.Sprintf("glob scan stopped after %d file candidate(s) at cap %d", scanned, cap),
+		fmt.Sprintf("glob scan stopped after %d visited entries at cap %d", visited, cap),
 		"Narrow the path or pattern and rerun to inspect remaining matches.",
 	)
 }
@@ -195,12 +195,14 @@ func globTool() tools.Tool {
 		pat = filepath.ToSlash(pat)
 		files := make([]string, 0, maxGlobResults)
 		totalFiles := 0
-		scannedCandidates := 0
+		visitedEntries := 0
+		scannedCandidates := 0 // files only; directories count toward visitedEntries
 		scanTruncated := false
 		skippedStat := globSkippedDiagnostics{}
 		skippedSymlink := globSkippedDiagnostics{}
 		skippedWalk := globSkippedDiagnostics{}
 		skippedDirs := []string{}
+		skipDirNames := s.searchSkipDirs()
 		walkErr := globWalkDir(base, func(path string, d os.DirEntry, walkErr error) error {
 			if walkErr != nil {
 				displayPath := resultPathForDisplay(s, path)
@@ -214,7 +216,7 @@ func globTool() tools.Tool {
 				return nil
 			}
 			if d.IsDir() {
-				if skippedSearchDirs[d.Name()] && !pathsEqual(filepath.Clean(path), filepath.Clean(base)) {
+				if skipDirNames[d.Name()] && !pathsEqual(filepath.Clean(path), filepath.Clean(base)) {
 					skippedDirs = append(skippedDirs, resultPathForDisplay(s, path))
 					return filepath.SkipDir
 				}
@@ -223,14 +225,15 @@ func globTool() tools.Tool {
 				}
 			}
 			// Directories count too, so a tree of empty directories is bounded.
-			if scannedCandidates >= maxGlobScanFiles {
+			if visitedEntries >= maxGlobScanFiles {
 				scanTruncated = true
 				return errGlobScanCapReached
 			}
-			scannedCandidates++
+			visitedEntries++
 			if d.IsDir() {
 				return nil
 			}
+			scannedCandidates++
 
 			rel, err := filepath.Rel(base, path)
 			if err != nil {
@@ -295,7 +298,7 @@ func globTool() tools.Tool {
 		walkWarning := globWalkWarning(skippedWalk)
 		scanWarning := ""
 		if scanTruncated {
-			scanWarning = globScanCapWarning(scannedCandidates, maxGlobScanFiles)
+			scanWarning = globScanCapWarning(visitedEntries, maxGlobScanFiles)
 		}
 		skippedCount := skippedStat.count + skippedSymlink.count + skippedWalk.count
 		skippedReason := ""
@@ -342,6 +345,7 @@ func globTool() tools.Tool {
 			meta["scan_cap"] = maxGlobScanFiles
 			meta["scanned_candidates"] = scannedCandidates
 			meta["scanned_files"] = scannedCandidates
+			meta["visited_entries"] = visitedEntries
 			meta["skipped_due_to_cap"] = true
 			if skippedCount == 0 {
 				meta["warning_kind"] = scanCapWarningKind

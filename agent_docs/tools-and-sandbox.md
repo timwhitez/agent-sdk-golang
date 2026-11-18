@@ -168,7 +168,7 @@ are never retried, and the original execution error/result is preserved.
 - Read streams line windows from an open file handle (offset/limit) and applies binary detection with BOM + extension-aware heuristics (`sdk/tools/sandbox/sandbox.go:628`, `sdk/tools/sandbox/sandbox.go:742`)
 - `ls` ignore globs and `grep` `glob` filters are validated once per request; malformed patterns now fail with explicit tool-scoped errors instead of silently changing match behavior (`sdk/tools/sandbox/sandbox.go:508`, `sdk/tools/sandbox/sandbox.go:1905`)
 - `glob` now surfaces matched-path `stat` failures as deterministic warnings and tool-result metadata (`has_errors`, `skipped_paths`, `skipped_path_samples`) so partial/no-match results do not masquerade as complete success (`sdk/tools/sandbox/sandbox.go:1762`, `sdk/tools/sandbox/sandbox.go:1792`)
-- `grep`/`glob` do not descend into `.git`, `.hg`, `.svn` or `node_modules` (unless one is the search `path`) and report them as `skipped_dirs` metadata plus a warning on empty results; the scan cap is a traversal/content budget independent of `max_results` (`sdk/tools/sandbox/sandbox_grep.go`, `sdk/tools/sandbox/sandbox_glob.go`)
+- `grep`/`glob` do not descend into `.git`, `.hg`, `.svn` or `node_modules` (unless one is the search `path`) and report them as `skipped_dirs` metadata plus a warning on empty results; hosts override the list with `Sandbox.SetSkippedSearchDirs` (nil = default, empty = skip nothing); the scan cap is a traversal/content budget independent of `max_results`; `visited_entries` counts files and directories, while `scanned_candidates`/`scanned_files` count file candidates only (`sdk/tools/sandbox/sandbox_grep.go`, `sdk/tools/sandbox/sandbox_glob.go`)
 - `apply_patch` accepts Codex `@@ <scope>` headers (consecutive headers locate nested scopes; a missing scope is an error), keeps each untouched line's own terminator, and `edit` rejects an empty or unchanged `old_string` (`sdk/tools/sandbox/sandbox_patch.go`, `sdk/tools/sandbox/sandbox_write.go`)
 - Atomic writes on Linux pin the destination directory with a no-follow `openat` walk, so a path component swapped for a symlink after revalidation fails closed; other platforms keep path-based checks (`sdk/tools/sandbox/sandbox_io_dir_linux.go`)
 - Artifact-envelope handling treats only text framed like `Encode` output (start marker first, end marker last) as an envelope; plain output that mentions a marker is not flagged (`sdk/artifact/codec.go` `IsFramedEnvelope`)
@@ -184,7 +184,9 @@ are never retried, and the original execution error/result is preserved.
   echoing credential values (`sdk/tools/sandbox/sandbox_webfetch.go`).
 - `webfetch` confirmation lists every model-supplied header: names and
   previews in `header_names`/`headers` and in `summary`/`raw`. Values of
-  `Authorization`, `Cookie`, `X-Api-Key` and `Proxy-*` headers are redacted and
+  `Proxy-*` and any header whose name contains `authorization`, `cookie`,
+  `token`, `secret`, `api-key`, `apikey`, `subscription-key`, `access-key` or
+  `password` (case-insensitive; includes `X-CSRF-Token`) are redacted and
   set `force_confirm`; other custom headers are shown but not force-confirmed.
   Idle connections of the per-call transport are closed when the call ends.
 - Execrunner bounds the post-exit pipe drain with `Options.PipeDrainGrace` (default 2s).

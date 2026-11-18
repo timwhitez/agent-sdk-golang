@@ -11,6 +11,7 @@ import (
 	"strings"
 	"testing"
 	"time"
+	"unicode/utf8"
 
 	"github.com/timwhitez/agent-sdk-golang/sdk/tools"
 )
@@ -105,5 +106,52 @@ func TestWebfetchDoesNotLeakIdleConnections(t *testing.T) {
 	time.Sleep(200 * time.Millisecond)
 	if extra := runtime.NumGoroutine() - before; extra >= calls {
 		t.Fatalf("%d webfetch calls left %d extra goroutines", calls, extra)
+	}
+}
+
+// Issue #267: credential headers are matched by rule, not by a short list.
+func TestDescribeWebfetchHeadersCredentialRule(t *testing.T) {
+	cases := []struct {
+		name string
+		cred bool
+	}{
+		{"Authorization", true}, {"X-Authorization", true}, {"Cookie", true}, {"X-Cookie", true}, {"Set-Cookie", true}, {"Proxy-Authorization", true}, {"Proxy-Foo", true},
+		{"X-Api-Key", true}, {"X-Goog-Api-Key", true}, {"Api-Key", true}, {"X-ApiKey", true},
+		{"X-Auth-Token", true}, {"Private-Token", true}, {"X-Amz-Security-Token", true},
+		{"Ocp-Apim-Subscription-Key", true}, {"X-Access-Key", true}, {"X-Client-Secret", true},
+		{"X-Password", true}, {"x-auth-TOKEN", true},
+		// A CSRF token is a session secret, so it is deliberately treated as a credential.
+		{"X-CSRF-Token", true},
+		{"User-Agent", false}, {"Accept", false}, {"Content-Type", false}, {"X-Request-Id", false},
+		{"Accept-Language", false}, {"Cache-Control", false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			_, preview, cred := describeWebfetchHeaders(map[string]string{tc.name: "value-123"})
+			if cred != tc.cred {
+				t.Fatalf("credential = %v, want %v", cred, tc.cred)
+			}
+			if shown := strings.Contains(preview[0], "value-123"); shown == tc.cred {
+				t.Fatalf("preview %q: value shown = %v, credential = %v", preview[0], shown, tc.cred)
+			}
+		})
+	}
+}
+
+// Truncation of a long header value must cut on a rune boundary.
+func TestDescribeWebfetchHeadersTruncatesOnRuneBoundary(t *testing.T) {
+	// 199 ASCII bytes then 3-byte runes: byte 197 falls inside the first rune.
+	long := strings.Repeat("a", 199) + strings.Repeat("世", 10)
+	_, preview, _ := describeWebfetchHeaders(map[string]string{"X-Note": long})
+	got := strings.TrimPrefix(preview[0], "X-Note: ")
+	if !utf8.ValidString(got) || !strings.HasSuffix(got, "...") {
+		t.Fatalf("preview not valid truncated UTF-8: %q", got)
+	}
+	if want := strings.Repeat("a", 197) + "..."; got != want {
+		t.Fatalf("got %d bytes, want %q", len(got), want)
+	}
+	short := strings.Repeat("世", 66) // 198 bytes, under the limit
+	if _, p, _ := describeWebfetchHeaders(map[string]string{"X-Note": short}); p[0] != "X-Note: "+short {
+		t.Fatalf("short value altered: %q", p[0])
 	}
 }
