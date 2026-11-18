@@ -191,7 +191,10 @@ are never retried, and the original execution error/result is preserved.
   Run owns the output pipes (`os.Pipe`) and observes EOF itself, because `exec.Cmd.Wait` reports `ErrWaitDelay` only for a zero exit. If the process exits but a descendant still holds stdout/stderr, Run returns
   the real exit status with `PipeDrainTimedOut=true`, no timeout, and a note
   appended to the output; canonical streams are aborted as incomplete. The
-  process group is only killed on a real timeout.
+  grace is wall time since exit minus time inside a consumer write (a slow sink
+  never loses output already written), hard-capped at
+  `PipeDrainGrace + KillWaitGrace`. The process group is only killed on a real
+  timeout.
 - Shell command confirmation and timeout-guarded execution (`sdk/tools/sandbox/sandbox.go:558`, `sdk/tools/sandbox/sandbox.go:572`)
 - Execrunner checks parent cancellation after argument validation, checks its
   timeout context before preparation, and checks again immediately before Start.

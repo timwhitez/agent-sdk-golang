@@ -236,11 +236,12 @@ func run(ctx context.Context, opts Options, withTimeout func(context.Context, ti
 	}()
 	go func() {
 		cmdWaitErr = cmd.Wait()
-		if !waitForPumpsDrain(streams, pumpsDone, runCtx.Done(), opts.PipeDrainGrace) {
+		if !waitForPumpsDrain(streams, pumpsDone, runCtx.Done(), opts.PipeDrainGrace, opts.PipeDrainGrace+opts.KillWaitGrace) {
 			drainForced.Store(true)
 			closePumpFiles()
 		}
 		<-pumpsDone
+		closePumpFiles() // release the read ends deterministically, not via GC
 		close(waitCh)
 	}()
 
@@ -250,7 +251,6 @@ func run(ctx context.Context, opts Options, withTimeout func(context.Context, ti
 	pipeDrainTimedOut := false
 	select {
 	case <-waitCh:
-		pipeDrainTimedOut = drainForced.Load()
 		rawWaitErr = cmdWaitErr
 		waitErr = rawWaitErr
 	case <-runCtx.Done():
@@ -295,6 +295,11 @@ func run(ctx context.Context, opts Options, withTimeout func(context.Context, ti
 		}
 	}
 
+	if !killWaitTimedOut {
+		// waitCh closed on every path, so this also covers a forced cut-off that
+		// raced with a timeout or cancellation: it must never be committed complete.
+		pipeDrainTimedOut = drainForced.Load()
+	}
 	if killWaitTimedOut {
 		// cmd.Wait never returned, so the wait goroutine still owns the stream
 		// writers and the legacy artifact file must stay open for any straggler
@@ -589,13 +594,16 @@ const pipeDrainTick = 10 * time.Millisecond
 // false when grace of wall time has passed since the exit, not counting time
 // any pump spent inside writer.Write: a slow consumer must not lose output the
 // process already wrote, but a descendant that keeps writing (or holds the pipe
-// silently) cannot extend the wait.
-func waitForPumpsDrain(streams []*outputPump, pumpsDone, stop <-chan struct{}, grace time.Duration) bool {
+// silently) cannot extend the wait. Excluding Write time cannot tell a slow
+// consumer from a fast producer, so ceiling is a hard wall-clock limit since the
+// exit that no excluded time can exceed.
+func waitForPumpsDrain(streams []*outputPump, pumpsDone, stop <-chan struct{}, grace, ceiling time.Duration) bool {
 	ticker := time.NewTicker(pipeDrainTick)
 	defer ticker.Stop()
-	last := time.Now()
+	begin := time.Now()
+	last := begin
 	var spent time.Duration
-	for spent < grace {
+	for spent < grace && last.Sub(begin) < ceiling {
 		select {
 		case <-pumpsDone:
 			return true
