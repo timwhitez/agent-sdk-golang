@@ -182,7 +182,7 @@ func grepTool() tools.Tool {
 				return nil
 			}
 			if d.IsDir() {
-				if skippedSearchDirs[d.Name()] && !pathsEqual(filepath.Clean(path), filepath.Clean(base)) {
+				if s.skipsSearchDir(d.Name()) && !pathsEqual(filepath.Clean(path), filepath.Clean(base)) {
 					skippedDirs = append(skippedDirs, resultPathForDisplay(s, path))
 					return filepath.SkipDir
 				}
@@ -396,6 +396,7 @@ func grepTool() tools.Tool {
 				"scan_cap":           scanCap,
 				"scanned_candidates": scannedCandidates,
 				"scanned_files":      scannedCandidates,
+				"visited_entries":    visitedEntries,
 				"skipped_due_to_cap": true,
 			}
 			if len(permissionDenied) == 0 && len(scanFailures) == 0 {

@@ -585,7 +585,14 @@ type outputPump struct {
 	// writeStart is the UnixNano time the pump entered writer.Write, or 0 while
 	// it is not inside the consumer.
 	writeStart atomic.Int64
+	// read is the total bytes read from the pipe.
+	read atomic.Int64
 }
+
+// pipeCapacityBytes is the default Linux pipe capacity. Output the process wrote
+// before exiting is at most this large, so reading more than that after the exit
+// proves a descendant is still writing.
+const pipeCapacityBytes = 64 * 1024
 
 const pipeDrainTick = 10 * time.Millisecond
 
@@ -596,13 +603,22 @@ const pipeDrainTick = 10 * time.Millisecond
 // process already wrote, but a descendant that keeps writing (or holds the pipe
 // silently) cannot extend the wait. Excluding Write time cannot tell a slow
 // consumer from a fast producer, so ceiling is a hard wall-clock limit since the
-// exit that no excluded time can exceed.
+// exit that no excluded time can exceed. Once more than one pipe capacity has
+// been read after the exit the output cannot all predate it, so Write time is no
+// longer excluded.
 func waitForPumpsDrain(streams []*outputPump, pumpsDone, stop <-chan struct{}, grace, ceiling time.Duration) bool {
 	ticker := time.NewTicker(pipeDrainTick)
 	defer ticker.Stop()
 	begin := time.Now()
 	last := begin
 	var spent time.Duration
+	readTotal := func() (n int64) {
+		for _, st := range streams {
+			n += st.read.Load()
+		}
+		return n
+	}
+	readAtExit := readTotal()
 	for spent < grace && last.Sub(begin) < ceiling {
 		select {
 		case <-pumpsDone:
@@ -614,7 +630,7 @@ func waitForPumpsDrain(streams []*outputPump, pumpsDone, stop <-chan struct{}, g
 			for _, st := range streams {
 				inWrite = inWrite || st.writeStart.Load() != 0
 			}
-			if !inWrite {
+			if !inWrite || readTotal()-readAtExit > pipeCapacityBytes {
 				spent += now.Sub(last)
 			}
 			last = now
@@ -646,6 +662,7 @@ func (p *outputPump) pump() {
 	for {
 		n, err := p.r.Read(buf)
 		if n > 0 {
+			p.read.Add(int64(n))
 			p.writeStart.Store(time.Now().UnixNano())
 			_, werr := p.writer.Write(buf[:n])
 			p.writeStart.Store(0)

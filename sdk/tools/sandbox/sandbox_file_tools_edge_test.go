@@ -266,3 +266,112 @@ func TestWriteToolsFailClosedWhenIntermediateDirBecomesSymlink(t *testing.T) {
 type allowAllConfirmer struct{}
 
 func (allowAllConfirmer) Confirm(context.Context, string, string) (bool, error) { return true, nil }
+
+// Issue #268: glob/grep scan-cap metadata keeps scanned_* as file counts and
+// reports directories separately as visited_entries.
+func TestScanCapMetadataSeparatesFilesFromVisitedEntries(t *testing.T) {
+	defer func(g, l int) { grepTraversalBudget, maxGlobScanFiles = g, l }(grepTraversalBudget, maxGlobScanFiles)
+	grepTraversalBudget, maxGlobScanFiles = 10, 10
+	deps := fakeGitRepo(t)
+	s, _ := tools.Get(deps, context.Background(), Key)
+	for i := 0; i < 4; i++ { // d0 d1 d2 d3, each with a file => 8 entries, then dirs
+		dir := filepath.Join(s.RootDir, "tree", fmt.Sprintf("d%d", i))
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(dir, "f.txt"), []byte("x"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for i := 4; i < 12; i++ {
+		if err := os.MkdirAll(filepath.Join(s.RootDir, "tree", fmt.Sprintf("d%d", i)), 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for name, tc := range map[string]struct {
+		tool tools.Tool
+		args string
+	}{
+		"glob": {globTool(), `{"pattern":"**/*.nomatch","path":"tree"}`},
+		"grep": {grepTool(), `{"pattern":"absent","path":"tree"}`},
+	} {
+		t.Run(name, func(t *testing.T) {
+			ctx := tools.WithToolResultMetadata(context.Background())
+			res, err := tc.tool.Execute(ctx, tc.args, deps)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if out := res.PlainText(); !strings.Contains(out, "stopped after 10 visited entries at cap 10") || strings.Contains(out, "file candidate") {
+				t.Fatalf("unexpected warning: %q", out)
+			}
+			meta := tools.ToolResultMetadataSnapshot(ctx)
+			if meta["visited_entries"] != 10 {
+				t.Fatalf("visited_entries = %#v", meta["visited_entries"])
+			}
+			files := meta["scanned_files"]
+			if files == 10 || files == nil || files != meta["scanned_candidates"] {
+				t.Fatalf("scanned_files/candidates must count files only, got %#v / %#v", files, meta["scanned_candidates"])
+			}
+		})
+	}
+}
+
+// Issue #268: the skipped-directory list is configurable per sandbox.
+func TestSkippedSearchDirsConfigurable(t *testing.T) {
+	deps := fakeGitRepo(t)
+	s, _ := tools.Get(deps, context.Background(), Key)
+	if err := os.MkdirAll(filepath.Join(s.RootDir, "vendor"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(s.RootDir, "vendor", "v.go"), []byte("package v\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	cases := []struct {
+		name         string
+		set          func()
+		wantGit      bool
+		wantVendor   bool
+		wantSkipMeta string
+	}{
+		{"default", func() { s.SetSkippedSearchDirs(nil) }, false, true, ".git"},
+		{"override", func() { s.SetSkippedSearchDirs([]string{"vendor"}) }, true, false, "vendor"},
+		{"empty skips nothing", func() { s.SetSkippedSearchDirs([]string{}) }, true, true, ""},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			tc.set()
+			ctx := tools.WithToolResultMetadata(context.Background())
+			run := func(tool tools.Tool, args, want string) bool {
+				res, err := tool.Execute(ctx, args, deps)
+				if err != nil {
+					t.Fatal(err)
+				}
+				return strings.Contains(res.PlainText(), want)
+			}
+			if got := run(globTool(), `{"pattern":"**/obj0001"}`, ".git/objects/01/obj0001"); got != tc.wantGit {
+				t.Errorf("glob .git searched = %v, want %v", got, tc.wantGit)
+			}
+			if got := run(globTool(), `{"pattern":"**/v.go"}`, "vendor/v.go"); got != tc.wantVendor {
+				t.Errorf("glob vendor searched = %v, want %v", got, tc.wantVendor)
+			}
+			if got := run(grepTool(), `{"pattern":"needle blob","glob":"**/obj0001","output_mode":"files_with_matches"}`, "obj0001"); got != tc.wantGit {
+				t.Errorf("grep .git searched = %v, want %v", got, tc.wantGit)
+			}
+			if got := run(grepTool(), `{"pattern":"package v","output_mode":"files_with_matches"}`, "vendor/v.go"); got != tc.wantVendor {
+				t.Errorf("grep vendor searched = %v, want %v", got, tc.wantVendor)
+			}
+			res, _ := globTool().Execute(ctx, `{"pattern":"**/*.nomatch"}`, deps)
+			meta := tools.ToolResultMetadataSnapshot(ctx)
+			samples, _ := meta["skipped_dir_samples"].([]string)
+			if tc.wantSkipMeta == "" && len(samples) != 0 || tc.wantSkipMeta != "" && (len(samples) != 1 || samples[0] != tc.wantSkipMeta) {
+				t.Errorf("skipped_dir_samples = %v, want [%s]; %s", samples, tc.wantSkipMeta, res.PlainText())
+			}
+		})
+	}
+	// An explicit path inside a configured-skipped directory is still searched.
+	s.SetSkippedSearchDirs([]string{"src"})
+	res, err := globTool().Execute(context.Background(), `{"pattern":"**/*.go","path":"src"}`, deps)
+	if err != nil || !strings.Contains(res.PlainText(), "src/main.go") {
+		t.Fatalf("explicit path in skipped dir not searched: %q err=%v", res.PlainText(), err)
+	}
+}

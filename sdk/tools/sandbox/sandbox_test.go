@@ -2947,7 +2947,7 @@ func TestGlobTool_ScanCapStopsTraversalOnSparseOrNoMatchesWithActionableWarning(
 	if !strings.Contains(out, "[WARN] glob scan stopped after") {
 		t.Fatalf("expected scan-cap warning, got %q", out)
 	}
-	if !strings.Contains(out, "file candidate(s) at cap") {
+	if !strings.Contains(out, "visited entries at cap") {
 		t.Fatalf("expected candidate-scan warning context, got %q", out)
 	}
 	idx := strings.LastIndex(out, "[WARN]")

@@ -259,3 +259,63 @@ func yesArgs(t *testing.T) []string {
 	args, _ := startYesScript(t)
 	return args
 }
+
+// Issue #248/#266: a finished foreground command must not kill a background
+// child that still holds stdout; the child outlives Run.
+func TestRunDoesNotKillBackgroundChildHoldingPipe(t *testing.T) {
+	dir := t.TempDir()
+	pidFile := filepath.Join(dir, "pid")
+	t.Cleanup(func() {
+		if b, err := os.ReadFile(pidFile); err == nil {
+			if pid, err := strconv.Atoi(strings.TrimSpace(string(b))); err == nil && pid > 1 {
+				_ = syscall.Kill(pid, syscall.SIGKILL) // exactly the PID this test started
+			}
+		}
+	})
+	res, err := Run(context.Background(), Options{
+		Program:        "sh",
+		Args:           []string{"-c", `sleep 30 & echo $! > "$0"; exit 0`, pidFile},
+		Timeout:        30 * time.Second, // safety net only
+		PipeDrainGrace: 100 * time.Millisecond,
+	})
+	if err != nil || res.TimedOut || res.ExitCode != 0 || !res.PipeDrainTimedOut {
+		t.Fatalf("Run() err=%v timed_out=%v exit=%d drain=%v", err, res.TimedOut, res.ExitCode, res.PipeDrainTimedOut)
+	}
+	b, err := os.ReadFile(pidFile) // written before the shell exited, so present once Run returns
+	if err != nil {
+		t.Fatalf("pid file: %v", err)
+	}
+	pid, err := strconv.Atoi(strings.TrimSpace(string(b)))
+	if err != nil {
+		t.Fatalf("pid %q: %v", b, err)
+	}
+	if err := syscall.Kill(pid, 0); err != nil {
+		t.Fatalf("background child %d was killed or exited after Run returned: %v", pid, err)
+	}
+}
+
+// Issue #266: a continuous writer behind a slow consumer must still be cut off
+// well before the hard ceiling once more than a pipe capacity is read after the
+// exit (Write time is excluded only for output that predates it).
+func TestRunContinuousWriterWithSlowConsumerIsCutOffBeforeCeiling(t *testing.T) {
+	args, stampFile := startYesScript(t)
+	res, err := Run(context.Background(), Options{
+		Program:        "sh",
+		Args:           args,
+		PipeDrainGrace: 300 * time.Millisecond,
+		KillWaitGrace:  30 * time.Second, // ceiling = 30.3s
+		OnOutputChunk:  func(OutputChunk) { time.Sleep(100 * time.Millisecond) },
+	})
+	end := time.Now()
+	if err != nil || res.TimedOut || !res.PipeDrainTimedOut {
+		t.Fatalf("Run() err=%v timed_out=%v drain=%v", err, res.TimedOut, res.PipeDrainTimedOut)
+	}
+	b, _ := os.ReadFile(stampFile)
+	exitNanos, perr := strconv.ParseInt(strings.TrimSpace(string(b)), 10, 64)
+	if perr != nil {
+		t.Fatalf("exit stamp unreadable: %v", perr)
+	}
+	if after := end.Sub(time.Unix(0, exitNanos)); after > 10*time.Second {
+		t.Fatalf("Run returned %s after exit; the slow consumer kept extending the drain", after)
+	}
+}

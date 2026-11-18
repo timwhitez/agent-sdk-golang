@@ -31,6 +31,8 @@ type Sandbox struct {
 
 	allowedRoots   []string
 	configuredRoot string
+	// skipDirs overrides skippedSearchDirs for grep/glob; nil means the default list.
+	skipDirs map[string]bool
 }
 
 type validatedSandboxPath struct {
@@ -117,6 +119,37 @@ func (s *Sandbox) ReplaceAllowedRoots(roots []string) {
 	s.mu.Lock()
 	s.allowedRoots = cleaned
 	s.mu.Unlock()
+}
+
+// SetSkippedSearchDirs sets the directory base names grep and glob do not descend
+// into. nil restores the default list; a non-nil empty slice skips nothing. A
+// directory passed explicitly as the search path is always searched.
+func (s *Sandbox) SetSkippedSearchDirs(names []string) {
+	if s == nil {
+		return
+	}
+	var m map[string]bool
+	if names != nil {
+		m = make(map[string]bool, len(names))
+		for _, n := range names {
+			if n = strings.TrimSpace(n); n != "" {
+				m[n] = true
+			}
+		}
+	}
+	s.mu.Lock()
+	s.skipDirs = m
+	s.mu.Unlock()
+}
+
+// skipsSearchDir reports whether grep/glob skip directories with this base name.
+func (s *Sandbox) skipsSearchDir(name string) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.skipDirs != nil {
+		return s.skipDirs[name]
+	}
+	return skippedSearchDirs[name]
 }
 
 func New(root string) (*Sandbox, error) {
