@@ -160,10 +160,15 @@ type Config struct {
 	// to the summary model. Values <= 0 use DefaultSummaryTargetTokens.
 	SummaryTargetTokens int
 	// TokenEstimator estimates prompt tokens for a text fragment. When nil, a
-	// naive (len+3)/4 heuristic is used. Hosts (e.g. Goode) inject a detailed
+	// naive (len+3)/4 heuristic is used. Hosts inject a detailed
 	// estimator so tier eligibility and reported token counts match the same
 	// estimator used for prompt-budget decisions outside the compaction package.
 	TokenEstimator func(text string) int
+	// HostNamespace scopes the compaction material schema and the summary
+	// checkpoint marker this service writes, and the host-internal message
+	// names it classifies (see messageorigin.ValidateHostNamespace). Empty
+	// uses messageorigin.DefaultHostNamespace. Legacy forms stay recognized.
+	HostNamespace string
 }
 
 // SummaryPromptFunc resolves a compaction summary prompt from the active model ID.

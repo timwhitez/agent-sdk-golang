@@ -29,11 +29,11 @@ func (e *summaryValidationError) Error() string {
 	return strings.Join(e.reasons, "; ")
 }
 
-func validateSummaryOutput(raw, material string) (string, error) {
+func validateSummaryOutput(namespace, raw, material string) (string, error) {
 	summary, reasons := validateSummaryEnvelope(raw)
 	if summary != "" {
 		reasons = append(reasons, validateRequiredSummarySections(summary)...)
-		facts, err := summaryValidationFactsFromMaterial(material)
+		facts, err := summaryValidationFactsFromMaterial(namespace, material)
 		if err != nil {
 			reasons = append(reasons, "compaction material framing is invalid: "+err.Error())
 		} else {
@@ -55,8 +55,8 @@ type summaryValidationFacts struct {
 	HostCheckpointStatus  string
 }
 
-func summaryValidationFactsFromMaterial(material string) (summaryValidationFacts, error) {
-	envelope, framed, err := decodeCompactionMaterialEnvelope(material)
+func summaryValidationFactsFromMaterial(namespace, material string) (summaryValidationFacts, error) {
+	envelope, framed, err := decodeCompactionMaterialEnvelope(namespace, material)
 	if err != nil {
 		return summaryValidationFacts{}, err
 	}

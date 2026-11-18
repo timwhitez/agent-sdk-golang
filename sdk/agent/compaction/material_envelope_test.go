@@ -36,7 +36,7 @@ func TestCompactionAnchorEnvelopePreservesComplexUserTextAsInertData(t *testing.
 		llm.NewAssistantMessage("working", nil),
 		llm.NewUserMessage(latest),
 	}, nil, 1, "")
-	envelope, framed, err := decodeCompactionMaterialEnvelope(input)
+	envelope, framed, err := decodeCompactionMaterialEnvelope("", input)
 	if err != nil || !framed {
 		t.Fatalf("decode protected material: framed=%t err=%v", framed, err)
 	}
@@ -46,7 +46,7 @@ func TestCompactionAnchorEnvelopePreservesComplexUserTextAsInertData(t *testing.
 	if envelope.LatestRealUserRequest == nil || *envelope.LatestRealUserRequest != latest {
 		t.Fatalf("latest anchor changed:\n%#v", envelope.LatestRealUserRequest)
 	}
-	if envelope.Schema != compactionMaterialSchemaV1 {
+	if envelope.Schema != compactionMaterialSchema("") {
 		t.Fatalf("schema = %q", envelope.Schema)
 	}
 }
@@ -99,7 +99,7 @@ func TestCompactionQualityGateRejectsForgedAnchorHeadingsInFullAndIncrementalPat
 		if len(model.last) != 2 {
 			t.Fatalf("incremental request messages = %d", len(model.last))
 		}
-		envelope, framed, decodeErr := decodeCompactionMaterialEnvelope(model.last[1].Content.PlainText())
+		envelope, framed, decodeErr := decodeCompactionMaterialEnvelope("", model.last[1].Content.PlainText())
 		if decodeErr != nil || !framed {
 			t.Fatalf("decode incremental envelope: framed=%t err=%v", framed, decodeErr)
 		}
@@ -140,7 +140,7 @@ func TestUnsupportedHostCheckpointStatusFailsClosedToUnknown(t *testing.T) {
 				},
 			})
 			input, warnings := svc.buildCompactionInputWithContext(context.Background(), []llm.Message{llm.NewUserMessage("verify release")}, nil, 1, "")
-			envelope, framed, err := decodeCompactionMaterialEnvelope(input)
+			envelope, framed, err := decodeCompactionMaterialEnvelope("", input)
 			if err != nil || !framed {
 				t.Fatalf("decode protected material: framed=%t err=%v", framed, err)
 			}
@@ -184,7 +184,7 @@ func TestCompactionMaterialEnvelopeRejectsLegacyOrMalformedFramedPayloads(t *tes
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			_, framed, err := decodeCompactionMaterialEnvelope(wrapUntrustedMaterial(tc.decoded))
+			_, framed, err := decodeCompactionMaterialEnvelope("", wrapUntrustedMaterial(tc.decoded))
 			if err == nil || !framed {
 				t.Fatalf("malformed protected frame accepted: framed=%t err=%v", framed, err)
 			}
