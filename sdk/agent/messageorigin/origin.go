@@ -4,6 +4,7 @@
 package messageorigin
 
 import (
+	"fmt"
 	"regexp"
 	"strings"
 
@@ -12,11 +13,61 @@ import (
 
 const (
 	SDKInternalNamePrefix   = "sdk_internal_"
-	HostInternalNamePrefix  = "goode_internal_"
 	CompactionSummaryName   = "compaction_summary"
-	GoodeMemoryName         = "goode_memory"
 	WideResearchContextName = "wide_research"
 )
+
+// Host namespaces scope the host-owned identifiers the SDK writes and
+// recognizes: "<ns>_internal_*" and "<ns>_memory" message names, the
+// "<ns>.compaction.material.v1" schema and the
+// "<!-- <ns>-compaction-checkpoint-id=" summary marker.
+const (
+	// DefaultHostNamespace is used when a host configures none.
+	DefaultHostNamespace = "agent"
+	// LegacyHostNamespace is the namespace earlier SDK releases hard-coded.
+	// Its forms stay recognized under every namespace so persisted
+	// histories keep loading and classifying exactly as before.
+	LegacyHostNamespace          = "goode"
+	LegacyHostInternalNamePrefix = LegacyHostNamespace + "_internal_"
+	LegacyHostMemoryName         = LegacyHostNamespace + "_memory"
+
+	// Deprecated: use LegacyHostInternalNamePrefix.
+	HostInternalNamePrefix = LegacyHostInternalNamePrefix
+	// Deprecated: use LegacyHostMemoryName.
+	GoodeMemoryName = LegacyHostMemoryName
+
+	maxHostNamespaceLen = 32
+)
+
+// ValidateHostNamespace accepts 1-32 bytes of [a-z0-9] starting with a letter.
+// The namespace is embedded in names and an HTML-comment marker that are
+// parsed later, so the separators "_", "-", "." and anything that could close
+// or extend the marker are excluded.
+func ValidateHostNamespace(namespace string) error {
+	if namespace == "" || len(namespace) > maxHostNamespaceLen {
+		return fmt.Errorf("host namespace %q must be 1-%d characters", namespace, maxHostNamespaceLen)
+	}
+	for i := 0; i < len(namespace); i++ {
+		c := namespace[i]
+		if (c < 'a' || c > 'z') && (i == 0 || c < '0' || c > '9') {
+			return fmt.Errorf("host namespace %q must match [a-z][a-z0-9]*", namespace)
+		}
+	}
+	return nil
+}
+
+// ResolveHostNamespace maps an empty namespace to DefaultHostNamespace. An
+// invalid namespace resolves to "" so that callers recognize only the SDK and
+// legacy forms and never build an identifier from it.
+func ResolveHostNamespace(namespace string) string {
+	if namespace == "" {
+		return DefaultHostNamespace
+	}
+	if ValidateHostNamespace(namespace) != nil {
+		return ""
+	}
+	return namespace
+}
 
 type Kind string
 
@@ -78,28 +129,45 @@ func NewInternalUserMessage(kind Kind, text string) llm.Message {
 	}
 }
 
+// IsInternalMessage classifies under DefaultHostNamespace; see IsInternalMessageIn.
 func IsInternalMessage(message llm.Message) bool {
+	return IsInternalMessageIn("", message)
+}
+
+// IsRealUserMessage classifies under DefaultHostNamespace; see IsRealUserMessageIn.
+func IsRealUserMessage(message llm.Message) bool {
+	return IsRealUserMessageIn("", message)
+}
+
+// IsInternalMessageIn reports whether a message is framework- or host-authored.
+// Host-owned names are recognized for the given namespace (empty means
+// DefaultHostNamespace) and for LegacyHostNamespace; other namespaces are not.
+func IsInternalMessageIn(namespace string, message llm.Message) bool {
 	name := strings.TrimSpace(message.Name)
-	if isReservedInternalName(name) {
+	if isReservedInternalName(ResolveHostNamespace(namespace), name) {
 		return true
 	}
 	return message.Role == llm.RoleUser && name == "" && isLegacyInternalUserText(message.Content.PlainText())
 }
 
-func IsRealUserMessage(message llm.Message) bool {
-	return message.Role == llm.RoleUser && !message.Destroyed && !IsInternalMessage(message)
+// IsRealUserMessageIn reports whether a message is a live user request under
+// the given host namespace.
+func IsRealUserMessageIn(namespace string, message llm.Message) bool {
+	return message.Role == llm.RoleUser && !message.Destroyed && !IsInternalMessageIn(namespace, message)
 }
 
-func isReservedInternalName(name string) bool {
+func isReservedInternalName(namespace, name string) bool {
 	if name == "" {
 		return false
 	}
 	switch name {
-	case CompactionSummaryName, GoodeMemoryName, WideResearchContextName:
+	case CompactionSummaryName, LegacyHostMemoryName, WideResearchContextName:
 		return true
-	default:
-		return strings.HasPrefix(name, SDKInternalNamePrefix) || strings.HasPrefix(name, HostInternalNamePrefix)
 	}
+	if strings.HasPrefix(name, SDKInternalNamePrefix) || strings.HasPrefix(name, LegacyHostInternalNamePrefix) {
+		return true
+	}
+	return namespace != "" && (name == namespace+"_memory" || strings.HasPrefix(name, namespace+"_internal_"))
 }
 
 func isLegacyInternalUserText(text string) bool {

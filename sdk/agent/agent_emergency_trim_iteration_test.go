@@ -281,7 +281,7 @@ func TestEmergencyTrimKeepsPairingLegalAcrossFrameworkInterleavings(t *testing.T
 				t.Errorf("%s: trimmed to a system-only history", label)
 			}
 			for _, m := range messages {
-				if !emergencyTrimProtected(m) {
+				if !emergencyTrimProtected("", m) {
 					continue
 				}
 				kept := false

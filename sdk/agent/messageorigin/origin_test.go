@@ -1,6 +1,7 @@
 package messageorigin
 
 import (
+	"strings"
 	"testing"
 
 	"github.com/timwhitez/agent-sdk-golang/sdk/llm"
@@ -28,5 +29,65 @@ func TestIsRealUserMessageRejectsDestroyedUser(t *testing.T) {
 	message.Destroyed = true
 	if IsRealUserMessage(message) {
 		t.Fatalf("destroyed user was classified as real: %#v", message)
+	}
+}
+
+func TestValidateHostNamespace(t *testing.T) {
+	for _, ns := range []string{"agent", "goode", "acme2", strings.Repeat("a", 32)} {
+		if err := ValidateHostNamespace(ns); err != nil {
+			t.Fatalf("ValidateHostNamespace(%q) = %v", ns, err)
+		}
+	}
+	for _, ns := range []string{"", "Acme", "a-b", "a_b", "a.b", "1abc", "a b", "x -->", "a\n", "é", strings.Repeat("a", 33)} {
+		if err := ValidateHostNamespace(ns); err == nil {
+			t.Fatalf("ValidateHostNamespace(%q) accepted", ns)
+		}
+	}
+}
+
+func TestHostNamespaceClassification(t *testing.T) {
+	named := func(name string) llm.Message {
+		return llm.Message{Role: llm.RoleUser, Name: name, Content: llm.TextContent("host text")}
+	}
+	cases := []struct {
+		name     string
+		internal map[string]bool // namespace -> want internal
+	}{
+		{"goode_internal_collab_history_repair", map[string]bool{"": true, "goode": true, "acme": true, "a_b": true}},
+		{"goode_memory", map[string]bool{"": true, "goode": true, "acme": true, "a_b": true}},
+		{"sdk_internal_require_done", map[string]bool{"": true, "goode": true, "acme": true}},
+		{"agent_internal_x", map[string]bool{"": true, "agent": true, "goode": false, "acme": false}},
+		{"agent_memory", map[string]bool{"": true, "goode": false, "acme": false}},
+		{"acme_internal_x", map[string]bool{"": false, "goode": false, "acme": true, "acme2": false}},
+		{"acme_memory", map[string]bool{"": false, "acme": true}},
+		// An invalid namespace contributes no forms of its own.
+		{"a_b_internal_x", map[string]bool{"a_b": false}},
+		{"_internal_x", map[string]bool{"a_b": false, "": false}},
+		{"acme_internalx", map[string]bool{"acme": false}},
+	}
+	for _, tc := range cases {
+		for ns, want := range tc.internal {
+			msg := named(tc.name)
+			if got := IsInternalMessageIn(ns, msg); got != want {
+				t.Errorf("IsInternalMessageIn(%q, %q) = %t, want %t", ns, tc.name, got, want)
+			}
+			if got := IsRealUserMessageIn(ns, msg); got == want {
+				t.Errorf("IsRealUserMessageIn(%q, %q) = %t, want %t", ns, tc.name, got, !want)
+			}
+		}
+	}
+	// Namespace forms are name-only: identical text without a name stays a real user request.
+	if !IsRealUserMessageIn("acme", llm.NewUserMessage("acme_internal_x")) {
+		t.Fatal("unnamed text matching a namespace form was classified internal")
+	}
+	if IsInternalMessage(named("acme_internal_x")) != IsInternalMessageIn("", named("acme_internal_x")) {
+		t.Fatal("IsInternalMessage differs from the default namespace")
+	}
+}
+
+func TestLegacyHostConstantsAreByteIdentical(t *testing.T) {
+	if LegacyHostInternalNamePrefix != "goode_internal_" || LegacyHostMemoryName != "goode_memory" ||
+		HostInternalNamePrefix != LegacyHostInternalNamePrefix || GoodeMemoryName != LegacyHostMemoryName {
+		t.Fatal("legacy host identifiers changed")
 	}
 }

@@ -9,19 +9,24 @@ import (
 )
 
 const (
-	summaryCheckpointMarkerPrefix = "<!-- goode-compaction-checkpoint-id="
+	summaryCheckpointMarkerOpen   = "<!-- "
+	summaryCheckpointMarkerName   = "-compaction-checkpoint-id="
 	summaryCheckpointMarkerSuffix = " -->"
 )
 
-func incrementalSummaryContext(messages []llm.Message, ledger *Ledger, keepRecentUsers int, estimate tokenEstimator) (string, string) {
+func summaryCheckpointMarkerPrefix(namespace string) string {
+	return summaryCheckpointMarkerOpen + resolveHostNamespace(namespace) + summaryCheckpointMarkerName
+}
+
+func incrementalSummaryContext(namespace string, messages []llm.Message, ledger *Ledger, keepRecentUsers int, estimate tokenEstimator) (string, string) {
 	if ledger == nil || ledger.Summary == nil || ledger.Summary.Version <= 0 {
 		return "", ""
 	}
-	binding, err := validateLedgerSummaryBinding(messages, ledger.Summary)
+	binding, err := validateLedgerSummaryBinding(namespace, messages, ledger.Summary)
 	if err != nil {
 		return "", incrementalSummaryRebuildWarning(err.Error())
 	}
-	delta := summaryDeltaMessages(messages, binding.summaryIndex+1, keepRecentUsers, estimate)
+	delta := summaryDeltaMessages(namespace, messages, binding.summaryIndex+1, keepRecentUsers, estimate)
 	if strings.TrimSpace(delta) == "" {
 		delta = fallbackSummaryContext
 	}
@@ -38,11 +43,17 @@ type ledgerSummaryBinding struct {
 // this shared validator when a durable lifecycle decision must agree with the
 // SDK's incremental-summary authority semantics.
 func ValidateLedgerSummaryBinding(messages []llm.Message, meta *LedgerSummary) error {
-	_, err := validateLedgerSummaryBinding(messages, meta)
+	return ValidateLedgerSummaryBindingIn("", messages, meta)
+}
+
+// ValidateLedgerSummaryBindingIn is ValidateLedgerSummaryBinding for a host
+// namespace (empty means messageorigin.DefaultHostNamespace).
+func ValidateLedgerSummaryBindingIn(namespace string, messages []llm.Message, meta *LedgerSummary) error {
+	_, err := validateLedgerSummaryBinding(namespace, messages, meta)
 	return err
 }
 
-func validateLedgerSummaryBinding(messages []llm.Message, meta *LedgerSummary) (ledgerSummaryBinding, error) {
+func validateLedgerSummaryBinding(namespace string, messages []llm.Message, meta *LedgerSummary) (ledgerSummaryBinding, error) {
 	if meta == nil || meta.Version <= 0 {
 		return ledgerSummaryBinding{}, fmt.Errorf("summary generation metadata missing")
 	}
@@ -69,7 +80,7 @@ func validateLedgerSummaryBinding(messages []llm.Message, meta *LedgerSummary) (
 			continue
 		}
 		summaryMessages++
-		candidateSummary, candidateCheckpointID, ok := splitSummaryCheckpoint(msg.Content.PlainText())
+		candidateSummary, candidateCheckpointID, ok := splitSummaryCheckpoint(namespace, msg.Content.PlainText())
 		if !ok || strings.TrimSpace(candidateCheckpointID) != strings.TrimSpace(meta.CheckpointID) {
 			continue
 		}
@@ -92,7 +103,7 @@ func validateLedgerSummaryBinding(messages []llm.Message, meta *LedgerSummary) (
 	}
 	for i := 0; i < summaryIndex; i++ {
 		msg := messages[i]
-		if msg.Destroyed || msg.Role == llm.RoleSystem || messageorigin.IsInternalMessage(msg) {
+		if msg.Destroyed || msg.Role == llm.RoleSystem || messageorigin.IsInternalMessageIn(namespace, msg) {
 			continue
 		}
 		return ledgerSummaryBinding{}, fmt.Errorf("current history topology mismatch: non-system message precedes checkpoint summary")
@@ -108,7 +119,7 @@ func incrementalSummaryRebuildWarning(reason string) string {
 	return fmt.Sprintf("[WARN] Incremental compaction ledger integrity mismatch - using full rebuild from current history. (reason=%s action=continuing safely; a successful rebuild will refresh stale summary-ledger metadata)", reason)
 }
 
-func summaryDeltaMessages(messages []llm.Message, start int, keepRecentUsers int, estimate tokenEstimator) string {
+func summaryDeltaMessages(namespace string, messages []llm.Message, start int, keepRecentUsers int, estimate tokenEstimator) string {
 	if len(messages) == 0 {
 		return ""
 	}
@@ -118,11 +129,11 @@ func summaryDeltaMessages(messages []llm.Message, start int, keepRecentUsers int
 	if start >= len(messages) {
 		return ""
 	}
-	protectedUsers := recentUserIndexes(messages, start, keepRecentUsers)
+	protectedUsers := recentUserIndexes(namespace, messages, start, keepRecentUsers)
 	var b strings.Builder
 	for i := start; i < len(messages); i++ {
 		msg := messages[i]
-		if msg.Destroyed || messageorigin.IsInternalMessage(msg) {
+		if msg.Destroyed || messageorigin.IsInternalMessageIn(namespace, msg) {
 			continue
 		}
 		if _, ok := protectedUsers[i]; ok {
@@ -170,7 +181,7 @@ func summaryDeltaMessages(messages []llm.Message, start int, keepRecentUsers int
 	return b.String()
 }
 
-func recentUserIndexes(messages []llm.Message, start int, keepRecentUsers int) map[int]struct{} {
+func recentUserIndexes(namespace string, messages []llm.Message, start int, keepRecentUsers int) map[int]struct{} {
 	protected := map[int]struct{}{}
 	if keepRecentUsers <= 0 || start >= len(messages) {
 		return protected
@@ -180,7 +191,7 @@ func recentUserIndexes(messages []llm.Message, start int, keepRecentUsers int) m
 	}
 	for i := len(messages) - 1; i >= start && len(protected) < keepRecentUsers; i-- {
 		msg := messages[i]
-		if !messageorigin.IsRealUserMessage(msg) {
+		if !messageorigin.IsRealUserMessageIn(namespace, msg) {
 			continue
 		}
 		protected[i] = struct{}{}
@@ -196,8 +207,8 @@ func truncateSummaryDeltaTextWithEstimator(text string, estimate tokenEstimator)
 	return truncateTextToTokenBudget(text, summaryDeltaTokenBudget, estimate)
 }
 
-func stripSummaryPrefix(text string) string {
-	summary, _, _ := splitSummaryCheckpoint(text)
+func stripSummaryPrefix(namespace, text string) string {
+	summary, _, _ := splitSummaryCheckpoint(namespace, text)
 	return summary
 }
 
@@ -234,7 +245,7 @@ func ledgerSummaryCheckpointID(meta *LedgerSummary) string {
 	return ContentHash(payload)
 }
 
-func withSummaryCheckpoint(summary string, meta *LedgerSummary) string {
+func withSummaryCheckpoint(namespace, summary string, meta *LedgerSummary) string {
 	checkpointID := ""
 	if meta != nil {
 		checkpointID = strings.TrimSpace(meta.CheckpointID)
@@ -242,21 +253,27 @@ func withSummaryCheckpoint(summary string, meta *LedgerSummary) string {
 	if checkpointID == "" {
 		return WithSummaryPrefix(summary)
 	}
-	marker := summaryCheckpointMarkerPrefix + checkpointID + summaryCheckpointMarkerSuffix
+	marker := summaryCheckpointMarkerPrefix(namespace) + checkpointID + summaryCheckpointMarkerSuffix
 	return WithSummaryPrefix(marker + "\n\n" + strings.TrimSpace(summary))
 }
 
-func splitSummaryCheckpoint(text string) (summary string, checkpointID string, ok bool) {
+// splitSummaryCheckpoint recognizes the marker of the given namespace and the
+// legacy marker; markers of any other namespace stay plain summary text.
+func splitSummaryCheckpoint(namespace, text string) (summary string, checkpointID string, ok bool) {
 	text = strings.TrimSpace(text)
 	text = strings.TrimSpace(strings.TrimPrefix(text, DefaultSummaryPrefix))
-	if !strings.HasPrefix(text, summaryCheckpointMarkerPrefix) {
-		return text, "", false
+	prefix := summaryCheckpointMarkerPrefix(namespace)
+	if !strings.HasPrefix(text, prefix) {
+		prefix = summaryCheckpointMarkerPrefix(messageorigin.LegacyHostNamespace)
+		if !strings.HasPrefix(text, prefix) {
+			return text, "", false
+		}
 	}
 	end := strings.Index(text, summaryCheckpointMarkerSuffix)
-	if end < len(summaryCheckpointMarkerPrefix) {
+	if end < len(prefix) {
 		return text, "", false
 	}
-	checkpointID = strings.TrimSpace(text[len(summaryCheckpointMarkerPrefix):end])
+	checkpointID = strings.TrimSpace(text[len(prefix):end])
 	summary = strings.TrimSpace(text[end+len(summaryCheckpointMarkerSuffix):])
 	if checkpointID == "" || summary == "" {
 		return summary, checkpointID, false

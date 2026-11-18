@@ -11,7 +11,11 @@ import (
 	"github.com/timwhitez/agent-sdk-golang/sdk/llm"
 )
 
-const compactionMaterialSchemaV1 = "goode.compaction.material.v1"
+const compactionMaterialSchemaSuffix = ".compaction.material.v1"
+
+func compactionMaterialSchema(namespace string) string {
+	return resolveHostNamespace(namespace) + compactionMaterialSchemaSuffix
+}
 
 type realUserAnchors struct {
 	First  *string
@@ -26,11 +30,11 @@ type compactionMaterialEnvelope struct {
 	Material              string  `json:"material"`
 }
 
-func collectRealUserAnchors(messages []llm.Message, estimate tokenEstimator) realUserAnchors {
+func collectRealUserAnchors(namespace string, messages []llm.Message, estimate tokenEstimator) realUserAnchors {
 	first := -1
 	latest := -1
 	for i, message := range messages {
-		if !messageorigin.IsRealUserMessage(message) {
+		if !messageorigin.IsRealUserMessageIn(namespace, message) {
 			continue
 		}
 		if first < 0 {
@@ -46,13 +50,13 @@ func collectRealUserAnchors(messages []llm.Message, estimate tokenEstimator) rea
 	return realUserAnchors{First: &firstText, Latest: &latestText}
 }
 
-func wrapCompactionMaterial(material string, anchors realUserAnchors, hostCheckpointStatus string) string {
+func wrapCompactionMaterial(namespace, material string, anchors realUserAnchors, hostCheckpointStatus string) string {
 	material = strings.TrimSpace(material)
 	if material == "" {
 		material = fallbackSummaryContext
 	}
 	envelope := compactionMaterialEnvelope{
-		Schema:                compactionMaterialSchemaV1,
+		Schema:                compactionMaterialSchema(namespace),
 		FirstRealUserRequest:  cloneStringPointer(anchors.First),
 		LatestRealUserRequest: cloneStringPointer(anchors.Latest),
 		HostCheckpointStatus:  normalizeCompactionHostCheckpointStatus(hostCheckpointStatus),
@@ -62,7 +66,7 @@ func wrapCompactionMaterial(material string, anchors realUserAnchors, hostCheckp
 	return wrapUntrustedMaterial(string(encoded))
 }
 
-func decodeCompactionMaterialEnvelope(material string) (compactionMaterialEnvelope, bool, error) {
+func decodeCompactionMaterialEnvelope(namespace, material string) (compactionMaterialEnvelope, bool, error) {
 	framed := strings.Contains(material, beginUntrustedMaterial) || strings.Contains(material, endUntrustedMaterial)
 	decoded, err := decodeSummaryValidationMaterial(material)
 	if err != nil {
@@ -78,12 +82,12 @@ func decodeCompactionMaterialEnvelope(material string) (compactionMaterialEnvelo
 	decoder.DisallowUnknownFields()
 	var envelope compactionMaterialEnvelope
 	if err := decoder.Decode(&envelope); err != nil {
-		return compactionMaterialEnvelope{}, true, fmt.Errorf("payload is not a valid %s object: %w", compactionMaterialSchemaV1, err)
+		return compactionMaterialEnvelope{}, true, fmt.Errorf("payload is not a valid %s object: %w", compactionMaterialSchema(namespace), err)
 	}
 	if err := ensureJSONDecoderEOF(decoder); err != nil {
 		return compactionMaterialEnvelope{}, true, err
 	}
-	if envelope.Schema != compactionMaterialSchemaV1 {
+	if envelope.Schema != compactionMaterialSchema(namespace) && envelope.Schema != compactionMaterialSchema(messageorigin.LegacyHostNamespace) {
 		return compactionMaterialEnvelope{}, true, fmt.Errorf("unsupported compaction material schema %q", envelope.Schema)
 	}
 	if (envelope.FirstRealUserRequest == nil) != (envelope.LatestRealUserRequest == nil) {

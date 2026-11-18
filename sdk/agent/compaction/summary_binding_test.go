@@ -19,7 +19,7 @@ func TestValidateLedgerSummaryBindingAcceptsCurrentEffectiveSummary(t *testing.T
 		{
 			Role:    llm.RoleUser,
 			Name:    CompactionSummaryMessageName,
-			Content: llm.TextContent(withSummaryCheckpoint("bounded current summary", meta)),
+			Content: llm.TextContent(withSummaryCheckpoint("", "bounded current summary", meta)),
 		},
 		llm.NewUserMessage("delta request"),
 	}
@@ -38,7 +38,7 @@ func TestValidateLedgerSummaryBindingRejectsMissingDuplicateAndDrift(t *testing.
 	current := llm.Message{
 		Role:    llm.RoleUser,
 		Name:    CompactionSummaryMessageName,
-		Content: llm.TextContent(withSummaryCheckpoint("bounded current summary", meta)),
+		Content: llm.TextContent(withSummaryCheckpoint("", "bounded current summary", meta)),
 	}
 
 	tests := []struct {
@@ -49,7 +49,7 @@ func TestValidateLedgerSummaryBindingRejectsMissingDuplicateAndDrift(t *testing.
 	}{
 		{name: "missing", messages: []llm.Message{llm.NewSystemMessage("system")}, meta: meta, want: "topology mismatch"},
 		{name: "duplicate", messages: []llm.Message{current, current}, meta: meta, want: "topology mismatch"},
-		{name: "summary hash drift", messages: []llm.Message{{Role: llm.RoleUser, Name: CompactionSummaryMessageName, Content: llm.TextContent(withSummaryCheckpoint("different summary", meta))}}, meta: meta, want: "summary hash mismatch"},
+		{name: "summary hash drift", messages: []llm.Message{{Role: llm.RoleUser, Name: CompactionSummaryMessageName, Content: llm.TextContent(withSummaryCheckpoint("", "different summary", meta))}}, meta: meta, want: "summary hash mismatch"},
 		{name: "coverage drift", messages: []llm.Message{current}, meta: func() *LedgerSummary {
 			drift := *meta
 			drift.CoveredEndKey = "drifted"
