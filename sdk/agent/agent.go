@@ -727,6 +727,7 @@ func (a *Agent) queryStreamWithSteering(ctx context.Context, input llm.Content, 
 
 		earlyStopReminderSent := false
 		requireDoneReminderLogged := false
+		requireDoneCapabilityDegradedLogged := false
 		requireDoneReminders := 0
 		forceRequireDoneToolChoice := false
 		requireDoneRecoveryDisableThinkingActive := false
@@ -915,10 +916,17 @@ func (a *Agent) queryStreamWithSteering(ctx context.Context, input llm.Content, 
 			}
 
 			requestToolChoice := a.toolChoice
-			if forceRequireDoneToolChoice {
-				switch strings.ToLower(strings.TrimSpace(string(requestToolChoice))) {
-				case "", "auto":
-					requestToolChoice = llm.ToolChoice("required")
+			effectiveDisableThinking := requireDoneRecoveryDisableThinkingActive
+			if forceRequireDoneToolChoice || requireDoneRecoveryDisableThinkingActive {
+				canForce, canDisableThinking, _, _ := requireDoneRecoveryPolicy(a.llm)
+				if forceRequireDoneToolChoice && canForce {
+					switch strings.ToLower(strings.TrimSpace(string(requestToolChoice))) {
+					case "", "auto":
+						requestToolChoice = llm.ToolChoice("required")
+					}
+				}
+				if !canDisableThinking {
+					effectiveDisableThinking = false
 				}
 			}
 			request := llm.InvokeRequest{
@@ -927,10 +935,11 @@ func (a *Agent) queryStreamWithSteering(ctx context.Context, input llm.Content, 
 				ToolChoice: requestToolChoice,
 				// A forced tool_choice is illegal on some providers (Anthropic) while
 				// extended thinking is enabled. Keep thinking disabled for the whole
-				// require-done recovery subloop: if the forced call chooses an ordinary
-				// work tool, its follow-up request must stay in the same thinking mode
-				// until done, steering, or turn termination closes the subloop.
-				DisableThinking: requireDoneRecoveryDisableThinkingActive,
+				// require-done recovery subloop when the model supports full
+				// DisableThinking: if the forced call chooses an ordinary work tool,
+				// its follow-up request stays in the same thinking mode until done,
+				// steering, or turn termination closes the subloop.
+				DisableThinking: effectiveDisableThinking,
 			}
 			frameOrdinal := iter + 1
 			frame, frameErr := newExecutionFrame(executionFrameID(out.queryID, frameOrdinal), a.llm, request, a.toolMap, a.toolMapNormalized)
@@ -1537,8 +1546,20 @@ func (a *Agent) queryStreamWithSteering(ctx context.Context, input llm.Content, 
 						emitPartialFinal(finalContent, finalResponseID, "require_done_safety", fallback)
 						return
 					}
-					forceRequireDoneToolChoice = true
-					requireDoneRecoveryDisableThinkingActive = true
+					canForce, canDisableThinking, degraded, degradedReason := requireDoneRecoveryPolicy(a.llm)
+					forceRequireDoneToolChoice = canForce
+					requireDoneRecoveryDisableThinkingActive = canDisableThinking
+					if degraded && !requireDoneCapabilityDegradedLogged {
+						requireDoneCapabilityDegradedLogged = true
+						msg := fmt.Sprintf("require-done: %s; sending reminder without disabling thinking or forcing tool_choice", degradedReason)
+						if canForce && !canDisableThinking {
+							msg = fmt.Sprintf("require-done: %s; sending reminder with forced tool_choice and without disabling thinking", degradedReason)
+						}
+						a.emitEvent(out, WarnEvent{
+							Kind:    "require_done_capability_degraded",
+							Message: msg,
+						}, correlation)
+					}
 					reminder := messageorigin.NewInternalUserMessage(messageorigin.KindRequireDone, requireDoneReminderText)
 					if a.hasCompactor {
 						if err := a.checkAndCompactWithGrowth(ctx, frame.id, comp, out, additionalSinceCompletion(), pendingMessageTokens(reminder)); err != nil {
@@ -1550,8 +1571,12 @@ func (a *Agent) queryStreamWithSteering(ctx context.Context, input llm.Content, 
 					a.messages = append(a.messages, reminder)
 					a.mu.Unlock()
 					// This producer succeeded; retain its actual completion's
-					// Frame, not an ambient most-recent event identity.
-					requireDoneControlSource = frame.id
+					// Frame only when DisableThinking recovery is actually active.
+					if canDisableThinking {
+						requireDoneControlSource = frame.id
+					} else {
+						requireDoneControlSource = ""
+					}
 					continue
 				}
 				continue
@@ -6533,4 +6558,29 @@ type nativeToolCall struct {
 	requiredFinal bool
 	// announced: Admit published StepStart+ToolCall for this call.
 	announced bool
+}
+
+// requireDoneRecoveryPolicy resolves whether RequireDone recovery may force
+// tool_choice and/or set InvokeRequest.DisableThinking for the active model.
+// Models that do not implement llm.ThinkingCapabilityProvider retain legacy
+// behavior. Models that report ThinkingCapabilities never receive unsupported
+// DisableThinking or forced tool_choice controls and never get bogus
+// RequestControlRequireDoneDisableThinking provenance.
+func requireDoneRecoveryPolicy(model llm.ChatModel) (forceToolChoice bool, disableThinking bool, degraded bool, reason string) {
+	caps, ok := llm.ModelThinkingCapabilities(model)
+	if !ok {
+		return true, true, false, ""
+	}
+	if caps.SupportsDisableThinking && caps.SupportsForcedToolChoice {
+		return true, true, false, ""
+	}
+	reason = strings.TrimSpace(caps.DisableThinkingReason)
+	if reason == "" {
+		if !caps.SupportsDisableThinking {
+			reason = "model does not support full DisableThinking"
+		} else {
+			reason = "model does not support forced tool_choice"
+		}
+	}
+	return caps.SupportsForcedToolChoice, false, true, reason
 }

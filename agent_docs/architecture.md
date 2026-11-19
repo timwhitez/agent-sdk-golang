@@ -268,7 +268,12 @@ same-budget evaluation.
 
 The optional Envelope `RequestControlRelation=require_done_disable_thinking`
 and `RequestControlSourceFrameID` identify only the successful reminder producer
-that enabled the logical request's DisableThinking recovery mode. The source is
+that enabled the logical request's DisableThinking recovery mode. RequireDone
+consults `llm.ModelThinkingCapabilities` before enabling `DisableThinking` or
+forcing `tool_choice`; when a model reports that full disable or forced tool
+choice is unsupported, recovery emits a `require_done_capability_degraded`
+warning, keeps thinking/tool_choice within supported bounds, and leaves
+`RequestControlRelation` unset. The source is
 captured after the reminder enters history and copied into each actual Frame;
 retries reuse it. Ordinary work can reset forced tool choice while retaining this
 thinking mode. Steering and done/safety resets clear future control state, without

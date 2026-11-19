@@ -28,6 +28,7 @@ var toolIDNormalizationWarningf = log.Printf
 
 // Client streams over HTTP SSE through InvokeStream.
 var _ llm.StreamingChatModel = (*Client)(nil)
+var _ llm.ThinkingCapabilityProvider = (*Client)(nil)
 
 type Client struct {
 	HTTPClient *http.Client
@@ -44,10 +45,16 @@ type Client struct {
 
 	// Thinking mode (Anthropic extended thinking). Manual mode uses
 	// ThinkingBudgetTokens. Adaptive mode uses ThinkingMode="adaptive" and may
-	// set ThinkingEffort for output_config.effort.
+	// set ThinkingEffort for output_config.effort. Explicit "disabled" or
+	// "between_tools" modes are validated against model capabilities.
 	ThinkingBudgetTokens *int
 	ThinkingMode         string
 	ThinkingEffort       string
+
+	// Capabilities optionally overrides inferred model capabilities (for
+	// example custom gateway aliases). When nil, capabilities are inferred from
+	// ModelName via CapabilitiesForModel.
+	Capabilities *ModelCapabilities
 
 	// Retry policy.
 	//
@@ -92,6 +99,40 @@ func (c *Client) PromptCacheCapabilities() llm.PromptCacheCapabilities {
 }
 
 func (c *Client) Model() string { return c.ModelName }
+
+func (c *Client) capabilities() ModelCapabilities {
+	if c != nil && c.Capabilities != nil {
+		return c.Capabilities.Clone()
+	}
+	modelName := ""
+	if c != nil {
+		modelName = c.ModelName
+	}
+	return CapabilitiesForModel(modelName)
+}
+
+// ThinkingCapabilities reports model-level DisableThinking and forced
+// tool_choice capabilities so callers such as the Agent RequireDone loop do
+// not issue unsupported controls or record untruthful provenance.
+func (c *Client) ThinkingCapabilities() (llm.ThinkingCapabilities, bool) {
+	if c == nil {
+		return llm.ThinkingCapabilities{}, false
+	}
+	caps := c.capabilities()
+	reason := ""
+	switch caps.effectiveDisableMode() {
+	case ThinkingDisableBetweenTools:
+		reason = fmt.Sprintf("model %q only supports thinking.type=\"between_tools\" and cannot guarantee full thinking disable", c.ModelName)
+	case ThinkingDisableUnsupported:
+		reason = fmt.Sprintf("model %q does not support disabling extended thinking", c.ModelName)
+	}
+	fullDisable := caps.SupportsFullDisable()
+	return llm.ThinkingCapabilities{
+		SupportsDisableThinking:  fullDisable,
+		SupportsForcedToolChoice: fullDisable && caps.ForcedToolChoiceWhenThinkingDisabled,
+		DisableThinkingReason:    reason,
+	}, true
+}
 
 func (c *Client) Invoke(ctx context.Context, req llm.InvokeRequest) (*llm.Completion, error) {
 	local := *c
@@ -184,7 +225,7 @@ func (c *Client) Invoke(ctx context.Context, req llm.InvokeRequest) (*llm.Comple
 				}
 			}
 			// Automatic downgrade: disable extended thinking on models/endpoints that don't support it.
-			if (resp.StatusCode == 400 || resp.StatusCode == 422) && localThinking != nil && looksLikeThinkingUnsupported(msg) {
+			if (resp.StatusCode == 400 || resp.StatusCode == 422) && !req.DisableThinking && localThinking != nil && localThinking.Type != "disabled" && looksLikeThinkingUnsupported(msg) {
 				localThinking = nil
 				didDowngrade = true
 				diagnostics = append(diagnostics, llm.Diagnostic{Kind: "provider_compatibility_downgrade", Message: "Anthropic provider rejected extended thinking; retrying without extended thinking."})
@@ -644,7 +685,7 @@ func normalizeToolCallIDWithWarning(id string, warnf func(string, ...any)) strin
 }
 
 type thinkingParam struct {
-	Type         string `json:"type"` // "enabled"|"adaptive"
+	Type         string `json:"type"` // "enabled"|"adaptive"|"disabled"|"between_tools"
 	BudgetTokens int    `json:"budget_tokens,omitempty"`
 }
 
@@ -792,7 +833,7 @@ func (c *Client) InvokeStream(ctx context.Context, req llm.InvokeRequest) (<-cha
 					}
 				}
 				// Automatic downgrade: disable thinking when unsupported.
-				if (resp.StatusCode == 400 || resp.StatusCode == 422) && localThinking != nil && looksLikeThinkingUnsupported(msg) {
+				if (resp.StatusCode == 400 || resp.StatusCode == 422) && !req.DisableThinking && localThinking != nil && localThinking.Type != "disabled" && looksLikeThinkingUnsupported(msg) {
 					localThinking = nil
 					didDowngrade = true
 				}
@@ -1271,31 +1312,115 @@ func (c *Client) buildRequestWithThinking(req llm.InvokeRequest, thinkingConfig 
 		}
 	}
 
-	// Effective extended thinking for this call. A per-call DisableThinking wins
-	// over the configured budget: the agent uses it for the require-done recovery
-	// invocation, where a forced tool_choice must be sent and thinking would make
-	// that illegal on Anthropic.
+	// Effective extended thinking for this call. A per-call DisableThinking
+	// expresses full thinking suppression according to model capability without
+	// mutating client configuration or conflating omission, disabled, and
+	// between_tools.
+	caps := c.capabilities()
 	var thinking *thinkingParam
 	var outputConfig *outputConfigParam
-	if thinkingConfig != nil && !req.DisableThinking {
+	thinkingActive := false
+
+	if req.DisableThinking {
+		switch caps.effectiveDisableMode() {
+		case ThinkingDisableOmit:
+			thinking = nil
+			outputConfig = nil
+			thinkingActive = false
+		case ThinkingDisableExplicit:
+			// Omit output_config on a per-call DisableThinking request so a
+			// client's normal effort (for example xhigh or max on Claude Opus 5
+			// or Haiku 5.5) never contradicts thinking.type="disabled".
+			thinking = &thinkingParam{Type: "disabled"}
+			outputConfig = nil
+			thinkingActive = false
+		case ThinkingDisableBetweenTools:
+			return nil, &llm.ThinkingCapabilityError{
+				Provider: "anthropic",
+				Model:    c.ModelName,
+				Control:  "disable_thinking",
+				Value:    "disabled",
+				Message:  fmt.Sprintf("DisableThinking is not fully supported by model %q: only between_tools is available and thinking may still run between tool calls", c.ModelName),
+			}
+		default:
+			return nil, &llm.ThinkingCapabilityError{
+				Provider: "anthropic",
+				Model:    c.ModelName,
+				Control:  "disable_thinking",
+				Value:    "disabled",
+				Message:  fmt.Sprintf("DisableThinking is not supported by model %q: thinking cannot be disabled", c.ModelName),
+			}
+		}
+	} else if thinkingConfig != nil {
 		switch strings.ToLower(strings.TrimSpace(thinkingConfig.Type)) {
 		case "adaptive":
 			thinking = &thinkingParam{Type: "adaptive"}
+			thinkingActive = true
 			if effort := strings.TrimSpace(thinkingConfig.Effort); effort != "" {
-				switch strings.ToLower(effort) {
-				case "low", "medium", "high", "max":
-					outputConfig = &outputConfigParam{Effort: strings.ToLower(effort)}
-				default:
-					return nil, fmt.Errorf("anthropic: unsupported adaptive thinking effort %q (expected low, medium, high, or max)", effort)
+				normalized, err := validateAnthropicEffort(c.ModelName, caps, effort)
+				if err != nil {
+					return nil, err
 				}
+				outputConfig = &outputConfigParam{Effort: normalized}
 			}
 		case "enabled":
 			if thinkingConfig.BudgetTokens > 0 {
 				thinking = &thinkingParam{Type: "enabled", BudgetTokens: thinkingConfig.BudgetTokens}
+				thinkingActive = true
+			}
+		case "disabled":
+			switch caps.effectiveDisableMode() {
+			case ThinkingDisableOmit, ThinkingDisableExplicit:
+				thinking = &thinkingParam{Type: "disabled"}
+				thinkingActive = false
+			case ThinkingDisableBetweenTools:
+				return nil, &llm.ThinkingCapabilityError{
+					Provider: "anthropic",
+					Model:    c.ModelName,
+					Control:  "thinking_mode",
+					Value:    "disabled",
+					Message:  fmt.Sprintf("thinking mode \"disabled\" is not supported by model %q (only \"between_tools\" is available)", c.ModelName),
+				}
+			default:
+				return nil, &llm.ThinkingCapabilityError{
+					Provider: "anthropic",
+					Model:    c.ModelName,
+					Control:  "thinking_mode",
+					Value:    "disabled",
+					Message:  fmt.Sprintf("thinking mode \"disabled\" is not supported by model %q", c.ModelName),
+				}
+			}
+			if effort := strings.TrimSpace(thinkingConfig.Effort); effort != "" {
+				normalized, err := validateAnthropicDisableEffort(c.ModelName, caps, effort)
+				if err != nil {
+					return nil, err
+				}
+				outputConfig = &outputConfigParam{Effort: normalized}
+			}
+		case "between_tools":
+			if !caps.SupportsBetweenTools() {
+				return nil, &llm.ThinkingCapabilityError{
+					Provider: "anthropic",
+					Model:    c.ModelName,
+					Control:  "thinking_mode",
+					Value:    "between_tools",
+					Message:  fmt.Sprintf("thinking mode \"between_tools\" is not supported by model %q", c.ModelName),
+				}
+			}
+			thinking = &thinkingParam{Type: "between_tools"}
+			thinkingActive = true
+			if effort := strings.TrimSpace(thinkingConfig.Effort); effort != "" {
+				normalized, err := validateAnthropicEffort(c.ModelName, caps, effort)
+				if err != nil {
+					return nil, err
+				}
+				outputConfig = &outputConfigParam{Effort: normalized}
 			}
 		default:
 			return nil, fmt.Errorf("anthropic: unsupported thinking mode %q", thinkingConfig.Type)
 		}
+	} else {
+		thinkingActive = caps.DefaultThinkingOn
 	}
 
 	var toolChoice *toolChoiceParam
@@ -1306,14 +1431,23 @@ func (c *Client) buildRequestWithThinking(req llm.InvokeRequest, thinkingConfig 
 		}
 		// Anthropic forbids a forced tool_choice (any / specific tool) while
 		// extended thinking is enabled; only auto and none are allowed. Agent-owned
-		// recovery disables thinking explicitly. Reject other conflicts instead of
-		// silently weakening the caller's forced-tool semantics.
-		if thinking != nil {
+		// recovery disables thinking explicitly when the model supports it. Reject
+		// other conflicts instead of silently weakening forced-tool semantics.
+		if thinkingActive {
 			switch strings.ToLower(strings.TrimSpace(string(tc))) {
 			case "auto", "none":
 				// allowed under extended thinking
 			default:
-				return nil, fmt.Errorf("anthropic: tool_choice %q is incompatible with extended thinking; use auto/none or set DisableThinking for this call", tc)
+				if caps.SupportsFullDisable() && caps.ForcedToolChoiceWhenThinkingDisabled {
+					return nil, fmt.Errorf("anthropic: tool_choice %q is incompatible with extended thinking; use auto/none or set DisableThinking for this call", tc)
+				}
+				return nil, &llm.ThinkingCapabilityError{
+					Provider: "anthropic",
+					Model:    c.ModelName,
+					Control:  "tool_choice",
+					Value:    string(tc),
+					Message:  fmt.Sprintf("tool_choice %q is incompatible with extended thinking on model %q, which does not support full DisableThinking; use auto or none", tc, c.ModelName),
+				}
 			}
 		}
 		toolChoice = mapToolChoice(tc)

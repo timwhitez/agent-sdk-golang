@@ -238,14 +238,28 @@ stream normalization, and response metadata behavior.
   context themselves.
 
 ## Anthropic Messages API
-- Extended thinking supports both manual budgets (`thinking.type="enabled"` +
-  `budget_tokens`) and adaptive mode (`thinking.type="adaptive"` + optional
-  `output_config.effort`). `InvokeRequest.DisableThinking` suppresses both
-  shapes for recovery calls.
-- While thinking is active, `tool_choice` is limited to `auto` or `none`.
-  Required/specific-tool conflicts return an actionable local error instead of
-  silently downgrading the caller's choice; agent-owned require-done recovery
-  sets `DisableThinking` before forcing a tool.
+- Extended thinking supports manual budgets (`thinking.type="enabled"` +
+  `budget_tokens`), adaptive mode (`thinking.type="adaptive"` + optional
+  `output_config.effort`), explicit `disabled`, and `between_tools` where
+  supported by model capabilities (`CapabilitiesForModel` / optional
+  `Client.Capabilities` override). Adaptive effort validates per model,
+  preserving native `xhigh` separately from `max` on models that support it
+  (Opus 4.7/4.8 and Claude 5+ families) while rejecting `xhigh` on older Claude
+  models such as Opus 4.6 and Sonnet 4.6.
+- `InvokeRequest.DisableThinking` expresses full thinking suppression according
+  to model capability without conflating omission, `disabled`, and
+  `between_tools`: default-off models omit `thinking` and `output_config`;
+  default-on disableable models (`claude-sonnet-5`, `claude-opus-5`,
+  `claude-haiku-5-5`) send `thinking: {"type": "disabled"}` while omitting
+  `output_config` so single-request suppression never contradicts effort limits
+  or mutates client config; models that only support `between_tools`
+  (`claude-sonnet-5-5`) or cannot disable thinking (`claude-opus-5-5`, Fable,
+  Mythos) return `*llm.ThinkingCapabilityError`. `Client` implements
+  `llm.ThinkingCapabilityProvider` so agent RequireDone recovery reads model
+  capabilities before setting `DisableThinking` or forcing `tool_choice`.
+- While thinking is active (explicitly or by model default), `tool_choice` is
+  limited to `auto` or `none`. Required/specific-tool conflicts return an
+  actionable local error instead of silently downgrading the caller's choice.
 - Compatibility retries on 400/422 downgrade unsupported beta/thinking options, including one final-attempt retry and structured code/param detection (`sdk/llm/anthropic/client.go:125`, `sdk/llm/anthropic/client.go:135`, `sdk/llm/anthropic/client.go:215`, `sdk/llm/anthropic/client.go:244`, `sdk/llm/anthropic/client.go:621`, `sdk/llm/anthropic/client.go:631`)
 - Successful beta/thinking downgrades append
   `provider_compatibility_downgrade` diagnostics to the returned

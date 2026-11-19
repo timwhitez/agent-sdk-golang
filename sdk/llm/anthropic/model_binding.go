@@ -24,6 +24,10 @@ func (c *Client) BindFrameModel(ctx context.Context) (llm.ChatModel, bool, error
 	bound.TopP = copyBindingValue(c.TopP)
 	bound.Seed = copyBindingValue(c.Seed)
 	bound.ThinkingBudgetTokens = copyBindingValue(c.ThinkingBudgetTokens)
+	if c.Capabilities != nil {
+		clonedCaps := c.Capabilities.Clone()
+		bound.Capabilities = &clonedCaps
+	}
 	if c.Beta != nil {
 		bound.Beta = append([]string{}, c.Beta...)
 	}
