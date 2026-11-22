@@ -708,7 +708,7 @@ func (c *ResponsesClient) InvokeStream(ctx context.Context, req llm.InvokeReques
 						return nil
 					}
 					if idx != candidate {
-						return fmt.Errorf("openai responses stream: conflicting %s %q maps to tool indexes %d and %d", kind, id, idx, candidate)
+						return &llm.ProviderError{Provider: local.Provider(), Message: fmt.Sprintf("Responses conflicting %s maps to tool indexes %d and %d", kind, idx, candidate)}
 					}
 					return nil
 				}
@@ -751,10 +751,12 @@ func (c *ResponsesClient) InvokeStream(ctx context.Context, req llm.InvokeReques
 			type streamedToolState struct {
 				hasName     bool
 				hasID       bool
-				hasArgs     bool
 				itemID      string
 				callID      string
+				name        string
+				emittedArgs strings.Builder
 				pendingArgs strings.Builder
+				argsFinal   bool
 			}
 			toolState := map[int]*streamedToolState{}
 			ensureToolState := func(idx int) *streamedToolState {
@@ -776,6 +778,7 @@ func (c *ResponsesClient) InvokeStream(ctx context.Context, req llm.InvokeReques
 				}
 				if strings.TrimSpace(name) != "" {
 					st.hasName = true
+					st.name = name
 				}
 			}
 			emitToolArgs := func(idx int, id, args string) {
@@ -787,17 +790,46 @@ func (c *ResponsesClient) InvokeStream(ctx context.Context, req llm.InvokeReques
 				if strings.TrimSpace(id) != "" {
 					st.hasID = true
 				}
-				st.hasArgs = true
+				st.emittedArgs.WriteString(args)
 			}
-			applyToolIdentity := func(idx int, itemID, callID, name, args string) error {
+			// Final snapshots may complete a streamed prefix, but may never replace
+			// arguments already delivered. Compare object-form JSON losslessly.
+			reconcileToolArgs := func(idx int, args string, final bool) error {
+				st := ensureToolState(idx)
+				prior := st.emittedArgs.String() + st.pendingArgs.String()
+				equivalent := args == prior || responsesJSONEqual([]byte(args), []byte(prior))
+				if (!strings.HasPrefix(args, prior) && !equivalent) || (st.argsFinal && !equivalent) {
+					return &llm.ProviderError{Provider: local.Provider(), Message: fmt.Sprintf("Responses tool index %d final arguments conflict with its streamed arguments", idx)}
+				}
+				if st.callID == "" {
+					st.pendingArgs.Reset()
+					st.pendingArgs.WriteString(args)
+				} else {
+					if st.pendingArgs.Len() > 0 {
+						pending := st.pendingArgs.String()
+						st.pendingArgs.Reset()
+						emitToolArgs(idx, st.callID, pending)
+					}
+					if !equivalent {
+						emitToolArgs(idx, st.callID, strings.TrimPrefix(args, prior))
+					}
+				}
+				st.argsFinal = st.argsFinal || final
+				return nil
+			}
+			applyToolIdentity := func(idx int, itemID, callID, name, args string, final, argsPresent bool) error {
 				st := ensureToolState(idx)
 				itemID = strings.TrimSpace(itemID)
 				callID = strings.TrimSpace(callID)
+				name = strings.TrimSpace(name)
 				if st.itemID != "" && itemID != "" && st.itemID != itemID {
-					return fmt.Errorf("openai responses stream: tool index %d changed item_id from %q to %q", idx, st.itemID, itemID)
+					return &llm.ProviderError{Provider: local.Provider(), Message: fmt.Sprintf("Responses tool index %d changed item_id", idx)}
 				}
 				if st.callID != "" && callID != "" && st.callID != callID {
-					return fmt.Errorf("openai responses stream: tool index %d changed call_id from %q to %q", idx, st.callID, callID)
+					return &llm.ProviderError{Provider: local.Provider(), Message: fmt.Sprintf("Responses tool index %d changed call_id", idx)}
+				}
+				if st.hasName && name != "" && st.name != name {
+					return &llm.ProviderError{Provider: local.Provider(), Message: fmt.Sprintf("Responses tool index %d changed function name", idx)}
 				}
 				if itemID != "" {
 					st.itemID = itemID
@@ -805,17 +837,15 @@ func (c *ResponsesClient) InvokeStream(ctx context.Context, req llm.InvokeReques
 				if callID != "" {
 					st.callID = callID
 				}
-				needIdentity := (strings.TrimSpace(name) != "" && !st.hasName) || (st.callID != "" && !st.hasID)
-				if needIdentity {
-					emitToolIdentity(idx, st.callID, name)
+				nameDelta := name
+				if st.hasName {
+					nameDelta = ""
 				}
-				if st.hasArgs {
-					return nil
+				if nameDelta != "" || (st.callID != "" && !st.hasID) {
+					emitToolIdentity(idx, st.callID, nameDelta)
 				}
-				if strings.TrimSpace(args) != "" {
-					st.pendingArgs.Reset()
-					emitToolArgs(idx, st.callID, args)
-					return nil
+				if args != "" || (final && argsPresent) {
+					return reconcileToolArgs(idx, args, final)
 				}
 				if st.callID != "" && st.pendingArgs.Len() > 0 {
 					pending := st.pendingArgs.String()
@@ -831,7 +861,7 @@ func (c *ResponsesClient) InvokeStream(ctx context.Context, req llm.InvokeReques
 					return nil
 				}
 				if existing, ok := callIDToIndex[itemID]; ok && existing != idx {
-					return fmt.Errorf("openai responses stream: compatibility call_id %q maps to tool indexes %d and %d", itemID, existing, idx)
+					return &llm.ProviderError{Provider: local.Provider(), Message: fmt.Sprintf("Responses compatibility call_id maps to tool indexes %d and %d", existing, idx)}
 				}
 				st.itemID = itemID
 				st.callID = itemID
@@ -846,7 +876,7 @@ func (c *ResponsesClient) InvokeStream(ctx context.Context, req llm.InvokeReques
 				}
 				st := ensureToolState(idx)
 				if st.itemID != "" && st.itemID != itemID {
-					return fmt.Errorf("openai responses stream: tool index %d changed item_id from %q to %q", idx, st.itemID, itemID)
+					return &llm.ProviderError{Provider: local.Provider(), Message: fmt.Sprintf("Responses tool index %d changed item_id", idx)}
 				}
 				st.itemID = itemID
 				return nil
@@ -1022,7 +1052,20 @@ func (c *ResponsesClient) InvokeStream(ctx context.Context, req llm.InvokeReques
 				items, _ := respObj["output"].([]any)
 				for outputIndex, itemAny := range items {
 					item, _ := itemAny.(map[string]any)
-					if stringFromAny(item["type"]) != "message" {
+					itemType := stringFromAny(item["type"])
+					if itemType == "function_call" || itemType == "tool_call" {
+						itemID, callID := responsesToolCallIdentifiers(item)
+						idx, err := bindToolIndex(itemID, callID, fmt.Sprintf("output:%d", outputIndex), outputIndex, true)
+						if err != nil {
+							return err
+						}
+						_, argsPresent := item["arguments"]
+						if err := applyToolIdentity(idx, itemID, callID, stringFromAny(item["name"]), responsesToolArguments(item["arguments"]), true, argsPresent); err != nil {
+							return err
+						}
+						continue
+					}
+					if itemType != "message" {
 						continue
 					}
 					itemID, _ := item["id"].(string)
@@ -1269,7 +1312,8 @@ func (c *ResponsesClient) InvokeStream(ctx context.Context, req llm.InvokeReques
 						if indexErr != nil {
 							return indexErr
 						}
-						if identityErr := applyToolIdentity(idx, itemID, callID, name, responsesToolArguments(item["arguments"])); identityErr != nil {
+						_, argsPresent := item["arguments"]
+						if identityErr := applyToolIdentity(idx, itemID, callID, name, responsesToolArguments(item["arguments"]), false, argsPresent); identityErr != nil {
 							return identityErr
 						}
 					}
@@ -1355,7 +1399,8 @@ func (c *ResponsesClient) InvokeStream(ctx context.Context, req llm.InvokeReques
 					if indexErr != nil {
 						return indexErr
 					}
-					if identityErr := applyToolIdentity(idx, itemID, callID, name, responsesToolArguments(item["arguments"])); identityErr != nil {
+					_, argsPresent := item["arguments"]
+					if identityErr := applyToolIdentity(idx, itemID, callID, name, responsesToolArguments(item["arguments"]), true, argsPresent); identityErr != nil {
 						return identityErr
 					}
 				case "response.function_call_arguments.delta":
@@ -1377,6 +1422,9 @@ func (c *ResponsesClient) InvokeStream(ctx context.Context, req llm.InvokeReques
 							return itemErr
 						}
 						st := ensureToolState(idx)
+						if st.argsFinal {
+							return &llm.ProviderError{Provider: local.Provider(), Message: fmt.Sprintf("Responses tool index %d received arguments after finalization", idx)}
+						}
 						if promoteErr := promoteCompatibilityItemID(idx, itemID); promoteErr != nil {
 							return promoteErr
 						}
@@ -1391,11 +1439,12 @@ func (c *ResponsesClient) InvokeStream(ctx context.Context, req llm.InvokeReques
 					if itemID == "" {
 						itemID, _ = root["id"].(string)
 					}
-					args := responsesToolArguments(root["arguments"])
-					if strings.TrimSpace(args) == "" {
-						args = responsesToolArguments(root["delta"])
+					argsValue, argsPresent := root["arguments"]
+					if !argsPresent {
+						argsValue, argsPresent = root["delta"]
 					}
-					if strings.TrimSpace(args) != "" {
+					args := responsesToolArguments(argsValue)
+					if argsPresent {
 						idxHint, hasIdxHint := firstIndexHint(root["output_index"], root["item_index"], root["index"])
 						autoKey := ""
 						if hasIdxHint {
@@ -1411,13 +1460,8 @@ func (c *ResponsesClient) InvokeStream(ctx context.Context, req llm.InvokeReques
 						if promoteErr := promoteCompatibilityItemID(idx, itemID); promoteErr != nil {
 							return promoteErr
 						}
-						if st := ensureToolState(idx); !st.hasArgs {
-							if st.callID == "" {
-								st.pendingArgs.Reset()
-								st.pendingArgs.WriteString(args)
-							} else {
-								emitToolArgs(idx, st.callID, args)
-							}
+						if argsErr := reconcileToolArgs(idx, args, true); argsErr != nil {
+							return argsErr
 						}
 					}
 				case "response.completed":
@@ -1522,7 +1566,7 @@ func parseResponsesStreamEventError(provider string, root map[string]any) error 
 		}
 	}
 	if msg == "" {
-		msg = "openai responses stream error"
+		msg = "openai stream error"
 	}
 
 	statusCode := firstPositiveInt(
@@ -1546,7 +1590,7 @@ func parseResponsesStreamEventError(provider string, root map[string]any) error 
 	}
 	code := strings.ToLower(stringFromAny(codeValue))
 	errType := strings.ToLower(stringFromAny(errObj["type"]))
-	rateLimited := statusCode == http.StatusTooManyRequests || looksLikeRateLimitError(code, errType, msg)
+	rateLimited := statusCode == http.StatusTooManyRequests || openAIRateLimitCodeReason(codeValue) != "" || looksLikeRateLimitError(code, errType, msg)
 	if statusCode == 0 && rateLimited {
 		statusCode = http.StatusTooManyRequests
 	}
@@ -2288,6 +2332,9 @@ func (c *ResponsesClient) buildRequest(req llm.InvokeRequest) (*responsesRequest
 		for _, m := range req.Messages {
 			role := string(m.Role)
 			if role != "system" && role != "user" && role != "assistant" && role != "tool" {
+				continue
+			}
+			if role == "system" && useInstructions {
 				continue
 			}
 			// Ark (and some OpenAI-compatible gateways) do not accept role "tool" in responses input.
