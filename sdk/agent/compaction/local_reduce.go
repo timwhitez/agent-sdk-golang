@@ -316,7 +316,18 @@ func (r *localReducer) reduce(messages []llm.Message) ([]llm.Message, []string, 
 		if repl.ReplacementText == msg.Content.PlainText() {
 			continue
 		}
-		msg.Content = llm.TextContent(repl.ReplacementText)
+		if repl.Tier == tierMicrocompact && len(msg.Content.Blocks) > 0 {
+			// User-code eligibility guarantees one text block. Archive and
+			// replace that block only; attachments keep their original order.
+			msg.Content = llm.CloneContent(msg.Content)
+			for j := range msg.Content.Blocks {
+				if msg.Content.Blocks[j].Type == "text" {
+					msg.Content.Blocks[j].Text = repl.ReplacementText
+				}
+			}
+		} else {
+			msg.Content = llm.TextContent(repl.ReplacementText)
+		}
 		out[i] = msg
 		changed++
 		applied[repl.Tier] = struct{}{}
@@ -681,6 +692,20 @@ func (r *localReducer) eligibleUserCodeMessage(index int, msg llm.Message) bool 
 	}
 	if index >= r.protectedFrom || index == r.latestUser || !messageorigin.IsRealUserMessageIn(r.service.hostNamespace(), msg) {
 		return false
+	}
+	if len(msg.Content.Blocks) > 0 {
+		// PlainText joins blocks and discards their boundaries. Until the
+		// archive represents those boundaries, only a single text block can
+		// be replaced without moving text around intervening attachments.
+		textBlocks := 0
+		for _, block := range msg.Content.Blocks {
+			if block.Type == "text" {
+				textBlocks++
+			}
+		}
+		if textBlocks != 1 || msg.Content.Text != "" {
+			return false
+		}
 	}
 	text := msg.Content.PlainText()
 	if strings.TrimSpace(text) == "" {
