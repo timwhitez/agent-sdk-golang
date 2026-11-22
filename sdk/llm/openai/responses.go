@@ -176,8 +176,7 @@ func (c *ResponsesClient) Invoke(ctx context.Context, req llm.InvokeRequest) (*l
 			// Automatic downgrade: some gateways reject reasoning/settings; apply all compatible changes before retrying.
 			compatChanged := false
 			if resp.StatusCode == 400 || resp.StatusCode == 422 {
-				if strings.TrimSpace(local.ReasoningEffort) != "" && looksLikeReasoningUnsupported(msg) {
-					local.ReasoningEffort = ""
+				if downgradeResponsesReasoningEffort(&local, &req, body, msg) {
 					compatChanged = true
 					local.warnf("[WARN] %s", downgradeReasoningEffortResponsesMessage)
 					diagnostics = append(diagnostics, llm.Diagnostic{Kind: "provider_compatibility_downgrade", Message: downgradeReasoningEffortResponsesMessage})
@@ -446,6 +445,40 @@ func downgradePromptCacheKey(req *llm.InvokeRequest, sent, msg string) bool {
 	return true
 }
 
+// downgradeResponsesReasoningEffort derives the retry from the actual wire
+// value, including per-request options and Extra overrides. Only invocation-
+// local copies are changed; unrelated reasoning fields keep their JSON values.
+func downgradeResponsesReasoningEffort(client *ResponsesClient, req *llm.InvokeRequest, body []byte, msg string) bool {
+	if !looksLikeReasoningUnsupported(msg) {
+		return false
+	}
+	var sent struct {
+		Reasoning map[string]json.RawMessage `json:"reasoning"`
+	}
+	if json.Unmarshal(body, &sent) != nil {
+		return false
+	}
+	var effort string
+	if json.Unmarshal(sent.Reasoning["effort"], &effort) != nil || strings.TrimSpace(effort) == "" {
+		return false
+	}
+	delete(sent.Reasoning, "effort")
+	client.ReasoningEffort = ""
+	if req.Responses != nil {
+		opts := *req.Responses
+		opts.Reasoning = nil
+		req.Responses = &opts
+	}
+	delete(client.Extra, "reasoning")
+	if len(sent.Reasoning) > 0 {
+		if client.Extra == nil {
+			client.Extra = make(map[string]any)
+		}
+		client.Extra["reasoning"] = sent.Reasoning
+	}
+	return true
+}
+
 func looksLikeResponsesInputUnsupported(msg string) bool {
 	s := strings.ToLower(msg)
 	if strings.Contains(s, "instructions") || strings.Contains(s, "responseitem") || strings.Contains(s, "response_item") {
@@ -566,8 +599,7 @@ func (c *ResponsesClient) InvokeStream(ctx context.Context, req llm.InvokeReques
 				// Automatic downgrade: apply all compatible request changes before retrying.
 				compatChanged := false
 				if resp.StatusCode == 400 || resp.StatusCode == 422 {
-					if strings.TrimSpace(local.ReasoningEffort) != "" && looksLikeReasoningUnsupported(msg) {
-						local.ReasoningEffort = ""
+					if downgradeResponsesReasoningEffort(&local, &req, body, msg) {
 						compatChanged = true
 						local.warnf("[WARN] %s", downgradeReasoningEffortResponsesMessage)
 					}
