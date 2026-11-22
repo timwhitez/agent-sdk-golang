@@ -82,7 +82,7 @@ func evidenceFamily(toolName string) string {
 	}
 }
 
-func newEvidenceRequest(toolName string, normalized json.RawMessage, raw string, deps *tools.Container) (evidenceRequest, bool) {
+func newEvidenceRequest(ctx context.Context, toolName string, normalized json.RawMessage, raw string, deps *tools.Container) (evidenceRequest, bool) {
 	family := evidenceFamily(toolName)
 	if family == "" {
 		return evidenceRequest{}, false
@@ -94,7 +94,10 @@ func newEvidenceRequest(toolName string, normalized json.RawMessage, raw string,
 	}
 	_ = json.Unmarshal(data, &args)
 	target := evidenceTargetFromArgs(family, args)
-	target = normalizeEvidenceTarget(target, deps)
+	target = normalizeEvidenceTarget(ctx, target, deps)
+	if ctx.Err() != nil {
+		return evidenceRequest{}, false
+	}
 	canonical := canonicalJSON(data, raw)
 	key := family + "|" + target
 	var readRange *evidenceRange
@@ -301,13 +304,13 @@ func evidenceTargetFromArgs(family string, args map[string]any) string {
 	}
 }
 
-func normalizeEvidenceTarget(target string, deps *tools.Container) string {
+func normalizeEvidenceTarget(ctx context.Context, target string, deps *tools.Container) string {
 	target = strings.TrimSpace(target)
 	if target == "" {
 		return ""
 	}
 	if deps != nil {
-		if sb, err := tools.Get(deps, context.Background(), sandbox.Key); err == nil && sb != nil {
+		if sb, err := tools.Get(deps, ctx, sandbox.Key); err == nil && sb != nil {
 			if resolved, err := sb.Resolve(target); err == nil {
 				return filepath.Clean(resolved)
 			}
