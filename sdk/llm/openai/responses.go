@@ -960,9 +960,6 @@ func (c *ResponsesClient) InvokeStream(ctx context.Context, req llm.InvokeReques
 				out <- llm.StreamTextDeltaEvent{Delta: delta}
 			}
 			emitContentFinal := func(parts *responsesTextParts, key responsesTextPartKey, final string) error {
-				if parts.kind == "refusal" && strings.TrimSpace(final) == "" {
-					return nil
-				}
 				prior := parts.text[key]
 				if !strings.HasPrefix(final, prior) {
 					return &llm.ProviderError{
@@ -989,15 +986,11 @@ func (c *ResponsesClient) InvokeStream(ctx context.Context, req llm.InvokeReques
 				if err := bindContentItem(itemID, outputIndex); err != nil {
 					return err
 				}
-				var text string
-				if parts == textParts {
-					var present bool
-					text, present = responsesStreamContentText(part)
-					if !present {
-						return nil
-					}
-				} else {
-					text = responsesContentText(part)
+				// An omitted field provides no snapshot. An explicit empty or
+				// whitespace-only string still finalizes this part's exact prefix.
+				text, present := responsesStreamContentText(part)
+				if !present {
+					return nil
 				}
 				key, err := contentPartKey(parts, itemID, outputIndex, contentIndex)
 				if err != nil {
@@ -1060,7 +1053,7 @@ func (c *ResponsesClient) InvokeStream(ctx context.Context, req llm.InvokeReques
 					}
 				}
 				if !sawRefusalPart {
-					if refusal, _ := respObj["refusal"].(string); refusal != "" {
+					if refusal, present := respObj["refusal"].(string); present {
 						if key, single := refusalParts.singleKey(); single {
 							return emitContentFinal(refusalParts, key, refusal)
 						}
