@@ -475,8 +475,12 @@ func (c *ChatClient) InvokeStream(ctx context.Context, req llm.InvokeRequest) (<
 				if err := json.Unmarshal([]byte(data), &r); err != nil {
 					return fmt.Errorf("openai chat stream: decode error (provider=openai status=%d model=%q url=%s): %w", resp.StatusCode, local.ModelName, openAIDiagnosticEndpoint(endpoint), err)
 				}
-				if r.Error != nil && strings.TrimSpace(r.Error.Message) != "" {
-					return fmt.Errorf("openai stream error: %s", r.Error.Message)
+				if len(r.Error) > 0 && string(r.Error) != "null" {
+					var root map[string]any
+					if err := decodeResponsesObject([]byte(data), &root); err != nil {
+						return &llm.ProviderError{Provider: local.Provider(), Message: "chat stream error envelope is invalid"}
+					}
+					return parseResponsesStreamEventError(local.Provider(), root)
 				}
 				if id := strings.TrimSpace(r.ID); id != "" && responseID == "" {
 					responseID = id
@@ -573,10 +577,8 @@ type chatCompletionStreamResponse struct {
 		} `json:"delta"`
 		FinishReason string `json:"finish_reason"`
 	} `json:"choices"`
-	Usage map[string]any `json:"usage"`
-	Error *struct {
-		Message string `json:"message"`
-	} `json:"error"`
+	Usage map[string]any  `json:"usage"`
+	Error json.RawMessage `json:"error"`
 }
 
 var errSSEDone = errors.New("_sse_done")

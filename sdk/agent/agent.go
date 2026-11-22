@@ -3509,7 +3509,7 @@ func (t *turnBackpressure) chargeFloorSpent(d time.Duration) {
 // and gives the turn a fresh floor budget (see criticalEventFloorTurnBudget).
 // The returned function must be called when the turn ends.
 func (a *Agent) registerTurnCancellation(out *eventOutput, ctx context.Context) func() {
-	if a == nil || out == nil || ctx == nil || ctx.Done() == nil {
+	if a == nil || out == nil || ctx == nil {
 		return func() {}
 	}
 	a.turnCancelMu.Lock()

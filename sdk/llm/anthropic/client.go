@@ -951,6 +951,12 @@ func (c *Client) InvokeStream(ctx context.Context, req llm.InvokeRequest) (<-cha
 					blk, _ := root["content_block"].(map[string]any)
 					btype, _ := blk["type"].(string)
 					switch btype {
+					case "text":
+						if text, _ := blk["text"].(string); text != "" {
+							if !sendEvent(llm.StreamTextDeltaEvent{Delta: text}) {
+								return ctx.Err()
+							}
+						}
 					case "tool_use":
 						id, _ := blk["id"].(string)
 						name, _ := blk["name"].(string)
@@ -1987,9 +1993,34 @@ type responsePayload struct {
 }
 
 func parseResponse(data []byte) (*llm.Completion, error) {
+	var envelope map[string]json.RawMessage
+	if err := json.Unmarshal(data, &envelope); err != nil || envelope == nil {
+		return nil, &llm.ProviderError{Provider: "anthropic", Message: "response must be a JSON object"}
+	}
+	if raw, ok := envelope["error"]; ok && string(raw) != "null" {
+		var root map[string]any
+		if err := json.Unmarshal(data, &root); err != nil {
+			return nil, &llm.ProviderError{Provider: "anthropic", Message: "response.error is invalid"}
+		}
+		return nil, parseAnthropicStreamEventError(root)
+	}
+	for _, field := range []struct{ name, want string }{{"type", "message"}, {"role", "assistant"}} {
+		if raw, present := envelope[field.name]; present {
+			var value string
+			if json.Unmarshal(raw, &value) != nil || value != field.want {
+				return nil, &llm.ProviderError{Provider: "anthropic", Message: "response." + field.name + " must be " + field.want}
+			}
+		}
+	}
+	// Some compatible endpoints omit type/role, but every message must still
+	// declare its content array. An empty array is a valid empty answer.
+	content, ok := envelope["content"]
+	if !ok || len(content) == 0 || content[0] != '[' {
+		return nil, &llm.ProviderError{Provider: "anthropic", Message: "response.content must be an array"}
+	}
 	var rp responsePayload
 	if err := json.Unmarshal(data, &rp); err != nil {
-		return nil, err
+		return nil, &llm.ProviderError{Provider: "anthropic", Message: "response message fields have invalid types"}
 	}
 
 	blocks := make([]llm.ContentBlock, 0, len(rp.Content))

@@ -146,6 +146,7 @@ func grepTool() tools.Tool {
 		files := []string{}
 		counts := map[string]int{}
 		scanTruncated := false
+		outputTruncated := false
 		permissionDenied := []string{}
 		permissionDeniedSeen := map[string]struct{}{}
 		scanFailures := []string{}
@@ -331,6 +332,8 @@ func grepTool() tools.Tool {
 						results = append(results, formatGrepLine(displayPath, pl.no, pl.text, showLineNumbers))
 						lastEmitted = pl.no
 						if len(results) >= maxOut {
+							outputTruncated = true
+							scanTruncated = true
 							stopped = true
 							break
 						}
@@ -343,6 +346,8 @@ func grepTool() tools.Tool {
 						results = append(results, formatGrepLine(displayPath, lineNo, line, showLineNumbers))
 						lastEmitted = lineNo
 						if len(results) >= maxOut {
+							outputTruncated = true
+							scanTruncated = true
 							stopped = true
 							break
 						}
@@ -356,6 +361,8 @@ func grepTool() tools.Tool {
 							results = append(results, formatGrepLine(displayPath, lineNo, line, showLineNumbers))
 							lastEmitted = lineNo
 							if len(results) >= maxOut {
+								outputTruncated = true
+								scanTruncated = true
 								stopped = true
 								break
 							}
@@ -407,7 +414,12 @@ func grepTool() tools.Tool {
 		warning := grepPermissionWarning(permissionDenied)
 		scanWarning := grepScanWarning(scanFailures)
 		capWarning := ""
-		if scanTruncated {
+		if outputTruncated {
+			capWarning = formatWarningDiagnostic(
+				fmt.Sprintf("grep reached max_results=%d output lines; the scan is incomplete and may have more matches", maxOut),
+				"Increase max_results or narrow the path/pattern and rerun.",
+			)
+		} else if scanTruncated {
 			scanned, unit := scannedCandidates, "file candidate(s)"
 			if traversalStopped {
 				scanned, unit = visitedEntries, "visited entries"
@@ -446,11 +458,16 @@ func grepTool() tools.Tool {
 		if scanTruncated {
 			meta := map[string]any{
 				"scan_truncated":     true,
-				"scan_cap":           scanCap,
 				"scanned_candidates": scannedCandidates,
 				"scanned_files":      scannedCandidates,
 				"visited_entries":    visitedEntries,
 				"skipped_due_to_cap": true,
+			}
+			if outputTruncated {
+				meta["output_truncated"] = true
+				meta["output_line_limit"] = maxOut
+			} else {
+				meta["scan_cap"] = scanCap
 			}
 			if len(permissionDenied) == 0 && len(scanFailures) == 0 {
 				meta["warning_kind"] = scanCapWarningKind
