@@ -165,6 +165,12 @@ are never retried, and the original execution error/result is preserved.
 - Sandbox resolves paths inside allowed roots and blocks escape patterns (`sdk/tools/sandbox/sandbox.go:75`, `sdk/tools/sandbox/sandbox.go:116`)
 - `Confirmer` is the explicit trust boundary for risky operations (`sdk/tools/sandbox/sandbox.go:306`)
 - Default toolset includes filesystem, shell, search, web fetch, patch/edit, todo, and completion tools (`sdk/tools/sandbox/sandbox.go:283`)
+- `read`, `ls`, `grep`, and `glob` check cancellation before filesystem access,
+  after dependency resolution, and at their directory/line iteration boundaries.
+  Cancellation returns the context error, including when a scan has collected
+  partial matches. An already-running operating-system read is not forcibly
+  interrupted (`sdk/tools/sandbox/sandbox_read.go`, `sdk/tools/sandbox/sandbox_ls.go`,
+  `sdk/tools/sandbox/sandbox_grep.go`, `sdk/tools/sandbox/sandbox_glob.go`).
 - Read streams line windows from an open file handle (offset/limit) and applies binary detection with BOM + extension-aware heuristics (`sdk/tools/sandbox/sandbox.go:628`, `sdk/tools/sandbox/sandbox.go:742`)
 - `ls` ignore globs and `grep` `glob` filters are validated once per request; malformed patterns now fail with explicit tool-scoped errors instead of silently changing match behavior (`sdk/tools/sandbox/sandbox.go:508`, `sdk/tools/sandbox/sandbox.go:1905`)
 - `glob` now surfaces matched-path `stat` failures as deterministic warnings and tool-result metadata (`has_errors`, `skipped_paths`, `skipped_path_samples`) so partial/no-match results do not masquerade as complete success (`sdk/tools/sandbox/sandbox.go:1762`, `sdk/tools/sandbox/sandbox.go:1792`)

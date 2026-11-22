@@ -32,8 +32,14 @@ const (
 // lsTool returns the ls tool implementation.
 func lsTool() tools.Tool {
 	return tools.Func[lsArgs]("ls", "List files and directories in a given path", func(ctx context.Context, a lsArgs, deps *tools.Container) (any, error) {
+		if err := ctx.Err(); err != nil {
+			return "", err
+		}
 		s, err := tools.Get(deps, ctx, Key)
 		if err != nil {
+			return "", err
+		}
+		if err := ctx.Err(); err != nil {
 			return "", err
 		}
 		p := strings.TrimSpace(a.Path)
@@ -54,6 +60,9 @@ func lsTool() tools.Tool {
 		}
 		ignore := make([]string, 0, len(a.Ignore))
 		for _, ig := range a.Ignore {
+			if err := ctx.Err(); err != nil {
+				return "", err
+			}
 			pat, err := validateGlobArgPattern("ls", "ignore", ig)
 			if err != nil {
 				return "", err
@@ -80,6 +89,9 @@ func lsTool() tools.Tool {
 
 	scanLoop:
 		for {
+			if err := ctx.Err(); err != nil {
+				return "", err
+			}
 			if scannedEntries >= maxLsScanEntries {
 				scanTruncated = true
 				truncatedReason = "scan_cap"
@@ -102,6 +114,9 @@ func lsTool() tools.Tool {
 				return "", fmt.Errorf("read dir %s: %w", accessPath.Abs(), readErr)
 			}
 			for _, e := range ents {
+				if err := ctx.Err(); err != nil {
+					return "", err
+				}
 				scannedEntries++
 				name := e.Name()
 				if matchIgnore(name) {
@@ -125,6 +140,9 @@ func lsTool() tools.Tool {
 			}
 		}
 
+		if err := ctx.Err(); err != nil {
+			return "", err
+		}
 		sort.Strings(items)
 
 		meta := map[string]any{

@@ -79,11 +79,17 @@ var (
 
 func grepTool() tools.Tool {
 	return tools.Func[grepArgs]("grep", "Search file contents with regex", func(ctx context.Context, a grepArgs, deps *tools.Container) (any, error) {
+		if err := ctx.Err(); err != nil {
+			return "", err
+		}
 		if err := validateGrepNumericArgs(a); err != nil {
 			return "", fmt.Errorf("invalid grep limits: %w; use context/before/after <= %d and max_results <= %d", err, maxGrepContextLines, maxGrepResults)
 		}
 		s, err := tools.Get(deps, ctx, Key)
 		if err != nil {
+			return "", err
+		}
+		if err := ctx.Err(); err != nil {
 			return "", err
 		}
 		basePath := "."
@@ -176,6 +182,9 @@ func grepTool() tools.Tool {
 			scanFailures = append(scanFailures, entry)
 		}
 		walkErr := grepWalkDirFn(base, func(path string, d os.DirEntry, err error) error {
+			if err := ctx.Err(); err != nil {
+				return err
+			}
 			if err != nil {
 				recordScanFailure(path, "walk", err)
 				if d != nil && d.IsDir() {
@@ -227,6 +236,9 @@ func grepTool() tools.Tool {
 			}
 			defer f.Close()
 			sample, err := grepReadSample(f, binaryDetectSampleBytes)
+			if err := ctx.Err(); err != nil {
+				return err
+			}
 			if err != nil {
 				recordScanFailure(path, "read", err)
 				return nil
@@ -242,6 +254,9 @@ func grepTool() tools.Tool {
 			if _, hasBOM := detectUnicodeTextEncoding(sample); hasBOM {
 				// Reuse read's Unicode contract without unboundedly buffering large files.
 				raw, err := io.ReadAll(io.LimitReader(f, maxReadFileBytes+1))
+				if err := ctx.Err(); err != nil {
+					return err
+				}
 				if err != nil {
 					recordScanFailure(path, "read", err)
 					return nil
@@ -286,7 +301,13 @@ func grepTool() tools.Tool {
 			lastEmitted := 0
 			fileMatched := false
 			matchCount := 0
-			for scanner.Scan() {
+			for {
+				if err := ctx.Err(); err != nil {
+					return err
+				}
+				if !scanner.Scan() {
+					break
+				}
 				lineNo++
 				line := scanner.Text()
 				isMatch := re.MatchString(line)
@@ -374,6 +395,12 @@ func grepTool() tools.Tool {
 			}
 			return nil
 		})
+		if err := ctx.Err(); err != nil {
+			return "", err
+		}
+		if errors.Is(walkErr, context.Canceled) || errors.Is(walkErr, context.DeadlineExceeded) {
+			return "", walkErr
+		}
 		if walkErr != nil && !errors.Is(walkErr, errGrepStop) {
 			recordScanFailure(base, "walk", walkErr)
 		}
