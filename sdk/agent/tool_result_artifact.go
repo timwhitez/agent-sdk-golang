@@ -35,7 +35,12 @@ func (a *Agent) applyToolResultBoundary(ctx context.Context, content llm.Content
 	// Only text framed like an Encode result is an envelope; ordinary output that
 	// merely mentions a marker (source code, docs) stays plain. Custom codecs keep
 	// deciding for themselves.
-	if _, isJSON := codec.(artifact.JSONEnvelopeCodec); !isJSON || artifact.IsFramedEnvelope(plain) {
+	decode := true
+	switch codec.(type) {
+	case artifact.JSONEnvelopeCodec, *artifact.JSONEnvelopeCodec:
+		decode = artifact.IsFramedEnvelope(plain)
+	}
+	if decode {
 		decoded, found, decodeErr = codec.Decode(plain)
 	}
 	if found {
