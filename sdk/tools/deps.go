@@ -239,6 +239,11 @@ func (c *Container) Clone() *Container {
 	return clone
 }
 
+// dependencyValue retains the registered type even when an interface value is nil.
+type dependencyValue[T any] struct {
+	value T
+}
+
 type inflightCall struct {
 	done chan struct{}
 	val  any
@@ -282,11 +287,11 @@ func Get[T any](c *Container, ctx context.Context, key DepKey[T]) (T, error) {
 	c.mu.Lock()
 	if v, ok := c.cache[key.Name]; ok {
 		c.mu.Unlock()
-		vv, ok := v.(T)
+		vv, ok := v.(dependencyValue[T])
 		if !ok {
 			return zero, fmt.Errorf("dependency %q has unexpected type", key.Name)
 		}
-		return vv, nil
+		return vv.value, nil
 	}
 	if in, ok := c.inflight[key.Name]; ok {
 		c.mu.Unlock()
@@ -294,11 +299,11 @@ func Get[T any](c *Container, ctx context.Context, key DepKey[T]) (T, error) {
 		if in.err != nil {
 			return zero, in.err
 		}
-		vv, ok := in.val.(T)
+		vv, ok := in.val.(dependencyValue[T])
 		if !ok {
 			return zero, fmt.Errorf("dependency %q has unexpected type", key.Name)
 		}
-		return vv, nil
+		return vv.value, nil
 	}
 	provAny, ok := c.overrides[key.Name]
 	if !ok {
@@ -325,10 +330,10 @@ func Get[T any](c *Container, ctx context.Context, key DepKey[T]) (T, error) {
 		c.mu.Unlock()
 		return zero, err
 	}
-	in.val = v
+	in.val = dependencyValue[T]{value: v}
 	close(in.done)
 	c.mu.Lock()
-	c.cache[key.Name] = v
+	c.cache[key.Name] = in.val
 	delete(c.inflight, key.Name)
 	c.mu.Unlock()
 	return v, nil
