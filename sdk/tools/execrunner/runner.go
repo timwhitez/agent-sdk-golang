@@ -39,9 +39,11 @@ var ErrProcessKillTimeout = errors.New("execrunner: process did not exit after k
 
 // Options controls command execution behavior.
 type Options struct {
-	Program        string
-	Args           []string
-	Dir            string
+	Program string
+	Args    []string
+	Dir     string
+	// Env follows exec.Cmd.Env: nil inherits the parent environment, while a
+	// non-nil empty slice requests an empty environment.
 	Env            []string
 	Timeout        time.Duration
 	MaxOutputBytes int
@@ -141,8 +143,9 @@ func run(ctx context.Context, opts Options, withTimeout func(context.Context, ti
 
 	cmd := exec.Command(opts.Program, opts.Args...)
 	cmd.Dir = opts.Dir
-	if len(opts.Env) > 0 {
-		cmd.Env = append([]string(nil), opts.Env...)
+	if opts.Env != nil {
+		cmd.Env = make([]string, len(opts.Env))
+		copy(cmd.Env, opts.Env)
 	}
 	configureProcessGroup(cmd)
 
