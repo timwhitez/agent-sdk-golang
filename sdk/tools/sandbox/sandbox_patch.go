@@ -886,7 +886,6 @@ func findScopeLine(lines []string, from int, scope string) int {
 func applyHunksToContent(relPath string, raw string, hunks []patchHunk) (string, error) {
 	lines, ends := splitLinesWithEnds(raw)
 	fallback := dominantLineEnding(ends)
-	hasTrailingNewline := len(ends) > 0 && ends[len(ends)-1] != ""
 	offset := 0
 	cursor := 0
 	for hunkIdx, h := range hunks {
@@ -970,7 +969,6 @@ func applyHunksToContent(relPath string, raw string, hunks []patchHunk) (string,
 		switch {
 		case i < len(lines)-1 && ends[i] == "":
 			out.WriteString(fallback)
-		case i == len(lines)-1 && !hasTrailingNewline:
 		default:
 			out.WriteString(ends[i])
 		}
@@ -1060,9 +1058,11 @@ func applyHunk(lines, ends []string, start int, h patchHunk, fallback string) ([
 	outEnds := append([]string(nil), ends[:start]...)
 	adjacent := fallback
 	switch {
-	case start > 0 && ends[start-1] != "":
+	case len(lines) == 0:
+		adjacent = ""
+	case start > 0:
 		adjacent = ends[start-1]
-	case start < len(ends) && ends[start] != "":
+	case start < len(ends):
 		adjacent = ends[start]
 	}
 	pos := start
@@ -1073,14 +1073,14 @@ func applyHunk(lines, ends []string, start int, h patchHunk, fallback string) ([
 		switch l[0] {
 		case ' ':
 			outLines, outEnds = append(outLines, lines[pos]), append(outEnds, ends[pos])
-			if ends[pos] != "" {
-				adjacent = ends[pos]
-			}
+			// An unterminated consumed line passes that state only to new lines;
+			// untouched preceding lines retain their own terminators.
+			adjacent = ends[pos]
 			pos++
 		case '-':
-			if ends[pos] != "" {
-				adjacent = ends[pos]
-			}
+			// An unterminated consumed line passes that state only to new lines;
+			// untouched preceding lines retain their own terminators.
+			adjacent = ends[pos]
 			pos++
 		case '+':
 			outLines, outEnds = append(outLines, l[1:]), append(outEnds, adjacent)
