@@ -1973,7 +1973,7 @@ type responsePayload struct {
 		Data      string          `json:"data,omitempty"`
 	} `json:"content"`
 	StopReason string `json:"stop_reason,omitempty"`
-	Usage      struct {
+	Usage      *struct {
 		InputTokens              int  `json:"input_tokens"`
 		OutputTokens             int  `json:"output_tokens"`
 		CacheReadInputTokens     *int `json:"cache_read_input_tokens,omitempty"`
@@ -2018,12 +2018,15 @@ func parseResponse(data []byte) (*llm.Completion, error) {
 		}
 	}
 
-	usage := normalizedAnthropicUsage(
-		rp.Usage.InputTokens,
-		rp.Usage.OutputTokens,
-		rp.Usage.CacheReadInputTokens,
-		rp.Usage.CacheCreationInputTokens,
-	)
+	var usage *llm.Usage
+	if rp.Usage != nil {
+		usage = normalizedAnthropicUsage(
+			rp.Usage.InputTokens,
+			rp.Usage.OutputTokens,
+			rp.Usage.CacheReadInputTokens,
+			rp.Usage.CacheCreationInputTokens,
+		)
+	}
 
 	return &llm.Completion{
 		Content:    llm.Content{Blocks: blocks},
