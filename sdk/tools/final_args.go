@@ -52,7 +52,7 @@ const (
 	FinalArgsUnavailable = "unavailable" // no sealed binding, custom decoder or decode failure
 	FinalArgsUnused      = "unused"      // prepared, but the adapter was never reached
 	FinalArgsConsumed    = "consumed"    // the adapter executed the prepared object itself
-	FinalArgsDiverged    = "diverged"    // a wrapper changed the bytes; the adapter decoded them anew
+	FinalArgsDiverged    = "diverged"    // the adapter's binding or bytes differed from the preparation
 )
 
 func newTypedArgsBinding[Args any](name string, schema map[string]any) *typedArgsBinding {
@@ -88,16 +88,17 @@ func prepareTypedArgs(binding *typedArgsBinding, normalized json.RawMessage) *pr
 // such as bytes rewritten by a wrapper, is decoded by the legacy path and the
 // prepared object is marked diverged. A prepared object is consumed once.
 func consumeTypedArgs[Args any](ctx context.Context, binding *typedArgsBinding, name string, schema map[string]any, raw json.RawMessage) (Args, error) {
-	if binding != nil && ctx != nil {
+	if ctx != nil {
 		prepared, _ := ctx.Value(preparedTypedArgsKey{}).(*preparedTypedArgs)
 		if prepared != nil && prepared.required && prepared.binding != binding {
 			// Another Func tool reached inside a call whose arguments are
-			// required: its effect was not planned, so it is refused.
+			// required: its effect was not planned, so it is refused. This
+			// includes custom-codec adapters, which have no sealed binding.
 			prepared.state.diverged.Store(true)
 			var zero Args
 			return zero, ErrFinalArgsChanged
 		}
-		if prepared != nil && prepared.binding == binding {
+		if binding != nil && prepared != nil && prepared.binding == binding {
 			if prepared.required && !bytes.Equal(prepared.raw, raw) {
 				prepared.state.diverged.Store(true)
 				var zero Args

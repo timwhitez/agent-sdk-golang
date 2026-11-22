@@ -106,9 +106,9 @@ func (p PreparedCall) FinalArgs() (json.RawMessage, bool) {
 
 // RequireFinalArgs returns a copy of p whose execution must consume exactly
 // the prepared final arguments: if a wrapper forwards different bytes to the
-// Func adapter, the adapter refuses with ErrFinalArgsChanged instead of
-// decoding them, so the tool never runs on arguments other than the ones
-// FinalArgs showed. Without final arguments it returns p unchanged.
+// Func adapter or enters a different Func adapter (including custom-codec
+// adapters), the adapter refuses with ErrFinalArgsChanged before decoding or
+// running its function. Without final arguments it returns p unchanged.
 func (p PreparedCall) RequireFinalArgs() PreparedCall {
 	if p.final == nil {
 		return p
@@ -130,7 +130,7 @@ func (p PreparedCall) RequireFinalArgs() PreparedCall {
 }
 
 // FinalArgsOutcome reports, after Execute, whether the adapter consumed the
-// prepared object, decoded different bytes, or was never reached.
+// prepared object, encountered a different binding or bytes, or was never reached.
 func (p PreparedCall) FinalArgsOutcome() string {
 	switch {
 	case p.final == nil:
