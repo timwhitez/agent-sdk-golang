@@ -277,6 +277,11 @@ func grepTool() tools.Tool {
 						files = append(files, displayPath)
 						break
 					}
+					// Count mode consumes one output slot per matching file, not per
+					// matching line, and must scan the whole file for an exact count.
+					if mode == "count" {
+						continue
+					}
 					// emit before context
 					for _, pl := range prev {
 						if pl.no <= lastEmitted {
