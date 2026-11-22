@@ -71,7 +71,7 @@ func (s *Service) compactPipeline(ctx context.Context, model llm.ChatModel, mess
 
 	additionalTokens := maxPipelineInt(req.AdditionalTokens, 0)
 	originalEstimate := s.approximateMessageTokens(messages) + additionalTokens
-	decisionTokens := s.TotalTokens(usage)
+	decisionTokens := s.DecisionTokens(usage)
 	if decisionTokens <= 0 {
 		decisionTokens = originalEstimate
 	}
