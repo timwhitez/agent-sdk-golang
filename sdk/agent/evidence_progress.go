@@ -198,7 +198,19 @@ func (l *evidenceProgressLedger) preflight(req evidenceRequest, compactionGenera
 	}
 }
 
-func (l *evidenceProgressLedger) observe(req evidenceRequest, result string, isError bool) map[string]any {
+// evidenceResultRangeComplete rejects coverage claims when either the tool or
+// the Agent's visible-result boundary omitted part of the requested content.
+// Repeated signatures and diagnostics remain eligible for no-progress detection.
+func evidenceResultRangeComplete(metadata map[string]any) bool {
+	for _, key := range []string{"read_truncated", "result_truncated", "truncated"} {
+		if truncated, _ := metadata[key].(bool); truncated {
+			return false
+		}
+	}
+	return true
+}
+
+func (l *evidenceProgressLedger) observe(req evidenceRequest, result string, isError, completeRange bool) map[string]any {
 	if l == nil || req.key == "" {
 		return nil
 	}
@@ -222,7 +234,7 @@ func (l *evidenceProgressLedger) observe(req evidenceRequest, result string, isE
 	_, digestSeen := state.resultDigests[digest]
 	state.resultDigests[digest] = struct{}{}
 	rangeNovel := false
-	if req.readRange != nil {
+	if !isError && completeRange && req.readRange != nil {
 		rangeNovel = addEvidenceRange(&state.ranges, *req.readRange)
 	}
 	progress := first || !digestSeen || rangeNovel
@@ -232,7 +244,7 @@ func (l *evidenceProgressLedger) observe(req evidenceRequest, result string, isE
 	} else {
 		state.noProgress++
 	}
-	repeated := signatureSeen || digestSeen || (req.readRange != nil && !rangeNovel)
+	repeated := signatureSeen || digestSeen || (!isError && completeRange && req.readRange != nil && !rangeNovel)
 	disposition := "first_seen"
 	var priorGeneration *uint64
 	if repeated {

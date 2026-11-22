@@ -1886,13 +1886,15 @@ func (a *Agent) queryStreamWithSteering(ctx context.Context, input llm.Content, 
 						isError = false
 						content = llm.TextContent("Task completed: " + tce.Message)
 					} else {
-						if c.evidenceTool {
-							meta = mergeToolResultMetadata(meta, progressLedger.observe(c.evidenceReq, content.PlainText(), isError))
-						}
 						progressLedger.invalidateAfter(c.resolvedName, isError)
 					}
 					original := content.PlainText()
+					completeRange := evidenceResultRangeComplete(meta)
 					content, meta = a.applyToolResultTruncation(ctx, content, meta, c.resolvedName, tc.ID)
+					if c.evidenceTool && !c.taskComplete {
+						completeRange = completeRange && evidenceResultRangeComplete(meta)
+						meta = mergeToolResultMetadata(meta, progressLedger.observe(c.evidenceReq, original, isError, completeRange))
+					}
 					projection := projectToolResult(llm.Message{Role: llm.RoleTool, ToolCallID: tc.ID, ToolName: c.resolvedName, Content: content, IsError: isError, Ephemeral: c.tool.EphemeralKeep > 0}, meta, original)
 					projection.errorOrigin = nativeToolErrorOrigin(isError, outcome, c.unknownToolFallback)
 					projection.handlerFailed = !c.unknownToolFallback && preparedCall(idx).handlerStarted.Load() && (outcome.Panic != nil || independentHandlerError(outcome.Err))

@@ -161,11 +161,11 @@ func TestEvidenceProgressAllowsOneRevalidationAfterCompaction(t *testing.T) {
 	if !ok {
 		t.Fatal("read request not classified")
 	}
-	first := ledger.observe(req, "same", false)
+	first := ledger.observe(req, "same", false, true)
 	if first["evidence_disposition"] != "first_seen" {
 		t.Fatalf("first evidence disposition = %#v", first)
 	}
-	repeated := ledger.observe(req, "same", false)
+	repeated := ledger.observe(req, "same", false, true)
 	if repeated["evidence_disposition"] != "repeated_same_generation" {
 		t.Fatalf("same-generation evidence disposition = %#v", repeated)
 	}
@@ -175,7 +175,7 @@ func TestEvidenceProgressAllowsOneRevalidationAfterCompaction(t *testing.T) {
 	if decision := ledger.preflight(req, 1); decision.suppress {
 		t.Fatalf("first post-compaction revalidation was suppressed: %#v", decision)
 	}
-	afterCompaction := ledger.observe(req, "same", false)
+	afterCompaction := ledger.observe(req, "same", false, true)
 	if afterCompaction["evidence_disposition"] != "repeated_after_compaction" || afterCompaction["evidence_prior_generation"] != uint64(0) {
 		t.Fatalf("post-compaction evidence disposition = %#v", afterCompaction)
 	}
@@ -199,8 +199,8 @@ func TestEvidenceProgressCanonicalizesReadAliasesAndRanges(t *testing.T) {
 		t.Fatalf("aliases not canonicalized: %#v vs %#v", first, second)
 	}
 	ledger := newEvidenceProgressLedger(nil, 0)
-	ledger.observe(first, "content", false)
-	ledger.observe(first, "content", false)
+	ledger.observe(first, "content", false, true)
+	ledger.observe(first, "content", false, true)
 	decision := ledger.preflight(second, 0)
 	if !decision.suppress {
 		t.Fatalf("covered alias range was not suppressed: %s", fmt.Sprint(decision.metadata))
@@ -224,8 +224,8 @@ func TestEvidenceProgressSeparatesByteRangeFromLineRange(t *testing.T) {
 	}
 
 	ledger := newEvidenceProgressLedger(nil, 0)
-	ledger.observe(line, "same visible prefix", false)
-	ledger.observe(line, "same visible prefix", false)
+	ledger.observe(line, "same visible prefix", false, true)
+	ledger.observe(line, "same visible prefix", false, true)
 	if decision := ledger.preflight(byteRange, 0); decision.suppress {
 		t.Fatalf("line evidence covered a byte range: %#v", decision)
 	}
@@ -252,13 +252,13 @@ func TestEvidenceProgressByteRangeCoverageAcrossAliases(t *testing.T) {
 	if decision := ledger.preflight(first, 0); decision.suppress {
 		t.Fatalf("first byte range was suppressed: %#v", decision)
 	}
-	ledger.observe(first, "chunk-a", false)
-	ledger.observe(first, "chunk-a", false)
+	ledger.observe(first, "chunk-a", false, true)
+	ledger.observe(first, "chunk-a", false, true)
 	if decision := ledger.preflight(distinct, 0); decision.suppress {
 		t.Fatalf("uncovered byte range was suppressed: %#v", decision)
 	}
-	ledger.observe(distinct, "chunk-b", false)
-	ledger.observe(distinct, "chunk-b", false)
+	ledger.observe(distinct, "chunk-b", false, true)
+	ledger.observe(distinct, "chunk-b", false, true)
 	if decision := ledger.preflight(covered, 0); !decision.suppress {
 		t.Fatalf("covered byte subrange was not suppressed after no progress: %#v", decision)
 	}
@@ -271,15 +271,15 @@ func TestEvidenceProgressByteRangeAllowsOneRevalidationAfterCompaction(t *testin
 	if !ok {
 		t.Fatal("byte read request not classified")
 	}
-	ledger.observe(req, "same byte window", false)
-	ledger.observe(req, "same byte window", false)
+	ledger.observe(req, "same byte window", false, true)
+	ledger.observe(req, "same byte window", false, true)
 	if decision := ledger.preflight(req, 0); !decision.suppress {
 		t.Fatal("expected covered byte range to be suppressed")
 	}
 	if decision := ledger.preflight(req, 1); decision.suppress {
 		t.Fatalf("first byte-range revalidation after compaction was suppressed: %#v", decision)
 	}
-	afterCompaction := ledger.observe(req, "same byte window", false)
+	afterCompaction := ledger.observe(req, "same byte window", false, true)
 	if afterCompaction["evidence_disposition"] != "repeated_after_compaction" || afterCompaction["evidence_prior_generation"] != uint64(0) {
 		t.Fatalf("post-compaction byte evidence disposition = %#v", afterCompaction)
 	}
@@ -299,8 +299,8 @@ func TestEvidenceProgressByteRangeResetsAfterTargetStateChange(t *testing.T) {
 	if !ok {
 		t.Fatal("byte read request not classified")
 	}
-	ledger.observe(first, "first", false)
-	ledger.observe(first, "first", false)
+	ledger.observe(first, "first", false, true)
+	ledger.observe(first, "first", false, true)
 	if decision := ledger.preflight(first, 0); !decision.suppress {
 		t.Fatal("expected unchanged byte range to be suppressed")
 	}
@@ -339,8 +339,8 @@ func TestEvidenceProgressAllowsReadAfterExternalTargetChange(t *testing.T) {
 	if !ok {
 		t.Fatal("read request not classified")
 	}
-	ledger.observe(first, "one", false)
-	ledger.observe(first, "one", false)
+	ledger.observe(first, "one", false, true)
+	ledger.observe(first, "one", false, true)
 	if decision := ledger.preflight(first, 0); !decision.suppress {
 		t.Fatal("expected unchanged target to be suppressed")
 	}

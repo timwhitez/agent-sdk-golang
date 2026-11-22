@@ -165,6 +165,12 @@ func readTool() tools.Tool {
 			msg := formatErrorDiagnosticFromErr("Unable to read file", err, "Check file encoding/path and retry.")
 			return llm.TextContent(msg), err
 		}
+		if truncatedOutput || truncatedLines {
+			// Keep this tool-level omission separate from Agent result truncation:
+			// a later envelope may preserve this preview in full without recovering
+			// the file content that was already omitted here.
+			tools.UpsertToolResultMetadata(ctx, map[string]any{"read_truncated": true})
+		}
 		if len(out) == 0 {
 			if truncatedOutput {
 				nextOffset := lastLine + 1
