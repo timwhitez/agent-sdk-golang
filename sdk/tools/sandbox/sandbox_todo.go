@@ -91,6 +91,9 @@ func todoWriteToolNamed(name string) tools.Tool {
 			denied, denyErr := denyToolResult(ctx, name, "user denied request")
 			return denied.PlainText(), denyErr
 		}
+		if err := ctx.Err(); err != nil {
+			return err.Error(), err
+		}
 		s.ReplaceTodos(a.Todos)
 		stats := map[string]int{"pending": 0, "in_progress": 0, "completed": 0}
 		for _, t := range a.Todos {
