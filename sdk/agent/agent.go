@@ -5982,8 +5982,9 @@ func takeNextSteering(ch <-chan SteeringMsg) (SteeringMsg, bool) {
 // wrapInvalidToolArgs constructs arguments for the "invalid" fallback tool,
 // including the original tool name and any original arguments.
 func wrapInvalidToolArgs(toolName, originalArgs string) string {
-	m := map[string]any{"tool": toolName}
-	var orig map[string]any
+	name, _ := json.Marshal(toolName)
+	m := map[string]json.RawMessage{"tool": name}
+	var orig map[string]json.RawMessage
 	if json.Unmarshal([]byte(originalArgs), &orig) == nil {
 		for k, v := range orig {
 			if k != "tool" {
@@ -5991,7 +5992,7 @@ func wrapInvalidToolArgs(toolName, originalArgs string) string {
 			}
 		}
 	} else if strings.TrimSpace(originalArgs) != "" {
-		m["original_args"] = originalArgs
+		m["original_args"], _ = json.Marshal(originalArgs)
 	}
 	b, _ := json.Marshal(m)
 	return string(b)
