@@ -108,7 +108,9 @@ func hasCustomArgumentCodec(typ reflect.Type, seen map[reflect.Type]bool, encode
 	case reflect.Struct:
 		for i := 0; i < typ.NumField(); i++ {
 			field := typ.Field(i)
-			if (field.PkgPath != "" && !field.Anonymous) || strings.Split(field.Tag.Get("json"), ",")[0] == "-" {
+			// Only an exact "-" tag is ignored; "-," and "-,omitempty"
+			// name an ordinary JSON field whose codecs still run.
+			if (field.PkgPath != "" && !field.Anonymous) || field.Tag.Get("json") == "-" {
 				continue
 			}
 			// omitzero belongs to this field, not its type: another field of
