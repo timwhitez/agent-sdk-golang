@@ -53,7 +53,6 @@ func TestAuditTerminalErrorsPreserveOpaqueOnlyProviderState(t *testing.T) {
 		t.Run(terminal, func(t *testing.T) {
 			m := &auditTerminalStateStream{events: []llm.StreamEvent{
 				llm.StreamProviderStateEvent{State: state},
-				llm.StreamToolCallDeltaEvent{Index: 0, ID: "unfinished", NameDelta: "unaccepted", ArgumentsDelta: `{"missing":`},
 			}}
 			if terminal == "error" {
 				m.events = append(m.events, llm.StreamErrorEvent{Err: errors.New("connection lost after state")})
@@ -67,7 +66,7 @@ func TestAuditTerminalErrorsPreserveOpaqueOnlyProviderState(t *testing.T) {
 				model = &frameScriptModel{invoke: func(req llm.InvokeRequest) (*llm.Completion, error) {
 					m.calls++
 					if m.calls == 1 {
-						return &llm.Completion{Content: content, ToolCalls: []llm.ToolCall{{ID: "unfinished", Function: llm.FunctionCall{Name: "unaccepted", Arguments: `{"missing":`}}}}, errors.New("partial provider failure")
+						return &llm.Completion{Content: content}, errors.New("partial provider failure")
 					}
 					for _, message := range req.Messages {
 						if message.Role == llm.RoleAssistant && llm.HasProviderState(message.Content) {

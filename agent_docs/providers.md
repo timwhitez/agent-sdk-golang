@@ -302,6 +302,12 @@ stream normalization, and response metadata behavior.
   signature never arrived; their text stays in `Completion.Thinking` for
   display but is never persisted or replayed. Complete streams keep unsigned
   thinking blocks unchanged for gateways that do not sign them.
+- Failed or interrupted completions retain observed visible content and report
+  their usage without accepting tool calls. If such a completion contains tool
+  calls, the Agent clears its entire opaque provider-state group, because that
+  group may replay the discarded call topology. A state-only completion with no
+  tool calls retains its opaque state. This rule also applies to steering and
+  stream-idle recovery, and does not require the driver to interpret provider JSON.
 - Agent-level invoke retry treats typed `RateLimitError`/`ProviderError`,
   transient network/timeout failures, and equivalent text-only gateway errors
   as retryable before visible output. An explicit non-retryable HTTP status (including 401/403) takes precedence over error prose.

@@ -1030,16 +1030,7 @@ func (a *Agent) queryStreamWithSteering(ctx context.Context, input llm.Content, 
 					previousResponseTruncated = false
 					pendingRequireDoneFinalText = ""
 					pendingRequireDoneFinalResponseID = ""
-					// Save partial assistant output, including a terminal
-					// provider-state-only event received just before steering.
-					if comp != nil && (!comp.Content.IsEmpty() || llm.HasProviderState(comp.Content)) {
-						a.mu.Lock()
-						a.messages = append(a.messages, llm.Message{
-							Role:    llm.RoleAssistant,
-							Content: llm.CloneContent(comp.Content),
-						})
-						a.mu.Unlock()
-					}
+					a.appendUnacceptedCompletion(comp)
 					// The provider already billed what it produced before the
 					// interrupt. This path continues the loop instead of ending
 					// the turn, so the tokens are only recorded here.
@@ -1070,14 +1061,7 @@ func (a *Agent) queryStreamWithSteering(ctx context.Context, input llm.Content, 
 					if streamIdleRecoveries < maxRecov {
 						streamIdleRecoveries++
 						streamIdleRecoveryTotal++
-						if comp != nil && (!comp.Content.IsEmpty() || llm.HasProviderState(comp.Content)) {
-							a.mu.Lock()
-							a.messages = append(a.messages, llm.Message{
-								Role:    llm.RoleAssistant,
-								Content: llm.CloneContent(comp.Content),
-							})
-							a.mu.Unlock()
-						}
+						a.appendUnacceptedCompletion(comp)
 						// Same as the steering path: the stalled response was
 						// already billed, and the recovery continues the loop
 						// rather than ending the turn, so emit it here.
@@ -1142,17 +1126,7 @@ func (a *Agent) queryStreamWithSteering(ctx context.Context, input llm.Content, 
 				if cont.hasPending() {
 					a.discardContinuationToolCalls(&cont, nil)
 				}
-				// Preserve visible partial content and opaque replay state even
-				// when the provider failed before emitting any visible text.
-				// Unaccepted partial tool calls are deliberately not published.
-				if comp != nil && (!comp.Content.IsEmpty() || llm.HasProviderState(comp.Content)) {
-					a.mu.Lock()
-					a.messages = append(a.messages, llm.Message{
-						Role:    llm.RoleAssistant,
-						Content: llm.CloneContent(comp.Content),
-					})
-					a.mu.Unlock()
-				}
+				a.appendUnacceptedCompletion(comp)
 				_ = streamedText
 				// The provider already billed whatever it produced before the
 				// error, and the partial completion carries that usage. Emit it
