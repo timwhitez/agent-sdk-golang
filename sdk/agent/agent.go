@@ -1907,7 +1907,7 @@ func (a *Agent) queryStreamWithSteering(ctx context.Context, input llm.Content, 
 					content, meta = a.applyToolResultTruncation(ctx, content, meta, c.resolvedName, tc.ID)
 					projection := projectToolResult(llm.Message{Role: llm.RoleTool, ToolCallID: tc.ID, ToolName: c.resolvedName, Content: content, IsError: isError, Ephemeral: c.tool.EphemeralKeep > 0}, meta, original)
 					projection.errorOrigin = nativeToolErrorOrigin(isError, outcome, c.unknownToolFallback)
-					projection.handlerFailed = !c.unknownToolFallback && (outcome.Panic != nil || independentHandlerError(outcome.Err))
+					projection.handlerFailed = !c.unknownToolFallback && preparedCall(idx).handlerStarted.Load() && (outcome.Panic != nil || independentHandlerError(outcome.Err))
 					if projection.handlerFailed {
 						out.handlerFailures.Add(1)
 					}
