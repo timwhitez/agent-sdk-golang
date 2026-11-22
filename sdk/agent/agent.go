@@ -2615,17 +2615,19 @@ func (a *Agent) invokeModelCompletionWithSteering(ctx context.Context, model llm
 			}
 			thinkingText := strings.TrimSpace(thinking.String())
 			toolCalls := acc.finalize()
-			visible := !content.IsEmpty() || thinkingText != "" || len(toolCalls) > 0 || len(providerState) > 0
+			// Structured content can be retained without a visible delta
+			// (for example redacted thinking). Preserve observed metadata even
+			// when those blocks precede the flush boundary and the stream fails.
 			completionUsage := usage
-			if completionUsage == nil && !visible {
+			if completionUsage == nil {
 				completionUsage = metadata.usage
 			}
 			completionResponseID := responseID
-			if strings.TrimSpace(completionResponseID) == "" && !visible {
+			if strings.TrimSpace(completionResponseID) == "" {
 				completionResponseID = metadata.responseID
 			}
 			completionProviderState := providerState
-			if len(completionProviderState) == 0 && !visible {
+			if len(completionProviderState) == 0 {
 				completionProviderState = metadata.providerState
 			}
 			content, err := llm.WithProviderState(content, completionProviderState)
