@@ -327,7 +327,24 @@ func Get[T any](c *Container, ctx context.Context, key DepKey[T]) (T, error) {
 	in := &inflightCall{done: make(chan struct{})}
 	c.inflight[key.Name] = in
 	c.mu.Unlock()
+	providerReturned := false
+	defer func() {
+		if providerReturned {
+			return
+		}
+		// A host may recover a provider panic (or the provider may Goexit).
+		// Preserve that control flow while retiring the shared call so existing
+		// waiters receive a failure and later callers can resolve again.
+		c.mu.Lock()
+		in.err = fmt.Errorf("dependency %q provider did not return", key.Name)
+		if c.inflight[key.Name] == in {
+			delete(c.inflight, key.Name)
+		}
+		close(in.done)
+		c.mu.Unlock()
+	}()
 	v, err := prov(ctx)
+	providerReturned = true
 	c.mu.Lock()
 	in.err = err
 	if err == nil {
