@@ -12,6 +12,7 @@ import (
 	"io"
 	"log"
 	"net/http"
+	"net/url"
 	"strings"
 	"time"
 
@@ -1926,10 +1927,37 @@ func anthropicEndpoint(baseURL, suffix string) string {
 	if strings.HasSuffix(baseURL, "/v1") {
 		return baseURL + "/" + suffix
 	}
-	if strings.Contains(baseURL, "/api/v") {
+	if hasEnterpriseVersionPath(baseURL) {
 		return baseURL + "/" + suffix
 	}
 	return baseURL + "/v1/" + suffix
+}
+
+// hasEnterpriseVersionPath recognizes complete /api/v<digits> path segments.
+// Prefixes such as /api/vision or /api/v2beta are ordinary gateway paths.
+func hasEnterpriseVersionPath(baseURL string) bool {
+	parsed, err := url.Parse(baseURL)
+	if err != nil {
+		return false
+	}
+	parts := strings.Split(strings.ToLower(parsed.Path), "/")
+	for i := 0; i < len(parts)-1; i++ {
+		version := parts[i+1]
+		if parts[i] != "api" || len(version) < 2 || version[0] != 'v' {
+			continue
+		}
+		numeric := true
+		for _, digit := range version[1:] {
+			if digit < '0' || digit > '9' {
+				numeric = false
+				break
+			}
+		}
+		if numeric {
+			return true
+		}
+	}
+	return false
 }
 
 type responsePayload struct {
