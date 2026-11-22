@@ -304,7 +304,10 @@ Continuation argument merging preserves JSON numbers with `json.Number` through
 recursive object and array-by-index merges. Both inputs must contain exactly one
 complete JSON value; malformed or concatenated values retain the fragment fallback.
 Numbers remain JSON numbers, and the final typed tool decode still rejects overflow.
-
+If merging changes the final fragment's tool calls, the driver drops that
+assistant's opaque provider state and replays the merged generic calls, so
+provider history matches the arguments actually executed. Unchanged calls retain
+their exact opaque state; visible content remains in either case.
 
 The optional Envelope `RequestContinuationRelation=tool_results_carried` and
 `RequestContinuationSourceFrameIDs` report that a Frame's request carries the
