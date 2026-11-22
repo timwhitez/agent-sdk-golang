@@ -775,6 +775,20 @@ func (a *Agent) queryStreamWithSteering(ctx context.Context, input llm.Content, 
 		a.userInputEpoch.Add(1)
 		usageFallbackWarned := false
 		cont := newToolCallContinuation(defaultMaxContinuationTurns)
+		var pendingContinuationAssistant *llm.Message
+		defer func() {
+			if cont.hasPending() {
+				// A continuation can end before its reminder is appended or
+				// before the next request is admitted. Retire its current
+				// assistant by identity as well as the reminder-owned earlier
+				// fragments before releasing query ownership or closing output.
+				if err := a.discardContinuationToolCalls(&cont, pendingContinuationAssistant); err != nil {
+					// A compaction may have already removed that assistant;
+					// still clear any earlier fragments remaining in history.
+					a.discardContinuationToolCalls(&cont, nil)
+				}
+			}
+		}()
 		// A new Query never inherits a previous Query's compaction relation.
 		_ = a.takeAppliedCompactionSource(out.queryID)
 		repeatGuard := newRepeatedToolSignatureGuard(a.repeatSigThreshold, a.repeatSigWindow)
@@ -1296,6 +1310,7 @@ func (a *Agent) queryStreamWithSteering(ctx context.Context, input llm.Content, 
 					continue
 				}
 				cont.addPartial(comp.ToolCalls, frameOrdinal)
+				pendingContinuationAssistant = &currentAssistant
 				pendingTextContinuation = completedResponseText
 				a.emitEvent(out, WarnEvent{
 					Message: fmt.Sprintf("continuing truncated tool-call arguments (%d/%d)", turn, cont.maxTurns),
@@ -1351,6 +1366,7 @@ func (a *Agent) queryStreamWithSteering(ctx context.Context, input llm.Content, 
 					}
 					// Still invalid JSON — keep accumulating.
 					cont.setAccumulated(merged, mergedSources)
+					pendingContinuationAssistant = &currentAssistant
 					pendingTextContinuation = completedResponseText
 					a.emitEvent(out, WarnEvent{
 						Message: fmt.Sprintf("tool-call merge remained invalid; requesting continuation (%d/%d)", turn, cont.maxTurns),
