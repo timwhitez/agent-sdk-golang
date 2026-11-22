@@ -119,6 +119,7 @@ func hasCustomArgumentCodec(typ reflect.Type, seen map[reflect.Type]bool, encode
 }
 
 // ToolArgsNormalization captures normalized tool arguments and metadata.
+// Display represents JSON numbers as json.Number so observation preserves precision.
 type ToolArgsNormalization struct {
 	Normalized json.RawMessage
 	Display    map[string]any
@@ -216,6 +217,7 @@ var errExpectedJSONObject = errors.New("expected JSON object")
 
 func decodeJSONValueStrict(raw string) (any, error) {
 	dec := json.NewDecoder(strings.NewReader(raw))
+	dec.UseNumber()
 	dec.DisallowUnknownFields()
 	var v any
 	if err := dec.Decode(&v); err != nil {
@@ -343,8 +345,9 @@ func decodeArgsObject(raw json.RawMessage, rawFallback string) map[string]any {
 	if len(raw) == 0 {
 		return map[string]any{}
 	}
-	var m map[string]any
-	if err := json.Unmarshal(raw, &m); err == nil {
+	v, err := decodeJSONValueStrict(string(raw))
+	m, ok := v.(map[string]any)
+	if err == nil && (ok || v == nil) {
 		if m == nil {
 			return map[string]any{}
 		}

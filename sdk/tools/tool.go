@@ -704,8 +704,8 @@ func repairLooseJSONObject(raw string, schema map[string]any) ([]byte, bool) {
 		return nil, false
 	}
 
-	var parsed any
-	if err := json.Unmarshal(repaired, &parsed); err != nil {
+	parsed, err := decodeJSONValueStrict(string(repaired))
+	if err != nil {
 		return nil, false
 	}
 	obj, ok := parsed.(map[string]any)
@@ -976,6 +976,16 @@ func jsonValueType(value any) string {
 		return "string"
 	case bool:
 		return "boolean"
+	case json.Number:
+		// Integer literals need not fit int64 or float64. Decimal/exponent forms
+		// retain the existing finite-number classification for loose repairs.
+		if !strings.ContainsAny(string(v), ".eE") {
+			return "integer"
+		}
+		if n, err := v.Float64(); err == nil && n == math.Trunc(n) {
+			return "integer"
+		}
+		return "number"
 	case float64:
 		if v == math.Trunc(v) {
 			return "integer"
