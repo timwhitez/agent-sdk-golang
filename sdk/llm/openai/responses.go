@@ -872,6 +872,68 @@ func (c *ResponsesClient) InvokeStream(ctx context.Context, req llm.InvokeReques
 			stopReason := ""
 			sawCompleted := false
 			thinkingEmitted := false
+			// Native summary deltas and later full snapshots describe the same
+			// item/part. Track each prefix separately to deliver progress once.
+			type summaryPartKey struct {
+				itemID      string
+				outputIndex int
+				partIndex   int
+			}
+			summaryText := map[summaryPartKey]string{}
+			summaryItemIDs := map[int]string{}
+			summaryKey := func(itemID string, outputIndex any, partIndex int) summaryPartKey {
+				index, hasIndex := indexFromAny(outputIndex)
+				if itemID == "" && hasIndex {
+					itemID = summaryItemIDs[index]
+				}
+				if itemID != "" {
+					key := summaryPartKey{itemID: itemID, outputIndex: -1, partIndex: partIndex}
+					if hasIndex {
+						summaryItemIDs[index] = itemID
+						// Some gateways start with only an index; others add an
+						// item with only its ID. Reconcile both with later snapshots.
+						indexed := summaryPartKey{outputIndex: index, partIndex: partIndex}
+						if prior, exists := summaryText[indexed]; exists {
+							if summaryText[key] == "" {
+								summaryText[key] = prior
+							}
+							delete(summaryText, indexed)
+						}
+					}
+					return key
+				}
+				if hasIndex {
+					return summaryPartKey{outputIndex: index, partIndex: partIndex}
+				}
+				return summaryPartKey{outputIndex: -1, partIndex: partIndex}
+			}
+			emitSummaryFinal := func(key summaryPartKey, final string) error {
+				if final == "" {
+					return nil
+				}
+				prior := summaryText[key]
+				if !strings.HasPrefix(final, prior) {
+					return &llm.ProviderError{Provider: local.Provider(), Message: "Responses reasoning summary conflicts with its streamed prefix"}
+				}
+				if suffix := strings.TrimPrefix(final, prior); suffix != "" {
+					out <- llm.StreamThinkingDeltaEvent{Delta: suffix}
+					thinkingEmitted = true
+				}
+				summaryText[key] = final
+				return nil
+			}
+			emitSummarySnapshot := func(item map[string]any, outputIndex any) error {
+				parts, _ := item["summary"].([]any)
+				itemID, _ := item["id"].(string)
+				for i, part := range parts {
+					partObject, _ := part.(map[string]any)
+					text, _ := partObject["text"].(string)
+					if err := emitSummaryFinal(summaryKey(itemID, outputIndex, i), text); err != nil {
+						return err
+					}
+				}
+				return nil
+			}
 			textEmitted := false
 			refusalText := ""
 			observedNonterminalStatus := ""
@@ -914,6 +976,15 @@ func (c *ResponsesClient) InvokeStream(ctx context.Context, req llm.InvokeReques
 				emitResponseID(responsesStreamResponseID(map[string]any{"response": respObj}))
 				if u := usageFromResponses(respObj); u != nil {
 					out <- llm.StreamUsageEvent{Usage: *u}
+				}
+				if len(summaryText) > 0 {
+					items, _ := respObj["output"].([]any)
+					for i, item := range items {
+						itemObject, _ := item.(map[string]any)
+						if err := emitSummarySnapshot(itemObject, i); err != nil {
+							return err
+						}
+					}
 				}
 				if !thinkingEmitted {
 					if thinking := extractThinkingFromResponses(respObj); thinking != "" {
@@ -1023,6 +1094,25 @@ func (c *ResponsesClient) InvokeStream(ctx context.Context, req llm.InvokeReques
 						return statusErr
 					}
 					observedNonterminalStatus = expectedStatus
+				case "response.reasoning_summary_text.delta":
+					if delta, ok := root["delta"].(string); ok && delta != "" {
+						itemID, _ := root["item_id"].(string)
+						partIndex, _ := indexFromAny(root["summary_index"])
+						key := summaryKey(itemID, root["output_index"], partIndex)
+						summaryText[key] += delta
+						out <- llm.StreamThinkingDeltaEvent{Delta: delta}
+						thinkingEmitted = true
+					}
+				case "response.reasoning_summary_text.done", "response.reasoning_summary_part.added", "response.reasoning_summary_part.done":
+					itemID, _ := root["item_id"].(string)
+					partIndex, _ := indexFromAny(root["summary_index"])
+					text, _ := root["text"].(string)
+					if part, ok := root["part"].(map[string]any); ok {
+						text, _ = part["text"].(string)
+					}
+					if err := emitSummaryFinal(summaryKey(itemID, root["output_index"], partIndex), text); err != nil {
+						return err
+					}
 				case "response.reasoning.delta", "response.reasoning_text.delta", "response.reasoning_content.delta", "response.thinking.delta":
 					if d, ok := root["delta"].(string); ok && d != "" {
 						out <- llm.StreamThinkingDeltaEvent{Delta: d}
@@ -1038,15 +1128,9 @@ func (c *ResponsesClient) InvokeStream(ctx context.Context, req llm.InvokeReques
 						} else if txt, ok := item["content"].(string); ok && strings.TrimSpace(txt) != "" {
 							out <- llm.StreamThinkingDeltaEvent{Delta: txt}
 							thinkingEmitted = true
-						} else if summaryArr, ok := item["summary"].([]any); ok {
-							// GLM format: reasoning in summary[].text
-							for _, sumAny := range summaryArr {
-								if sumMap, ok := sumAny.(map[string]any); ok {
-									if txt, ok := sumMap["text"].(string); ok && strings.TrimSpace(txt) != "" {
-										out <- llm.StreamThinkingDeltaEvent{Delta: txt}
-										thinkingEmitted = true
-									}
-								}
+						} else if _, ok := item["summary"].([]any); ok {
+							if err := emitSummarySnapshot(item, root["output_index"]); err != nil {
+								return err
 							}
 						}
 						return nil
@@ -1126,14 +1210,9 @@ func (c *ResponsesClient) InvokeStream(ctx context.Context, req llm.InvokeReques
 						} else if txt, ok := item["content"].(string); ok && strings.TrimSpace(txt) != "" {
 							out <- llm.StreamThinkingDeltaEvent{Delta: txt}
 							thinkingEmitted = true
-						} else if summaryArr, ok := item["summary"].([]any); ok {
-							for _, sumAny := range summaryArr {
-								if sumMap, ok := sumAny.(map[string]any); ok {
-									if txt, ok := sumMap["text"].(string); ok && strings.TrimSpace(txt) != "" {
-										out <- llm.StreamThinkingDeltaEvent{Delta: txt}
-										thinkingEmitted = true
-									}
-								}
+						} else if _, ok := item["summary"].([]any); ok {
+							if err := emitSummarySnapshot(item, root["output_index"]); err != nil {
+								return err
 							}
 						}
 						return nil
