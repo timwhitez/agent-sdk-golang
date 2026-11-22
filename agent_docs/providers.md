@@ -154,6 +154,7 @@ stream normalization, and response metadata behavior.
 - Reasoning controls: effort and summary mode (`sdk/llm/responses_options.go:17`)
 
 ## OpenAI Chat Completions
+- Both buffered and streaming calls expose choice index `0` as the single SDK completion. If `Extra["n"]` requests multiple choices, other choices do not contribute text, thinking, tool calls, or stop reasons; provider usage still describes the whole request.
 - Non-stream Chat parsing now synthesizes stable `tool_call_id` values (`call_N`) when compatible gateways omit them, preserving existing IDs and preventing invalid follow-up `tool` messages in multi-turn tool loops.
 - Request building rejects invalid assistant tool-call/tool-result history locally with an `invalid tool history` error before sending to OpenAI-compatible endpoints.
 - `ChatClient.ProviderLabel` can override the default `"openai"` provider label;
