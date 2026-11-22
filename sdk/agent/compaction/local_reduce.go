@@ -408,7 +408,7 @@ func (r *localReducer) reduceToolMessage(index int, msg llm.Message) (LedgerRepl
 			r.replaceReplacement(created)
 			repl = created
 		} else {
-			validated, warning, valid := r.validateCanonicalReplacement(msg, repl)
+			validated, warning, valid := r.validateCanonicalReplacement(msg, repl, original)
 			if !valid {
 				return LedgerReplacement{}, warning, false
 			}
@@ -481,7 +481,7 @@ func (r *localReducer) reduceAssistantMessage(index int, msg llm.Message) (Ledge
 			return repl, "", true
 		}
 		if repl.CanonicalArtifact != nil {
-			validated, warning, valid := r.validateCanonicalReplacement(msg, repl)
+			validated, warning, valid := r.validateCanonicalReplacement(msg, repl, original)
 			return validated, warning, valid
 		}
 		created, warning, migrated := r.createAssistantReplacement(msg, key, partKey, original)
@@ -585,7 +585,7 @@ func (r *localReducer) reduceUserCodeMessage(index int, msg llm.Message) (Ledger
 			return repl, "", true
 		}
 		if repl.CanonicalArtifact != nil {
-			validated, warning, valid := r.validateCanonicalReplacement(msg, repl)
+			validated, warning, valid := r.validateCanonicalReplacement(msg, repl, original)
 			return validated, warning, valid
 		}
 		created, warning, migrated := r.createUserCodeReplacement(msg, key, partKey, original)

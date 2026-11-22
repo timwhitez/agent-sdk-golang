@@ -134,7 +134,7 @@ func (r *localReducer) canonicalArtifactOwner(msg llm.Message) (artifact.Owner, 
 	return owner, nil
 }
 
-func (r *localReducer) validateCanonicalReplacement(msg llm.Message, replacement LedgerReplacement) (LedgerReplacement, string, bool) {
+func (r *localReducer) validateCanonicalReplacement(msg llm.Message, replacement LedgerReplacement, source ...string) (LedgerReplacement, string, bool) {
 	if replacement.CanonicalArtifact == nil {
 		warning := canonicalCompactionArtifactWarning(r.sessionID, msg.ToolName, msg.ToolCallID, compactionArtifactValidateStage, "legacy/unverified full_artifact has no canonical source descriptor")
 		return LedgerReplacement{}, warning, false
@@ -152,7 +152,30 @@ func (r *localReducer) validateCanonicalReplacement(msg llm.Message, replacement
 	if msg.Role != llm.RoleTool {
 		wantKind = artifact.ObjectKindCompactionMaterial
 	}
-	manifest, err := r.resolveCanonicalArtifact(*replacement.CanonicalArtifact, owner, wantKind, nil)
+	var exactContent []byte
+	if len(source) > 0 {
+		codec := r.service.Config.ArtifactEnvelopeCodec
+		if codec == nil {
+			codec = artifact.JSONEnvelopeCodec{}
+		}
+		envelope, found, err := codec.Decode(source[0])
+		if err == nil && found {
+			err = envelope.Validate()
+			if err == nil && !canonicalManifestIdentityEqual(envelope.Manifest, *replacement.CanonicalArtifact) {
+				err = fmt.Errorf("current canonical envelope does not match the ledger source")
+			}
+		}
+		if err != nil {
+			warning := canonicalCompactionArtifactWarning(r.sessionID, msg.ToolName, msg.ToolCallID, compactionArtifactValidateStage, err.Error())
+			return LedgerReplacement{}, warning, false
+		}
+		if !found {
+			// Stable ledger keys intentionally normalize whitespace. A matching
+			// key cannot establish exact source ownership when full bytes remain.
+			exactContent = []byte(source[0])
+		}
+	}
+	manifest, err := r.resolveCanonicalArtifact(*replacement.CanonicalArtifact, owner, wantKind, exactContent)
 	if err != nil {
 		warning := canonicalCompactionArtifactWarning(r.sessionID, msg.ToolName, msg.ToolCallID, compactionArtifactValidateStage, err.Error())
 		return LedgerReplacement{}, warning, false
@@ -205,7 +228,7 @@ func (r *localReducer) resolveCanonicalArtifact(descriptor artifact.Manifest, ow
 		return artifact.Manifest{}, fmt.Errorf("resolved canonical sha256 mismatch")
 	}
 	if exactContent != nil && !bytes.Equal(result.Content, exactContent) {
-		return artifact.Manifest{}, fmt.Errorf("resolved canonical content does not match the bytes supplied to the sink")
+		return artifact.Manifest{}, fmt.Errorf("resolved canonical content does not match the supplied source bytes")
 	}
 	return result.Manifest.Clone(), nil
 }
