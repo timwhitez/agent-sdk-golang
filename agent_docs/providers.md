@@ -164,7 +164,7 @@ stream normalization, and response metadata behavior.
   diagnostics to the returned `Completion`, so agent surfaces can warn that
   reasoning/extra/thinking options were not honored.
 - Streaming parser emits normalized text/thinking/tool-call deltas plus usage and stop reason (`sdk/llm/openai/chat.go:285`, `sdk/llm/openai/chat.go:301`, `sdk/llm/openai/chat.go:313`, `sdk/llm/openai/chat.go:316`, `sdk/llm/openai/chat.go:322`)
-- OpenAI Chat + Responses now share one retry policy normalizer (default attempts/base/max) and crypto-random 10% jitter source for backoff timing consistency (`sdk/llm/openai/retry_policy.go:9`, `sdk/llm/openai/chat.go:64`, `sdk/llm/openai/responses.go:62`). The default provider retryable status set is 401, 403, 408, 409, 425, 429, and any 5xx status, with explicit per-client override through `RetryableStatusCodes`.
+- OpenAI Chat + Responses now share one retry policy normalizer (default attempts/base/max) and crypto-random 10% jitter source for backoff timing consistency (`sdk/llm/openai/retry_policy.go:9`, `sdk/llm/openai/chat.go:64`, `sdk/llm/openai/responses.go:62`). The default provider retryable status set is 408, 409, 425, 429, and any 5xx status, with explicit per-client override through `RetryableStatusCodes`.
 - Stream decode failures now include provider, HTTP status, model, and endpoint context for easier multi-provider debugging (`sdk/llm/openai/chat.go:296`)
 - `parallel_tool_calls` is omitted unless explicitly enabled on the chat client, improving compatibility with strict OpenAI-compatible gateways (`sdk/llm/openai/chat.go:783`)
 - Strict tool schema conversion recurses through nested object properties and array item schemas, including arrays of objects and nested arrays, before Chat or Responses sends tool definitions to OpenAI-compatible gateways (`sdk/llm/openai/chat.go:1009`, `sdk/llm/openai/responses.go:1506`)
@@ -265,7 +265,7 @@ stream normalization, and response metadata behavior.
 - Successful beta/thinking downgrades append
   `provider_compatibility_downgrade` diagnostics to the returned
   `Completion`.
-- Backoff jitter now uses `crypto/rand` with a time-based fallback, avoiding deterministic jitter on older runtimes (`sdk/llm/anthropic/client.go:26`, `sdk/llm/anthropic/client.go:220`). The default retryable status set is 401, 403, 408, 409, 425, 429, and any 5xx status, with explicit per-client override through `RetryableStatusCodes`.
+- Backoff jitter now uses `crypto/rand` with a time-based fallback, avoiding deterministic jitter on older runtimes (`sdk/llm/anthropic/client.go:26`, `sdk/llm/anthropic/client.go:220`). The default retryable status set is 408, 425, 429, and any 5xx status, with explicit per-client override through `RetryableStatusCodes`.
 - Streaming parser maps content-block events into normalized text/thinking/tool
   deltas, preserves whitespace-only thinking deltas, and carries Anthropic
   thinking block indices, opaque `signature_delta` data, and redacted-thinking
@@ -304,8 +304,8 @@ stream normalization, and response metadata behavior.
   thinking blocks unchanged for gateways that do not sign them.
 - Agent-level invoke retry treats typed `RateLimitError`/`ProviderError`,
   transient network/timeout failures, and equivalent text-only gateway errors
-  as retryable before visible output. Text-only status detection covers 401,
-  403, 408, 409, 425, 429, and 5xx statuses so adapters that cannot preserve
+  as retryable before visible output. An explicit non-retryable HTTP status (including 401/403) takes precedence over error prose.
+  Text-only status detection covers 408, 409, 425, 429, and 5xx statuses so adapters that cannot preserve
   typed provider errors still get bounded backoff.
 - Metadata-only stream events (`response_id`, usage, and done markers) are
   buffered until visible text/thinking/tool-call deltas. If a retryable
