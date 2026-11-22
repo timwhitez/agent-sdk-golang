@@ -43,3 +43,21 @@ func TestCompactionCheckpointIsDeterministicAndValidated(t *testing.T) {
 		t.Fatal("tampered checkpoint unexpectedly validated")
 	}
 }
+
+func TestNewCompactionCheckpointRejectsNonReplayableCandidates(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		messages []llm.Message
+		result   Result
+	}{
+		{"nil messages", nil, Result{Compacted: true}},
+		{"empty messages", []llm.Message{}, Result{Compacted: true}},
+		{"uncompacted result", []llm.Message{llm.NewUserMessage("source")}, Result{}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if _, err := NewCompactionCheckpoint(tc.messages, tc.result); err == nil {
+				t.Fatal("accepted a checkpoint that cannot be replayed")
+			}
+		})
+	}
+}
