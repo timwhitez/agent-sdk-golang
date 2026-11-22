@@ -73,7 +73,10 @@ func ProjectUsage(usage llm.Usage, estimators ...Estimator) Payload {
 			SummationPolicy:       "usage_sum_v1",
 		},
 	}
-	if usage.PromptTokens > 0 || strings.TrimSpace(usage.PromptTokensSource) != "" {
+	// A missing source describes absence, not an observed zero. Preserve the
+	// independent completion/provider fields even when the prompt is unknown.
+	source := strings.TrimSpace(usage.PromptTokensSource)
+	if source != llm.PromptTokensSourceMissing && (usage.PromptTokens > 0 || usage.PromptTokensValid || source != "") {
 		payload.Usage.EffectivePromptTokens = intPointer(usage.PromptTokens)
 	}
 	if usage.CompletionTokens > 0 {
