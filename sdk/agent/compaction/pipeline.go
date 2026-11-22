@@ -114,12 +114,13 @@ func (s *Service) compactPipeline(ctx context.Context, model llm.ChatModel, mess
 	shouldSummarize := req.ForceSummary || (req.AllowSummary && targetRank >= pipelineWatermarkRank("summarize") && currentDecisionTokens >= s.threshold())
 	if shouldSummarize {
 		out, res, err := s.compactSummary(ctx, model, current)
-		if res.NewTokens > 0 && res.Compacted {
-			res.NewTokens += additionalTokens
+		if res.Compacted {
+			currentEstimate = s.approximateMessageTokens(out) + additionalTokens
+			res.NewTokens = currentEstimate
 		}
 		results = append(results, res)
 		merged := mergePipelineResults(results...)
-		finalizePipelineResult(&merged, trigger, target, originalEstimate, merged.NewTokens, usage)
+		finalizePipelineResult(&merged, trigger, target, originalEstimate, currentEstimate, usage)
 		if err != nil {
 			return current, merged, err
 		}
