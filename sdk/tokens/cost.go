@@ -537,6 +537,12 @@ func (tc *TokenCost) calculateCost(ctx context.Context, model string, usage llm.
 	if usage.PromptCachedTokens != nil {
 		uncachedPrompt -= *usage.PromptCachedTokens
 	}
+	// total_input_v1 includes cache creation in the prompt total. When a
+	// separate creation price is available those tokens must not also pay the
+	// ordinary input price. Without that price retain the ordinary fallback.
+	if usage.PromptTokensSemantics == llm.PromptTokensSemanticsTotalInputV1 && usage.PromptCacheCreationTokens != nil && p.CacheCreationInputTokenCost != nil {
+		uncachedPrompt -= *usage.PromptCacheCreationTokens
+	}
 	if uncachedPrompt < 0 {
 		uncachedPrompt = 0
 	}
