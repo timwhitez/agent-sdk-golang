@@ -5264,6 +5264,11 @@ func (a *Agent) persistCompactionCheckpoint(ctx context.Context, messages []llm.
 		return commit, fmt.Errorf("compaction checkpoint persistence failed: %w", err)
 	}
 	commit.result = checkpoint.Result
+	// Writers may retain the checkpoint value in memory. The public result
+	// must not expose slices or usage pointers that can mutate that snapshot.
+	commit.result.Warnings = append([]string(nil), checkpoint.Result.Warnings...)
+	commit.result.TiersApplied = append([]string(nil), checkpoint.Result.TiersApplied...)
+	commit.result.Usage = llm.CloneUsage(checkpoint.Result.Usage)
 	commit.transaction = transaction
 	commit.persisted = true
 	commit.writer = writer
