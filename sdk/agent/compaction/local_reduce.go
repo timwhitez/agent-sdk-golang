@@ -327,10 +327,11 @@ func (r *localReducer) reduce(messages []llm.Message) ([]llm.Message, []string, 
 		if repl.ReplacementText == msg.Content.PlainText() {
 			continue
 		}
-		if repl.Tier == tierMicrocompact && len(msg.Content.Blocks) > 0 {
-			// User-code eligibility guarantees one text block. Archive and
-			// replace that block only; attachments keep their original order.
-			msg.Content = llm.CloneContent(msg.Content)
+		if len(msg.Content.Blocks) > 0 && msg.Content.Text == "" {
+			// Eligibility guarantees one text block. Archive and replace only
+			// that block; attachments keep their original order. A rewritten
+			// message cannot replay provider state for its original text.
+			msg.Content = llm.WithoutProviderState(msg.Content)
 			for j := range msg.Content.Blocks {
 				if msg.Content.Blocks[j].Type == "text" {
 					msg.Content.Blocks[j].Text = repl.ReplacementText
@@ -353,7 +354,7 @@ func (r *localReducer) isPrune() bool {
 func (r *localReducer) reduceToolMessage(index int, msg llm.Message) (LedgerReplacement, string, bool) {
 	// Protection applies to existing previews as well as original output. A
 	// restored ledger must not bypass the current service's protection policy.
-	if index >= r.protectedFrom || msg.Destroyed || isProtectedTool(msg.ToolName, r.service.protectedTools) {
+	if index >= r.protectedFrom || msg.Destroyed || isProtectedTool(msg.ToolName, r.service.protectedTools) || !hasSingleLocalTextSource(msg.Content) {
 		return LedgerReplacement{}, "", false
 	}
 	if r.isPrune() {
@@ -555,7 +556,7 @@ func (r *localReducer) eligibleAssistantMessage(index int, msg llm.Message) bool
 	if index >= r.protectedFrom {
 		return false
 	}
-	if msg.Destroyed || len(msg.ToolCalls) > 0 {
+	if msg.Destroyed || len(msg.ToolCalls) > 0 || !hasSingleLocalTextSource(msg.Content) {
 		return false
 	}
 	text := msg.Content.PlainText()
@@ -697,6 +698,22 @@ func isAssistantCompactionStub(text string) bool {
 	return strings.HasPrefix(strings.TrimSpace(text), "[Assistant text compacted:")
 }
 
+func hasSingleLocalTextSource(content llm.Content) bool {
+	// PlainText joins blocks and discards their boundaries. Until the archive
+	// represents those boundaries, replace only one text block in-place.
+	textBlocks, visibleBlocks := 0, 0
+	for _, block := range content.Blocks {
+		if llm.IsProviderStateBlock(block) {
+			continue
+		}
+		visibleBlocks++
+		if block.Type == "text" {
+			textBlocks++
+		}
+	}
+	return visibleBlocks == 0 || (textBlocks == 1 && content.Text == "")
+}
+
 func (r *localReducer) eligibleUserCodeMessage(index int, msg llm.Message) bool {
 	if !r.service.Config.EnableUserCodeMicrocompact {
 		return false
@@ -704,19 +721,8 @@ func (r *localReducer) eligibleUserCodeMessage(index int, msg llm.Message) bool 
 	if index >= r.protectedFrom || index == r.latestUser || !messageorigin.IsRealUserMessageIn(r.service.hostNamespace(), msg) {
 		return false
 	}
-	if len(msg.Content.Blocks) > 0 {
-		// PlainText joins blocks and discards their boundaries. Until the
-		// archive represents those boundaries, only a single text block can
-		// be replaced without moving text around intervening attachments.
-		textBlocks := 0
-		for _, block := range msg.Content.Blocks {
-			if block.Type == "text" {
-				textBlocks++
-			}
-		}
-		if textBlocks != 1 || msg.Content.Text != "" {
-			return false
-		}
+	if !hasSingleLocalTextSource(msg.Content) {
+		return false
 	}
 	text := msg.Content.PlainText()
 	if strings.TrimSpace(text) == "" {
