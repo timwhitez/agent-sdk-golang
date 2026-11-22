@@ -73,6 +73,7 @@ type Config struct {
 	// AccountingEstimator identifies the estimator used for comparable
 	// original/visible accounting. An incomplete identity leaves estimator-token
 	// measurements unknown rather than inventing comparable values.
+	// It does not identify the separate prompt or compaction estimators.
 	AccountingEstimator sdkaccounting.Estimator
 	// ArtifactOwner identifies the host session, agent, or run that owns
 	// canonical objects created at the Agent tool-result boundary. It is the
@@ -3219,7 +3220,9 @@ func (a *Agent) emitUsageWithAccounting(out *eventOutput, usage llm.Usage, respo
 		return
 	}
 	a.emitAccounting(out, AccountingEvent{
-		Payload:         sdkaccounting.ProjectUsage(usage, a.accountingEstimator),
+		// Prompt fallback is calculated independently of AccountingEstimator.
+		// Usage carries its source kind, but no verified estimator identity.
+		Payload:         sdkaccounting.ProjectUsage(usage),
 		CorrelationKind: "response",
 		ResponseID:      strings.TrimSpace(responseID),
 	}, correlations...)
@@ -3249,7 +3252,9 @@ func (a *Agent) emitCompactionWithAccounting(out *eventOutput, event CompactionE
 		return
 	}
 	a.emitAccounting(out, AccountingEvent{
-		Payload:         sdkaccounting.ProjectCompaction(event.Result, a.accountingEstimator),
+		// The compactor may use its own TokenEstimator. A tool accounting
+		// estimator does not establish provenance for these counts.
+		Payload:         sdkaccounting.ProjectCompaction(event.Result, sdkaccounting.Estimator{}),
 		CorrelationKind: "compaction",
 	})
 }
