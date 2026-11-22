@@ -917,39 +917,11 @@ func (a *Agent) queryStreamWithSteering(ctx context.Context, input llm.Content, 
 				toolDefs = append(toolDefs, t.Definition())
 			}
 
-			requestToolChoice := a.toolChoice
-			effectiveDisableThinking := requireDoneRecoveryDisableThinkingActive
-			if forceRequireDoneToolChoice || requireDoneRecoveryDisableThinkingActive {
-				canForce, canDisableThinking, _, _ := requireDoneRecoveryPolicy(a.llm)
-				if forceRequireDoneToolChoice && canForce {
-					switch strings.ToLower(strings.TrimSpace(string(requestToolChoice))) {
-					case "", "auto":
-						requestToolChoice = llm.ToolChoice("required")
-					}
-				}
-				if !canDisableThinking {
-					effectiveDisableThinking = false
-				}
-			}
 			request := llm.InvokeRequest{
-				Messages:   messages,
-				Tools:      toolDefs,
-				ToolChoice: requestToolChoice,
-				// A forced tool_choice is illegal on some providers (Anthropic) while
-				// extended thinking is enabled. Keep thinking disabled for the whole
-				// require-done recovery subloop when the model supports full
-				// DisableThinking: if the forced call chooses an ordinary work tool,
-				// its follow-up request stays in the same thinking mode until done,
-				// steering, or turn termination closes the subloop.
-				DisableThinking: effectiveDisableThinking,
+				Messages: messages, Tools: toolDefs, ToolChoice: a.toolChoice,
 			}
 			frameOrdinal := iter + 1
 			frame, frameErr := newExecutionFrame(executionFrameID(out.queryID, frameOrdinal), a.llm, request, a.toolMap, a.toolMapNormalized)
-			// Capture only this request's disable-thinking control provenance.
-			// Later resets never relabel events from an already-created Frame.
-			if frameErr == nil && frame.request.DisableThinking {
-				frame.controlSource = requireDoneControlSource
-			}
 			// An automatic compaction published since the previous Frame
 			// rewrote this request's history; record its triggering Frame once.
 			if historySource := a.takeAppliedCompactionSource(out.queryID); frameErr == nil {
@@ -994,6 +966,30 @@ func (a *Agent) queryStreamWithSteering(ctx context.Context, input llm.Content, 
 					frameFailureHint = "check the model's FrameModelBinder implementation"
 				} else {
 					frame.model = bound
+				}
+			}
+			if frameFailure == "" && (forceRequireDoneToolChoice || requireDoneRecoveryDisableThinkingActive) {
+				canForce, canDisableThinking, degraded, degradedReason := requireDoneRecoveryPolicy(frame.model)
+				if forceRequireDoneToolChoice && canForce {
+					switch strings.ToLower(strings.TrimSpace(string(frame.request.ToolChoice))) {
+					case "", "auto":
+						frame.request.ToolChoice = llm.ToolChoice("required")
+					}
+				}
+				// Apply controls only after binding, using the same model that
+				// executes this Frame. Keep recovery active across work tools.
+				frame.request.DisableThinking = requireDoneRecoveryDisableThinkingActive && canDisableThinking
+				if frame.request.DisableThinking {
+					frame.controlSource = requireDoneControlSource
+				}
+				if degraded && !requireDoneCapabilityDegradedLogged {
+					requireDoneCapabilityDegradedLogged = true
+					msg := fmt.Sprintf("require-done: %s; sending reminder without disabling thinking or forcing tool_choice", degradedReason)
+					choice := strings.ToLower(strings.TrimSpace(string(frame.request.ToolChoice)))
+					if choice != "" && choice != "auto" && choice != "none" && !frame.request.DisableThinking {
+						msg = fmt.Sprintf("require-done: %s; sending reminder with forced tool_choice and without disabling thinking", degradedReason)
+					}
+					a.emitEvent(out, WarnEvent{Kind: "require_done_capability_degraded", Message: msg}, eventCorrelation{frameID: frame.id})
 				}
 			}
 			if frameFailure != "" {
@@ -1146,7 +1142,7 @@ func (a *Agent) queryStreamWithSteering(ctx context.Context, input llm.Content, 
 					a.mu.Lock()
 					a.messages = append(a.messages, llm.Message{
 						Role:    llm.RoleAssistant,
-							Content: llm.CloneContent(comp.Content),
+						Content: llm.CloneContent(comp.Content),
 					})
 					a.mu.Unlock()
 				}
@@ -1548,20 +1544,10 @@ func (a *Agent) queryStreamWithSteering(ctx context.Context, input llm.Content, 
 						emitPartialFinal(finalContent, finalResponseID, "require_done_safety", fallback)
 						return
 					}
-					canForce, canDisableThinking, degraded, degradedReason := requireDoneRecoveryPolicy(a.llm)
-					forceRequireDoneToolChoice = canForce
-					requireDoneRecoveryDisableThinkingActive = canDisableThinking
-					if degraded && !requireDoneCapabilityDegradedLogged {
-						requireDoneCapabilityDegradedLogged = true
-						msg := fmt.Sprintf("require-done: %s; sending reminder without disabling thinking or forcing tool_choice", degradedReason)
-						if canForce && !canDisableThinking {
-							msg = fmt.Sprintf("require-done: %s; sending reminder with forced tool_choice and without disabling thinking", degradedReason)
-						}
-						a.emitEvent(out, WarnEvent{
-							Kind:    "require_done_capability_degraded",
-							Message: msg,
-						}, correlation)
-					}
+					// Record recovery intent. The next Frame resolves capabilities
+					// after binding its actual model, which may differ from this one.
+					forceRequireDoneToolChoice = true
+					requireDoneRecoveryDisableThinkingActive = true
 					reminder := messageorigin.NewInternalUserMessage(messageorigin.KindRequireDone, requireDoneReminderText)
 					if a.hasCompactor {
 						if err := a.checkAndCompactWithGrowth(ctx, frame.id, comp, out, additionalSinceCompletion(), pendingMessageTokens(reminder)); err != nil {
@@ -1572,13 +1558,9 @@ func (a *Agent) queryStreamWithSteering(ctx context.Context, input llm.Content, 
 					a.mu.Lock()
 					a.messages = append(a.messages, reminder)
 					a.mu.Unlock()
-					// This producer succeeded; retain its actual completion's
-					// Frame only when DisableThinking recovery is actually active.
-					if canDisableThinking {
-						requireDoneControlSource = frame.id
-					} else {
-						requireDoneControlSource = ""
-					}
+					// Retain the source; publish it only if the next bound Frame
+					// actually applies DisableThinking.
+					requireDoneControlSource = frame.id
 					continue
 				}
 				continue
