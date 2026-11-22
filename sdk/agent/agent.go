@@ -1145,7 +1145,7 @@ func (a *Agent) queryStreamWithSteering(ctx context.Context, input llm.Content, 
 					a.mu.Lock()
 					a.messages = append(a.messages, llm.Message{
 						Role:    llm.RoleAssistant,
-						Content: comp.Content,
+							Content: llm.CloneContent(comp.Content),
 					})
 					a.mu.Unlock()
 				}
