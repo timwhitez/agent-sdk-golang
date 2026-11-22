@@ -497,9 +497,10 @@ func (c *outputCollector) snapshot() outputSnapshot {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
-	truncated := c.truncated || c.total > int64(c.preview.Len())
+	preview, textTruncated := boundedUTF8Preview(c.preview.Bytes(), c.limit)
+	truncated := c.truncated || c.total > int64(c.preview.Len()) || textTruncated
 	return outputSnapshot{
-		preview:       boundedUTF8Preview(c.preview.Bytes(), c.limit),
+		preview:       preview,
 		totalBytes:    c.total,
 		truncated:     truncated,
 		outputPath:    c.artifactPath,
@@ -547,18 +548,17 @@ func writeArtifactChunk(w io.Writer, p []byte) (int, error) {
 	return written, err
 }
 
-func boundedUTF8Preview(raw []byte, limit int) string {
+func boundedUTF8Preview(raw []byte, limit int) (string, bool) {
 	if limit <= 0 || len(raw) == 0 {
-		return ""
+		return "", len(raw) > 0
 	}
 	// Command streams are byte-oriented and a cap may split a multi-byte rune.
 	// The artifact remains byte-exact; the preview marks undecodable bytes with
 	// U+FFFD instead of deleting them, then backs off to a rune boundary so it is
 	// always bounded, valid UTF-8 without silently swallowing characters.
-	return truncateAtRuneBoundary(
-		strings.ToValidUTF8(string(raw), invalidUTF8PreviewReplacement),
-		limit,
-	)
+	text := strings.ToValidUTF8(string(raw), invalidUTF8PreviewReplacement)
+	preview := truncateAtRuneBoundary(text, limit)
+	return preview, len(preview) < len(text)
 }
 
 // truncateAtRuneBoundary caps text at maxBytes without splitting a multi-byte
