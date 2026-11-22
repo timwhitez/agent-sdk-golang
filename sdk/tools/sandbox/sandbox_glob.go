@@ -187,12 +187,13 @@ func globTool() tools.Tool {
 		if err != nil {
 			return "", fmt.Errorf("Security error: %w", err)
 		}
-		pat := strings.TrimSpace(a.Pattern)
+		pat, err := validateGlobArgPattern("glob", "pattern", a.Pattern)
+		if err != nil {
+			return "", err
+		}
 		if pat == "" {
 			return "", fmt.Errorf("empty pattern")
 		}
-		// Support ** patterns (doublestar) and normal * patterns.
-		pat = filepath.ToSlash(pat)
 		files := make([]string, 0, maxGlobResults)
 		totalFiles := 0
 		visitedEntries := 0
