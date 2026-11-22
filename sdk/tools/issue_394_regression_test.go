@@ -147,7 +147,7 @@ func TestFinalArgsOmitZeroPlainControlsRemainPrepared(t *testing.T) {
 	})
 	t.Run("unexported_field", func(t *testing.T) {
 		issue394CheckPreparation[struct {
-			value issue394ValueZero `json:"value,omitzero"`
+			value issue394ValueZero
 		}](t, `{}`, true)
 	})
 	t.Run("flattened_embedding_ignores_its_options", func(t *testing.T) {
