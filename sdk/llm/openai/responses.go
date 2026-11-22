@@ -1937,12 +1937,24 @@ func (c *ResponsesClient) buildRequest(req llm.InvokeRequest) (*responsesRequest
 	if c.ModelName == "" {
 		return nil, fmt.Errorf("openai responses: model is required")
 	}
-	if err := validateOpenAIToolHistory(req.Messages, "openai responses"); err != nil {
-		return nil, err
-	}
-
-	stringContent := c.forceStringInput()
 	opts := req.Responses
+	conversationID := ""
+	previousResponseID := ""
+	if opts != nil {
+		conversationID = strings.TrimSpace(opts.ConversationID)
+	}
+	if rawPreviousResponseID, present := c.Extra["previous_response_id"]; present {
+		value, ok := rawPreviousResponseID.(string)
+		if !ok {
+			return nil, fmt.Errorf("openai responses: previous_response_id extra must be a string")
+		}
+		previousResponseID = strings.TrimSpace(value)
+	}
+	if conversationID != "" && previousResponseID != "" {
+		return nil, fmt.Errorf("openai responses: conversation and previous_response_id cannot both be set")
+	}
+	serverManaged := conversationID != "" || previousResponseID != ""
+	stringContent := c.forceStringInput()
 	useItems := false
 	useInstructions := false
 	instructions := ""
@@ -1959,6 +1971,9 @@ func (c *ResponsesClient) buildRequest(req llm.InvokeRequest) (*responsesRequest
 				useInstructions = true
 			}
 		}
+	}
+	if err := validateResponsesToolHistory(req.Messages, serverManaged && useItems); err != nil {
+		return nil, err
 	}
 	containsOutputState, err := responsesMessagesContainOutputState(req.Messages)
 	if err != nil {
@@ -2187,8 +2202,6 @@ func (c *ResponsesClient) buildRequest(req llm.InvokeRequest) (*responsesRequest
 	textParam := responsesTextControlsFromOptions(opts)
 	include := []string(nil)
 	promptCacheKey := ""
-	conversationID := ""
-	previousResponseID := ""
 	store := (*bool)(nil)
 	parallelToolCalls := (*bool)(nil)
 	if opts != nil {
@@ -2196,23 +2209,12 @@ func (c *ResponsesClient) buildRequest(req llm.InvokeRequest) (*responsesRequest
 			include = append([]string(nil), opts.Include...)
 		}
 		promptCacheKey = strings.TrimSpace(opts.PromptCacheKey)
-		conversationID = strings.TrimSpace(opts.ConversationID)
 		store = opts.Store
 		if opts.ParallelToolCalls != nil {
 			parallelToolCalls = opts.ParallelToolCalls
 		}
 	}
-	if rawPreviousResponseID, present := c.Extra["previous_response_id"]; present {
-		value, ok := rawPreviousResponseID.(string)
-		if !ok {
-			return nil, fmt.Errorf("openai responses: previous_response_id extra must be a string")
-		}
-		previousResponseID = strings.TrimSpace(value)
-	}
-	if conversationID != "" && previousResponseID != "" {
-		return nil, fmt.Errorf("openai responses: conversation and previous_response_id cannot both be set")
-	}
-	if (conversationID != "" || previousResponseID != "") && containsOutputState {
+	if serverManaged && containsOutputState {
 		return nil, fmt.Errorf("openai responses: conversation or previous_response_id cannot be combined with manually replayed provider state")
 	}
 

@@ -52,3 +52,40 @@ func validateOpenAIToolHistory(messages []llm.Message, provider string) error {
 	}
 	return nil
 }
+
+// validateResponsesToolHistory allows outputs whose calls are held by the
+// selected server conversation. Local calls must still have valid, contiguous
+// results, and an output may be supplied only once within this request.
+func validateResponsesToolHistory(messages []llm.Message, serverManaged bool) error {
+	const provider = "openai responses"
+	if !serverManaged {
+		return validateOpenAIToolHistory(messages, provider)
+	}
+	localCalls := make(map[string]struct{})
+	for _, message := range messages {
+		if message.Role == llm.RoleAssistant {
+			for _, call := range message.ToolCalls {
+				localCalls[strings.TrimSpace(call.ID)] = struct{}{}
+			}
+		}
+	}
+	seenResults := make(map[string]struct{})
+	localMessages := make([]llm.Message, 0, len(messages))
+	for i, message := range messages {
+		if message.Role == llm.RoleTool {
+			id := strings.TrimSpace(message.ToolCallID)
+			if id == "" {
+				return fmt.Errorf("%s: invalid tool history: tool message at index %d has empty tool_call_id", provider, i)
+			}
+			if _, exists := seenResults[id]; exists {
+				return fmt.Errorf("%s: invalid tool history: tool message at index %d repeats tool_call_id %q", provider, i, id)
+			}
+			seenResults[id] = struct{}{}
+			if _, local := localCalls[id]; !local {
+				continue
+			}
+		}
+		localMessages = append(localMessages, message)
+	}
+	return validateOpenAIToolHistory(localMessages, provider)
+}
