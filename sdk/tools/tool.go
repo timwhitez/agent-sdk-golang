@@ -478,10 +478,12 @@ func repairArrayBySchema(in []any, schema map[string]any, opts schemaRepairOptio
 func repairObjectBySchema(in map[string]any, schema map[string]any, opts schemaRepairOptions) (map[string]any, bool, error) {
 	props, _ := schema["properties"].(map[string]any)
 	matcher := newObjectKeyMatcher(props, opts.ToolName)
-	_, additionalSchema := schemaAllowsAdditionalProperties(schema)
+	allowAdditional, additionalSchema := schemaAllowsAdditionalProperties(schema)
+	// Without fixed properties, an open schema (including an empty schema for
+	// any) cannot identify unknown keys. Preserve its payload while retaining
+	// StripUnknown's existing behavior for objects with declared properties.
 	stripUnknown := opts.StripUnknown
-	// Keep map-like payloads (no fixed properties + typed additionalProperties).
-	if len(props) == 0 && additionalSchema != nil {
+	if len(props) == 0 && allowAdditional {
 		stripUnknown = false
 	}
 
