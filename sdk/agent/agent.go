@@ -1142,9 +1142,10 @@ func (a *Agent) queryStreamWithSteering(ctx context.Context, input llm.Content, 
 				if cont.hasPending() {
 					a.discardContinuationToolCalls(&cont, nil)
 				}
-				// Save partial assistant message if any text was streamed,
-				// so the conversation history reflects what the user saw.
-				if comp != nil && !comp.Content.IsEmpty() {
+				// Preserve visible partial content and opaque replay state even
+				// when the provider failed before emitting any visible text.
+				// Unaccepted partial tool calls are deliberately not published.
+				if comp != nil && (!comp.Content.IsEmpty() || llm.HasProviderState(comp.Content)) {
 					a.mu.Lock()
 					a.messages = append(a.messages, llm.Message{
 						Role:    llm.RoleAssistant,
