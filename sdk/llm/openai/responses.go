@@ -665,24 +665,7 @@ func (c *ResponsesClient) InvokeStream(ctx context.Context, req llm.InvokeReques
 			usedIndices := map[int]struct{}{}
 			nextIndex := 0
 
-			indexFromAny := func(v any) (int, bool) {
-				switch x := v.(type) {
-				case float64:
-					return int(x), true
-				case int:
-					return x, true
-				case int64:
-					return int(x), true
-				case json.Number:
-					if i, err := x.Int64(); err == nil {
-						return int(i), true
-					}
-					f, err := x.Float64()
-					return int(f), err == nil
-				default:
-					return 0, false
-				}
-			}
+			indexFromAny := responsesStreamIndex
 
 			firstIndexHint := func(values ...any) (int, bool) {
 				for _, v := range values {
@@ -934,55 +917,27 @@ func (c *ResponsesClient) InvokeStream(ctx context.Context, req llm.InvokeReques
 				}
 				return nil
 			}
-			textEmitted := false
-			type refusalPartKey struct {
-				itemID                    string
-				outputIndex, contentIndex int
+			textParts := newResponsesTextParts("text")
+			refusalParts := newResponsesTextParts("refusal")
+			bindContentItem := func(itemID string, outputIndex any) error {
+				for _, parts := range []*responsesTextParts{textParts, refusalParts} {
+					if err := parts.bindItem(itemID, outputIndex); err != nil {
+						return &llm.ProviderError{Provider: local.Provider(), Message: err.Error()}
+					}
+				}
+				return nil
 			}
-			refusalText := map[refusalPartKey]string{}
-			refusalItemIDs := map[int]string{}
-			alignRefusalKey := func(key refusalPartKey) refusalPartKey {
-				// A legacy single-part event may have no identity at all. Bind
-				// it when its first indexed/identified snapshot becomes available.
-				anonymous := refusalPartKey{outputIndex: -1, contentIndex: key.contentIndex}
-				if len(refusalText) == 1 {
-					if prior, exists := refusalText[anonymous]; exists {
-						refusalText[key] = prior
-						delete(refusalText, anonymous)
-					}
+			contentPartKey := func(parts *responsesTextParts, itemID string, outputIndex any, contentIndex int) (responsesTextPartKey, error) {
+				// A binding learned from either kind also identifies sibling
+				// text/refusal parts on the same message item.
+				if err := bindContentItem(itemID, outputIndex); err != nil {
+					return responsesTextPartKey{}, err
 				}
-				return key
-			}
-			refusalKey := func(itemID string, outputIndex any, contentIndex int) refusalPartKey {
-				index, hasIndex := indexFromAny(outputIndex)
-				if !hasIndex && itemID == "" {
-					if len(refusalText) == 1 {
-						for key := range refusalText {
-							if key.contentIndex == contentIndex {
-								return key
-							}
-						}
-					}
-					return refusalPartKey{outputIndex: -1, contentIndex: contentIndex}
+				key, err := parts.key(itemID, outputIndex, contentIndex)
+				if err != nil {
+					return responsesTextPartKey{}, &llm.ProviderError{Provider: local.Provider(), Message: err.Error()}
 				}
-				if itemID == "" && hasIndex {
-					itemID = refusalItemIDs[index]
-				}
-				if itemID != "" {
-					key := refusalPartKey{itemID: itemID, outputIndex: -1, contentIndex: contentIndex}
-					if hasIndex {
-						refusalItemIDs[index] = itemID
-						indexed := refusalPartKey{outputIndex: index, contentIndex: contentIndex}
-						if prior, exists := refusalText[indexed]; exists {
-							if refusalText[key] == "" {
-								refusalText[key] = prior
-							}
-							delete(refusalText, indexed)
-						}
-					}
-					return alignRefusalKey(key)
-				}
-				return alignRefusalKey(refusalPartKey{outputIndex: index, contentIndex: contentIndex})
+				return key, nil
 			}
 			observedNonterminalStatus := ""
 			streamOutputItems := map[int]llm.ProviderState{}
@@ -997,29 +952,58 @@ func (c *ResponsesClient) InvokeStream(ctx context.Context, req llm.InvokeReques
 				streamResponseID = id
 				out <- llm.StreamResponseEvent{ResponseID: id}
 			}
-			emitRefusalDelta := func(key refusalPartKey, delta string) {
+			emitContentDelta := func(parts *responsesTextParts, key responsesTextPartKey, delta string) {
 				if delta == "" {
 					return
 				}
-				refusalText[key] += delta
+				parts.text[key] += delta
 				out <- llm.StreamTextDeltaEvent{Delta: delta}
 			}
-			emitRefusalFinal := func(key refusalPartKey, final string) error {
-				if strings.TrimSpace(final) == "" {
+			emitContentFinal := func(parts *responsesTextParts, key responsesTextPartKey, final string) error {
+				if parts.kind == "refusal" && strings.TrimSpace(final) == "" {
 					return nil
 				}
-				prior := refusalText[key]
+				prior := parts.text[key]
 				if !strings.HasPrefix(final, prior) {
 					return &llm.ProviderError{
 						Provider: local.Provider(),
-						Message:  "Responses refusal final text conflicts with the streamed refusal prefix",
+						Message:  fmt.Sprintf("Responses %s final text conflicts with the streamed %s prefix", parts.kind, parts.kind),
 					}
 				}
 				if suffix := strings.TrimPrefix(final, prior); suffix != "" {
 					out <- llm.StreamTextDeltaEvent{Delta: suffix}
 				}
-				refusalText[key] = final
+				parts.text[key] = final
 				return nil
+			}
+			emitContentPart := func(itemID string, outputIndex any, contentIndex int, part map[string]any) error {
+				var parts *responsesTextParts
+				switch stringFromAny(part["type"]) {
+				case "output_text", "text":
+					parts = textParts
+				case "refusal":
+					parts = refusalParts
+				default:
+					return nil
+				}
+				if err := bindContentItem(itemID, outputIndex); err != nil {
+					return err
+				}
+				var text string
+				if parts == textParts {
+					var present bool
+					text, present = responsesStreamContentText(part)
+					if !present {
+						return nil
+					}
+				} else {
+					text = responsesContentText(part)
+				}
+				key, err := contentPartKey(parts, itemID, outputIndex, contentIndex)
+				if err != nil {
+					return err
+				}
+				return emitContentFinal(parts, key, text)
 			}
 			emitTerminalResponse := func(respObj map[string]any) error {
 				emitResponseID(responsesStreamResponseID(map[string]any{"response": respObj}))
@@ -1041,13 +1025,7 @@ func (c *ResponsesClient) InvokeStream(ctx context.Context, req llm.InvokeReques
 						thinkingEmitted = true
 					}
 				}
-				if !textEmitted {
-					if text := extractTextFromResponses(respObj); strings.TrimSpace(text) != "" {
-						out <- llm.StreamTextDeltaEvent{Delta: text}
-						textEmitted = true
-					}
-				}
-				sawRefusalPart := false
+				sawTextPart, sawRefusalPart := false, false
 				items, _ := respObj["output"].([]any)
 				for outputIndex, itemAny := range items {
 					item, _ := itemAny.(map[string]any)
@@ -1055,21 +1033,37 @@ func (c *ResponsesClient) InvokeStream(ctx context.Context, req llm.InvokeReques
 						continue
 					}
 					itemID, _ := item["id"].(string)
+					if err := bindContentItem(itemID, outputIndex); err != nil {
+						return err
+					}
 					parts, _ := item["content"].([]any)
 					for contentIndex, partAny := range parts {
 						part, _ := partAny.(map[string]any)
-						if stringFromAny(part["type"]) != "refusal" {
-							continue
+						switch stringFromAny(part["type"]) {
+						case "output_text", "text":
+							sawTextPart = true
+						case "refusal":
+							sawRefusalPart = true
 						}
-						sawRefusalPart = true
-						if err := emitRefusalFinal(refusalKey(itemID, outputIndex, contentIndex), responsesContentText(part)); err != nil {
+						if err := emitContentPart(itemID, outputIndex, contentIndex, part); err != nil {
 							return err
+						}
+					}
+				}
+				if !sawTextPart {
+					if text, ok := respObj["output_text"].(string); ok {
+						if key, single := textParts.singleKey(); single {
+							if err := emitContentFinal(textParts, key, text); err != nil {
+								return err
+							}
 						}
 					}
 				}
 				if !sawRefusalPart {
 					if refusal, _ := respObj["refusal"].(string); refusal != "" {
-						return emitRefusalFinal(refusalKey("", nil, 0), refusal)
+						if key, single := refusalParts.singleKey(); single {
+							return emitContentFinal(refusalParts, key, refusal)
+						}
 					}
 				}
 				return nil
@@ -1137,20 +1131,49 @@ func (c *ResponsesClient) InvokeStream(ctx context.Context, req llm.InvokeReques
 				case "response.output_text.delta":
 					// Preserve whitespace deltas to keep streaming output faithful.
 					if d, ok := root["delta"].(string); ok && d != "" {
-						out <- llm.StreamTextDeltaEvent{Delta: d}
-						textEmitted = true
+						itemID, _ := root["item_id"].(string)
+						contentIndex, _ := indexFromAny(root["content_index"])
+						key, err := contentPartKey(textParts, itemID, root["output_index"], contentIndex)
+						if err != nil {
+							return err
+						}
+						emitContentDelta(textParts, key, d)
+					}
+				case "response.output_text.done":
+					if text, ok := root["text"].(string); ok {
+						itemID, _ := root["item_id"].(string)
+						contentIndex, _ := indexFromAny(root["content_index"])
+						key, err := contentPartKey(textParts, itemID, root["output_index"], contentIndex)
+						if err != nil {
+							return err
+						}
+						return emitContentFinal(textParts, key, text)
 					}
 				case "response.refusal.delta":
 					if d, ok := root["delta"].(string); ok && d != "" {
 						itemID, _ := root["item_id"].(string)
 						contentIndex, _ := indexFromAny(root["content_index"])
-						emitRefusalDelta(refusalKey(itemID, root["output_index"], contentIndex), d)
+						key, err := contentPartKey(refusalParts, itemID, root["output_index"], contentIndex)
+						if err != nil {
+							return err
+						}
+						emitContentDelta(refusalParts, key, d)
 					}
 				case "response.refusal.done":
 					if refusal, ok := root["refusal"].(string); ok {
 						itemID, _ := root["item_id"].(string)
 						contentIndex, _ := indexFromAny(root["content_index"])
-						return emitRefusalFinal(refusalKey(itemID, root["output_index"], contentIndex), refusal)
+						key, err := contentPartKey(refusalParts, itemID, root["output_index"], contentIndex)
+						if err != nil {
+							return err
+						}
+						return emitContentFinal(refusalParts, key, refusal)
+					}
+				case "response.content_part.added", "response.content_part.done":
+					if part, ok := root["part"].(map[string]any); ok {
+						itemID, _ := root["item_id"].(string)
+						contentIndex, _ := indexFromAny(root["content_index"])
+						return emitContentPart(itemID, root["output_index"], contentIndex, part)
 					}
 				case "response.created":
 					respObj, _ := root["response"].(map[string]any)
@@ -1196,6 +1219,12 @@ func (c *ResponsesClient) InvokeStream(ctx context.Context, req llm.InvokeReques
 				case "response.output_item.added":
 					item, _ := root["item"].(map[string]any)
 					itType, _ := item["type"].(string)
+					if itType == "message" {
+						itemID, _ := item["id"].(string)
+						if err := bindContentItem(itemID, root["output_index"]); err != nil {
+							return err
+						}
+					}
 					if itType == "reasoning" || itType == "thinking" || itType == "reasoning_text" {
 						if txt, ok := item["text"].(string); ok && strings.TrimSpace(txt) != "" {
 							out <- llm.StreamThinkingDeltaEvent{Delta: txt}
@@ -1218,17 +1247,10 @@ func (c *ResponsesClient) InvokeStream(ctx context.Context, req llm.InvokeReques
 									continue
 								}
 								ct, _ := cm["type"].(string)
-								if ct == "output_text" || ct == "text" {
-									if txt := responsesContentText(cm); strings.TrimSpace(txt) != "" && !textEmitted {
-										out <- llm.StreamTextDeltaEvent{Delta: txt}
-										textEmitted = true
-									}
-								} else if ct == "refusal" {
-									if txt := responsesContentText(cm); strings.TrimSpace(txt) != "" {
-										itemID, _ := item["id"].(string)
-										if err := emitRefusalFinal(refusalKey(itemID, root["output_index"], contentIndex), txt); err != nil {
-											return err
-										}
+								if ct == "output_text" || ct == "text" || ct == "refusal" {
+									itemID, _ := item["id"].(string)
+									if err := emitContentPart(itemID, root["output_index"], contentIndex, cm); err != nil {
+										return err
 									}
 								} else if ct == "reasoning" || ct == "reasoning_text" || ct == "thinking" {
 									if txt, ok := cm["text"].(string); ok && strings.TrimSpace(txt) != "" {
@@ -1281,6 +1303,12 @@ func (c *ResponsesClient) InvokeStream(ctx context.Context, req llm.InvokeReques
 					}
 					item, _ := root["item"].(map[string]any)
 					itType, _ := item["type"].(string)
+					if itType == "message" {
+						itemID, _ := item["id"].(string)
+						if err := bindContentItem(itemID, root["output_index"]); err != nil {
+							return err
+						}
+					}
 					if itType == "reasoning" || itType == "thinking" || itType == "reasoning_text" {
 						if txt, ok := item["text"].(string); ok && strings.TrimSpace(txt) != "" {
 							out <- llm.StreamThinkingDeltaEvent{Delta: txt}
@@ -1303,17 +1331,10 @@ func (c *ResponsesClient) InvokeStream(ctx context.Context, req llm.InvokeReques
 									continue
 								}
 								ct, _ := cm["type"].(string)
-								if ct == "output_text" || ct == "text" {
-									if txt := responsesContentText(cm); strings.TrimSpace(txt) != "" && !textEmitted {
-										out <- llm.StreamTextDeltaEvent{Delta: txt}
-										textEmitted = true
-									}
-								} else if ct == "refusal" {
-									if txt := responsesContentText(cm); strings.TrimSpace(txt) != "" {
-										itemID, _ := item["id"].(string)
-										if refusalErr := emitRefusalFinal(refusalKey(itemID, root["output_index"], contentIndex), txt); refusalErr != nil {
-											return refusalErr
-										}
+								if ct == "output_text" || ct == "text" || ct == "refusal" {
+									itemID, _ := item["id"].(string)
+									if err := emitContentPart(itemID, root["output_index"], contentIndex, cm); err != nil {
+										return err
 									}
 								} else if ct == "reasoning" || ct == "reasoning_text" || ct == "thinking" {
 									if txt, ok := cm["text"].(string); ok && strings.TrimSpace(txt) != "" {
