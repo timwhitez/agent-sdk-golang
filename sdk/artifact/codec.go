@@ -34,7 +34,9 @@ func (JSONEnvelopeCodec) Encode(envelope Envelope, budget Budget) (string, Envel
 	estimate = safeTokenEstimator(estimate)
 
 	normalized := envelope.Clone()
+	byteRange, hasByteRange := previewByteRange(normalized.Manifest.Preview, len(normalized.Preview))
 	updateByteContinuation := false
+	continuationStart := int64(0)
 	if continuation := normalized.Continuation; continuation != nil && continuation.RangeUnit == RangeUnitBytes {
 		updateByteContinuation = continuation.Next == 0
 		// Re-encoding a prefix produced by this codec must move its cursor
@@ -46,14 +48,23 @@ func (JSONEnvelopeCodec) Encode(envelope Envelope, budget Budget) (string, Envel
 				updateByteContinuation = true
 			}
 		}
+		if hasByteRange {
+			continuationStart = byteRange.Start
+			if continuation.Next == byteRange.End {
+				updateByteContinuation = true
+			}
+		}
 	}
 	render := func(preview string) (string, Envelope, error) {
 		candidate := normalized.Clone()
 		candidate.Preview = preview
 		candidate.Manifest.Preview = normalizePreview(candidate.Manifest.Preview, len(preview), len(preview) < len(normalized.Preview))
+		if hasByteRange && len(preview) > 0 {
+			candidate.Manifest.Preview.Ranges[0].End = byteRange.Start + int64(len(preview))
+		}
 		candidate.Manifest.VisibleMeasurement = visibleMeasurement(preview, estimate, !candidate.Manifest.Preview.Truncated)
 		if updateByteContinuation {
-			candidate.Continuation.Next = int64(len(preview))
+			candidate.Continuation.Next = continuationStart + int64(len(preview))
 		}
 		if err := candidate.Validate(); err != nil {
 			return "", Envelope{}, err
@@ -66,19 +77,26 @@ func (JSONEnvelopeCodec) Encode(envelope Envelope, budget Budget) (string, Envel
 		return encoded, candidate, nil
 	}
 
-	fixed, fixedEnvelope, err := render("")
-	if err != nil {
-		return "", Envelope{}, err
-	}
-	if !fitsEnvelopeBudget(fixed, budget, estimate) {
-		return "", Envelope{}, fmt.Errorf("%w: fixed envelope fields exceed max_bytes=%d or max_tokens=%d", ErrEnvelopeBudgetTooSmall, budget.MaxBytes, budget.MaxTokens)
-	}
 	full, fullEnvelope, err := render(envelope.Preview)
 	if err != nil {
 		return "", Envelope{}, err
 	}
 	if fitsEnvelopeBudget(full, budget, estimate) {
 		return full, fullEnvelope, nil
+	}
+	preview := normalized.Manifest.Preview
+	if len(preview.Ranges) > 0 && preview.Kind != PreviewKindFull && preview.Kind != PreviewKindPrefix && !hasByteRange {
+		// A structured or multi-range view can include separators or other
+		// transformations. Without an exact byte mapping, a shorter string
+		// cannot truthfully retain its original source coverage.
+		return "", Envelope{}, fmt.Errorf("%w: cannot shorten preview without a byte range mapping", ErrEnvelopeBudgetTooSmall)
+	}
+	fixed, fixedEnvelope, err := render("")
+	if err != nil {
+		return "", Envelope{}, err
+	}
+	if !fitsEnvelopeBudget(fixed, budget, estimate) {
+		return "", Envelope{}, fmt.Errorf("%w: fixed envelope fields exceed max_bytes=%d or max_tokens=%d", ErrEnvelopeBudgetTooSmall, budget.MaxBytes, budget.MaxTokens)
 	}
 
 	low, high := 0, len(envelope.Preview)
@@ -103,6 +121,14 @@ func (JSONEnvelopeCodec) Encode(envelope Envelope, budget Budget) (string, Envel
 		return bestText, bestEnvelope, nil
 	}
 	return bestText, bestEnvelope, nil
+}
+
+func previewByteRange(preview Preview, previewBytes int) (Range, bool) {
+	if preview.Kind != PreviewKindRange || len(preview.Ranges) != 1 {
+		return Range{}, false
+	}
+	r := preview.Ranges[0]
+	return r, r.Unit == RangeUnitBytes && r.End-r.Start == int64(previewBytes)
 }
 
 // IsFramedEnvelope reports whether text has the shape JSONEnvelopeCodec.Encode
