@@ -34,12 +34,25 @@ func (JSONEnvelopeCodec) Encode(envelope Envelope, budget Budget) (string, Envel
 	estimate = safeTokenEstimator(estimate)
 
 	normalized := envelope.Clone()
+	updateByteContinuation := false
+	if continuation := normalized.Continuation; continuation != nil && continuation.RangeUnit == RangeUnitBytes {
+		updateByteContinuation = continuation.Next == 0
+		// Re-encoding a prefix produced by this codec must move its cursor
+		// back when the budget shrinks. An unrelated host cursor is left as-is.
+		preview := normalized.Manifest.Preview
+		if (preview.Kind == PreviewKindPrefix || preview.Kind == PreviewKindFull) && len(preview.Ranges) == 1 {
+			r := preview.Ranges[0]
+			if r.Unit == RangeUnitBytes && r.Start == 0 && r.End == int64(len(normalized.Preview)) && continuation.Next == r.End {
+				updateByteContinuation = true
+			}
+		}
+	}
 	render := func(preview string) (string, Envelope, error) {
 		candidate := normalized.Clone()
 		candidate.Preview = preview
 		candidate.Manifest.Preview = normalizePreview(candidate.Manifest.Preview, len(preview), len(preview) < len(normalized.Preview))
 		candidate.Manifest.VisibleMeasurement = visibleMeasurement(preview, estimate, !candidate.Manifest.Preview.Truncated)
-		if candidate.Continuation != nil && candidate.Continuation.RangeUnit == RangeUnitBytes && candidate.Continuation.Next == 0 {
+		if updateByteContinuation {
 			candidate.Continuation.Next = int64(len(preview))
 		}
 		if err := candidate.Validate(); err != nil {
