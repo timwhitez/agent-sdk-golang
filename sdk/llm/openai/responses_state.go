@@ -4,6 +4,8 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
+	"io"
+	"math/big"
 	"reflect"
 	"strings"
 
@@ -220,10 +222,57 @@ func orderedResponsesStreamState(items map[int]llm.ProviderState) ([]llm.Provide
 }
 
 func responsesJSONEqual(left, right []byte) bool {
-	var leftValue any
-	var rightValue any
-	if json.Unmarshal(left, &leftValue) != nil || json.Unmarshal(right, &rightValue) != nil {
-		return false
+	// Opaque output may contain counters, schema bounds, or future numeric
+	// fields beyond float64. Compare their lossless JSON values while still
+	// ignoring object key order, whitespace, and equivalent number spellings.
+	var values [2]any
+	for i, data := range [][]byte{left, right} {
+		decoder := json.NewDecoder(bytes.NewReader(data))
+		decoder.UseNumber()
+		if decoder.Decode(&values[i]) != nil || decoder.Decode(new(any)) != io.EOF {
+			return false
+		}
+		values[i] = normalizeResponsesJSONNumbers(values[i])
 	}
-	return reflect.DeepEqual(leftValue, rightValue)
+	return reflect.DeepEqual(values[0], values[1])
+}
+
+func normalizeResponsesJSONNumbers(value any) any {
+	switch value := value.(type) {
+	case json.Number:
+		mantissa, exponentText, _ := strings.Cut(strings.ToLower(value.String()), "e")
+		var exponent big.Int
+		if exponentText != "" {
+			// JSON decoding validated the decimal exponent. Store only its
+			// value, never materialize 10^exponent for untrusted large powers.
+			exponent.SetString(exponentText, 10)
+		}
+		negative := strings.HasPrefix(mantissa, "-")
+		mantissa = strings.TrimPrefix(mantissa, "-")
+		fractionDigits := 0
+		if point := strings.IndexByte(mantissa, '.'); point >= 0 {
+			fractionDigits = len(mantissa) - point - 1
+			mantissa = mantissa[:point] + mantissa[point+1:]
+		}
+		digits := strings.TrimLeft(mantissa, "0")
+		if digits == "" {
+			return json.Number("0")
+		}
+		coefficient := strings.TrimRight(digits, "0")
+		adjustment := int64(len(digits) - len(coefficient) - fractionDigits)
+		exponent.Add(&exponent, big.NewInt(adjustment))
+		if negative {
+			coefficient = "-" + coefficient
+		}
+		return json.Number(coefficient + "e" + exponent.String())
+	case map[string]any:
+		for key, child := range value {
+			value[key] = normalizeResponsesJSONNumbers(child)
+		}
+	case []any:
+		for i, child := range value {
+			value[i] = normalizeResponsesJSONNumbers(child)
+		}
+	}
+	return value
 }
