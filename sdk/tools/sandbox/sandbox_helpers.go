@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
+	"unicode/utf8"
 
 	"github.com/bmatcuk/doublestar/v4"
 	"github.com/timwhitez/agent-sdk-golang/sdk/llm"
@@ -105,27 +106,36 @@ func isSymlinkSecurityError(err error) bool {
 // Truncation utilities
 // ============================================================================
 
-// truncate truncates a string to a maximum length, adding "..." if truncated.
+// truncate caps a text preview in Unicode code points, including its ellipsis.
 func truncate(s string, max int) string {
-	if len(s) <= max {
-		return s
+	if max <= 0 {
+		return ""
 	}
-	if max <= 3 {
-		return s[:max]
-	}
-	return s[:max-3] + "..."
+	out, _ := truncateLine(s, max)
+	return out
 }
 
-// truncateLine truncates a string to a maximum length for a single line.
-// Returns the truncated string and a boolean indicating if truncation occurred.
+// truncateLine limits a line in Unicode code points; byte budgets are enforced
+// separately by the caller. It never splits a valid UTF-8 sequence.
 func truncateLine(s string, max int) (string, bool) {
-	if max <= 0 || len(s) <= max {
+	if max <= 0 || utf8.RuneCountInString(s) <= max {
 		return s, false
 	}
 	if max <= 3 {
-		return s[:max], true
+		return runePrefix(s, max), true
 	}
-	return s[:max-3] + "...", true
+	return runePrefix(s, max-3) + "...", true
+}
+
+func runePrefix(s string, count int) string {
+	n := 0
+	for i := range s {
+		if n == count {
+			return s[:i]
+		}
+		n++
+	}
+	return s
 }
 
 // truncateForMeta truncates a string for metadata fields.

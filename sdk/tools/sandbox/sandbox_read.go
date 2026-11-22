@@ -144,10 +144,9 @@ func readTool() tools.Tool {
 				break
 			}
 			line := strings.TrimSuffix(scanner.Text(), "\r")
-			if maxReadLineChars > 0 && len(line) > maxReadLineChars {
-				line, _ = truncateLine(line, maxReadLineChars)
-				truncatedLines = true
-			}
+			var lineTruncated bool
+			line, lineTruncated = truncateLine(line, maxReadLineChars)
+			truncatedLines = truncatedLines || lineTruncated
 			formatted := fmt.Sprintf("%4d  %s", lineNo, line)
 			lineBytes := len(formatted)
 			if len(out) > 0 {
