@@ -385,7 +385,7 @@ func (c *ResponsesClient) forceStringInput() bool {
 	}
 	// Auto-detect: enterprise versioned endpoints tend to be OpenAI-compatible but not fully spec-complete.
 	base := strings.TrimRight(strings.TrimSpace(c.baseURL()), "/")
-	return strings.Contains(base, "/api/v")
+	return hasEnterpriseVersionPath(base)
 }
 
 func shouldAutoCompat(req llm.InvokeRequest) bool {
