@@ -935,7 +935,55 @@ func (c *ResponsesClient) InvokeStream(ctx context.Context, req llm.InvokeReques
 				return nil
 			}
 			textEmitted := false
-			refusalText := ""
+			type refusalPartKey struct {
+				itemID                    string
+				outputIndex, contentIndex int
+			}
+			refusalText := map[refusalPartKey]string{}
+			refusalItemIDs := map[int]string{}
+			alignRefusalKey := func(key refusalPartKey) refusalPartKey {
+				// A legacy single-part event may have no identity at all. Bind
+				// it when its first indexed/identified snapshot becomes available.
+				anonymous := refusalPartKey{outputIndex: -1, contentIndex: key.contentIndex}
+				if len(refusalText) == 1 {
+					if prior, exists := refusalText[anonymous]; exists {
+						refusalText[key] = prior
+						delete(refusalText, anonymous)
+					}
+				}
+				return key
+			}
+			refusalKey := func(itemID string, outputIndex any, contentIndex int) refusalPartKey {
+				index, hasIndex := indexFromAny(outputIndex)
+				if !hasIndex && itemID == "" {
+					if len(refusalText) == 1 {
+						for key := range refusalText {
+							if key.contentIndex == contentIndex {
+								return key
+							}
+						}
+					}
+					return refusalPartKey{outputIndex: -1, contentIndex: contentIndex}
+				}
+				if itemID == "" && hasIndex {
+					itemID = refusalItemIDs[index]
+				}
+				if itemID != "" {
+					key := refusalPartKey{itemID: itemID, outputIndex: -1, contentIndex: contentIndex}
+					if hasIndex {
+						refusalItemIDs[index] = itemID
+						indexed := refusalPartKey{outputIndex: index, contentIndex: contentIndex}
+						if prior, exists := refusalText[indexed]; exists {
+							if refusalText[key] == "" {
+								refusalText[key] = prior
+							}
+							delete(refusalText, indexed)
+						}
+					}
+					return alignRefusalKey(key)
+				}
+				return alignRefusalKey(refusalPartKey{outputIndex: index, contentIndex: contentIndex})
+			}
 			observedNonterminalStatus := ""
 			streamOutputItems := map[int]llm.ProviderState{}
 			streamOutputBytes := 0
@@ -949,27 +997,28 @@ func (c *ResponsesClient) InvokeStream(ctx context.Context, req llm.InvokeReques
 				streamResponseID = id
 				out <- llm.StreamResponseEvent{ResponseID: id}
 			}
-			emitRefusalDelta := func(delta string) {
+			emitRefusalDelta := func(key refusalPartKey, delta string) {
 				if delta == "" {
 					return
 				}
-				refusalText += delta
+				refusalText[key] += delta
 				out <- llm.StreamTextDeltaEvent{Delta: delta}
 			}
-			emitRefusalFinal := func(final string) error {
+			emitRefusalFinal := func(key refusalPartKey, final string) error {
 				if strings.TrimSpace(final) == "" {
 					return nil
 				}
-				if !strings.HasPrefix(final, refusalText) {
+				prior := refusalText[key]
+				if !strings.HasPrefix(final, prior) {
 					return &llm.ProviderError{
 						Provider: local.Provider(),
 						Message:  "Responses refusal final text conflicts with the streamed refusal prefix",
 					}
 				}
-				if suffix := strings.TrimPrefix(final, refusalText); suffix != "" {
+				if suffix := strings.TrimPrefix(final, prior); suffix != "" {
 					out <- llm.StreamTextDeltaEvent{Delta: suffix}
 				}
-				refusalText = final
+				refusalText[key] = final
 				return nil
 			}
 			emitTerminalResponse := func(respObj map[string]any) error {
@@ -998,8 +1047,30 @@ func (c *ResponsesClient) InvokeStream(ctx context.Context, req llm.InvokeReques
 						textEmitted = true
 					}
 				}
-				if refusal := extractRefusalFromResponses(respObj); refusal != "" {
-					return emitRefusalFinal(refusal)
+				sawRefusalPart := false
+				items, _ := respObj["output"].([]any)
+				for outputIndex, itemAny := range items {
+					item, _ := itemAny.(map[string]any)
+					if stringFromAny(item["type"]) != "message" {
+						continue
+					}
+					itemID, _ := item["id"].(string)
+					parts, _ := item["content"].([]any)
+					for contentIndex, partAny := range parts {
+						part, _ := partAny.(map[string]any)
+						if stringFromAny(part["type"]) != "refusal" {
+							continue
+						}
+						sawRefusalPart = true
+						if err := emitRefusalFinal(refusalKey(itemID, outputIndex, contentIndex), responsesContentText(part)); err != nil {
+							return err
+						}
+					}
+				}
+				if !sawRefusalPart {
+					if refusal, _ := respObj["refusal"].(string); refusal != "" {
+						return emitRefusalFinal(refusalKey("", nil, 0), refusal)
+					}
 				}
 				return nil
 			}
@@ -1071,11 +1142,15 @@ func (c *ResponsesClient) InvokeStream(ctx context.Context, req llm.InvokeReques
 					}
 				case "response.refusal.delta":
 					if d, ok := root["delta"].(string); ok && d != "" {
-						emitRefusalDelta(d)
+						itemID, _ := root["item_id"].(string)
+						contentIndex, _ := indexFromAny(root["content_index"])
+						emitRefusalDelta(refusalKey(itemID, root["output_index"], contentIndex), d)
 					}
 				case "response.refusal.done":
 					if refusal, ok := root["refusal"].(string); ok {
-						return emitRefusalFinal(refusal)
+						itemID, _ := root["item_id"].(string)
+						contentIndex, _ := indexFromAny(root["content_index"])
+						return emitRefusalFinal(refusalKey(itemID, root["output_index"], contentIndex), refusal)
 					}
 				case "response.created":
 					respObj, _ := root["response"].(map[string]any)
@@ -1137,7 +1212,7 @@ func (c *ResponsesClient) InvokeStream(ctx context.Context, req llm.InvokeReques
 					}
 					if itType == "message" {
 						if contentArr, ok := item["content"].([]any); ok {
-							for _, cAny := range contentArr {
+							for contentIndex, cAny := range contentArr {
 								cm, ok := cAny.(map[string]any)
 								if !ok {
 									continue
@@ -1150,7 +1225,10 @@ func (c *ResponsesClient) InvokeStream(ctx context.Context, req llm.InvokeReques
 									}
 								} else if ct == "refusal" {
 									if txt := responsesContentText(cm); strings.TrimSpace(txt) != "" {
-										emitRefusalDelta(txt)
+										itemID, _ := item["id"].(string)
+										if err := emitRefusalFinal(refusalKey(itemID, root["output_index"], contentIndex), txt); err != nil {
+											return err
+										}
 									}
 								} else if ct == "reasoning" || ct == "reasoning_text" || ct == "thinking" {
 									if txt, ok := cm["text"].(string); ok && strings.TrimSpace(txt) != "" {
@@ -1219,7 +1297,7 @@ func (c *ResponsesClient) InvokeStream(ctx context.Context, req llm.InvokeReques
 					}
 					if itType == "message" {
 						if contentArr, ok := item["content"].([]any); ok {
-							for _, cAny := range contentArr {
+							for contentIndex, cAny := range contentArr {
 								cm, ok := cAny.(map[string]any)
 								if !ok {
 									continue
@@ -1232,7 +1310,8 @@ func (c *ResponsesClient) InvokeStream(ctx context.Context, req llm.InvokeReques
 									}
 								} else if ct == "refusal" {
 									if txt := responsesContentText(cm); strings.TrimSpace(txt) != "" {
-										if refusalErr := emitRefusalFinal(txt); refusalErr != nil {
+										itemID, _ := item["id"].(string)
+										if refusalErr := emitRefusalFinal(refusalKey(itemID, root["output_index"], contentIndex), txt); refusalErr != nil {
 											return refusalErr
 										}
 									}
