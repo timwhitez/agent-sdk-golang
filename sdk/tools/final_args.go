@@ -57,7 +57,7 @@ const (
 
 func newTypedArgsBinding[Args any](name string, schema map[string]any) *typedArgsBinding {
 	// Preparing decodes and encodes the arguments; both must be free of user
-	// code (custom JSON/Text decoders or encoders anywhere in the type).
+	// code (custom JSON/Text codecs or omitzero IsZero hooks in the type).
 	if hasCustomArgumentCodec(reflect.TypeOf((*Args)(nil)).Elem(), make(map[reflect.Type]bool), true) {
 		return nil
 	}

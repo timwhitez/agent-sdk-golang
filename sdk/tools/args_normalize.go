@@ -9,6 +9,7 @@ import (
 	"io"
 	"reflect"
 	"strings"
+	"unicode"
 )
 
 // Original spelling is needed only if a later typed decode repairs arguments.
@@ -78,7 +79,7 @@ func hasCustomArgumentDecoder(typ reflect.Type, seen map[reflect.Type]bool) bool
 
 // hasCustomArgumentCodec reports whether decoding (and, with encoders, also
 // encoding) typ could run user code: a JSON or Text (un)marshaler on the type,
-// a field, a container element or a map key.
+// a field, a container element or a map key, or an omitzero IsZero method.
 func hasCustomArgumentCodec(typ reflect.Type, seen map[reflect.Type]bool, encoders bool) bool {
 	if seen[typ] {
 		return false
@@ -110,12 +111,54 @@ func hasCustomArgumentCodec(typ reflect.Type, seen map[reflect.Type]bool, encode
 			if (field.PkgPath != "" && !field.Anonymous) || strings.Split(field.Tag.Get("json"), ",")[0] == "-" {
 				continue
 			}
+			// omitzero belongs to this field, not its type: another field of
+			// the same type may already be in seen without that option.
+			if encoders && fieldUsesCustomIsZero(field) {
+				return true
+			}
 			if hasCustomArgumentCodec(field.Type, seen, encoders) {
 				return true
 			}
 		}
 	}
 	return false
+}
+
+func fieldUsesCustomIsZero(field reflect.StructField) bool {
+	name, options, _ := strings.Cut(field.Tag.Get("json"), ",")
+	typ := field.Type
+	if typ.Kind() == reflect.Pointer {
+		typ = typ.Elem()
+	}
+	if field.Anonymous {
+		// encoding/json ignores unexported non-struct embeddings. It also
+		// flattens unnamed embedded structs (including invalid tag names),
+		// whose tag options do not govern a field of their own.
+		if !field.IsExported() && typ.Kind() != reflect.Struct {
+			return false
+		}
+		if !validJSONArgumentFieldName(name) && typ.Kind() == reflect.Struct {
+			return false
+		}
+	}
+	for _, option := range strings.Split(options, ",") {
+		if option == "omitzero" {
+			isZeroer := reflect.TypeOf((*interface{ IsZero() bool })(nil)).Elem()
+			return field.Type.Implements(isZeroer) || reflect.PointerTo(field.Type).Implements(isZeroer)
+		}
+	}
+	return false
+}
+
+func validJSONArgumentFieldName(name string) bool {
+	// encoding/json permits letters, digits and this punctuation in tag names;
+	// other names are treated as empty when deciding whether to flatten fields.
+	for _, r := range name {
+		if !strings.ContainsRune("!#$%&()*+-./:;<=>?@[]^_{|}~ ", r) && !unicode.IsLetter(r) && !unicode.IsDigit(r) {
+			return false
+		}
+	}
+	return name != ""
 }
 
 // ToolArgsNormalization captures normalized tool arguments and metadata.
