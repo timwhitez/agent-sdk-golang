@@ -1009,6 +1009,9 @@ func (c *Client) InvokeStream(ctx context.Context, req llm.InvokeRequest) (<-cha
 							return ctx.Err()
 						}
 					}
+					// message_stop completes the logical response. Release the
+					// HTTP body now instead of waiting for a transport-level EOF.
+					return errSSEMessageStop
 				case "error":
 					// Anthropic can emit mid-stream errors (e.g. overloaded_error);
 					// dropping them would surface a truncated response as success.
@@ -1016,7 +1019,7 @@ func (c *Client) InvokeStream(ctx context.Context, req llm.InvokeRequest) (<-cha
 				}
 				return nil
 			})
-			if err != nil {
+			if err != nil && !errors.Is(err, errSSEMessageStop) {
 				sendEvent(llm.StreamErrorEvent{Err: err})
 				return
 			}
@@ -1104,6 +1107,8 @@ func streamResponseIDFromEvent(eventType string, root map[string]any) string {
 	}
 	return ""
 }
+
+var errSSEMessageStop = errors.New("anthropic SSE message stopped")
 
 // Budgets apply to one logical event, including malformed fragments separated
 // by premature blank lines. Valid independent events reset both budgets.
