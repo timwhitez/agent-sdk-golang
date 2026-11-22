@@ -1445,7 +1445,13 @@ func parseResponsesStreamEventError(provider string, root map[string]any) error 
 		retryAfterFromAny(root["retry_after"], false),
 	)
 
-	code := strings.ToLower(stringFromAny(errObj["code"]))
+	// Native Responses error events carry code at the top level. Retain
+	// the nested envelope used by compatible gateways and failed responses.
+	codeValue := errObj["code"]
+	if errObj == nil {
+		codeValue = root["code"]
+	}
+	code := strings.ToLower(stringFromAny(codeValue))
 	errType := strings.ToLower(stringFromAny(errObj["type"]))
 	rateLimited := statusCode == http.StatusTooManyRequests || looksLikeRateLimitError(code, errType, msg)
 	if statusCode == 0 && rateLimited {
@@ -1453,9 +1459,9 @@ func parseResponsesStreamEventError(provider string, root map[string]any) error 
 	}
 	provider = openAIProviderLabel(provider)
 	if rateLimited {
-		return &llm.RateLimitError{Provider: provider, Message: msg, RetryAfter: retryAfter, Reason: openAIRateLimitCodeReason(errObj["code"])}
+		return &llm.RateLimitError{Provider: provider, Message: msg, RetryAfter: retryAfter, Reason: openAIRateLimitCodeReason(codeValue)}
 	}
-	return &llm.ProviderError{Provider: provider, StatusCode: statusCode, Message: msg, RetryAfter: retryAfter, Reason: openAIErrorCodeReason(errObj["code"])}
+	return &llm.ProviderError{Provider: provider, StatusCode: statusCode, Message: msg, RetryAfter: retryAfter, Reason: openAIErrorCodeReason(codeValue)}
 }
 
 func responsesHasError(resp map[string]any) bool {

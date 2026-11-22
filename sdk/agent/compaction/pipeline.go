@@ -16,7 +16,7 @@ func (s *Service) CompactPipeline(ctx context.Context, model llm.ChatModel, mess
 	if ctx != nil && ctx.Err() != nil {
 		return messages, Result{Compacted: false}, ctx.Err()
 	}
-	if s.Config.LedgerStore != nil && s.Config.CheckpointWriter != nil {
+	if s.Config.LedgerStore != nil && (s.Config.CheckpointWriter != nil || req.DeferLedgerCommit) {
 		return s.compactPipelineWithDeferredLedger(ctx, model, messages, req)
 	}
 	return s.compactPipeline(ctx, model, messages, req)
