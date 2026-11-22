@@ -266,7 +266,7 @@ func parsePatchOps(lines []string) ([]patchOp, error) {
 						i++
 						// Consecutive scope headers locate nested scopes in order.
 						if i < len(lines) {
-							if next := strings.TrimSpace(lines[i]); strings.HasPrefix(next, "@@ ") {
+							if next := lines[i]; strings.HasPrefix(next, "@@ ") {
 								if _, _, _, _, nextOK := parseHunkHeader(next); !nextOK {
 									l, lt = lines[i], next
 									continue
@@ -282,13 +282,13 @@ func parsePatchOps(lines []string) ([]patchOp, error) {
 					endOfFile := false
 					for i < len(lines) {
 						ll := lines[i]
-						llt := strings.TrimSpace(ll)
 						if ll == "*** End of File" {
 							endOfFile = true
 							i++
 							break
 						}
-						if strings.HasPrefix(llt, "@@") || strings.HasPrefix(llt, "*** ") {
+						// Control markers have no hunk prefix; a leading space is literal context.
+						if strings.HasPrefix(ll, "@@") || strings.HasPrefix(ll, "*** ") {
 							break
 						}
 						if ll == "" {
