@@ -1441,12 +1441,16 @@ func (c *Client) buildRequestWithThinking(req llm.InvokeRequest, thinkingConfig 
 				if caps.SupportsFullDisable() && caps.ForcedToolChoiceWhenThinkingDisabled {
 					return nil, fmt.Errorf("anthropic: tool_choice %q is incompatible with extended thinking; use auto/none or set DisableThinking for this call", tc)
 				}
+				message := fmt.Sprintf("tool_choice %q is incompatible with extended thinking on model %q, which does not support full DisableThinking; use auto or none", tc, c.ModelName)
+				if caps.SupportsFullDisable() {
+					message = fmt.Sprintf("tool_choice %q is incompatible with extended thinking on model %q, which does not support forced tool choice even when thinking is disabled; use auto or none", tc, c.ModelName)
+				}
 				return nil, &llm.ThinkingCapabilityError{
 					Provider: "anthropic",
 					Model:    c.ModelName,
 					Control:  "tool_choice",
 					Value:    string(tc),
-					Message:  fmt.Sprintf("tool_choice %q is incompatible with extended thinking on model %q, which does not support full DisableThinking; use auto or none", tc, c.ModelName),
+					Message:  message,
 				}
 			}
 		}
