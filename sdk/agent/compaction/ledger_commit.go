@@ -33,8 +33,8 @@ func (s *deferredLedgerStore) Save(_ context.Context, _ string, ledger *Ledger) 
 	return nil
 }
 
-// CommitPendingLedger persists a summary-ledger update that was deferred until
-// the Agent is ready to write the matching replayable runtime checkpoint.
+// CommitPendingLedger persists an update deferred until the publisher has
+// checked the source and is ready to commit the candidate history.
 func (s *Service) CommitPendingLedger(ctx context.Context, res *Result) error {
 	if res == nil || res.pendingLedger == nil {
 		return nil
@@ -58,8 +58,8 @@ func (s *Service) RollbackPendingLedger(ctx context.Context, res *Result) error 
 	return s.saveLedger(ctx, strings.TrimSpace(s.Config.SessionID), res.previousLedger)
 }
 
-// FinalizePendingLedger drops transient transaction state after both ledger and
-// runtime checkpoint persistence have succeeded.
+// FinalizePendingLedger drops transient transaction state after persistence
+// and publication have succeeded.
 func (s *Service) FinalizePendingLedger(res *Result) {
 	if res == nil {
 		return

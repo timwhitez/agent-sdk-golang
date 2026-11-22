@@ -39,7 +39,8 @@ func (a *Agent) beginManualCompaction(ctx context.Context) (func(), error) {
 // Stale history, pending work and admission conflicts reject before persistence.
 // A successful writer acknowledgement is followed by publication even if ctx
 // was canceled in the meantime; this is not an automatic durable rollback.
-// Without a writer, publication is memory-only and no CheckpointID is invented.
+// Without a checkpoint writer, no CheckpointID is invented; any prepared ledger
+// update still commits before the in-memory history is published.
 // A writer implementing compaction.CompactionCheckpointSettler is told the
 // checkpoint was published before this returns. The candidate is installed
 // verbatim; later ephemeral recycling inside it is ordinary history change.
@@ -101,7 +102,7 @@ func (a *Agent) CommitCompactionHistoryRevision(ctx context.Context, expected, m
 	a.resetEphemeralTrackingLocked()
 	a.compactionGeneration.Add(1)
 	a.mu.Unlock()
-	if commit.persisted {
+	if commit.ledgerCommitted {
 		a.compactor.FinalizePendingLedger(&commit.transaction)
 	}
 	a.settleCheckpoint(commit, true, "")

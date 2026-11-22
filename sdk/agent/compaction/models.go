@@ -215,9 +215,9 @@ type Result struct {
 	// still have compacted.
 	SummaryNotSmaller bool `json:"summary_not_smaller,omitempty"`
 
-	// Ledger updates are deferred when a runtime checkpoint writer is configured.
-	// The Agent commits this transaction immediately before the replayable
-	// checkpoint, then rolls it back if checkpoint persistence fails.
+	// Ledger updates are deferred for checkpoint writers and when the publisher
+	// requests a prepared candidate. The Agent commits after source validation,
+	// then rolls back if persistence or publication fails.
 	pendingLedger  *Ledger
 	previousLedger *Ledger
 }
@@ -233,6 +233,11 @@ type PipelineRequest struct {
 	TargetWatermark  string
 	AllowSummary     bool
 	ForceSummary     bool
+	// DeferLedgerCommit prepares a candidate without changing the LedgerStore.
+	// Its publisher must use CommitPendingLedger after checking the source,
+	// then FinalizePendingLedger on publication or RollbackPendingLedger if
+	// publication fails. CheckpointWriter configurations always defer.
+	DeferLedgerCommit bool
 }
 
 var (

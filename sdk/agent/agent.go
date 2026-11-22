@@ -4644,10 +4644,11 @@ func (a *Agent) compactOverflowWithPlan(ctx context.Context, messages []llm.Mess
 			return messages, lastRes, err
 		}
 		pipelineMsgs, pipelineRes, err := a.compactor.CompactPipeline(ctx, a.llm, messages, compaction.PipelineRequest{
-			Trigger:         "overflow",
-			Usage:           usage,
-			TargetWatermark: "overflow",
-			AllowSummary:    allowSummary,
+			Trigger:           "overflow",
+			Usage:             usage,
+			TargetWatermark:   "overflow",
+			AllowSummary:      allowSummary,
+			DeferLedgerCommit: true,
 		})
 		if pipelineRes.Compacted {
 			fallbackMsgs = pipelineMsgs
@@ -4904,22 +4905,22 @@ func (a *Agent) applyPendingCompaction(out *eventOutput) (published bool) {
 	if !sameMessageIdentity(a.messages, source) {
 		a.mu.Unlock()
 		rollbackErr := error(nil)
-		if commit.persisted {
+		if commit.ledgerCommitted {
 			rollbackErr = a.compactor.RollbackPendingLedger(context.Background(), &commit.transaction)
 		}
 		a.requeuePendingCompaction(pending)
 		a.compactionRetryPending.Store(true)
-		const reason = "history changed while checkpoint persistence was running"
+		const reason = "history changed while compaction persistence was running"
 		if rollbackErr != nil {
 			a.warnf("compaction apply deferred because %s; ledger rollback failed: %v", reason, rollbackErr)
 		} else {
-			a.warnf("compaction apply deferred because %s; ledger state was rolled back and the acknowledged checkpoint was not published", reason)
+			a.warnf("compaction apply deferred because %s; ledger state was rolled back and the candidate was not published", reason)
 		}
 		// The writer acknowledged a checkpoint that will never be installed.
 		a.settleCheckpoint(commit, false, reason)
 		return false
 	}
-	if commit.persisted {
+	if commit.ledgerCommitted {
 		a.compactor.FinalizePendingLedger(&commit.transaction)
 	}
 	a.messages = merged
@@ -5150,7 +5151,7 @@ func (a *Agent) CompactPipelineNow(ctx context.Context, req compaction.PipelineR
 		if commitErr != nil {
 			return commit.result, commitErr
 		}
-		if commit.persisted {
+		if commit.ledgerCommitted {
 			a.compactor.FinalizePendingLedger(&commit.transaction)
 		}
 		res = commit.result
@@ -5173,9 +5174,10 @@ func (a *Agent) CompactPipelineNow(ctx context.Context, req compaction.PipelineR
 // callers replace in-memory history. A persistence failure is fail-closed: the
 // returned result is not reported as compacted and the caller keeps old state.
 type pendingCheckpointCommit struct {
-	result      compaction.Result
-	transaction compaction.Result
-	persisted   bool
+	result          compaction.Result
+	transaction     compaction.Result
+	persisted       bool
+	ledgerCommitted bool
 	// writer acknowledged the checkpoint when persisted is true; its outcome
 	// is settled through it even if the configuration changed since.
 	writer compaction.CompactionCheckpointWriter
@@ -5213,13 +5215,13 @@ func (a *Agent) settleCheckpoint(commit pendingCheckpointCommit, published bool,
 // after it has atomically published the matching in-memory history.
 func (a *Agent) persistCompactionCheckpoint(ctx context.Context, messages []llm.Message, res compaction.Result) (pendingCheckpointCommit, error) {
 	commit := pendingCheckpointCommit{result: res, transaction: res}
-	if a == nil || !res.Compacted || a.compactor == nil || a.compactor.Config.CheckpointWriter == nil {
+	if a == nil || !res.Compacted || a.compactor == nil || (a.compactor.Config.CheckpointWriter == nil && a.compactor.Config.LedgerStore == nil) {
 		return commit, nil
 	}
 	if ctx == nil {
 		ctx = context.Background()
 	}
-	if a.checkpointQuarantined.Load() {
+	if a.compactor.Config.CheckpointWriter != nil && a.checkpointQuarantined.Load() {
 		failed := res
 		failed.Compacted, failed.CheckpointID = false, ""
 		failed.Warnings = append(failed.Warnings, "[ERROR] Compaction checkpoint not written - an earlier checkpoint write had an unknown outcome; history was not replaced. (stage=append_compaction_checkpoint action=reconcile the checkpoint store, then call CheckpointStoreReconciled)")
@@ -5228,7 +5230,7 @@ func (a *Agent) persistCompactionCheckpoint(ctx context.Context, messages []llm.
 	}
 	transaction := res
 	if err := a.compactor.CommitPendingLedger(ctx, &transaction); err != nil {
-		warning := fmt.Sprintf("[WARN] Compaction ledger persistence failed before runtime checkpoint - original in-memory history was preserved and compaction remains retryable. (stage=save_compaction_ledger action=check ledger storage and retry: %v)", err)
+		warning := fmt.Sprintf("[WARN] Compaction ledger persistence failed before history publication - original in-memory history was preserved and compaction remains retryable. (stage=save_compaction_ledger action=check ledger storage and retry: %v)", err)
 		failed := res
 		failed.Compacted = false
 		failed.CheckpointID = ""
@@ -5237,6 +5239,14 @@ func (a *Agent) persistCompactionCheckpoint(ctx context.Context, messages []llm.
 		return commit, fmt.Errorf("compaction ledger persistence failed: %w", err)
 	}
 	writer := a.compactor.Config.CheckpointWriter
+	commit.transaction = transaction
+	commit.ledgerCommitted = true
+	if writer == nil {
+		// A ledger-only runtime still commits at the publication boundary,
+		// but has no durable history checkpoint identity or acknowledgement.
+		a.compactor.FinalizePendingLedger(&commit.result)
+		return commit, nil
+	}
 	checkpoint, err := compaction.NewCompactionCheckpoint(messages, transaction)
 	if err == nil {
 		err = writer.SaveCompactionCheckpoint(ctx, checkpoint)
@@ -5300,7 +5310,7 @@ func (a *Agent) commitCompactionCheckpoint(ctx context.Context, messages []llm.M
 	if err != nil {
 		return commit.result, err
 	}
-	if commit.persisted {
+	if commit.ledgerCommitted {
 		a.compactor.FinalizePendingLedger(&commit.transaction)
 	}
 	return commit.result, nil
@@ -5547,6 +5557,9 @@ func (a *Agent) compactionRetryDelay(attempt int) time.Duration {
 }
 
 func (a *Agent) compactWithRetry(ctx context.Context, messages []llm.Message, req compaction.PipelineRequest) ([]llm.Message, compaction.Result, error) {
+	// Candidates are prepared against an earlier history snapshot. Even a
+	// ledger-only host must not observe them before source-checked publication.
+	req.DeferLedgerCommit = true
 	attempts := a.compactionMaxAttempts()
 	if attempts <= 0 {
 		attempts = 1
