@@ -85,13 +85,13 @@ func (l *Ledger) Clone() *Ledger {
 		summary := *l.Summary
 		out.Summary = &summary
 	}
-	if len(l.Replacements) > 0 {
-		out.Replacements = append([]LedgerReplacement(nil), l.Replacements...)
-		for i := range out.Replacements {
-			if l.Replacements[i].CanonicalArtifact != nil {
-				manifest := l.Replacements[i].CanonicalArtifact.Clone()
-				out.Replacements[i].CanonicalArtifact = &manifest
-			}
+	// Detach even an empty slice: it may still hold append capacity owned by
+	// the source ledger or another snapshot.
+	out.Replacements = append([]LedgerReplacement(nil), l.Replacements...)
+	for i := range out.Replacements {
+		if l.Replacements[i].CanonicalArtifact != nil {
+			manifest := l.Replacements[i].CanonicalArtifact.Clone()
+			out.Replacements[i].CanonicalArtifact = &manifest
 		}
 	}
 	return &out
