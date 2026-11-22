@@ -261,6 +261,8 @@ func (c *Container) OverrideAny(name string, provider any) {
 	defer c.mu.Unlock()
 	c.overrides[name] = provider
 	delete(c.cache, name)
+	// Existing callers retain their binding; subsequent calls resolve the override.
+	delete(c.inflight, name)
 }
 
 func Provide[T any](c *Container, key DepKey[T], p Provider[T]) { c.ProvideAny(key.Name, p) }
@@ -326,19 +328,23 @@ func Get[T any](c *Container, ctx context.Context, key DepKey[T]) (T, error) {
 	c.inflight[key.Name] = in
 	c.mu.Unlock()
 	v, err := prov(ctx)
-	if err != nil {
-		in.err = err
-		close(in.done)
-		c.mu.Lock()
+	c.mu.Lock()
+	in.err = err
+	if err == nil {
+		in.val = dependencyValue[T]{value: v}
+	}
+	// An override detaches the old call. Only the active binding may publish
+	// into the container, or retire its current in-flight entry.
+	if c.inflight[key.Name] == in {
+		if err == nil {
+			c.cache[key.Name] = in.val
+		}
 		delete(c.inflight, key.Name)
-		c.mu.Unlock()
+	}
+	close(in.done)
+	c.mu.Unlock()
+	if err != nil {
 		return zero, err
 	}
-	in.val = dependencyValue[T]{value: v}
-	close(in.done)
-	c.mu.Lock()
-	c.cache[key.Name] = in.val
-	delete(c.inflight, key.Name)
-	c.mu.Unlock()
 	return v, nil
 }
