@@ -115,10 +115,18 @@ func WithPromptEstimate(u *Usage, estimatedPrompt int) *Usage {
 		}
 		return out
 	}
-	rawPrompt := out.PromptTokens
-	rawTotal := out.TotalTokens
-	out.ProviderPromptTokens = &rawPrompt
-	out.ProviderTotalTokens = &rawTotal
+	// An earlier estimate is not a new provider observation. Retain any raw
+	// evidence already captured and leave absent observations absent.
+	if out.PromptTokensSource != PromptTokensSourceEstimate {
+		if out.ProviderPromptTokens == nil {
+			rawPrompt := out.PromptTokens
+			out.ProviderPromptTokens = &rawPrompt
+		}
+		if out.ProviderTotalTokens == nil {
+			rawTotal := out.TotalTokens
+			out.ProviderTotalTokens = &rawTotal
+		}
+	}
 	out.PromptTokens = estimatedPrompt
 	out.TotalTokens = estimatedPrompt + maxInt(out.CompletionTokens, 0)
 	out.PromptTokensValid = false
