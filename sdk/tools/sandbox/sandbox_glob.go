@@ -171,8 +171,14 @@ func resultPathForMatch(s *Sandbox, base string, abs string) string {
 func globTool() tools.Tool {
 	return tools.Func[globArgs]("glob", "Find files matching a glob pattern", func(ctx context.Context, a globArgs, deps *tools.Container) (any, error) {
 		const maxGlobResults = 50
+		if err := ctx.Err(); err != nil {
+			return "", err
+		}
 		s, err := tools.Get(deps, ctx, Key)
 		if err != nil {
+			return "", err
+		}
+		if err := ctx.Err(); err != nil {
 			return "", err
 		}
 		basePath := "."
@@ -205,6 +211,9 @@ func globTool() tools.Tool {
 		skippedDirs := []string{}
 		skipDirNames := s.searchSkipDirs()
 		walkErr := globWalkDir(base, func(path string, d os.DirEntry, walkErr error) error {
+			if err := ctx.Err(); err != nil {
+				return err
+			}
 			if walkErr != nil {
 				displayPath := resultPathForDisplay(s, path)
 				if pathsEqual(filepath.Clean(path), filepath.Clean(base)) {
@@ -291,6 +300,9 @@ func globTool() tools.Tool {
 			}
 			return nil
 		})
+		if err := ctx.Err(); err != nil {
+			return "", err
+		}
 		if walkErr != nil && !errors.Is(walkErr, errGlobScanCapReached) {
 			return "", fmt.Errorf("glob scan failed: %w", walkErr)
 		}

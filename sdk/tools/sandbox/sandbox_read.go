@@ -45,12 +45,18 @@ func validateReadNumericArgs(args readArgs) error {
 // offset/limit support, and binary file detection.
 func readTool() tools.Tool {
 	return toolWithArgs[readArgs]("read", "Read contents of a file", func(ctx context.Context, a readArgs, deps *tools.Container) (llm.Content, error) {
+		if err := ctx.Err(); err != nil {
+			return llm.TextContent(""), err
+		}
 		if err := validateReadNumericArgs(a); err != nil {
 			msg := formatErrorDiagnosticFromErr("Invalid read range", err, fmt.Sprintf("Use offset <= %d and limit <= %d, then retry.", maxReadLineOffset, maxReadLineLimit))
 			return llm.TextContent(msg), err
 		}
 		s, err := tools.Get(deps, ctx, Key)
 		if err != nil {
+			return llm.TextContent(""), err
+		}
+		if err := ctx.Err(); err != nil {
 			return llm.TextContent(""), err
 		}
 		p, err := s.resolveForAccess(a.FilePath)
@@ -84,6 +90,9 @@ func readTool() tools.Tool {
 		}
 
 		sample, err := readSampleBytes(f, binaryDetectSampleBytes)
+		if err := ctx.Err(); err != nil {
+			return llm.TextContent(""), err
+		}
 		if err != nil {
 			msg := formatErrorDiagnosticFromErr("Unable to read file sample", err, "Check file permissions and retry.")
 			return llm.TextContent(msg), err
@@ -98,6 +107,9 @@ func readTool() tools.Tool {
 			return llm.TextContent(msg), err
 		}
 		raw, err := io.ReadAll(io.LimitReader(f, maxReadFileBytes+1))
+		if err := ctx.Err(); err != nil {
+			return llm.TextContent(""), err
+		}
 		if err != nil {
 			msg := formatErrorDiagnosticFromErr("Unable to read file", err, "Check file permissions and retry.")
 			return llm.TextContent(msg), err
@@ -135,7 +147,13 @@ func readTool() tools.Tool {
 		lastLine := offset - 1
 		processed := 0
 		lineNo := 0
-		for scanner.Scan() {
+		for {
+			if err := ctx.Err(); err != nil {
+				return llm.TextContent(""), err
+			}
+			if !scanner.Scan() {
+				break
+			}
 			lineNo++
 			if lineNo < offset {
 				continue
@@ -160,6 +178,9 @@ func readTool() tools.Tool {
 			outputBytes += lineBytes
 			lastLine = lineNo
 			processed++
+		}
+		if err := ctx.Err(); err != nil {
+			return llm.TextContent(""), err
 		}
 		if err := scanner.Err(); err != nil {
 			msg := formatErrorDiagnosticFromErr("Unable to read file", err, "Check file encoding/path and retry.")
