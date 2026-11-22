@@ -143,8 +143,11 @@ func consumeAgentOutput(next func() (agent.EventEnvelope, bool), w, diag io.Writ
 	// final snapshot. Reconcile the complete text already shown at the end
 	// of the turn; partial or lost answer text still prints the snapshot.
 	var turn strings.Builder
+	var frameText strings.Builder
 	shownBeforeDone := ""
 	shownBeforeTool := ""
+	shownFrameBeforeDone := ""
+	shownFrameBeforeTool := ""
 	textFrame := ""
 	controlSource := ""
 	continueText := false
@@ -190,6 +193,7 @@ func consumeAgentOutput(next func() (agent.EventEnvelope, bool), w, diag io.Writ
 		case agent.TextDeltaEvent:
 			continuedFragment := continueText && e.Delta != ""
 			if (strings.TrimSpace(e.Delta) != "" || continuedFragment) && frameID != "" && frameID != textFrame {
+				frameText.Reset()
 				// Distinct response text can follow a text-only reminder, with
 				// no tool event in between. FrameID is the existing producer
 				// identity; tool names or warning prose cannot prove a boundary.
@@ -208,29 +212,38 @@ func consumeAgentOutput(next func() (agent.EventEnvelope, bool), w, diag io.Writ
 				continueText = false
 				shownBeforeDone = ""
 				shownBeforeTool = ""
+				shownFrameBeforeDone = ""
+				shownFrameBeforeTool = ""
 			}
 			turn.WriteString(e.Delta)
+			frameText.WriteString(e.Delta)
 			if err := write(e.Delta); err != nil {
 				return err
 			}
 		case agent.ToolCallEvent:
 			if strings.TrimSpace(turn.String()) != "" {
 				shownBeforeTool = turn.String()
+				shownFrameBeforeTool = frameText.String()
 			}
 			if e.Tool == "done" {
 				shownBeforeDone = shownBeforeTool
+				shownFrameBeforeDone = shownFrameBeforeTool
 			} else {
 				shownBeforeDone = ""
+				shownFrameBeforeDone = ""
 			}
 			turn.Reset()
+			frameText.Reset()
 			if err := endLine(); err != nil {
 				return err
 			}
 		case agent.ToolResultEvent:
 			if e.Tool != "done" || e.IsError {
 				shownBeforeDone = ""
+				shownFrameBeforeDone = ""
 			}
 			turn.Reset()
+			frameText.Reset()
 			if err := endLine(); err != nil {
 				return err
 			}
@@ -239,18 +252,26 @@ func consumeAgentOutput(next func() (agent.EventEnvelope, bool), w, diag io.Writ
 		case agent.FinalResponseEvent:
 			content := e.Content
 			shownText := strings.TrimSpace(turn.String())
+			shownFrame := strings.TrimSpace(frameText.String())
 			if shownText == "" {
 				shownText = strings.TrimSpace(shownBeforeDone)
+				shownFrame = strings.TrimSpace(shownFrameBeforeDone)
 			}
 			if shownText == "" {
 				shownText = strings.TrimSpace(shownBeforeTool)
+				shownFrame = strings.TrimSpace(shownFrameBeforeTool)
+			}
+			matchesShown := func(text string) bool {
+				// Compare complete displayed answers. A frame can replace an
+				// abandoned continuation; an arbitrary text suffix is not proof.
+				return text != "" && (shownText == text || shownFrame == text)
 			}
 			finalText := strings.TrimSpace(content)
-			shown := finalText != "" && strings.HasSuffix(shownText, finalText)
+			shown := matchesShown(finalText)
 			// A retained answer followed by a completion paragraph extends text
 			// already shown. Print only the new paragraph.
 			for boundary := strings.LastIndex(finalText, "\n\n"); boundary > 0; boundary = strings.LastIndex(finalText[:boundary], "\n\n") {
-				if strings.HasSuffix(shownText, finalText[:boundary]) {
+				if matchesShown(finalText[:boundary]) {
 					content = finalText[boundary+2:]
 					break
 				}
