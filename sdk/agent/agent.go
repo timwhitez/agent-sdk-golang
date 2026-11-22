@@ -712,6 +712,7 @@ func (a *Agent) queryStreamWithSteering(ctx context.Context, input llm.Content, 
 
 		if a.compactionInFlight.Load() {
 			if err := a.waitForCompactionIdle(ctx, out); err != nil {
+				a.emitEventFrom(out, a.errEvent(err), EventOriginSDKDriver)
 				return
 			}
 		}
