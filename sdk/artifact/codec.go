@@ -30,6 +30,9 @@ func (JSONEnvelopeCodec) Encode(envelope Envelope, budget Budget) (string, Envel
 	if err := envelope.Validate(); err != nil {
 		return "", Envelope{}, err
 	}
+	if !utf8.ValidString(envelope.Preview) {
+		return "", Envelope{}, fmt.Errorf("artifact envelope encode: preview must be valid UTF-8")
+	}
 	estimate := budget.EstimateTokens
 	estimate = safeTokenEstimator(estimate)
 
@@ -159,6 +162,13 @@ func (JSONEnvelopeCodec) Decode(text string) (Envelope, bool, error) {
 	}
 	if err := envelope.Validate(); err != nil {
 		return Envelope{}, true, err
+	}
+	visible := envelope.Manifest.VisibleMeasurement
+	if visible.Bytes != nil && *visible.Bytes != int64(len(envelope.Preview)) {
+		return Envelope{}, true, fmt.Errorf("artifact envelope decode: visible byte count does not match preview")
+	}
+	if hash := strings.TrimSpace(visible.SHA256); hash != "" && hash != DigestSHA256([]byte(envelope.Preview)) {
+		return Envelope{}, true, fmt.Errorf("artifact envelope decode: visible sha256 does not match preview")
 	}
 	return envelope, true, nil
 }
