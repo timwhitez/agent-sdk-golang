@@ -329,6 +329,11 @@ func (r *localReducer) isPrune() bool {
 }
 
 func (r *localReducer) reduceToolMessage(index int, msg llm.Message) (LedgerReplacement, string, bool) {
+	// Protection applies to existing previews as well as original output. A
+	// restored ledger must not bypass the current service's protection policy.
+	if index >= r.protectedFrom || msg.Destroyed || isProtectedTool(msg.ToolName, r.service.protectedTools) {
+		return LedgerReplacement{}, "", false
+	}
 	if r.isPrune() {
 		text := msg.Content.PlainText()
 		if parent, ok := r.findReplacementByText(text, msg); ok {
