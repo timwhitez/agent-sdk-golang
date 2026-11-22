@@ -95,8 +95,9 @@ func (t Tool) PrepareCall(argsJSON string) (PreparedCall, ToolArgsNormalization)
 // sealed decoder accepted when the call was prepared. Execution consumes that
 // same decoded object unless a wrapper changes the bytes it forwards (see
 // FinalArgsOutcome). ok is false for tools without a sealed decoder, types
-// with custom decoders and arguments that do not decode. The view is
-// observation only; it neither authorizes effects nor proves independence.
+// with custom JSON/Text codecs or omitzero IsZero hooks, and arguments that do
+// not decode. The view is observation only; it neither authorizes effects nor
+// proves independence.
 func (p PreparedCall) FinalArgs() (json.RawMessage, bool) {
 	if p.final == nil {
 		return nil, false
