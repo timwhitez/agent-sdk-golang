@@ -23,6 +23,12 @@ func (s *Service) CompactPipeline(ctx context.Context, model llm.ChatModel, mess
 }
 
 func (s *Service) compactPipelineWithDeferredLedger(ctx context.Context, model llm.ChatModel, messages []llm.Message, req PipelineRequest) ([]llm.Message, Result, error) {
+	return s.compactWithDeferredLedger(ctx, messages, func(tx *Service) ([]llm.Message, Result, error) {
+		return tx.compactPipeline(ctx, model, messages, req)
+	})
+}
+
+func (s *Service) compactWithDeferredLedger(ctx context.Context, messages []llm.Message, compact func(*Service) ([]llm.Message, Result, error)) ([]llm.Message, Result, error) {
 	sessionID := strings.TrimSpace(s.Config.SessionID)
 	previous, loadWarnings, err := s.loadLedger(ctx, sessionID)
 	if err != nil {
@@ -37,7 +43,7 @@ func (s *Service) compactPipelineWithDeferredLedger(ctx context.Context, model l
 	// recursively starting another deferred transaction.
 	tx.Config.CheckpointWriter = nil
 
-	out, res, err := tx.compactPipeline(ctx, model, messages, req)
+	out, res, err := compact(&tx)
 	if len(loadWarnings) > 0 {
 		res.Warnings = append(append([]string(nil), loadWarnings...), res.Warnings...)
 	}
