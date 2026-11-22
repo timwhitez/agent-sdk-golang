@@ -2,6 +2,7 @@ package sandbox
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -237,7 +238,26 @@ func grepTool() tools.Tool {
 				recordScanFailure(path, "seek", err)
 				return nil
 			}
-			scanner := bufio.NewScanner(f)
+			var textReader io.Reader = f
+			if _, hasBOM := detectUnicodeTextEncoding(sample); hasBOM {
+				// Reuse read's Unicode contract without unboundedly buffering large files.
+				raw, err := io.ReadAll(io.LimitReader(f, maxReadFileBytes+1))
+				if err != nil {
+					recordScanFailure(path, "read", err)
+					return nil
+				}
+				if int64(len(raw)) > maxReadFileBytes {
+					recordScanFailure(path, "decode", fmt.Errorf("Unicode text exceeds %d byte decoding limit", maxReadFileBytes))
+					return nil
+				}
+				decoded, err := decodeUnicodeTextBOM(raw)
+				if err != nil {
+					recordScanFailure(path, "decode", err)
+					return nil
+				}
+				textReader = bytes.NewReader(decoded)
+			}
+			scanner := bufio.NewScanner(textReader)
 			scannerBuf := make([]byte, 0, 64*1024)
 			scanner.Buffer(scannerBuf, 1024*1024)
 			type prevLine struct {
