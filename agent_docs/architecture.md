@@ -74,6 +74,9 @@ promise about arbitrary host goroutines.
   serialization may still transform the outgoing copy.
 - Partial continuation calls are not accepted Tool Blocks. Finalized calls use
   the finalizing Frame's dispatch context; their content can have multiple sources.
+  Every query exit retires unfinished continuation calls and their opaque provider
+  state before releasing query ownership, including exits before the continuation
+  reminder is published. Visible partial content and earlier completed blocks remain.
 - Provider Call IDs may repeat across blocks. The sequential block authority uses
   ordinal/state transitions, one history writer, and one-time publication claims.
   A claimed/persisted result is not proof that its event was delivered.
