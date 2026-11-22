@@ -827,14 +827,20 @@ func (a *Agent) queryStreamWithSteering(ctx context.Context, input llm.Content, 
 		var activeToolBlock *toolBlockState
 		var activeToolBlockCorrelation eventCorrelation
 		var pendingBlockMessages []llm.Message
+		var pendingBlockSteering []llm.Message
 		blockFailed := false
 		commitToolHistory := func(messages []llm.Message) { a.appendMessages(messages) }
+		flushPendingBlockMessages := func() {
+			a.appendMessages(pendingBlockMessages)
+			steering := pendingBlockSteering
+			pendingBlockMessages, pendingBlockSteering = nil, nil
+			a.emitSteeringReceived(out, steering)
+		}
 		failToolBlock := func(err error) bool {
 			if !blockFailed {
 				blockFailed = true
 				commitToolHistory(activeToolBlock.abortOpen())
-				a.appendMessages(pendingBlockMessages)
-				pendingBlockMessages = nil
+				flushPendingBlockMessages()
 				message := "Tool lifecycle validation failed; remaining calls closed without further execution"
 				var transition *toolBlockTransitionError
 				if errors.As(err, &transition) {
@@ -1587,7 +1593,7 @@ func (a *Agent) queryStreamWithSteering(ctx context.Context, input llm.Content, 
 				failToolBlock(err)
 				return
 			}
-			pendingBlockMessages = nil
+			pendingBlockMessages, pendingBlockSteering = nil, nil
 			// blockSteering reports that pendingBlockMessages holds accepted
 			// user steering; it enters history only when the block closes.
 			blockSteering := false
@@ -1948,7 +1954,7 @@ func (a *Agent) queryStreamWithSteering(ctx context.Context, input llm.Content, 
 						requireDoneRecoveryDisableThinkingActive = false
 						requireDoneControlSource = ""
 					}
-					steeringMessages := a.collectSteering(steeringCh, out)
+					steeringMessages := a.collectSteering(steeringCh)
 					blockSteering = blockSteering || len(steeringMessages) > 0
 					if len(steeringMessages) > 0 || outcome.Interrupted {
 						requireDoneReminders = 0
@@ -1958,6 +1964,7 @@ func (a *Agent) queryStreamWithSteering(ctx context.Context, input llm.Content, 
 						pendingRequireDoneFinalText = ""
 						pendingRequireDoneFinalResponseID = ""
 						pendingBlockMessages = append(pendingBlockMessages, steeringMessages...)
+						pendingBlockSteering = append(pendingBlockSteering, steeringMessages...)
 						return BlockSteering
 					}
 					return BlockContinue
@@ -1983,14 +1990,12 @@ func (a *Agent) queryStreamWithSteering(ctx context.Context, input llm.Content, 
 				return
 			}
 			if stop == BlockRootBeforeStart || stop == BlockRootAfterHandler || stop == BlockRootAfterDone {
-				a.appendMessages(pendingBlockMessages)
-				pendingBlockMessages = nil
+				flushPendingBlockMessages()
 				emitSDKErr(a.errEvent(ctx.Err()))
 				return
 			}
 			if stop == BlockDone {
-				a.appendMessages(pendingBlockMessages)
-				pendingBlockMessages = nil
+				flushPendingBlockMessages()
 				if a.hasCompactor {
 					_ = a.checkAndCompact(ctx, frame.id, comp, out, additionalSinceCompletion())
 				}
@@ -2017,8 +2022,7 @@ func (a *Agent) queryStreamWithSteering(ctx context.Context, input llm.Content, 
 			if !finishToolBlock() {
 				return
 			}
-			a.appendMessages(pendingBlockMessages)
-			pendingBlockMessages = nil
+			flushPendingBlockMessages()
 			if blockSteering {
 				// The block is closed and the steering is now in history.
 				pendingSteeringSource = frame.id
@@ -5917,20 +5921,21 @@ func errEventForModel(err error, model llm.ChatModel) ErrorEvent {
 // The function returns immediately if the channel is nil or empty.
 // Each received message triggers a SteeringReceivedEvent to notify the CLI layer.
 func (a *Agent) drainSteering(ch <-chan SteeringMsg, out *eventOutput) int {
-	messages := a.collectSteering(ch, out)
+	messages := a.collectSteering(ch)
 	if len(messages) == 0 {
 		return 0
 	}
 	a.appendMessages(messages)
+	a.emitSteeringReceived(out, messages)
 	return len(messages)
 }
 
-// collectSteering drains the pending steering messages and emits their events
-// without appending them to history. Callers that are in the middle of an
+// collectSteering drains pending steering without acknowledging it or
+// appending it to history. Callers that are in the middle of an
 // assistant tool-call block must first complete the tool_result block and only
 // then append the returned messages: a provider rejects a tool_use block whose
 // tool results are interleaved with user text.
-func (a *Agent) collectSteering(ch <-chan SteeringMsg, out *eventOutput) []llm.Message {
+func (a *Agent) collectSteering(ch <-chan SteeringMsg) []llm.Message {
 	if ch == nil {
 		return nil
 	}
@@ -5945,7 +5950,13 @@ func (a *Agent) collectSteering(ch <-chan SteeringMsg, out *eventOutput) []llm.M
 			Content: llm.TextContent(msg.Content),
 		})
 		a.userInputEpoch.Add(1)
-		a.emitEvent(out, SteeringReceivedEvent{Content: msg.Content})
+	}
+}
+
+// emitSteeringReceived acknowledges only steering already committed to history.
+func (a *Agent) emitSteeringReceived(out *eventOutput, messages []llm.Message) {
+	for _, message := range messages {
+		a.emitEvent(out, SteeringReceivedEvent{Content: message.PlainText()})
 	}
 }
 
