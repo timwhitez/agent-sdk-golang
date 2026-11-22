@@ -57,11 +57,7 @@ func (r *localReducer) canonicalArtifactForContent(msg llm.Message, kind artifac
 	if err != nil {
 		return artifact.Manifest{}, compactionArtifactBindingStage, err
 	}
-	codec := r.service.Config.ArtifactEnvelopeCodec
-	if codec == nil {
-		codec = artifact.JSONEnvelopeCodec{}
-	}
-	envelope, found, err := codec.Decode(content)
+	envelope, found, err := r.decodeCanonicalEnvelope(content)
 	if found {
 		if err != nil {
 			return artifact.Manifest{}, compactionArtifactValidateStage, err
@@ -103,6 +99,23 @@ func (r *localReducer) canonicalArtifactForContent(msg llm.Message, kind artifac
 		return artifact.Manifest{}, compactionArtifactValidateStage, err
 	}
 	return resolved, "", nil
+}
+
+func (r *localReducer) decodeCanonicalEnvelope(content string) (artifact.Envelope, bool, error) {
+	codec := r.service.Config.ArtifactEnvelopeCodec
+	if codec == nil {
+		codec = artifact.JSONEnvelopeCodec{}
+	}
+	switch codec.(type) {
+	case artifact.JSONEnvelopeCodec, *artifact.JSONEnvelopeCodec:
+		// Source files and tool output may quote the marker text. Only the
+		// complete default frame is an envelope; custom codecs retain their
+		// own recognition rules.
+		if !artifact.IsFramedEnvelope(content) {
+			return artifact.Envelope{}, false, nil
+		}
+	}
+	return codec.Decode(content)
 }
 
 func (r *localReducer) canonicalArtifactOwner(msg llm.Message) (artifact.Owner, error) {
@@ -154,11 +167,7 @@ func (r *localReducer) validateCanonicalReplacement(msg llm.Message, replacement
 	}
 	var exactContent []byte
 	if len(source) > 0 {
-		codec := r.service.Config.ArtifactEnvelopeCodec
-		if codec == nil {
-			codec = artifact.JSONEnvelopeCodec{}
-		}
-		envelope, found, err := codec.Decode(source[0])
+		envelope, found, err := r.decodeCanonicalEnvelope(source[0])
 		if err == nil && found {
 			err = envelope.Validate()
 			if err == nil && !canonicalManifestIdentityEqual(envelope.Manifest, *replacement.CanonicalArtifact) {
