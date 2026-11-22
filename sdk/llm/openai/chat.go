@@ -486,6 +486,11 @@ func (c *ChatClient) InvokeStream(ctx context.Context, req llm.InvokeRequest) (<
 					out <- llm.StreamUsageEvent{Usage: *u}
 				}
 				for _, ch := range r.Choices {
+					// The SDK exposes one completion, matching buffered choice 0.
+					// Other choices have independent text, tools and finish reasons.
+					if ch.Index != 0 {
+						continue
+					}
 					if ch.FinishReason != "" {
 						stopReason = normalizeOpenAIStopReason(ch.FinishReason)
 					}
@@ -546,6 +551,7 @@ func (c *ChatClient) InvokeStream(ctx context.Context, req llm.InvokeRequest) (<
 type chatCompletionStreamResponse struct {
 	ID      string `json:"id"`
 	Choices []struct {
+		Index int `json:"index"`
 		Delta struct {
 			Content          string              `json:"content"`
 			Refusal          string              `json:"refusal"`
@@ -1803,6 +1809,7 @@ type legacyFunctionCall struct {
 type chatCompletionResponse struct {
 	ID      string `json:"id"`
 	Choices []struct {
+		Index   int `json:"index"`
 		Message struct {
 			Role             string              `json:"role"`
 			Content          json.RawMessage     `json:"content"`
@@ -1951,7 +1958,18 @@ func parseChatCompletion(data []byte) (*llm.Completion, error) {
 	if len(r.Choices) == 0 {
 		return nil, fmt.Errorf("openai: empty choices")
 	}
-	msg := r.Choices[0].Message
+	choiceIndex := -1
+	for i := range r.Choices {
+		if r.Choices[i].Index == 0 {
+			choiceIndex = i
+			break
+		}
+	}
+	if choiceIndex < 0 {
+		return nil, fmt.Errorf("openai: missing choice index 0")
+	}
+	choice := r.Choices[choiceIndex]
+	msg := choice.Message
 
 	content, err := parseChatMessageContent(msg.Content, msg.Refusal)
 	if err != nil {
@@ -1965,7 +1983,7 @@ func parseChatCompletion(data []byte) (*llm.Completion, error) {
 
 	usage := parseUsage(r.Usage)
 
-	stopReason := normalizeOpenAIStopReason(r.Choices[0].FinishReason)
+	stopReason := normalizeOpenAIStopReason(choice.FinishReason)
 
 	thinking := strings.TrimSpace(msg.ReasoningContent)
 	if thinking == "" {
