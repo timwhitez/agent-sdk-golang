@@ -47,6 +47,9 @@ func NewCompactionCheckpoint(messages []llm.Message, res Result) (CompactionChec
 	}
 	checkpoint.CheckpointID = id
 	checkpoint.Result.CheckpointID = id
+	if err := checkpoint.Validate(); err != nil {
+		return CompactionCheckpoint{}, err
+	}
 	return checkpoint, nil
 }
 
