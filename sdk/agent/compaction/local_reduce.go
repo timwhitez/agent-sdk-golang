@@ -26,6 +26,17 @@ const (
 var truncationArtifactRe = regexp.MustCompile(`(?i)(?:saved to\s+|full output:\s*|full_output=\s*)([^\]\s]+(?:/|\\)truncated(?:/|\\)[^\]\s]+)`)
 
 func (s *Service) CompactLocal(ctx context.Context, messages []llm.Message, usage *llm.Usage) ([]llm.Message, Result, error) {
+	if s == nil || !s.Config.Enabled || len(messages) == 0 {
+		return messages, Result{Compacted: false}, nil
+	}
+	if ctx != nil && ctx.Err() != nil {
+		return messages, Result{Compacted: false}, ctx.Err()
+	}
+	if s.Config.LedgerStore != nil && s.Config.CheckpointWriter != nil {
+		return s.compactWithDeferredLedger(ctx, messages, func(tx *Service) ([]llm.Message, Result, error) {
+			return tx.compactLocalWithWatermark(ctx, messages, usage, "")
+		})
+	}
 	return s.compactLocalWithWatermark(ctx, messages, usage, "")
 }
 
