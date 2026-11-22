@@ -295,7 +295,11 @@ func Get[T any](c *Container, ctx context.Context, key DepKey[T]) (T, error) {
 	}
 	if in, ok := c.inflight[key.Name]; ok {
 		c.mu.Unlock()
-		<-in.done
+		select {
+		case <-ctx.Done():
+			return zero, ctx.Err()
+		case <-in.done:
+		}
 		if in.err != nil {
 			return zero, in.err
 		}
