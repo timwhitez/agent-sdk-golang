@@ -2054,6 +2054,15 @@ func (a *Agent) queryStreamWithSteering(ctx context.Context, input llm.Content, 
 
 		// Max iterations reached — emit both error and final events.
 		// Unreachable when maxIterations < 0 (unlimited).
+		if cont.hasPending() {
+			a.discardContinuationToolCalls(&cont, nil)
+			// No following request will consume the last continuation reminder.
+			a.mu.Lock()
+			if n := len(a.messages); n > 0 && a.messages[n-1].Role == llm.RoleUser && a.messages[n-1].Name == messageorigin.Name(messageorigin.KindToolCallContinuation) {
+				a.messages = a.messages[:n-1]
+			}
+			a.mu.Unlock()
+		}
 		msg := fmt.Sprintf("Max iterations reached (%d)", a.maxIterations)
 		emitErr(ErrorEvent{Provider: a.llm.Provider(), Message: msg, Kind: "max_iterations"}, EventOriginSDKDriver)
 		emitFinal(fmt.Sprintf("[Max iterations reached] %d", a.maxIterations), lastResponseID)
