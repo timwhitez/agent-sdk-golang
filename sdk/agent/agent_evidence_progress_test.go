@@ -157,7 +157,7 @@ func TestEvidenceProgressDoesNotCacheStateChangingTools(t *testing.T) {
 func TestEvidenceProgressAllowsOneRevalidationAfterCompaction(t *testing.T) {
 	ledger := newEvidenceProgressLedger(nil, 0)
 	raw := json.RawMessage(`{"filePath":"a.go","offset":1,"limit":10}`)
-	req, ok := newEvidenceRequest("read", raw, string(raw), nil)
+	req, ok := newEvidenceRequest(t.Context(), "read", raw, string(raw), nil)
 	if !ok {
 		t.Fatal("read request not classified")
 	}
@@ -187,11 +187,11 @@ func TestEvidenceProgressAllowsOneRevalidationAfterCompaction(t *testing.T) {
 }
 
 func TestEvidenceProgressCanonicalizesReadAliasesAndRanges(t *testing.T) {
-	first, ok := newEvidenceRequest("read", json.RawMessage(`{"filePath":"./a.go","offset":1,"limit":20}`), "", nil)
+	first, ok := newEvidenceRequest(t.Context(), "read", json.RawMessage(`{"filePath":"./a.go","offset":1,"limit":20}`), "", nil)
 	if !ok {
 		t.Fatal("read not classified")
 	}
-	second, ok := newEvidenceRequest("read_file", json.RawMessage(`{"filePath":"a.go","offset":2,"limit":5}`), "", nil)
+	second, ok := newEvidenceRequest(t.Context(), "read_file", json.RawMessage(`{"filePath":"a.go","offset":2,"limit":5}`), "", nil)
 	if !ok {
 		t.Fatal("read_file not classified")
 	}
@@ -208,11 +208,11 @@ func TestEvidenceProgressCanonicalizesReadAliasesAndRanges(t *testing.T) {
 }
 
 func TestEvidenceProgressSeparatesByteRangeFromLineRange(t *testing.T) {
-	line, ok := newEvidenceRequest("read", json.RawMessage(`{"filePath":"a.go","offset":1,"limit":2000}`), "", nil)
+	line, ok := newEvidenceRequest(t.Context(), "read", json.RawMessage(`{"filePath":"a.go","offset":1,"limit":2000}`), "", nil)
 	if !ok {
 		t.Fatal("line read not classified")
 	}
-	byteRange, ok := newEvidenceRequest("read", json.RawMessage(`{"filePath":"a.go","byte_offset":0,"byte_limit":64}`), "", nil)
+	byteRange, ok := newEvidenceRequest(t.Context(), "read", json.RawMessage(`{"filePath":"a.go","byte_offset":0,"byte_limit":64}`), "", nil)
 	if !ok {
 		t.Fatal("byte read not classified")
 	}
@@ -232,15 +232,15 @@ func TestEvidenceProgressSeparatesByteRangeFromLineRange(t *testing.T) {
 }
 
 func TestEvidenceProgressByteRangeCoverageAcrossAliases(t *testing.T) {
-	first, ok := newEvidenceRequest("read", json.RawMessage(`{"filePath":"./a.go","byte_offset":0,"byte_limit":64}`), "", nil)
+	first, ok := newEvidenceRequest(t.Context(), "read", json.RawMessage(`{"filePath":"./a.go","byte_offset":0,"byte_limit":64}`), "", nil)
 	if !ok {
 		t.Fatal("first byte read not classified")
 	}
-	distinct, ok := newEvidenceRequest("read_file", json.RawMessage(`{"filePath":"a.go","byte_offset":64,"byte_limit":64}`), "", nil)
+	distinct, ok := newEvidenceRequest(t.Context(), "read_file", json.RawMessage(`{"filePath":"a.go","byte_offset":64,"byte_limit":64}`), "", nil)
 	if !ok {
 		t.Fatal("distinct byte read alias not classified")
 	}
-	covered, ok := newEvidenceRequest("read_file", json.RawMessage(`{"filePath":"a.go","byte_offset":16,"byte_limit":16}`), "", nil)
+	covered, ok := newEvidenceRequest(t.Context(), "read_file", json.RawMessage(`{"filePath":"a.go","byte_offset":16,"byte_limit":16}`), "", nil)
 	if !ok {
 		t.Fatal("covered byte read alias not classified")
 	}
@@ -267,7 +267,7 @@ func TestEvidenceProgressByteRangeCoverageAcrossAliases(t *testing.T) {
 func TestEvidenceProgressByteRangeAllowsOneRevalidationAfterCompaction(t *testing.T) {
 	ledger := newEvidenceProgressLedger(nil, 0)
 	raw := json.RawMessage(`{"filePath":"a.go","byte_offset":1048576,"byte_limit":16384}`)
-	req, ok := newEvidenceRequest("read_file", raw, string(raw), nil)
+	req, ok := newEvidenceRequest(t.Context(), "read_file", raw, string(raw), nil)
 	if !ok {
 		t.Fatal("byte read request not classified")
 	}
@@ -295,7 +295,7 @@ func TestEvidenceProgressByteRangeResetsAfterTargetStateChange(t *testing.T) {
 	}
 	ledger := newEvidenceProgressLedger(nil, 0)
 	raw := json.RawMessage(fmt.Sprintf(`{"filePath":%q,"byte_offset":0,"byte_limit":5}`, path))
-	first, ok := newEvidenceRequest("read", raw, string(raw), nil)
+	first, ok := newEvidenceRequest(t.Context(), "read", raw, string(raw), nil)
 	if !ok {
 		t.Fatal("byte read request not classified")
 	}
@@ -307,7 +307,7 @@ func TestEvidenceProgressByteRangeResetsAfterTargetStateChange(t *testing.T) {
 	if err := os.WriteFile(path, []byte("second and larger"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	changed, ok := newEvidenceRequest("read_file", raw, string(raw), nil)
+	changed, ok := newEvidenceRequest(t.Context(), "read_file", raw, string(raw), nil)
 	if !ok {
 		t.Fatal("changed byte read alias not classified")
 	}
@@ -335,7 +335,7 @@ func TestEvidenceProgressAllowsReadAfterExternalTargetChange(t *testing.T) {
 	}
 	ledger := newEvidenceProgressLedger(nil, 0)
 	raw := json.RawMessage(fmt.Sprintf(`{"filePath":%q,"offset":1,"limit":10}`, path))
-	first, ok := newEvidenceRequest("read", raw, string(raw), nil)
+	first, ok := newEvidenceRequest(t.Context(), "read", raw, string(raw), nil)
 	if !ok {
 		t.Fatal("read request not classified")
 	}
@@ -347,7 +347,7 @@ func TestEvidenceProgressAllowsReadAfterExternalTargetChange(t *testing.T) {
 	if err := os.WriteFile(path, []byte("two and larger\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	changed, ok := newEvidenceRequest("read", raw, string(raw), nil)
+	changed, ok := newEvidenceRequest(t.Context(), "read", raw, string(raw), nil)
 	if !ok {
 		t.Fatal("changed read request not classified")
 	}

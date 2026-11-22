@@ -1671,7 +1671,7 @@ func (a *Agent) queryStreamWithSteering(ctx context.Context, input llm.Content, 
 						shadowPlan = a.toolPlanShadowEvaluator(planningObservation)
 					}
 					a.observeToolCallPlan(legacyPlan, shadowPlan)
-					c.evidenceReq, c.evidenceTool = newEvidenceRequest(c.resolvedName, norm.Normalized, execArgs, a.deps)
+					c.evidenceReq, c.evidenceTool = newEvidenceRequest(root, c.resolvedName, norm.Normalized, execArgs, a.deps)
 					if !strings.EqualFold(strings.TrimSpace(c.resolvedName), "done") {
 						pendingRequireDoneFinalText = ""
 						pendingRequireDoneFinalResponseID = ""
