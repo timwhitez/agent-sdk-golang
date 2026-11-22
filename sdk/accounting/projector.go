@@ -61,6 +61,8 @@ func ProjectToolResult(input ToolResultInput, estimator Estimator) Payload {
 	return payload
 }
 
+// ProjectUsage projects counts without recomputing them. An optional estimator
+// must identify the algorithm that actually produced the effective prompt count.
 func ProjectUsage(usage llm.Usage, estimators ...Estimator) Payload {
 	payload := Payload{
 		SchemaVersion: SchemaVersion,
@@ -102,6 +104,8 @@ func ProjectUsage(usage llm.Usage, estimators ...Estimator) Payload {
 	return payload
 }
 
+// ProjectCompaction projects existing counts. Supply an estimator only when its
+// identity is known to describe the algorithm that produced those counts.
 func ProjectCompaction(result compaction.Result, estimator Estimator) Payload {
 	payload := Payload{
 		SchemaVersion: SchemaVersion,

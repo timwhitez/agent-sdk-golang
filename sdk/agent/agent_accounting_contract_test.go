@@ -92,6 +92,9 @@ func TestAgentEmitsOneAccountingEventPerUsageAndToolResult(t *testing.T) {
 				usageAccountingCount++
 			case sdkaccounting.EventKindToolResult:
 				toolAccountingIndex = i
+				if e.Payload.Estimator == nil || e.Payload.Estimator.PolicyHash != estimator.PolicyHash {
+					t.Fatalf("actual tool-result estimator provenance missing: %#v", e.Payload.Estimator)
+				}
 				if e.ToolCallID != "call-accounting-1" {
 					t.Fatalf("tool correlation = %#v", e)
 				}
@@ -117,7 +120,7 @@ func TestAgentEmitsOneAccountingEventPerUsageAndToolResult(t *testing.T) {
 	}
 }
 
-func TestAgentUsageAccountingPinsConfiguredEstimatorForEstimatedPrompt(t *testing.T) {
+func TestAgentUsageAccountingDoesNotAttributeAnUnrelatedEstimator(t *testing.T) {
 	estimator := sdkaccounting.Estimator{
 		Name:       "fixture_estimator",
 		Version:    "2",
@@ -136,7 +139,7 @@ func TestAgentUsageAccountingPinsConfiguredEstimatorForEstimatedPrompt(t *testin
 		if !ok || accountingEvent.Payload.EventKind != sdkaccounting.EventKindProviderUsage {
 			continue
 		}
-		if accountingEvent.Payload.Estimator == nil || accountingEvent.Payload.Estimator.PolicyHash != estimator.PolicyHash {
+		if accountingEvent.Payload.Estimator != nil {
 			t.Fatalf("estimated usage accounting estimator = %#v", accountingEvent.Payload.Estimator)
 		}
 		return
