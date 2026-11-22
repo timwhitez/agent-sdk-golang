@@ -19,10 +19,41 @@ const (
 	artifactDecodeFailureStage     = "artifact_decode"
 	artifactCodecFailureStage      = "artifact_codec"
 	artifactLineageFailureStage    = "artifact_lineage"
+	artifactProjectionFailureStage = "artifact_projection"
+	artifactProjectionAction       = "return_single_text_block_with_attachments"
 )
 
-func (a *Agent) applyToolResultBoundary(ctx context.Context, content llm.Content, meta map[string]any, toolName, toolCallID string) (llm.Content, map[string]any) {
+func (a *Agent) applyToolResultBoundary(ctx context.Context, content llm.Content, meta map[string]any, toolName, toolCallID string) (result llm.Content, resultMeta map[string]any) {
+	content, multipleTextBlocks, mixedTextAndBlocks := toolResultTextLayout(content)
 	plain := content.PlainText()
+	// Every text rewrite, including an error fallback, passes through the same
+	// projection. Attachments are never part of the text/plain archive and must
+	// retain their positions and independent ownership in the visible content.
+	defer func() {
+		text := result.PlainText()
+		if text == plain && !mixedTextAndBlocks {
+			result = llm.CloneContent(content)
+			return
+		}
+		if multipleTextBlocks || mixedTextAndBlocks {
+			diagnostic := toolResultFallbackDiagnostic(artifactProjectionFailureStage, artifactProjectionAction)
+			result = projectToolResultPrefix(content, text, diagnostic)
+			// PlainText ignores whitespace-only parts. If that changes the input
+			// to a custom estimator, keep only the bounded diagnostic rather than
+			// accidentally exceeding the aggregate text budget.
+			if a.toolResultExceedsBudget(result.PlainText()) {
+				diagnosticOnly := boundedToolResultFallback("", diagnostic, a.toolResultArtifactBudget())
+				result = projectToolResultPrefix(content, diagnosticOnly, diagnostic)
+			}
+			resultMeta = cloneToolResultMetadata(resultMeta)
+			resultMeta["result_bytes"] = len(result.PlainText())
+			return
+		}
+		result = replaceToolResultText(content, text)
+	}()
+	if mixedTextAndBlocks {
+		return a.nonRecoverableToolResultFallback(plain, withoutArtifactSourceManifests(meta), artifactProjectionFailureStage, artifactProjectionAction, fmt.Errorf("tool result combines Text and visible Blocks"))
+	}
 	codec := a.artifactEnvelopeCodec
 	if codec == nil {
 		codec = artifact.JSONEnvelopeCodec{}
@@ -42,6 +73,13 @@ func (a *Agent) applyToolResultBoundary(ctx context.Context, content llm.Content
 	}
 	if decode {
 		decoded, found, decodeErr = codec.Decode(plain)
+	}
+	_, hasSourceMetadata := meta[artifact.SourceManifestsMetadataKey]
+	if multipleTextBlocks && (found || hasSourceMetadata || a.toolResultExceedsBudget(plain)) {
+		// Joining text parts loses their relationship to intervening attachments.
+		// Until canonical objects describe that layout, preserve only in-place
+		// prefixes with an explicit non-recoverable diagnostic, without a sink write.
+		return a.nonRecoverableToolResultFallback(plain, withoutArtifactSourceManifests(meta), artifactProjectionFailureStage, artifactProjectionAction, fmt.Errorf("tool result has multiple text blocks"))
 	}
 	if found {
 		if decodeErr != nil {
@@ -126,6 +164,83 @@ func (a *Agent) applyToolResultBoundary(ctx context.Context, content llm.Content
 		return a.nonRecoverableToolResultFallback(plain, meta, artifactCodecFailureStage, "increase_budget_or_shorten_fixed_recovery_fields", err)
 	}
 	return llm.TextContent(encoded), projectArtifactManifestMetadata(meta, normalized.Manifest, len(plain), len(encoded), a.maxToolResultBytes)
+}
+
+// toolResultTextLayout makes an invalid mixed Text/Blocks value explicit: its
+// Text field becomes a leading text part so neither representation is ignored.
+// The caller always degrades this form instead of claiming a canonical object.
+func toolResultTextLayout(content llm.Content) (llm.Content, bool, bool) {
+	textBlocks, visibleBlocks := 0, 0
+	for _, block := range content.Blocks {
+		if !llm.IsProviderStateBlock(block) {
+			visibleBlocks++
+		}
+		if block.Type == "text" {
+			textBlocks++
+		}
+	}
+	mixed := content.Text != "" && visibleBlocks > 0
+	if mixed {
+		blocks := make([]llm.ContentBlock, len(content.Blocks)+1)
+		blocks[0] = llm.ContentBlock{Type: "text", Text: content.Text}
+		copy(blocks[1:], content.Blocks)
+		content.Text, content.Blocks = "", blocks
+		textBlocks++
+	}
+	return content, textBlocks > 1, mixed
+}
+
+func replaceToolResultText(content llm.Content, text string) llm.Content {
+	out := llm.WithoutProviderState(content)
+	for i := range out.Blocks {
+		if out.Blocks[i].Type == "text" {
+			out.Blocks[i].Text = text
+			return out
+		}
+	}
+	if len(out.Blocks) == 0 {
+		out.Text = text
+	} else {
+		out.Blocks = append(out.Blocks, llm.ContentBlock{Type: "text", Text: text})
+	}
+	return out
+}
+
+// projectToolResultPrefix maps a bounded PlainText prefix back to its original
+// text slots; it never moves text across an attachment. The diagnostic occupies
+// the last text slot, and all non-text blocks retain their order and data.
+func projectToolResultPrefix(content llm.Content, bounded, diagnostic string) llm.Content {
+	out := llm.WithoutProviderState(content)
+	remaining, notice := "", bounded
+	if prefix, ok := strings.CutSuffix(bounded, "\n"+diagnostic); ok {
+		remaining, notice = prefix, diagnostic
+	}
+	lastText, seenText := -1, false
+	for i := range out.Blocks {
+		block := &out.Blocks[i]
+		if block.Type != "text" {
+			continue
+		}
+		original := block.Text
+		block.Text = ""
+		lastText = i
+		if strings.TrimSpace(original) == "" {
+			continue
+		}
+		if seenText && len(remaining) > 0 {
+			remaining = strings.TrimPrefix(remaining, "\n")
+		}
+		seenText = true
+		length := min(len(original), len(remaining))
+		block.Text, remaining = remaining[:length], remaining[length:]
+	}
+	if lastText >= 0 {
+		if strings.TrimSpace(out.Blocks[lastText].Text) != "" {
+			out.Blocks[lastText].Text += "\n"
+		}
+		out.Blocks[lastText].Text += notice
+	}
+	return out
 }
 
 func withoutArtifactSourceManifests(meta map[string]any) map[string]any {
@@ -321,7 +436,7 @@ func cloneToolResultMetadata(meta map[string]any) map[string]any {
 }
 
 func (a *Agent) nonRecoverableToolResultFallback(plain string, meta map[string]any, stage, action string, cause error) (llm.Content, map[string]any) {
-	diagnostic := fmt.Sprintf("[WARN] stage=%s action=%s complete=false recoverable=false", stage, action)
+	diagnostic := toolResultFallbackDiagnostic(stage, action)
 	if cause != nil {
 		a.warnf("warning: %s detail=%v", diagnostic, cause)
 	} else {
@@ -354,6 +469,10 @@ func (a *Agent) nonRecoverableToolResultFallback(plain string, meta map[string]a
 	meta["truncated"] = true
 	meta["originalSize"] = len(plain)
 	return llm.TextContent(bounded), meta
+}
+
+func toolResultFallbackDiagnostic(stage, action string) string {
+	return fmt.Sprintf("[WARN] stage=%s action=%s complete=false recoverable=false", stage, action)
 }
 
 func (a *Agent) toolResultArtifactBudget() artifact.Budget {

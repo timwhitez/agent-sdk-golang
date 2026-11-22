@@ -116,6 +116,18 @@ are never retried, and the original execution error/result is preserved.
   and re-encoded instead of raw prefix-cut. Missing or failed capabilities
   return a bounded stage/action diagnostic with `complete=false` and
   `recoverable=false`; they do not invent an object ref.
+- The tool-result boundary archives and bounds text only. A single text block
+  is replaced in place, with independently owned image, document, and other
+  non-text blocks retained in order on every success and fallback path. A
+  `text/plain` artifact does not claim to archive these attachments or their layout.
+  Multiple text blocks pass through unchanged when no rewrite is needed. If
+  bounding or envelope processing is needed, they use an explicit
+  `artifact_projection` fallback: keep text prefixes in their original slots,
+  place the bounded diagnostic in the last text slot, and retain all attachments.
+  This path writes no canonical object and makes no canonical recovery claim;
+  any legacy dump contains only the joined text. An invalid mixture of `Text`
+  and visible `Blocks` uses the same fallback, with `Text` represented as the
+  leading text part so neither text source is silently ignored.
 - `ArtifactOwnerProvider` is resolved once per oversized/existing-canonical
   tool-result boundary and takes precedence over `ArtifactOwner`. The returned
   owner is copied before the active tool name/call ID are bound. Provider
