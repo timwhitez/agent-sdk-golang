@@ -1395,6 +1395,12 @@ func (a *Agent) queryStreamWithSteering(ctx context.Context, input llm.Content, 
 				}
 				cont.clearPartialToolCalls(a.messages, msgIndex)
 				blockSources = unionFrameSources(mergedSources)
+				// Opaque state describes the final provider fragment, not any
+				// arguments or names reconstructed by the driver. Replay from
+				// the generic calls when merging changed that fragment.
+				if !sameToolCalls(comp.ToolCalls, merged) {
+					comp.Content = llm.WithoutProviderState(comp.Content)
+				}
 				comp.ToolCalls = merged
 				currentAssistant = llm.CloneMessage(llm.Message{Role: llm.RoleAssistant, Content: comp.Content, ToolCalls: merged})
 				a.messages[msgIndex] = currentAssistant
@@ -6532,7 +6538,7 @@ func sameToolCalls(a, b []llm.ToolCall) bool {
 		return false
 	}
 	for i := range a {
-		if a[i].ID != b[i].ID || a[i].Function.Name != b[i].Function.Name || a[i].Function.Arguments != b[i].Function.Arguments {
+		if a[i].ID != b[i].ID || a[i].Type != b[i].Type || a[i].Function != b[i].Function || !slices.Equal(a[i].ThoughtSig, b[i].ThoughtSig) {
 			return false
 		}
 	}
