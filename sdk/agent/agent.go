@@ -2943,6 +2943,11 @@ func (a *Agent) transientInvokeRetryDelay(err error, partial *llm.Completion, st
 		var pe *llm.ProviderError
 		if errors.As(err, &pe) {
 			transient = retryableProviderStatus(pe.StatusCode)
+			// A concrete non-retryable HTTP status is authoritative. Error
+			// prose such as "rate limit settings unavailable" cannot override it.
+			if pe.StatusCode >= 400 && pe.StatusCode <= 599 && !transient {
+				return 0, false
+			}
 			if pe.RetryAfter > 0 {
 				retryAfter = pe.RetryAfter
 			}
