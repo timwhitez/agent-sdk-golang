@@ -17,6 +17,7 @@ func TestToolCallDropRootCancellationPreventsHandlerAdmission(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	var effects, providers atomic.Int32
+	var droppedResults atomic.Int32
 	var once atomic.Bool
 	dropped := make(chan struct{})
 	states := make(chan []toolCallState, 1)
@@ -29,6 +30,9 @@ func TestToolCallDropRootCancellationPreventsHandlerAdmission(t *testing.T) {
 	}}
 	ag, err := New(Config{LLM: model, EventBufferSize: 1, EventSendTimeout: time.Millisecond, EventDropLogEvery: 1, Warningf: func(format string, args ...any) {
 		message := fmt.Sprintf(format, args...)
+		if strings.Contains(message, "dropping consistency-critical agent event agent.ToolResultEvent") {
+			droppedResults.Add(1)
+		}
 		if strings.Contains(message, "dropping consistency-critical agent event agent.ToolCallEvent") && once.CompareAndSwap(false, true) {
 			cancel()
 			close(dropped)
@@ -52,12 +56,17 @@ func TestToolCallDropRootCancellationPreventsHandlerAdmission(t *testing.T) {
 	}
 	resultEvents := 0
 	for envelope := range stream {
-		if _, ok := envelope.Event.(ToolResultEvent); ok {
+		if result, ok := envelope.Event.(ToolResultEvent); ok {
 			resultEvents++
+			if result.ToolCallID != "first" || !result.IsError || result.ErrorOrigin != ToolErrorOriginCanceled || result.HandlerFailed {
+				t.Fatalf("unexpected canceled terminal: %+v", result)
+			}
 		}
 	}
-	if effects.Load() != 0 || providers.Load() != 1 || resultEvents != 0 {
-		t.Fatalf("effects=%d providers=%d result events=%d", effects.Load(), providers.Load(), resultEvents)
+	// The first call was announced before cancellation; its terminal is
+	// delivered if a buffer slot opens, otherwise it must be explicitly dropped.
+	if effects.Load() != 0 || providers.Load() != 1 || resultEvents+int(droppedResults.Load()) != 1 {
+		t.Fatalf("effects=%d providers=%d result events=%d dropped results=%d", effects.Load(), providers.Load(), resultEvents, droppedResults.Load())
 	}
 	snapshot := <-states
 	if len(snapshot) != 2 {
