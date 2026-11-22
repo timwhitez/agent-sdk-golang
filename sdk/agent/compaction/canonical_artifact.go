@@ -271,7 +271,21 @@ func canonicalManifestIdentityEqual(left, right artifact.Manifest) bool {
 	right.VisibleMeasurement = artifact.Measurement{}
 	left.Preview = artifact.Preview{Kind: artifact.PreviewKindNone}
 	right.Preview = artifact.Preview{Kind: artifact.PreviewKindNone}
+	// JSON transports instants and offsets, not Go's location names or
+	// monotonic clock readings. Compare the retention instants canonically.
+	normalizeCanonicalRetention(&left.Retention)
+	normalizeCanonicalRetention(&right.Retention)
 	return reflect.DeepEqual(left, right)
+}
+
+func normalizeCanonicalRetention(retention *artifact.Retention) {
+	retention.CreatedAt = retention.CreatedAt.UTC()
+	if retention.GCEligibleAfter != nil {
+		*retention.GCEligibleAfter = retention.GCEligibleAfter.UTC()
+	}
+	if retention.ExpiresAt != nil {
+		*retention.ExpiresAt = retention.ExpiresAt.UTC()
+	}
 }
 
 func canonicalRecoveryEqual(left, right artifact.Recovery) bool {
