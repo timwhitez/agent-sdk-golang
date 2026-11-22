@@ -109,7 +109,7 @@ func (a *Agent) planNativeCall(idx int, p *nativePreparedCall) BlockCallPlan {
 	}
 	resources := append([]string(nil), plan.Resources...)
 	for _, target := range targets {
-		resources = append(resources, "sdk.evidence:"+family+"|"+target)
+		resources = append(resources, "sdk.evidence:"+target)
 	}
 	return BlockCallPlan{Concurrent: true, Resources: resources}
 }

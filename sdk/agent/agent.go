@@ -1987,8 +1987,10 @@ func (a *Agent) queryStreamWithSteering(ctx context.Context, input llm.Content, 
 				plans := make([]*BlockCallPlan, len(comp.ToolCalls))
 				adapter.Parallel = &BlockParallelism{MaxWorkers: par.MaxWorkers, Plan: func(idx int) BlockCallPlan {
 					if plans[idx] == nil {
-						plan := a.planNativeCall(idx, preparedCall(idx))
-						plans[idx] = &plan
+						// Cache the conservative fallback before calling host code:
+						// the owner recovers panics without consulting Plan again.
+						plans[idx] = &BlockCallPlan{}
+						*plans[idx] = a.planNativeCall(idx, preparedCall(idx))
 					}
 					return *plans[idx]
 				}}
