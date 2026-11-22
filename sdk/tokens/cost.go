@@ -321,9 +321,9 @@ func (tc *TokenCost) AddUsage(ctx context.Context, model string, usage llm.Usage
 	if err := tc.Initialize(ctx); err != nil {
 		return TokenUsageEntry{}, err
 	}
-	entry := TokenUsageEntry{Model: model, At: time.Now(), Usage: usage}
+	entry := TokenUsageEntry{Model: model, At: time.Now(), Usage: *llm.CloneUsage(&usage)}
 	if tc.IncludeCost {
-		calc, err := tc.calculateCost(ctx, model, usage)
+		calc, err := tc.calculateCost(ctx, model, entry.Usage)
 		if err != nil {
 			pricingCacheWarningf(
 				"tokens: cost calculation failed (model=%q prompt=%d completion=%d total=%d): %v",
@@ -338,9 +338,31 @@ func (tc *TokenCost) AddUsage(ctx context.Context, model string, usage llm.Usage
 		}
 	}
 	tc.mu.Lock()
-	tc.usageHistory = append(tc.usageHistory, entry)
+	tc.usageHistory = append(tc.usageHistory, cloneTokenUsageEntry(entry))
 	tc.mu.Unlock()
 	return entry, nil
+}
+
+func cloneTokenUsageEntry(entry TokenUsageEntry) TokenUsageEntry {
+	out := entry
+	out.Usage = *llm.CloneUsage(&entry.Usage)
+	if entry.Cost != nil {
+		cost := *entry.Cost
+		cost.PromptReadCachedTokens = cloneCostValue(entry.Cost.PromptReadCachedTokens)
+		cost.PromptReadCachedCost = cloneCostValue(entry.Cost.PromptReadCachedCost)
+		cost.PromptCacheCreationTokens = cloneCostValue(entry.Cost.PromptCacheCreationTokens)
+		cost.PromptCacheCreationCost = cloneCostValue(entry.Cost.PromptCacheCreationCost)
+		out.Cost = &cost
+	}
+	return out
+}
+
+func cloneCostValue[T int | float64](value *T) *T {
+	if value == nil {
+		return nil
+	}
+	copy := *value
+	return &copy
 }
 
 func (tc *TokenCost) GetUsageSummary() UsageSummary {
