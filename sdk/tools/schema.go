@@ -160,8 +160,37 @@ func collectSchemaFields(t reflect.Type, depth int, optional bool, path map[refl
 		if name == "" {
 			continue
 		}
-		*out = append(*out, schemaField{name: name, depth: depth, tagged: tagName != "", schema: schemaForType(ft, path), required: !omit && !isPtr && !optional})
+		fieldSchema := schemaForType(ft, path)
+		if jsonFieldQuoted(f) {
+			fieldSchema = map[string]any{"type": "string"}
+		}
+		*out = append(*out, schemaField{name: name, depth: depth, tagged: tagName != "", schema: fieldSchema, required: !omit && !isPtr && !optional})
 	}
+}
+
+// jsonFieldQuoted mirrors encoding/json's supported ,string field kinds.
+func jsonFieldQuoted(f reflect.StructField) bool {
+	_, options, _ := strings.Cut(f.Tag.Get("json"), ",")
+	quoted := false
+	for _, option := range strings.Split(options, ",") {
+		if option == "string" {
+			quoted = true
+		}
+	}
+	if !quoted {
+		return false
+	}
+	t := f.Type
+	if t.Name() == "" && t.Kind() == reflect.Pointer {
+		t = t.Elem()
+	}
+	switch t.Kind() {
+	case reflect.Bool, reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64,
+		reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64, reflect.Uintptr,
+		reflect.Float32, reflect.Float64, reflect.String:
+		return true
+	}
+	return false
 }
 
 func schemaForType(t reflect.Type, path map[reflect.Type]bool) map[string]any {
