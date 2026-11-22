@@ -1755,9 +1755,10 @@ func toAnthropicMessageForCache(m llm.Message, warnf func(string, ...any), recor
 			}
 			input := any(map[string]any{})
 			if strings.TrimSpace(tc.Function.Arguments) != "" {
-				var v any
-				if json.Unmarshal([]byte(tc.Function.Arguments), &v) == nil {
-					input = v
+				// Replay validated JSON directly: decoding through any would
+				// round integers above 2^53 and reject large JSON exponents.
+				if json.Valid([]byte(tc.Function.Arguments)) {
+					input = json.RawMessage(tc.Function.Arguments)
 				} else {
 					input = map[string]any{"_raw": tc.Function.Arguments}
 				}
