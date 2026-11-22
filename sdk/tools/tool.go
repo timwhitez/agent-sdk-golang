@@ -113,10 +113,19 @@ func (p PreparedCall) RequireFinalArgs() PreparedCall {
 	if p.final == nil {
 		return p
 	}
-	required := *p.final
+	// Each required copy owns a fresh decoded object, including nested maps,
+	// slices and pointers. Sharing args while resetting only the consumption
+	// state would let one invocation mutate what another executes.
+	// Sealed bindings are pure, so this does not invoke a custom codec.
+	required := prepareTypedArgs(p.final.binding, p.final.raw)
+	if required == nil || !bytes.Equal(required.view, p.final.view) {
+		// A caller may have changed a tool's schema since preparation. Refuse
+		// rather than silently change the final arguments that planning saw.
+		p.err = ErrFinalArgsChanged
+		return p
+	}
 	required.required = true
-	required.state = &finalArgsState{}
-	p.final = &required
+	p.final = required
 	return p
 }
 
