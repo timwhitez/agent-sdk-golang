@@ -145,6 +145,14 @@ func IsFramedEnvelope(text string) bool {
 func (JSONEnvelopeCodec) Decode(text string) (Envelope, bool, error) {
 	start := strings.Index(text, EnvelopeStartMarker)
 	end := strings.Index(text, EnvelopeEndMarker)
+	if IsFramedEnvelope(text) {
+		// A complete frame must consume its entire payload. The first end
+		// marker may occur inside a JSON string or be followed by another
+		// frame; using the final marker lets json.Unmarshal reject any extra
+		// payload instead of silently discarding it. Non-framed embedded
+		// decoding retains its existing surrounding-prose compatibility.
+		end = strings.LastIndex(text, EnvelopeEndMarker)
+	}
 	if start < 0 && end < 0 {
 		return Envelope{}, false, nil
 	}
