@@ -2,9 +2,11 @@ package agent
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 
 	"github.com/timwhitez/agent-sdk-golang/sdk/llm"
 	"github.com/timwhitez/agent-sdk-golang/sdk/tools"
@@ -58,6 +60,7 @@ type nativePreparedCall struct {
 	execArgs        string
 	prepared        tools.PreparedCall
 	norm            tools.ToolArgsNormalization
+	handlerStarted  atomic.Bool
 }
 
 func prepareNativeCall(tc llm.ToolCall, exact, normalized map[string]tools.Tool) *nativePreparedCall {
@@ -72,7 +75,14 @@ func prepareNativeCall(tc llm.ToolCall, exact, normalized map[string]tools.Tool)
 			p.tool = autoInvalidTool()
 		}
 	}
-	p.prepared, p.norm = p.tool.PrepareCall(p.execArgs)
+	executable := p.tool
+	if handler := executable.Handler; handler != nil {
+		executable.Handler = func(ctx context.Context, args json.RawMessage, deps *tools.Container) (llm.Content, error) {
+			p.handlerStarted.Store(true)
+			return handler(ctx, args, deps)
+		}
+	}
+	p.prepared, p.norm = executable.PrepareCall(p.execArgs)
 	return p
 }
 
