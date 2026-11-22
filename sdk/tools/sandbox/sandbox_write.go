@@ -229,8 +229,12 @@ func editTool() tools.Tool {
 			msg := formatErrorDiagnostic(fmt.Sprintf("Path is a directory: %s", a.FilePath), "Provide a file path (not a directory) and retry.")
 			return llm.TextContent(msg), err
 		}
-		content := string(b)
-		target := writeTargetSnapshot{Exists: true, Info: st, Content: content, ContentFull: true}
+		decoded, err := decodeUnicodeTextBOM(b)
+		if err != nil {
+			return llm.TextContent(err.Error()), err
+		}
+		content := string(decoded)
+		target := writeTargetSnapshot{Exists: true, Info: st, Content: string(b), ContentFull: true}
 		if !strings.Contains(content, a.OldString) {
 			err := fmt.Errorf("string not found")
 			msg := formatErrorDiagnostic(fmt.Sprintf("String not found in %s", a.FilePath), "Check old_string matches file content and retry.")
@@ -242,6 +246,10 @@ func editTool() tools.Tool {
 			return llm.TextContent(msg), fmt.Errorf("edit requires unique match")
 		}
 		newContent := strings.Replace(content, a.OldString, a.NewString, count)
+		encoded, err := encodeUnicodeTextBOM(newContent, b)
+		if err != nil {
+			return llm.TextContent(err.Error()), err
+		}
 		raw := fmt.Sprintf("%s (replace %d occurrence(s))", a.FilePath, count)
 		meta := attachToolCallMeta(ctx, map[string]any{
 			"category":  "filesystem_write",
@@ -273,7 +281,7 @@ func editTool() tools.Tool {
 			msg := formatErrorDiagnosticFromErr("Unable to verify file before edit", err, "Check file permissions/path and retry.")
 			return llm.TextContent(msg), err
 		}
-		if err := s.writeFilePreserveMode(resolvedPath, []byte(newContent), 0o644); err != nil {
+		if err := s.writeFilePreserveMode(resolvedPath, encoded, 0o644); err != nil {
 			msg := formatErrorDiagnosticFromErr("Unable to write edited file", err, "Check file permissions/path and retry.")
 			return llm.TextContent(msg), err
 		}
@@ -341,8 +349,12 @@ func multieditTool() tools.Tool {
 			msg := formatErrorDiagnostic(fmt.Sprintf("Path is a directory: %s", a.FilePath), "Provide a file path (not a directory) and retry.")
 			return llm.TextContent(msg), err
 		}
-		orig := string(b)
-		target := writeTargetSnapshot{Exists: true, Info: st, Content: orig, ContentFull: true}
+		decoded, err := decodeUnicodeTextBOM(b)
+		if err != nil {
+			return llm.TextContent(err.Error()), err
+		}
+		orig := string(decoded)
+		target := writeTargetSnapshot{Exists: true, Info: st, Content: string(b), ContentFull: true}
 		content := orig
 		counts := make([]int, 0, len(a.Edits))
 		for i, e := range a.Edits {
@@ -369,6 +381,10 @@ func multieditTool() tools.Tool {
 			content = strings.Replace(content, e.OldString, e.NewString, replaced)
 		}
 
+		encoded, err := encodeUnicodeTextBOM(content, b)
+		if err != nil {
+			return llm.TextContent(err.Error()), err
+		}
 		summary := fmt.Sprintf("%s (multiedit %d step(s))", a.FilePath, len(a.Edits))
 		rawLines := []string{summary}
 		for i, c := range counts {
@@ -404,7 +420,7 @@ func multieditTool() tools.Tool {
 			msg := formatErrorDiagnosticFromErr("Unable to verify file before multiedit", err, "Check file permissions/path and retry.")
 			return llm.TextContent(msg), err
 		}
-		if err := s.writeFilePreserveMode(resolvedPath, []byte(content), 0o644); err != nil {
+		if err := s.writeFilePreserveMode(resolvedPath, encoded, 0o644); err != nil {
 			msg := formatErrorDiagnosticFromErr("Unable to write multiedit result", err, "Check file permissions/path and retry.")
 			return llm.TextContent(msg), err
 		}

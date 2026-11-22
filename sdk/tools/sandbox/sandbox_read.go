@@ -275,6 +275,38 @@ func decodeUnicodeTextBOM(raw []byte) ([]byte, error) {
 	return out, nil
 }
 
+// encodeUnicodeTextBOM encodes edited UTF-8 text using the original BOM and
+// byte order. Files without a BOM retain the existing byte-oriented behavior.
+func encodeUnicodeTextBOM(text string, original []byte) ([]byte, error) {
+	encoding, ok := detectUnicodeTextEncoding(original)
+	if !ok {
+		return []byte(text), nil
+	}
+	if !utf8.ValidString(text) {
+		return nil, fmt.Errorf("edited %s text is not valid UTF-8", encoding.name)
+	}
+	out := append([]byte(nil), original[:encoding.bomBytes]...)
+	if encoding.unitBytes == 1 {
+		return append(out, text...), nil
+	}
+	var unit [4]byte
+	for _, r := range text {
+		if encoding.unitBytes == 4 {
+			encoding.order.PutUint32(unit[:], uint32(r))
+			out = append(out, unit[:]...)
+		} else if r < 0x10000 {
+			encoding.order.PutUint16(unit[:2], uint16(r))
+			out = append(out, unit[:2]...)
+		} else {
+			high, low := utf16.EncodeRune(r)
+			encoding.order.PutUint16(unit[:2], uint16(high))
+			encoding.order.PutUint16(unit[2:], uint16(low))
+			out = append(out, unit[:]...)
+		}
+	}
+	return out, nil
+}
+
 func minInt(a, b int) int {
 	if a < b {
 		return a
